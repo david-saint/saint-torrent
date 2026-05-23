@@ -705,6 +705,8 @@ func generatePeerID() [20]byte {
 
 func main() {
 	downloadDir := "."
+	configDir := ""
+	persist := true
 	var filesToAdd []string
 
 	for i := 1; i < len(os.Args); i++ {
@@ -714,10 +716,18 @@ func main() {
 				downloadDir = os.Args[i+1]
 				i++
 			}
+		} else if arg == "-c" || arg == "--config" {
+			if i+1 < len(os.Args) {
+				configDir = os.Args[i+1]
+				i++
+			}
+		} else if arg == "--no-persist" {
+			persist = false
 		} else {
 			filesToAdd = append(filesToAdd, arg)
 		}
 	}
+
 	var startupWarns []string
 
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
@@ -729,6 +739,23 @@ func main() {
 
 	if err := mgr.StartDHT(downloadDir, 6881); err != nil {
 		startupWarns = append(startupWarns, fmt.Sprintf("DHT unavailable: %v", err))
+	}
+
+	if persist {
+		if configDir == "" {
+			userConfig, err := os.UserConfigDir()
+			if err == nil {
+				configDir = filepath.Join(userConfig, "sainttorrent")
+			} else {
+				configDir = ".sainttorrent"
+			}
+		}
+		warning, err := mgr.EnablePersistence(configDir)
+		if err != nil {
+			startupWarns = append(startupWarns, fmt.Sprintf("Failed to initialize persistence: %v", err))
+		} else if warning != "" {
+			startupWarns = append(startupWarns, warning)
+		}
 	}
 
 	for _, item := range filesToAdd {

@@ -92,6 +92,10 @@ type Session struct {
 	completedAnnounced bool
 	stoppedAnnounced   bool
 
+	OnStateChange         func()
+	MagnetURI             string
+	PendingFilePriorities []FilePriority
+
 	// File selection and priorities
 	FilePriorities []FilePriority
 
@@ -487,15 +491,6 @@ func (s *Session) Start() {
 		}
 		return
 	}
-	if s.paused {
-		s.paused = false
-		s.queueTrackerEventLocked("started")
-		for _, pState := range s.Peers {
-			if !pState.Active {
-				pState.LastAttempt = time.Time{}
-			}
-		}
-	}
 	s.started = true
 	s.mu.Unlock()
 	started := false
@@ -564,7 +559,9 @@ func (s *Session) Close() {
 		if wasStarted {
 			s.announceStopped()
 		}
-		s.cancel()
+		if s.cancel != nil {
+			s.cancel()
+		}
 
 		s.mu.Lock()
 		s.closed = true
@@ -1872,6 +1869,10 @@ func (s *Session) Pause() {
 	default:
 		// Already signaled
 	}
+
+	if s.OnStateChange != nil {
+		s.OnStateChange()
+	}
 }
 
 // Resume resumes the session and queues a started tracker event.
@@ -1897,14 +1898,26 @@ func (s *Session) Resume() {
 	default:
 		// Already signaled
 	}
+
+	if s.OnStateChange != nil {
+		s.OnStateChange()
+	}
 }
 
 // SetFilePriority sets the download priority for a specific file.
 func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	changed := false
 	if fileIndex >= 0 && fileIndex < len(s.FilePriorities) {
-		s.FilePriorities[fileIndex] = priority
+		if s.FilePriorities[fileIndex] != priority {
+			s.FilePriorities[fileIndex] = priority
+			changed = true
+		}
+	}
+	s.mu.Unlock()
+
+	if changed && s.OnStateChange != nil {
+		s.OnStateChange()
 	}
 }
 
@@ -2136,6 +2149,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	for i := range s.FilePriorities {
 		s.FilePriorities[i] = PriorityNormal
 	}
+	if len(s.PendingFilePriorities) > 0 {
+		for i := 0; i < len(s.FilePriorities) && i < len(s.PendingFilePriorities); i++ {
+			prio := s.PendingFilePriorities[i]
+			if prio >= PrioritySkip && prio <= PriorityHigh {
+				s.FilePriorities[i] = prio
+			}
+		}
+		s.PendingFilePriorities = nil
+	}
 
 	// Reinitialize piece states
 	numPieces := len(s.Torrent.PieceHashes)
@@ -2173,6 +2195,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.metadataMode = false
 	close(s.metadataCompletedCh)
 	s.mu.Unlock()
+
+	if s.OnStateChange != nil {
+		s.OnStateChange()
+	}
 
 	return nil
 }
