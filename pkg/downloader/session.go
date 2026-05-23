@@ -471,6 +471,11 @@ func (s *Session) Start() {
 		if wasPaused {
 			s.paused = false
 			s.queueTrackerEventLocked("started")
+			for _, pState := range s.Peers {
+				if !pState.Active {
+					pState.LastAttempt = time.Time{}
+				}
+			}
 		}
 		s.mu.Unlock()
 		s.lifecycleMu.Unlock()
@@ -485,6 +490,11 @@ func (s *Session) Start() {
 	if s.paused {
 		s.paused = false
 		s.queueTrackerEventLocked("started")
+		for _, pState := range s.Peers {
+			if !pState.Active {
+				pState.LastAttempt = time.Time{}
+			}
+		}
 	}
 	s.started = true
 	s.mu.Unlock()
@@ -604,7 +614,10 @@ func (s *Session) trackerLoop() {
 		hasMoreEvents := len(s.trackerEvents) > 0
 		s.mu.RUnlock()
 
-		if hasMoreEvents {
+		if interval == 0 && hasMoreEvents {
+			// Announce failed, back off to prevent spamming trackers
+			nextInterval = 15 * time.Second
+		} else if hasMoreEvents {
 			// Flush transition events quickly
 			nextInterval = 100 * time.Millisecond
 		} else if interval > 0 {
@@ -1871,6 +1884,11 @@ func (s *Session) Resume() {
 	}
 	s.paused = false
 	s.queueTrackerEventLocked("started")
+	for _, pState := range s.Peers {
+		if !pState.Active {
+			pState.LastAttempt = time.Time{}
+		}
+	}
 	s.mu.Unlock()
 
 	// Signal tracker loop to announce immediately
