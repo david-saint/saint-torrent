@@ -1,6 +1,6 @@
 # Binaries
-sainttorrent
-sainttorrent.exe
+/sainttorrent
+/sainttorrent.exe
 *.exe
 
 # OS generated files
