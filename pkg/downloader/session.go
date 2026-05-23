@@ -88,8 +88,9 @@ type Session struct {
 	closed             bool
 	started            bool
 	resumeCh           chan struct{} // signal to wake tracker loop on resume
-	nextTrackerEvent   string        // "started", "completed", "stopped", or ""
+	trackerEvents      []string      // Queue of pending tracker events
 	completedAnnounced bool
+	stoppedAnnounced   bool
 
 	// File selection and priorities
 	FilePriorities []FilePriority
@@ -162,7 +163,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		metadataMode:        metadataMode,
 		metadataCompletedCh: make(chan struct{}),
 		downloadDir:         resolvedDir,
-		nextTrackerEvent:    "started",
+		trackerEvents:      []string{"started"},
 	}
 
 	if !metadataMode {
@@ -219,7 +220,7 @@ func (s *Session) verifyExistingPieces() {
 		stats := s.completionStatsLocked()
 		if stats.completedTotalBytes == stats.totalBytes && stats.totalBytes > 0 {
 			s.completedAnnounced = true
-			s.nextTrackerEvent = "completed"
+			s.queueTrackerEventLocked("completed")
 			select {
 			case s.resumeCh <- struct{}{}:
 			default:
@@ -408,7 +409,7 @@ func (s *Session) markPieceCompleted(index int64) {
 		stats := s.completionStatsLocked()
 		if stats.completedTotalBytes == stats.totalBytes && stats.totalBytes > 0 {
 			s.completedAnnounced = true
-			s.nextTrackerEvent = "completed"
+			s.queueTrackerEventLocked("completed")
 			completedNow = true
 		}
 	}
@@ -467,7 +468,10 @@ func (s *Session) Start() {
 	}
 	if s.started {
 		wasPaused := s.paused
-		s.paused = false
+		if wasPaused {
+			s.paused = false
+			s.queueTrackerEventLocked("started")
+		}
 		s.mu.Unlock()
 		s.lifecycleMu.Unlock()
 		if wasPaused {
@@ -480,6 +484,7 @@ func (s *Session) Start() {
 	}
 	if s.paused {
 		s.paused = false
+		s.queueTrackerEventLocked("started")
 	}
 	s.started = true
 	s.mu.Unlock()
@@ -582,10 +587,11 @@ func (s *Session) trackerLoop() {
 	for {
 		s.mu.RLock()
 		paused := s.paused
+		hasEvents := len(s.trackerEvents) > 0
 		s.mu.RUnlock()
 
 		var interval int
-		if !paused {
+		if !paused || hasEvents {
 			interval = s.announceAndConnect()
 		}
 		select {
@@ -594,24 +600,33 @@ func (s *Session) trackerLoop() {
 		default:
 		}
 
-		if interval > 0 {
+		s.mu.RLock()
+		hasMoreEvents := len(s.trackerEvents) > 0
+		s.mu.RUnlock()
+
+		if hasMoreEvents {
+			// Flush transition events quickly
+			nextInterval = 100 * time.Millisecond
+		} else if interval > 0 {
 			nextInterval = time.Duration(interval) * time.Second
 		} else {
 			nextInterval = 30 * time.Second
 		}
 
-		if nextInterval < 5*time.Second {
-			nextInterval = 5 * time.Second
-		}
-		if nextInterval > 1*time.Hour {
-			nextInterval = 1 * time.Hour
+		if !hasMoreEvents {
+			if nextInterval < 5*time.Second {
+				nextInterval = 5 * time.Second
+			}
+			if nextInterval > 1*time.Hour {
+				nextInterval = 1 * time.Hour
+			}
 		}
 
 		timer := time.NewTimer(nextInterval)
 		select {
 		case <-timer.C:
 		case <-s.resumeCh:
-			// Resume triggered — announce immediately
+			// Event triggered — announce immediately
 			timer.Stop()
 		case <-s.ctx.Done():
 			timer.Stop()
@@ -679,13 +694,24 @@ func (s *Session) speedMonitorLoop() {
 }
 
 func (s *Session) announceAndConnect() int {
+	s.mu.Lock()
 	trackers := s.Torrent.Trackers
 	if len(trackers) == 0 {
+		// No trackers configured: consume all queued events as completed/success
+		if len(s.trackerEvents) > 0 {
+			for _, ev := range s.trackerEvents {
+				if ev == "stopped" {
+					s.stoppedAnnounced = true
+				} else if ev == "started" {
+					s.stoppedAnnounced = false
+				}
+			}
+			s.trackerEvents = nil
+		}
+		s.mu.Unlock()
 		return 0
 	}
 
-	// Gather download stats and the next event
-	s.mu.Lock()
 	var downloaded, left int64
 	if s.metadataMode || s.Storage == nil || len(s.PieceStates) == 0 {
 		left = 1
@@ -699,10 +725,12 @@ func (s *Session) announceAndConnect() int {
 	}
 	port := s.Port
 	uploaded := s.Uploaded
-	event := s.nextTrackerEvent
-	if event != "stopped" {
-		s.nextTrackerEvent = "" // Reset event
+	var event string
+	if len(s.trackerEvents) > 0 {
+		event = s.trackerEvents[0]
+		s.trackerEvents = s.trackerEvents[1:]
 	}
+	paused := s.paused
 	s.mu.Unlock()
 
 	var peers []tracker.Peer
@@ -775,13 +803,28 @@ func (s *Session) announceAndConnect() int {
 
 	s.mu.Lock()
 	s.lastErr = trackerErr
-	if trackerErr != nil && event != "" {
-		s.nextTrackerEvent = event
+	if trackerErr != nil {
+		if event != "" {
+			s.trackerEvents = append([]string{event}, s.trackerEvents...)
+			if event == "stopped" {
+				s.stoppedAnnounced = false
+			}
+		}
+	} else {
+		if event == "stopped" {
+			s.stoppedAnnounced = true
+		} else if event == "started" {
+			s.stoppedAnnounced = false
+		}
 	}
 	s.mu.Unlock()
 
 	if trackerErr != nil {
 		return 0
+	}
+
+	if paused {
+		return interval
 	}
 
 	// Connect to new peers
@@ -1740,12 +1783,38 @@ func (s *Session) sendPeerControlLocked(c *peer.Client, fn func(*peer.Client) er
 	}()
 }
 
-// Status returns the current status text (Downloading, Seeding, Paused, or Error).
+func (s *Session) isCompletedLocked() bool {
+	if s.Storage == nil || s.metadataMode || s.Torrent == nil || len(s.PieceStates) == 0 {
+		return false
+	}
+	stats := s.completionStatsLocked()
+	return stats.wantedBytes == 0 || (stats.wantedPieces > 0 && stats.completedWantedPieces == stats.wantedPieces)
+}
+
+func (s *Session) queueTrackerEventLocked(event string) {
+	if len(s.trackerEvents) > 0 && s.trackerEvents[len(s.trackerEvents)-1] == event {
+		return
+	}
+	s.trackerEvents = append(s.trackerEvents, event)
+}
+
+// IsCompleted returns whether the download is completed.
+func (s *Session) IsCompleted() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isCompletedLocked()
+}
+
+// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
 func (s *Session) Status() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	isCompleted := s.isCompletedLocked()
 	if s.paused {
+		if isCompleted {
+			return "Stopped"
+		}
 		return "Paused"
 	}
 	if s.lastErr != nil {
@@ -1755,14 +1824,7 @@ func (s *Session) Status() string {
 		return "Metadata"
 	}
 
-	stats := s.completionStatsLocked()
-	if stats.wantedBytes == 0 {
-		return "Seeding"
-	}
-	if stats.wantedPieces == 0 {
-		return "Downloading"
-	}
-	if stats.completedWantedPieces == stats.wantedPieces {
+	if isCompleted {
 		return "Seeding"
 	}
 	return "Downloading"
@@ -1775,23 +1837,40 @@ func (s *Session) IsMetadataMode() bool {
 	return s.metadataMode
 }
 
-// Pause pauses the session and closes active connections.
+// Pause pauses the session, closes active connections, and queues a stopped tracker event.
 func (s *Session) Pause() {
 	s.mu.Lock()
+	if s.paused {
+		s.mu.Unlock()
+		return
+	}
 	s.paused = true
+	s.queueTrackerEventLocked("stopped")
 	for _, client := range s.activePeers {
 		if client.Conn != nil {
 			_ = client.Conn.Close()
 		}
 	}
 	s.mu.Unlock()
+
+	// Signal tracker loop to announce immediately
+	select {
+	case s.resumeCh <- struct{}{}:
+	default:
+		// Already signaled
+	}
 }
 
-// Resume resumes the session.
+// Resume resumes the session and queues a started tracker event.
 // P1 FIX: No longer spawns untracked goroutines — signals tracker loop via resumeCh.
 func (s *Session) Resume() {
 	s.mu.Lock()
+	if !s.paused {
+		s.mu.Unlock()
+		return
+	}
 	s.paused = false
+	s.queueTrackerEventLocked("started")
 	s.mu.Unlock()
 
 	// Signal tracker loop to announce immediately
@@ -2203,17 +2282,28 @@ func (s *Session) AttachDHT(d *dht.DHT) {
 }
 
 func (s *Session) announceStopped() {
+	s.mu.Lock()
+	if s.stoppedAnnounced {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
 	// Short timeout (2s) on a background context
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	s.announceWithEvent(ctx, "stopped")
+	if s.announceWithEvent(ctx, "stopped") {
+		s.mu.Lock()
+		s.stoppedAnnounced = true
+		s.mu.Unlock()
+	}
 }
 
-func (s *Session) announceWithEvent(ctx context.Context, event string) {
+func (s *Session) announceWithEvent(ctx context.Context, event string) bool {
 	trackers := s.Torrent.Trackers
 	if len(trackers) == 0 {
-		return
+		return true // No trackers configured, counts as success
 	}
 
 	s.mu.RLock()
@@ -2232,9 +2322,13 @@ func (s *Session) announceWithEvent(ctx context.Context, event string) {
 	uploaded := s.Uploaded
 	s.mu.RUnlock()
 
+	success := false
 	for _, tr := range trackers {
 		if bytes.HasPrefix([]byte(tr), []byte("udp")) {
-			_, _ = tracker.UDPAnnounce(ctx, tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, event)
+			_, err := tracker.UDPAnnounce(ctx, tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, event)
+			if err == nil {
+				success = true
+			}
 		} else if bytes.HasPrefix([]byte(tr), []byte("http")) {
 			u, err := tracker.BuildTrackerURL(tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, true, event)
 			if err != nil {
@@ -2248,7 +2342,9 @@ func (s *Session) announceWithEvent(ctx context.Context, event string) {
 			resp, err := client.Do(req)
 			if err == nil {
 				resp.Body.Close()
+				success = true
 			}
 		}
 	}
+	return success
 }

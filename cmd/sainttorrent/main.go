@@ -413,12 +413,7 @@ func (m model) viewTorrentList() string {
 		sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 78)) + "\n")
 
 		for i, s := range m.sessions {
-			indicator := " "
-			if s.IsPaused() {
-				indicator = "⏸"
-			} else {
-				indicator = "▶"
-			}
+			indicator := getIndicator(s.IsPaused(), s.IsCompleted())
 
 			name := s.Torrent.Name
 			if len(name) > 23 {
@@ -441,6 +436,8 @@ func (m model) viewTorrentList() string {
 			switch status {
 			case "Paused":
 				statusBadge = statusPausedStyle.Render("PAUSED")
+			case "Stopped":
+				statusBadge = statusPausedStyle.Render("STOPPED")
 			case "Seeding":
 				statusBadge = statusSeedingStyle.Render("SEEDING")
 			case "Metadata":
@@ -451,11 +448,7 @@ func (m model) viewTorrentList() string {
 				statusBadge = statusDownloadingStyle.Render("DOWNLOADING")
 			}
 
-			speed := s.CurrentSpeed()
-			speedStr := fmt.Sprintf("↓ %-6s", formatSpeed(speed))
-			if s.IsPaused() {
-				speedStr = "paused"
-			}
+			speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), s.CurrentSpeed())
 
 			rowContent := fmt.Sprintf("  %-3s %-25s %-9s %-12s %-11s %-15s",
 				indicator, name, sizeStr, pctStr, statusBadge, speedStr)
@@ -503,7 +496,12 @@ func (m model) viewTorrentList() string {
 		warnStyle.Render(upLimitStr),
 	))
 
-	sb.WriteString(helpStyle.Render("  [enter] Details | [space] Pause/Resume | [a] Add | [d] Down Limit | [u] Up Limit | [q] Quit") + "\n")
+	spaceActionHelp := "Pause/Resume"
+	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+		s := m.sessions[m.selectedIdx]
+		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	}
+	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [enter] Details | [space] %s | [a] Add | [d] Down Limit | [u] Up Limit | [q] Quit", spaceActionHelp)) + "\n")
 	return sb.String()
 }
 
@@ -523,6 +521,8 @@ func (m model) viewTorrentDetails() string {
 	switch status {
 	case "Paused":
 		statusBadge = statusPausedStyle.Render("PAUSED")
+	case "Stopped":
+		statusBadge = statusPausedStyle.Render("STOPPED")
 	case "Seeding":
 		statusBadge = statusSeedingStyle.Render("SEEDING")
 	case "Metadata":
@@ -549,7 +549,11 @@ func (m model) viewTorrentDetails() string {
 	peers := s.GetActivePeers()
 	if len(peers) == 0 {
 		if s.IsPaused() {
-			peersContent.WriteString(subtleStyle.Render("  Session is paused.") + "\n")
+			if s.IsCompleted() {
+				peersContent.WriteString(subtleStyle.Render("  Session is stopped.") + "\n")
+			} else {
+				peersContent.WriteString(subtleStyle.Render("  Session is paused.") + "\n")
+			}
 		} else {
 			peersContent.WriteString(subtleStyle.Render("  No connected peers. Searching via DHT/Tracker...") + "\n")
 		}
@@ -590,7 +594,8 @@ func (m model) viewTorrentDetails() string {
 		sb.WriteString("\n\n")
 	}
 
-	sb.WriteString(helpStyle.Render("  [esc] Back to Dashboard | [space] Pause/Resume | [f] File Priorities | [q] Quit") + "\n")
+	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back to Dashboard | [space] %s | [f] File Priorities | [q] Quit", spaceActionHelp)) + "\n")
 	return sb.String()
 }
 

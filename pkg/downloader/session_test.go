@@ -4,10 +4,13 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -598,10 +601,10 @@ func TestAnnounceKeepsStartedEventAfterFailure(t *testing.T) {
 
 	sess.announceAndConnect()
 	sess.mu.RLock()
-	event := sess.nextTrackerEvent
+	events := sess.trackerEvents
 	sess.mu.RUnlock()
-	if event != "started" {
-		t.Fatalf("expected failed announce to preserve started event, got %q", event)
+	if len(events) != 1 || events[0] != "started" {
+		t.Fatalf("expected failed announce to preserve started event, got %v", events)
 	}
 }
 
@@ -730,4 +733,292 @@ func TestSessionChokingStrategy(t *testing.T) {
 		t.Error("expected optimistic peer to be unchoked")
 	}
 	sess.mu.RUnlock()
+}
+
+func TestSessionStatusStopped(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "sainttorrent_session_stopped_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	tor := &torrent.Torrent{
+		Name:        "stopped_test.txt",
+		PieceLength: 1024,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("data"))},
+		Files: []torrent.File{
+			{Length: 1024, Path: []string{"stopped_test.txt"}},
+		},
+	}
+
+	files := []storage.FileInfo{
+		{Path: filepath.Join(tor.Files[0].Path...), Length: tor.Files[0].Length},
+	}
+	st, err := storage.NewStorage(tempDir, files, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	peerID := [20]byte{4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4}
+	sess, err := NewSession(tor, st, peerID, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	if sess.IsCompleted() {
+		t.Error("expected session not to be completed initially")
+	}
+
+	// Complete the session
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.mu.Unlock()
+
+	if !sess.IsCompleted() {
+		t.Error("expected session to be completed")
+	}
+
+	if status := sess.Status(); status != "Seeding" {
+		t.Errorf("expected status 'Seeding', got %q", status)
+	}
+
+	sess.Pause()
+	if !sess.IsPaused() {
+		t.Error("expected session to be paused/stopped")
+	}
+
+	if status := sess.Status(); status != "Stopped" {
+		t.Errorf("expected status 'Stopped' for completed paused session, got %q", status)
+	}
+
+	sess.Resume()
+	if sess.IsPaused() {
+		t.Error("expected session to be resumed/started")
+	}
+
+	if status := sess.Status(); status != "Seeding" {
+		t.Errorf("expected status 'Seeding', got %q", status)
+	}
+}
+
+func TestSessionPauseResumeAnnounceQueue(t *testing.T) {
+	tor := &torrent.Torrent{
+		Name:     "announce_test",
+		InfoHash: sha1.Sum([]byte("announce_test")),
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Verify initial event is "started"
+	sess.mu.RLock()
+	events := sess.trackerEvents
+	sess.mu.RUnlock()
+	if len(events) != 1 || events[0] != "started" {
+		t.Errorf("expected initial trackerEvents [started], got %v", events)
+	}
+
+	// Manually queue completed event
+	sess.mu.Lock()
+	sess.queueTrackerEventLocked("completed")
+	sess.mu.Unlock()
+
+	// Pause
+	sess.Pause()
+
+	// Resume
+	sess.Resume()
+
+	sess.mu.RLock()
+	events = sess.trackerEvents
+	sess.mu.RUnlock()
+
+	// Queue should now contain: started, completed, stopped, started in order
+	expected := []string{"started", "completed", "stopped", "started"}
+	if len(events) != len(expected) {
+		t.Fatalf("expected queue length %d, got %d (events: %v)", len(expected), len(events), events)
+	}
+	for i, ev := range expected {
+		if events[i] != ev {
+			t.Errorf("expected event[%d] = %q, got %q", i, ev, events[i])
+		}
+	}
+}
+
+func TestSessionAnnounceFailureRetainsQueue(t *testing.T) {
+	// Dynamically find a closed port to prevent flakiness
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // Immediately close to guarantee it fails
+
+	tor := &torrent.Torrent{
+		Name:     "announce_fail_test",
+		InfoHash: sha1.Sum([]byte("announce_fail_test")),
+		Trackers: []string{"http://" + addr + "/announce"},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// Queue should have "started" initially. Let's call announceAndConnect.
+	// Since the announce fails, the "started" event should remain in trackerEvents.
+	sess.announceAndConnect()
+
+	sess.mu.RLock()
+	events := sess.trackerEvents
+	lastErr := sess.lastErr
+	sess.mu.RUnlock()
+
+	if len(events) != 1 || events[0] != "started" {
+		t.Errorf("expected event 'started' to be retained on failure, got %v", events)
+	}
+	if lastErr == nil {
+		t.Error("expected lastErr to be set after failed announce")
+	}
+}
+
+func TestSessionAnnounceNoTrackersQueue(t *testing.T) {
+	// No trackers configured
+	tor := &torrent.Torrent{
+		Name:     "no_trackers_test",
+		InfoHash: sha1.Sum([]byte("no_trackers_test")),
+		Trackers: []string{},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.queueTrackerEventLocked("completed")
+	sess.queueTrackerEventLocked("stopped")
+	sess.mu.Unlock()
+
+	sess.announceAndConnect()
+
+	sess.mu.RLock()
+	events := sess.trackerEvents
+	stoppedAnn := sess.stoppedAnnounced
+	sess.mu.RUnlock()
+
+	if len(events) != 0 {
+		t.Errorf("expected queue to be fully consumed for no-tracker session, got %v", events)
+	}
+	if !stoppedAnn {
+		t.Error("expected stoppedAnnounced to be true after consuming stopped event in no-tracker path")
+	}
+}
+
+func TestSessionStatusStoppedPrecedence(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "sainttorrent_session_precedence_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	tor := &torrent.Torrent{
+		Name:        "precedence.txt",
+		PieceLength: 1024,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("data"))},
+		Files: []torrent.File{
+			{Length: 1024, Path: []string{"precedence.txt"}},
+		},
+	}
+
+	files := []storage.FileInfo{
+		{Path: filepath.Join(tor.Files[0].Path...), Length: tor.Files[0].Length},
+	}
+	st, err := storage.NewStorage(tempDir, files, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	peerID := [20]byte{4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4}
+	sess, err := NewSession(tor, st, peerID, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	// 1. Mark completed
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.mu.Unlock()
+
+	// 2. Set an error
+	sess.mu.Lock()
+	sess.lastErr = fmt.Errorf("some tracker error")
+	sess.mu.Unlock()
+
+	// 3. Pause
+	sess.Pause()
+
+	// Verify status is "Stopped" rather than "Error" because paused/stopped has priority!
+	if status := sess.Status(); status != "Stopped" {
+		t.Errorf("expected status 'Stopped' (precedence), got %q", status)
+	}
+}
+
+func TestSessionStartResumesQueue(t *testing.T) {
+	var eventsReceived []string
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		eventsReceived = append(eventsReceived, r.URL.Query().Get("event"))
+		mu.Unlock()
+		_, _ = w.Write([]byte("d8:intervali60ee"))
+	}))
+	defer ts.Close()
+
+	tor := &torrent.Torrent{
+		Name:     "start_resume_test",
+		InfoHash: sha1.Sum([]byte("start_resume_test")),
+		Trackers: []string{ts.URL},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	// Start the session (sends initial "started")
+	sess.Start()
+
+	// Wait for the "started" event to be received by the test server
+	waitForEvent := func(target string, expectedCount int) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			count := 0
+			for _, ev := range eventsReceived {
+				if ev == target {
+					count++
+				}
+			}
+			mu.Unlock()
+			if count >= expectedCount {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		actual := eventsReceived
+		mu.Unlock()
+		t.Fatalf("timed out waiting for event %q to reach count %d, actual: %v", target, expectedCount, actual)
+	}
+
+	waitForEvent("started", 1)
+
+	// Pause the session (queues and sends "stopped")
+	sess.Pause()
+	waitForEvent("stopped", 1)
+
+	// Start again (resumes, queues and sends "started")
+	sess.Start()
+	waitForEvent("started", 2)
 }
