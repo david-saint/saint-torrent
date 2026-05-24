@@ -26,9 +26,11 @@ type TrackerResponse struct {
 	Incomplete  int
 }
 
+const defaultNumWant = 200
+
 // BuildTrackerURL constructs the tracker announce URL with the proper parameters.
 // Specifically, it escapes infoHash and peerID exactly as required by the BitTorrent spec.
-func BuildTrackerURL(baseURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, compact bool, event string) (string, error) {
+func BuildTrackerURL(baseURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, compact bool, event string, numWant ...int) (string, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
@@ -45,6 +47,15 @@ func BuildTrackerURL(baseURL string, infoHash [20]byte, peerID [20]byte, port ui
 		params.Set("compact", "1")
 	} else {
 		params.Set("compact", "0")
+	}
+	want := defaultNumWant
+	if len(numWant) > 0 {
+		want = numWant[0]
+	}
+	if want != 0 {
+		params.Set("numwant", strconv.Itoa(want))
+	} else {
+		params.Del("numwant")
 	}
 	if event != "" {
 		params.Set("event", event)

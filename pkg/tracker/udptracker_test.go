@@ -480,3 +480,69 @@ func TestUDPAnnounce_WithEvent(t *testing.T) {
 		t.Fatal("timed out waiting for announce event")
 	}
 }
+
+func TestUDPAnnounce_SendsNumWant(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	done := make(chan struct{})
+	receivedNumWant := make(chan int32, 1)
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			action := binary.BigEndian.Uint32(buf[8:12])
+			if action == actionConnect {
+				txnID := binary.BigEndian.Uint32(buf[12:16])
+				var resp [16]byte
+				binary.BigEndian.PutUint32(resp[0:4], actionConnect)
+				binary.BigEndian.PutUint32(resp[4:8], txnID)
+				binary.BigEndian.PutUint64(resp[8:16], 0x1122334455667788)
+				pc.WriteTo(resp[:], addr)
+			} else if action == actionAnnounce {
+				if n >= udpAnnounceRequestSize {
+					select {
+					case receivedNumWant <- int32(binary.BigEndian.Uint32(buf[92:96])):
+					default:
+					}
+					txnID := binary.BigEndian.Uint32(buf[12:16])
+					var resp [20]byte
+					binary.BigEndian.PutUint32(resp[0:4], actionAnnounce)
+					binary.BigEndian.PutUint32(resp[4:8], txnID)
+					binary.BigEndian.PutUint32(resp[8:12], 1800)
+					pc.WriteTo(resp[:], addr)
+				}
+			}
+		}
+	}()
+	defer func() {
+		pc.Close()
+		<-done
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err = UDPAnnounce(ctx, "udp://"+pc.LocalAddr().String()+"/announce", [20]byte{}, [20]byte{}, 6881, 0, 0, 0, "", 123)
+	if err != nil {
+		t.Fatalf("UDPAnnounce failed: %v", err)
+	}
+
+	select {
+	case got := <-receivedNumWant:
+		if got != 123 {
+			t.Errorf("expected num_want 123, got %d", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for announce num_want")
+	}
+}

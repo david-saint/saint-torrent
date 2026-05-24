@@ -851,10 +851,16 @@ func (d *DHT) bootstrap() {
 	}
 }
 
+const (
+	dhtLookupStartNodes  = 32
+	dhtLookupQueryLimit  = 128
+	dhtLookupParallelism = 8
+)
+
 // Lookup queries the DHT swarm for a given torrent's info-hash.
 func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 	d.goTracked(func() {
-		startNodes := d.getCloserNodes(infoHash, 8)
+		startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
 		if len(startNodes) == 0 {
 			d.bootstrap()
 			select {
@@ -862,7 +868,7 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 			case <-d.ctx.Done():
 				return
 			}
-			startNodes = d.getCloserNodes(infoHash, 8)
+			startNodes = d.getCloserNodes(infoHash, dhtLookupStartNodes)
 			if len(startNodes) == 0 {
 				return
 			}
@@ -870,75 +876,94 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 
 		visited := make(map[string]bool)
 		queue := append([]Node{}, startNodes...)
-		queriesLimit := 20
 		queriesCount := 0
 
-		for len(queue) > 0 && queriesCount < queriesLimit {
+		for len(queue) > 0 && queriesCount < dhtLookupQueryLimit {
 			select {
 			case <-d.ctx.Done():
 				return
 			default:
 			}
 
-			curr := queue[0]
-			queue = queue[1:]
+			batch := make([]Node, 0, dhtLookupParallelism)
+			for len(queue) > 0 && len(batch) < dhtLookupParallelism && queriesCount < dhtLookupQueryLimit {
+				curr := queue[0]
+				queue = queue[1:]
 
-			addrStr := curr.Addr.String()
-			if visited[addrStr] {
-				continue
-			}
-			visited[addrStr] = true
-			queriesCount++
-
-			ctx, cancel := context.WithTimeout(d.ctx, 3*time.Second)
-			res, err := d.getPeersQuery(ctx, infoHash, curr.Addr)
-			cancel()
-
-			if err != nil {
-				continue
-			}
-
-			d.addNode(curr.ID, curr.Addr)
-
-			for _, cp := range res.Peers {
-				if len(cp) != 6 {
+				addrStr := curr.Addr.String()
+				if visited[addrStr] {
 					continue
 				}
-				ip := net.IP([]byte(cp[0:4]))
-				port := binary.BigEndian.Uint16([]byte(cp[4:6]))
-				if port == 0 {
+				visited[addrStr] = true
+				queriesCount++
+				batch = append(batch, curr)
+			}
+			if len(batch) == 0 {
+				continue
+			}
+
+			type lookupResult struct {
+				node Node
+				res  *GetPeersResult
+				err  error
+			}
+			results := make(chan lookupResult, len(batch))
+			for _, node := range batch {
+				n := node
+				go func() {
+					ctx, cancel := context.WithTimeout(d.ctx, 3*time.Second)
+					res, err := d.getPeersQuery(ctx, infoHash, n.Addr)
+					cancel()
+					results <- lookupResult{node: n, res: res, err: err}
+				}()
+			}
+
+			for range batch {
+				result := <-results
+				if result.err != nil {
 					continue
 				}
 
-				select {
-				case d.peerChan <- DiscoveredPeer{
-					InfoHash: infoHash,
-					IP:       ip,
-					Port:     port,
-				}:
-				case <-d.ctx.Done():
-					return
-				default:
-				}
-			}
+				d.addNode(result.node.ID, result.node.Addr)
 
-			if res.Token != "" && peerPort != 0 {
-				n := curr
-				token := res.Token
-				d.goTracked(func() {
+				for _, cp := range result.res.Peers {
+					if len(cp) != 6 {
+						continue
+					}
+					ip := net.IP([]byte(cp[0:4]))
+					port := binary.BigEndian.Uint16([]byte(cp[4:6]))
+					if port == 0 {
+						continue
+					}
+
 					select {
+					case d.peerChan <- DiscoveredPeer{
+						InfoHash: infoHash,
+						IP:       ip,
+						Port:     port,
+					}:
 					case <-d.ctx.Done():
 						return
 					default:
 					}
-					ctxAnn, cancelAnn := context.WithTimeout(d.ctx, 3*time.Second)
-					defer cancelAnn()
-					_ = d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr)
-				})
-			}
+				}
 
-			if len(res.Nodes) > 0 {
-				for _, n := range res.Nodes {
+				if result.res.Token != "" && peerPort != 0 {
+					n := result.node
+					token := result.res.Token
+					d.goTracked(func() {
+						select {
+						case <-d.ctx.Done():
+							return
+						default:
+						}
+						ctxAnn, cancelAnn := context.WithTimeout(d.ctx, 3*time.Second)
+						defer cancelAnn()
+						_ = d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr)
+					})
+				}
+
+				for _, n := range result.res.Nodes {
 					if !visited[n.Addr.String()] {
 						queue = append(queue, n)
 					}

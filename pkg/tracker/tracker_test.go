@@ -57,6 +57,9 @@ func TestBuildTrackerURL(t *testing.T) {
 	if q.Get("compact") != "1" {
 		t.Errorf("Expected compact 1, got %s", q.Get("compact"))
 	}
+	if q.Get("numwant") != strconv.Itoa(defaultNumWant) {
+		t.Errorf("Expected numwant %d, got %s", defaultNumWant, q.Get("numwant"))
+	}
 
 	// Wait, standard URL parsing decodes %-encoded params.
 	// But let's check the raw query string to verify binary fields are encoded correctly (with uppercase hex-encoding for non-alphanumeric).

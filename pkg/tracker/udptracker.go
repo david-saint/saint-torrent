@@ -72,7 +72,7 @@ func newTransactionID() (uint32, error) {
 // The function respects context cancellation and applies exponential backoff
 // retries on timeouts. Callers should pass a bounded context for app-level
 // tracker fallback; cancellation closes the UDP connection promptly.
-func UDPAnnounce(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string) (*TrackerResponse, error) {
+func UDPAnnounce(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, numWant ...int) (*TrackerResponse, error) {
 	u, err := url.Parse(announceURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing announce URL: %w", err)
@@ -109,7 +109,7 @@ func UDPAnnounce(ctx context.Context, announceURL string, infoHash [20]byte, pee
 	}
 
 	// Step 2: Announce.
-	resp, err := udpAnnounceRequest(ctx, conn, connectionID, infoHash, peerID, port, uploaded, downloaded, left, event)
+	resp, err := udpAnnounceRequest(ctx, conn, connectionID, infoHash, peerID, port, uploaded, downloaded, left, event, numWant...)
 	if err != nil {
 		return nil, fmt.Errorf("UDP announce: %w", err)
 	}
@@ -205,7 +205,7 @@ func udpConnect(ctx context.Context, conn net.Conn) (uint64, error) {
 // udpAnnounceRequest performs the BEP 15 announce on an already-connected UDP
 // connection using the given connection_id. It retries with exponential backoff
 // up to udpMaxRetries times.
-func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string) (*TrackerResponse, error) {
+func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, numWant ...int) (*TrackerResponse, error) {
 	txnID, err := newTransactionID()
 	if err != nil {
 		return nil, err
@@ -223,7 +223,7 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 	// [80..84] event (0 = none)
 	// [84..88] IP address (0 = default)
 	// [88..92] key (random)
-	// [92..96] num_want (-1 = default)
+	// [92..96] num_want
 	// [96..98] port
 	var req [udpAnnounceRequestSize]byte
 	binary.BigEndian.PutUint64(req[0:8], connectionID)
@@ -250,7 +250,11 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 	// key: random 32-bit value for identification across requests
 	keyID, _ := newTransactionID()
 	binary.BigEndian.PutUint32(req[88:92], keyID)
-	binary.BigEndian.PutUint32(req[92:96], 0xFFFFFFFF) // num_want = -1 (default)
+	want := defaultNumWant
+	if len(numWant) > 0 {
+		want = numWant[0]
+	}
+	binary.BigEndian.PutUint32(req[92:96], uint32(int32(want)))
 	binary.BigEndian.PutUint16(req[96:98], port)
 
 	for n := 0; n <= udpMaxRetries; n++ {

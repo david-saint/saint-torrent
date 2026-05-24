@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -527,7 +528,7 @@ func TestAnnounceMagnetUsesNonZeroLeft(t *testing.T) {
 	trackerAnnounceTimeout = 2 * time.Second
 	defer func() { trackerAnnounceTimeout = oldTimeout }()
 
-	leftCh := make(chan string, 1)
+	leftCh := make(chan url.Values, 1)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen failed: %v", err)
@@ -555,7 +556,7 @@ func TestAnnounceMagnetUsesNonZeroLeft(t *testing.T) {
 		if err != nil {
 			return
 		}
-		leftCh <- u.Query().Get("left")
+		leftCh <- u.Query()
 		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nd8:intervali5ee"))
 	}()
 
@@ -573,8 +574,11 @@ func TestAnnounceMagnetUsesNonZeroLeft(t *testing.T) {
 
 	select {
 	case got := <-leftCh:
-		if got != "1" {
-			t.Fatalf("expected magnet announce left=1 before metadata, got %q", got)
+		if got.Get("left") != "1" {
+			t.Fatalf("expected magnet announce left=1 before metadata, got %q", got.Get("left"))
+		}
+		if got.Get("numwant") != strconv.Itoa(trackerDefaultNumWant) {
+			t.Fatalf("expected announce numwant=%d, got %q", trackerDefaultNumWant, got.Get("numwant"))
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for announce")
@@ -605,6 +609,96 @@ func TestAnnounceKeepsStartedEventAfterFailure(t *testing.T) {
 	sess.mu.RUnlock()
 	if len(events) != 1 || events[0] != "started" {
 		t.Fatalf("expected failed announce to preserve started event, got %v", events)
+	}
+}
+
+func TestAnnounceQueriesAllTrackers(t *testing.T) {
+	oldTimeout := trackerAnnounceTimeout
+	trackerAnnounceTimeout = 2 * time.Second
+	defer func() { trackerAnnounceTimeout = oldTimeout }()
+
+	tracker1Seen := make(chan struct{}, 1)
+	tracker1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case tracker1Seen <- struct{}{}:
+		default:
+		}
+		_, _ = w.Write([]byte("d8:intervali60ee"))
+	}))
+	defer tracker1.Close()
+
+	tracker2Seen := make(chan struct{}, 1)
+	tracker2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case tracker2Seen <- struct{}{}:
+		default:
+		}
+		_, _ = w.Write([]byte("d8:intervali60ee"))
+	}))
+	defer tracker2.Close()
+
+	tor := &torrent.Torrent{
+		Name:     "multi-tracker",
+		InfoHash: sha1.Sum([]byte("multi-tracker")),
+		Trackers: []string{tracker1.URL, tracker2.URL},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.announceAndConnect()
+
+	select {
+	case <-tracker1Seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first tracker was not announced to")
+	}
+	select {
+	case <-tracker2Seen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("second tracker was not announced to")
+	}
+}
+
+func TestAnnounceSucceedsWhenOneTrackerFails(t *testing.T) {
+	oldTimeout := trackerAnnounceTimeout
+	trackerAnnounceTimeout = 2 * time.Second
+	defer func() { trackerAnnounceTimeout = oldTimeout }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	failedTrackerURL := "http://" + ln.Addr().String() + "/announce"
+	ln.Close()
+
+	workingTracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("d8:intervali60ee"))
+	}))
+	defer workingTracker.Close()
+
+	tor := &torrent.Torrent{
+		Name:     "partial-tracker-failure",
+		InfoHash: sha1.Sum([]byte("partial-tracker-failure")),
+		Trackers: []string{failedTrackerURL, workingTracker.URL},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.announceAndConnect()
+
+	sess.mu.RLock()
+	lastErr := sess.lastErr
+	events := append([]string(nil), sess.trackerEvents...)
+	sess.mu.RUnlock()
+	if lastErr != nil {
+		t.Fatalf("expected successful tracker announce to clear lastErr, got %v", lastErr)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected successful tracker announce to consume started event, got %v", events)
 	}
 }
 

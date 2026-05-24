@@ -34,6 +34,7 @@ type Storage struct {
 	files       []fileLayout
 	pieceLength int64
 	totalSize   int64
+	stateFileMt map[string]int64
 }
 
 // NewStorage creates the target directories and pre-allocates files to their
@@ -51,6 +52,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 	var layouts []fileLayout
 	var currentOffset int64
 	seenPaths := make(map[string]bool)
+	stateFileMt := make(map[string]int64, len(files))
 
 	for _, file := range files {
 		if file.Length < 0 {
@@ -95,11 +97,26 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 			return nil, fmt.Errorf("failed to open/create file %s: %w", file.Path, err)
 		}
 
-		if err := f.Truncate(file.Length); err != nil {
+		fi, err := f.Stat()
+		if err != nil {
 			f.Close()
-			return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", file.Path, err)
+			return nil, fmt.Errorf("failed to stat file %s: %w", file.Path, err)
 		}
-		f.Close()
+		if fi.Size() != file.Length {
+			if err := f.Truncate(file.Length); err != nil {
+				f.Close()
+				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", file.Path, err)
+			}
+			fi, err = f.Stat()
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("failed to stat file %s after resize: %w", file.Path, err)
+			}
+		}
+		stateFileMt[file.Path] = fi.ModTime().UnixNano()
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close file %s: %w", file.Path, err)
+		}
 	}
 
 	return &Storage{
@@ -107,6 +124,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		files:       layouts,
 		pieceLength: pieceLength,
 		totalSize:   currentOffset,
+		stateFileMt: stateFileMt,
 	}, nil
 }
 
@@ -249,6 +267,9 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 			if int64(n) != nBytes {
 				return fmt.Errorf("short write on file %s: expected %d bytes, got %d", file.path, nBytes, n)
 			}
+			if fi, err := os.Stat(absPath); err == nil {
+				s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+			}
 		}
 	}
 
@@ -257,19 +278,45 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
 func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	pieceLen := s.PieceLength(pieceIndex)
 	if pieceLen == 0 {
 		return false, fmt.Errorf("invalid piece index: %d", pieceIndex)
 	}
 
-	// Read block handles locking, bounds checks, and multi-file mapping
 	buf := make([]byte, pieceLen)
-	n, err := s.ReadBlock(pieceIndex, 0, buf)
-	if err != nil {
-		return false, fmt.Errorf("failed to read piece %d for verification: %w", pieceIndex, err)
-	}
-	if int64(n) != pieceLen {
-		return false, fmt.Errorf("incomplete read for piece verification: read %d of %d bytes", n, pieceLen)
+	globalStart := pieceIndex * s.pieceLength
+	globalEnd := globalStart + pieceLen
+
+	for _, file := range s.files {
+		if globalStart < file.endOffset && globalEnd > file.startOffset {
+			overlapStart := max(globalStart, file.startOffset)
+			overlapEnd := min(globalEnd, file.endOffset)
+
+			fileOffset := overlapStart - file.startOffset
+			bufOffset := overlapStart - globalStart
+			nBytes := overlapEnd - overlapStart
+
+			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
+			if err != nil {
+				return false, err
+			}
+			f, err := openNoFollow(absPath, os.O_RDONLY, 0)
+			if err != nil {
+				return false, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
+			}
+
+			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
+			f.Close()
+			if err != nil && err != io.EOF {
+				return false, fmt.Errorf("read error on file %s: %w", file.path, err)
+			}
+			if int64(n) != nBytes {
+				return false, fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, nBytes, n)
+			}
+		}
 	}
 
 	actualHash := sha1.Sum(buf)
@@ -308,31 +355,14 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	}
 
 	for _, f := range s.files {
-		absPath, err := ResolveAndValidatePath(s.baseDir, f.path)
-		if err != nil {
-			return err
-		}
-		fi, err := os.Stat(absPath)
-		if err != nil {
-			state.Files = append(state.Files, struct {
-				Path  string `json:"path"`
-				Size  int64  `json:"size"`
-				Mtime int64  `json:"mtime"`
-			}{
-				Path:  f.path,
-				Size:  0,
-				Mtime: 0,
-			})
-			continue
-		}
 		state.Files = append(state.Files, struct {
 			Path  string `json:"path"`
 			Size  int64  `json:"size"`
 			Mtime int64  `json:"mtime"`
 		}{
 			Path:  f.path,
-			Size:  fi.Size(),
-			Mtime: fi.ModTime().UnixNano(),
+			Size:  f.length,
+			Mtime: s.stateMtimeLocked(f.path, 0),
 		})
 	}
 
@@ -342,6 +372,13 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	}
 
 	return os.WriteFile(statePath, data, 0644)
+}
+
+func (s *Storage) stateMtimeLocked(path string, fallback int64) int64 {
+	if mt, ok := s.stateFileMt[path]; ok {
+		return mt
+	}
+	return fallback
 }
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
@@ -389,6 +426,9 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 		if fi.Size() != savedFile.Size || fi.ModTime().UnixNano() != savedFile.Mtime {
 			return nil, fmt.Errorf("file modification mismatch for %s", f.path)
 		}
+	}
+	for i, f := range s.files {
+		s.stateFileMt[f.path] = state.Files[i].Mtime
 	}
 
 	return state.CompletedPieces, nil

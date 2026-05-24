@@ -34,6 +34,14 @@ const (
 // BlockSize is the standard block length for BitTorrent transfers (16 KB).
 const BlockSize = 16384
 
+// Keep enough block requests in flight to saturate high-latency peers.
+const maxPendingBlockRequests = 128
+
+// Large enough to avoid kernel socket buffers becoming the bottleneck on fast peers.
+const peerSocketBufferSize = 4 * 1024 * 1024
+
+const trackerDefaultNumWant = 200
+
 var trackerAnnounceTimeout = 15 * time.Second
 
 // PeerState holds per-peer state visible to the TUI.
@@ -167,7 +175,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		metadataMode:        metadataMode,
 		metadataCompletedCh: make(chan struct{}),
 		downloadDir:         resolvedDir,
-		trackerEvents:      []string{"started"},
+		trackerEvents:       []string{"started"},
 	}
 
 	if !metadataMode {
@@ -393,6 +401,16 @@ func maxInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func tunePeerConn(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcpConn.SetNoDelay(true)
+	_ = tcpConn.SetReadBuffer(peerSocketBufferSize)
+	_ = tcpConn.SetWriteBuffer(peerSocketBufferSize)
 }
 
 func (s *Session) blocksInPiece(pieceIndex int64) int64 {
@@ -703,9 +721,62 @@ func (s *Session) speedMonitorLoop() {
 	}
 }
 
+type trackerAnnounceResult struct {
+	peers    []tracker.Peer
+	interval int
+	err      error
+}
+
+func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, timeout time.Duration) trackerAnnounceResult {
+	announceCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if bytes.HasPrefix([]byte(tr), []byte("udp")) {
+		resp, err := tracker.UDPAnnounce(announceCtx, tr, infoHash, peerID, port, uploaded, downloaded, left, event, trackerDefaultNumWant)
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+		return trackerAnnounceResult{peers: resp.Peers, interval: resp.Interval}
+	}
+
+	if bytes.HasPrefix([]byte(tr), []byte("http")) {
+		u, err := tracker.BuildTrackerURL(tr, infoHash, peerID, port, uploaded, downloaded, left, true, event, trackerDefaultNumWant)
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+
+		req, err := http.NewRequestWithContext(announceCtx, "GET", u, nil)
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+
+		client := &http.Client{Timeout: timeout}
+		resp, err := client.Do(req)
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+
+		buf := new(bytes.Buffer)
+		_, err = io.Copy(buf, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+
+		trackerResp, err := tracker.ParseTrackerResponse(buf.Bytes())
+		if err != nil {
+			return trackerAnnounceResult{err: err}
+		}
+
+		return trackerAnnounceResult{peers: trackerResp.Peers, interval: trackerResp.Interval}
+	}
+
+	return trackerAnnounceResult{err: fmt.Errorf("unsupported tracker scheme: %s", tr)}
+}
+
 func (s *Session) announceAndConnect() int {
 	s.mu.Lock()
-	trackers := s.Torrent.Trackers
+	trackers := append([]string(nil), s.Torrent.Trackers...)
 	if len(trackers) == 0 {
 		// No trackers configured: consume all queued events as completed/success
 		if len(s.trackerEvents) > 0 {
@@ -735,6 +806,8 @@ func (s *Session) announceAndConnect() int {
 	}
 	port := s.Port
 	uploaded := s.Uploaded
+	infoHash := s.Torrent.InfoHash
+	peerID := s.PeerID
 	var event string
 	if len(s.trackerEvents) > 0 {
 		event = s.trackerEvents[0]
@@ -747,67 +820,40 @@ func (s *Session) announceAndConnect() int {
 	var interval int
 	var trackerErr error
 
+	results := make(chan trackerAnnounceResult, len(trackers))
 	for _, tr := range trackers {
-		announceCtx, cancel := context.WithTimeout(s.ctx, trackerAnnounceTimeout)
-		if bytes.HasPrefix([]byte(tr), []byte("udp")) {
-			// UDP tracker
-			resp, err := tracker.UDPAnnounce(announceCtx, tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, event)
-			cancel()
-			if err != nil {
-				trackerErr = err
-				continue
-			}
-			peers = resp.Peers
-			interval = resp.Interval
-			trackerErr = nil
-			break
-		} else if bytes.HasPrefix([]byte(tr), []byte("http")) {
-			// HTTP tracker
-			u, err := tracker.BuildTrackerURL(tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, true, event)
-			if err != nil {
-				cancel()
-				trackerErr = err
-				continue
-			}
+		trackerURL := tr
+		go func() {
+			results <- announceTracker(s.ctx, trackerURL, infoHash, peerID, port, uploaded, downloaded, left, event, trackerAnnounceTimeout)
+		}()
+	}
 
-			req, err := http.NewRequestWithContext(announceCtx, "GET", u, nil)
-			if err != nil {
-				cancel()
-				trackerErr = err
+	seenPeers := make(map[string]bool)
+	trackerSuccess := false
+	for range trackers {
+		result := <-results
+		if result.err != nil {
+			if !trackerSuccess {
+				trackerErr = result.err
+			}
+			continue
+		}
+
+		trackerSuccess = true
+		trackerErr = nil
+		if result.interval > 0 && (interval == 0 || result.interval < interval) {
+			interval = result.interval
+		}
+		for _, p := range result.peers {
+			if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
 				continue
 			}
-
-			client := &http.Client{
-				Timeout: 15 * time.Second,
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				cancel()
-				trackerErr = err
+			peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+			if seenPeers[peerAddr] {
 				continue
 			}
-
-			buf := new(bytes.Buffer)
-			_, err = io.Copy(buf, resp.Body)
-			resp.Body.Close()
-			cancel()
-			if err != nil {
-				trackerErr = err
-				continue
-			}
-
-			trackerResp, err := tracker.ParseTrackerResponse(buf.Bytes())
-			if err != nil {
-				trackerErr = err
-				continue
-			}
-
-			peers = trackerResp.Peers
-			interval = trackerResp.Interval
-			trackerErr = nil
-			break
-		} else {
-			cancel()
+			seenPeers[peerAddr] = true
+			peers = append(peers, p)
 		}
 	}
 
@@ -903,6 +949,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		return
 	}
 	defer conn.Close()
+	tunePeerConn(conn)
 
 	// Spawn context monitor to interrupt immediately on shutdown
 	doneCh := make(chan struct{})
@@ -995,6 +1042,7 @@ func (s *Session) inboundListenerLoop() {
 
 func (s *Session) handleIncomingConnection(conn net.Conn) {
 	defer conn.Close()
+	tunePeerConn(conn)
 
 	s.mu.RLock()
 	paused := s.paused
@@ -1217,9 +1265,6 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return (peerBitfield[byteIndex] & (1 << (7 - bitIndex))) != 0
 	}
 
-	// Request pipeline management
-	const maxPending = 5
-
 	sendRequests := func() {
 		s.mu.RLock()
 		paused := s.paused
@@ -1237,7 +1282,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 
-		for pendingCount < maxPending {
+		for pendingCount < maxPendingBlockRequests {
 			// Find next block to request
 			var nextBegin int64 = -1
 			for b := int64(0); b < numBlocks; b++ {
@@ -1573,30 +1618,29 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				// Check if piece is complete
 				numBlocks := s.blocksInPiece(dl.pieceIndex)
 				if dl.blocksReceived == numBlocks {
-					// Write piece blocks to storage
-					writeErr := func() error {
-						var offset int64
-						for b := int64(0); b < numBlocks; b++ {
-							err := s.Storage.WriteBlock(dl.pieceIndex, offset, dl.blocks[b])
-							if err != nil {
-								return err
-							}
-							offset += int64(len(dl.blocks[b]))
+					pieceData := make([]byte, dl.length)
+					var offset int64
+					validPiece := true
+					for b := int64(0); b < numBlocks; b++ {
+						block := dl.blocks[b]
+						if block == nil || offset+int64(len(block)) > int64(len(pieceData)) {
+							validPiece = false
+							break
 						}
-						return nil
-					}()
+						copy(pieceData[offset:], block)
+						offset += int64(len(block))
+					}
 
-					if writeErr == nil {
-						ok, err := s.Storage.VerifyPiece(dl.pieceIndex, dl.hash)
-						if err == nil && ok {
+					if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
+						if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil {
 							s.markPieceCompleted(dl.pieceIndex)
 						} else {
-							// Hash mismatch — mark empty for retry
 							s.mu.Lock()
 							s.PieceStates[dl.pieceIndex] = PieceEmpty
 							s.mu.Unlock()
 						}
 					} else {
+						// Hash mismatch or incomplete assembly: retry this piece from another peer.
 						s.mu.Lock()
 						s.PieceStates[dl.pieceIndex] = PieceEmpty
 						s.mu.Unlock()
@@ -2205,7 +2249,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	// Initial lookup
@@ -2369,12 +2413,12 @@ func (s *Session) announceWithEvent(ctx context.Context, event string) bool {
 	success := false
 	for _, tr := range trackers {
 		if bytes.HasPrefix([]byte(tr), []byte("udp")) {
-			_, err := tracker.UDPAnnounce(ctx, tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, event)
+			_, err := tracker.UDPAnnounce(ctx, tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, event, trackerDefaultNumWant)
 			if err == nil {
 				success = true
 			}
 		} else if bytes.HasPrefix([]byte(tr), []byte("http")) {
-			u, err := tracker.BuildTrackerURL(tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, true, event)
+			u, err := tracker.BuildTrackerURL(tr, s.Torrent.InfoHash, s.PeerID, port, uploaded, downloaded, left, true, event, trackerDefaultNumWant)
 			if err != nil {
 				continue
 			}
