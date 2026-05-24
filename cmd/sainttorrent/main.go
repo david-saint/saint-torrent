@@ -105,6 +105,7 @@ const (
 	viewDetail
 	viewFiles
 	viewInput
+	viewDeleteConfirm
 )
 
 type inputMode int
@@ -125,18 +126,22 @@ func tickCmd() tea.Cmd {
 }
 
 type model struct {
-	manager         *downloader.TorrentManager
-	downloadDir     string
-	progress        progress.Model
-	textInput       textinput.Model
-	viewMode        viewMode
-	inputMode       inputMode
-	selectedIdx     int
-	selectedFileIdx int
-	quitting        bool
-	inputErr        string
-	startupWarn     string
-	sessions        []*downloader.Session
+	manager          *downloader.TorrentManager
+	downloadDir      string
+	progress         progress.Model
+	textInput        textinput.Model
+	viewMode         viewMode
+	inputMode        inputMode
+	selectedIdx      int
+	selectedFileIdx  int
+	quitting         bool
+	inputErr         string
+	startupWarn      string
+	sessions         []*downloader.Session
+	deleteWithFiles  bool
+	deleteErr        error
+	deleteTargetName string
+	deleteTargetHash string
 }
 
 func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string) model {
@@ -318,6 +323,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.selectedFileIdx = 0
 					}
 				}
+			case "x":
+				m.viewMode = viewDeleteConfirm
+				m.deleteWithFiles = false
+				m.deleteErr = nil
+				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+					s := m.sessions[m.selectedIdx]
+					m.deleteTargetName = s.Torrent.Name
+					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
+				} else {
+					m.deleteTargetName = ""
+					m.deleteTargetHash = ""
+				}
+			case "X":
+				m.viewMode = viewDeleteConfirm
+				m.deleteWithFiles = true
+				m.deleteErr = nil
+				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+					s := m.sessions[m.selectedIdx]
+					m.deleteTargetName = s.Torrent.Name
+					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
+				} else {
+					m.deleteTargetName = ""
+					m.deleteTargetHash = ""
+				}
 			}
 
 		case viewFiles:
@@ -362,6 +391,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					s.SetFilePriority(m.selectedFileIdx, next)
 				}
 			}
+
+		case viewDeleteConfirm:
+			switch msg.String() {
+			case "q", "ctrl+c":
+				m.quitting = true
+				m.manager.Close()
+				return m, tea.Quit
+			case "esc", "n", "N":
+				if m.deleteErr != nil {
+					m.viewMode = viewList
+					m.deleteErr = nil
+				} else {
+					m.viewMode = viewDetail
+				}
+			case "y", "Y":
+				if m.deleteErr != nil {
+					m.viewMode = viewList
+					m.deleteErr = nil
+					return m, nil
+				}
+				if m.deleteTargetHash != "" {
+					err := m.manager.RemoveSession(m.deleteTargetHash, m.deleteWithFiles)
+					if err != nil {
+						m.deleteErr = err
+						m.sessions = m.manager.ListSessions()
+						if m.selectedIdx >= len(m.sessions) && len(m.sessions) > 0 {
+							m.selectedIdx = len(m.sessions) - 1
+						} else if len(m.sessions) == 0 {
+							m.selectedIdx = 0
+						}
+						return m, nil
+					}
+				}
+				m.sessions = m.manager.ListSessions()
+				if m.selectedIdx >= len(m.sessions) && len(m.sessions) > 0 {
+					m.selectedIdx = len(m.sessions) - 1
+				} else if len(m.sessions) == 0 {
+					m.selectedIdx = 0
+				}
+				m.viewMode = viewList
+			}
 		}
 
 	case tickMsg:
@@ -398,6 +468,8 @@ func (m model) View() string {
 		sb.WriteString(m.viewFileExplorer())
 	case viewInput:
 		sb.WriteString(m.viewInputBox())
+	case viewDeleteConfirm:
+		sb.WriteString(m.viewDeleteConfirm())
 	}
 
 	return sb.String()
@@ -595,7 +667,7 @@ func (m model) viewTorrentDetails() string {
 	}
 
 	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
-	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back to Dashboard | [space] %s | [f] File Priorities | [q] Quit", spaceActionHelp)) + "\n")
+	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back | [space] %s | [f] Files | [x] Delete Task | [X] Delete Task & Files | [q] Quit", spaceActionHelp)) + "\n")
 	return sb.String()
 }
 
@@ -782,4 +854,45 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running UI: %v\n", err)
 	}
+}
+
+func (m model) viewDeleteConfirm() string {
+	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		if m.deleteErr != nil {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), m.deleteTargetName))
+			sb.WriteString(cardStyle.Render(errorStyle.Render(m.deleteErr.Error())))
+			sb.WriteString("\n\n")
+			sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
+			return sb.String()
+		}
+		return ""
+	}
+
+	var sb strings.Builder
+	if m.deleteErr != nil {
+		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), m.deleteTargetName))
+		sb.WriteString(cardStyle.Render(errorStyle.Render(m.deleteErr.Error())))
+		sb.WriteString("\n\n")
+		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
+		return sb.String()
+	}
+
+	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Confirm Delete:"), m.deleteTargetName))
+
+	var warnMsg string
+	if m.deleteWithFiles {
+		warnMsg = errorStyle.Render("WARNING: This will permanently delete the task, state, and ALL downloaded files from disk!")
+	} else {
+		warnMsg = warnStyle.Render("This will delete the task state and fast-resume file, but keep downloaded files on disk.")
+	}
+
+	cardContent := fmt.Sprintf(
+		"Are you sure you want to delete this torrent?\n\n%s",
+		warnMsg,
+	)
+	sb.WriteString(cardStyle.Render(cardContent))
+	sb.WriteString("\n\n")
+	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Delete | [n]/[esc] Cancel") + "\n")
+	return sb.String()
 }

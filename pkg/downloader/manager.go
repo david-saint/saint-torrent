@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"sainttorrent/pkg/bencode"
@@ -32,10 +33,10 @@ type TorrentManager struct {
 	wg                    sync.WaitGroup
 	closed                bool
 
-	stateDir              string
-	restoring             bool
-	writeMu               sync.Mutex
-	failedTorrents        []PersistedTorrent
+	stateDir       string
+	restoring      bool
+	writeMu        sync.Mutex
+	failedTorrents []PersistedTorrent
 }
 
 // NewTorrentManager creates and initializes a TorrentManager.
@@ -119,8 +120,10 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	}
 }
 
-// RemoveSession stops the session associated with the given info hash and removes it from the manager.
-func (m *TorrentManager) RemoveSession(infoHashHex string) {
+// RemoveSession stops the session associated with the given info hash, removes it from the manager,
+// and deletes state files. If deleteFiles is true, it also deletes the downloaded files.
+// It returns any aggregated errors encountered during the removal process.
+func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) error {
 	m.mu.Lock()
 	sess, ok := m.sessions[infoHashHex]
 	if ok {
@@ -128,11 +131,13 @@ func (m *TorrentManager) RemoveSession(infoHashHex string) {
 	}
 	var newFailed []PersistedTorrent
 	failedRemoved := false
+	var failedEntry PersistedTorrent
 	for _, failed := range m.failedTorrents {
 		if strings.ToLower(failed.InfoHashHex) != strings.ToLower(infoHashHex) {
 			newFailed = append(newFailed, failed)
 		} else {
 			failedRemoved = true
+			failedEntry = failed
 		}
 	}
 	m.failedTorrents = newFailed
@@ -140,17 +145,131 @@ func (m *TorrentManager) RemoveSession(infoHashHex string) {
 	m.mu.Unlock()
 
 	if !ok && !failedRemoved {
-		return
+		return fmt.Errorf("torrent with info hash %s not found", infoHashHex)
 	}
 
+	var downloadDir string
+	var torrentFiles []torrent.File
+	var closeSession func()
+
 	if ok {
-		sess.Close()
+		sess.mu.RLock()
+		if sess.Storage != nil {
+			downloadDir = sess.Storage.BaseDir()
+		} else {
+			downloadDir = sess.downloadDir
+		}
+		if sess.Torrent != nil {
+			torrentFiles = sess.Torrent.Files
+		}
+		sess.mu.RUnlock()
+		closeSession = sess.Close
+	} else if failedRemoved {
+		downloadDir = failedEntry.DownloadDir
 	}
+
+	var errs []error
+
+	// 1. Close session if active (this will block until all goroutines exit)
+	if closeSession != nil {
+		closeSession()
+	}
+
+	// 2. Delete the fast-resume state file
+	if downloadDir != "" {
+		resumePath := filepath.Join(downloadDir, "."+infoHashHex+".state")
+		if err := os.Remove(resumePath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("failed to delete fast-resume state file: %w", err))
+		}
+	}
+
+	// 3. Delete downloaded files if requested
+	if deleteFiles {
+		// For failed restoration entries, try to parse the cached torrent file if files list is empty
+		if failedRemoved && len(torrentFiles) == 0 && stateDir != "" {
+			cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
+			if torrentData, err := os.ReadFile(cachedPath); err == nil {
+				if tor, err := torrent.Parse(torrentData); err == nil {
+					torrentFiles = tor.Files
+				} else {
+					errs = append(errs, fmt.Errorf("failed to parse cached torrent file for file list: %w", err))
+				}
+			} else if !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("failed to read cached torrent file for file list: %w", err))
+			} else {
+				errs = append(errs, fmt.Errorf("cannot delete files: cached torrent file is missing"))
+			}
+		}
+
+		if downloadDir == "" {
+			errs = append(errs, fmt.Errorf("cannot delete files: download directory is empty"))
+		} else if len(torrentFiles) > 0 {
+			for _, f := range torrentFiles {
+				relPath := filepath.Join(f.Path...)
+				absPath, err := storage.ResolveAndValidatePath(downloadDir, relPath)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("safe path validation failed for %s: %w", relPath, err))
+					continue
+				}
+
+				if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+					errs = append(errs, fmt.Errorf("failed to delete file %s: %w", relPath, err))
+				}
+
+				// Clean up empty parent folders up to downloadDir
+				parent := filepath.Dir(absPath)
+				canonicalDownloadDir, err := filepath.EvalSymlinks(downloadDir)
+				if err != nil {
+					canonicalDownloadDir, err = filepath.Abs(downloadDir)
+					if err != nil {
+						canonicalDownloadDir = downloadDir
+					}
+				}
+				cleanDownloadDir := filepath.Clean(canonicalDownloadDir)
+
+				for parent != cleanDownloadDir && parent != "." && parent != "/" {
+					if err := os.Remove(parent); err != nil {
+						if pe, ok := err.(*os.PathError); ok {
+							if errno, ok := pe.Err.(syscall.Errno); ok {
+								// ENOTEMPTY (Unix) or 145 (Windows ERROR_DIR_NOT_EMPTY) is expected behavior for non-empty dirs.
+								if errno == syscall.ENOTEMPTY || errno == 145 {
+									break
+								}
+							}
+						}
+						if os.IsNotExist(err) {
+							parent = filepath.Dir(parent)
+							continue
+						}
+						// Aggregate other unexpected errors (like permission issues) and stop propagating
+						errs = append(errs, fmt.Errorf("failed to clean up empty directory %s: %w", parent, err))
+						break
+					}
+					parent = filepath.Dir(parent)
+				}
+			}
+		}
+	}
+
+	// 4. Delete the cached .torrent file
 	if stateDir != "" {
 		cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
-		_ = os.Remove(cachedPath)
+		if err := os.Remove(cachedPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("failed to delete cached torrent file: %w", err))
+		}
 	}
+
 	m.saveState()
+
+	if len(errs) > 0 {
+		var errStrs []string
+		for _, e := range errs {
+			errStrs = append(errStrs, e.Error())
+		}
+		return fmt.Errorf("removal completed with errors: %s", strings.Join(errStrs, "; "))
+	}
+
+	return nil
 }
 
 // GetSession retrieves a session by its info hash hex string.

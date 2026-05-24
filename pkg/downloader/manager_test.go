@@ -99,7 +99,9 @@ func TestTorrentManager(t *testing.T) {
 	}
 
 	// Remove session
-	mgr.RemoveSession(infoHashHex)
+	if err := mgr.RemoveSession(infoHashHex, false); err != nil {
+		t.Errorf("unexpected error on RemoveSession: %v", err)
+	}
 	if len(mgr.ListSessions()) != 0 {
 		t.Errorf("expected 0 sessions after removal, got %d", len(mgr.ListSessions()))
 	}
@@ -184,7 +186,7 @@ func TestPersistenceRestorePaused(t *testing.T) {
 	tempDir := t.TempDir()
 
 	mgr := NewTorrentManager()
-	
+
 	// Create a dummy config dir
 	configDir := filepath.Join(tempDir, "config")
 	if err := os.MkdirAll(filepath.Join(configDir, "torrents"), 0755); err != nil {
@@ -267,7 +269,7 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 
 	mgr := NewTorrentManager()
 	configDir := filepath.Join(tempDir, "config")
-	
+
 	magnetURI := "magnet:?xt=urn:btih:4cf469d37a3b7f65fbdb6bf8b36e6ab495e5a0fb&dn=TestTorrent"
 	mag, _ := torrent.ParseMagnet(magnetURI)
 	infoHashHex := fmt.Sprintf("%x", mag.InfoHash)
@@ -464,9 +466,9 @@ func TestPersistenceCorruptCacheFallback(t *testing.T) {
 		Torrents: []PersistedTorrent{
 			{
 				InfoHashHex: infoHashHex,
-				MagnetURI:      magnetURI,
-				DownloadDir:    tempDir,
-				Paused:         false,
+				MagnetURI:   magnetURI,
+				DownloadDir: tempDir,
+				Paused:      false,
 			},
 		},
 	}
@@ -606,7 +608,7 @@ func TestPersistenceRemoveSessionNoOp(t *testing.T) {
 	sessionPath := filepath.Join(configDir, "session.json")
 	_ = os.Remove(sessionPath)
 
-	mgr.RemoveSession("0000000000000000000000000000000000000000")
+	_ = mgr.RemoveSession("0000000000000000000000000000000000000000", false)
 
 	if _, err := os.Stat(sessionPath); !os.IsNotExist(err) {
 		t.Error("expected session.json to NOT be created on no-op RemoveSession")
@@ -631,7 +633,7 @@ func TestPersistenceCloseReconstructsMagnet(t *testing.T) {
 	dummyInfoBytes := []byte("d6:lengthi100e4:name4:test12:piece lengthi256e6:pieces20:01234567890123456789e")
 	infoHash := sha1.Sum(dummyInfoBytes)
 	infoHashHex := fmt.Sprintf("%x", infoHash)
-	
+
 	sess := &Session{
 		Torrent: &torrent.Torrent{
 			InfoHash:  infoHash,
@@ -670,4 +672,223 @@ func TestPersistenceCloseReconstructsMagnet(t *testing.T) {
 			t.Errorf("info hash mismatch: expected %v, got %v", infoHash, parsed.InfoHash)
 		}
 	}
+}
+
+func TestRemoveSession_DeleteTaskOnly(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	downloadDir := filepath.Join(tempDir, "download")
+	_ = os.MkdirAll(filepath.Join(configDir, "torrents"), 0755)
+	_ = os.MkdirAll(downloadDir, 0755)
+
+	mgr := NewTorrentManager()
+	_, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+
+	// Create dummy torrent files on disk
+	filePath := filepath.Join(downloadDir, "testfile.txt")
+	_ = os.WriteFile(filePath, []byte("dummy data"), 0644)
+
+	// Create a dummy session
+	infoHash := sha1.Sum([]byte("task-only"))
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	tor := &torrent.Torrent{
+		Name:        "testfile.txt",
+		InfoHash:    infoHash,
+		PieceLength: 10,
+		Files: []torrent.File{
+			{Length: 10, Path: []string{"testfile.txt"}},
+		},
+	}
+	st, _ := storage.NewStorage(downloadDir, []storage.FileInfo{{Path: "testfile.txt", Length: 10}}, 10)
+	sess, err := NewSession(tor, st, [20]byte{}, 0, downloadDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	mgr.AddSession(infoHashHex, sess)
+
+	// Write mock .state and .torrent cached files
+	cachedTorrentPath := filepath.Join(configDir, "torrents", infoHashHex+".torrent")
+	_ = os.WriteFile(cachedTorrentPath, []byte("d6:lengthi10e4:name12:testfile.txt12:piece lengthi10e6:pieces20:01234567890123456789e"), 0644)
+
+	stateFilePath := filepath.Join(downloadDir, "."+infoHashHex+".state")
+	_ = os.WriteFile(stateFilePath, []byte("state info"), 0644)
+
+	// Remove session: delete task only (deleteFiles = false)
+	err = mgr.RemoveSession(infoHashHex, false)
+	if err != nil {
+		t.Fatalf("RemoveSession failed: %v", err)
+	}
+
+	// Verify manager states
+	if len(mgr.ListSessions()) != 0 {
+		t.Error("session still exists in manager list")
+	}
+
+	// Verify cached .torrent file is deleted
+	if _, err := os.Stat(cachedTorrentPath); !os.IsNotExist(err) {
+		t.Error("expected cached .torrent file to be deleted")
+	}
+
+	// Verify fast-resume state file is deleted
+	if _, err := os.Stat(stateFilePath); !os.IsNotExist(err) {
+		t.Error("expected fast-resume state file to be deleted")
+	}
+
+	// Verify downloaded file is NOT deleted
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		t.Error("expected downloaded file to remain on disk")
+	}
+
+	mgr.Close()
+}
+
+func TestRemoveSession_DeleteTaskAndFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	downloadDir := filepath.Join(tempDir, "download")
+	_ = os.MkdirAll(filepath.Join(configDir, "torrents"), 0755)
+	_ = os.MkdirAll(downloadDir, 0755)
+
+	mgr := NewTorrentManager()
+	_, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+
+	// Create dummy torrent files on disk
+	filePath := filepath.Join(downloadDir, "testfile.txt")
+	_ = os.WriteFile(filePath, []byte("dummy data"), 0644)
+
+	// Create a dummy session
+	infoHash := sha1.Sum([]byte("task-and-files"))
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	tor := &torrent.Torrent{
+		Name:        "testfile.txt",
+		InfoHash:    infoHash,
+		PieceLength: 10,
+		Files: []torrent.File{
+			{Length: 10, Path: []string{"testfile.txt"}},
+		},
+	}
+	st, _ := storage.NewStorage(downloadDir, []storage.FileInfo{{Path: "testfile.txt", Length: 10}}, 10)
+	sess, err := NewSession(tor, st, [20]byte{}, 0, downloadDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	mgr.AddSession(infoHashHex, sess)
+
+	// Write mock .state and .torrent cached files
+	cachedTorrentPath := filepath.Join(configDir, "torrents", infoHashHex+".torrent")
+	_ = os.WriteFile(cachedTorrentPath, []byte("d6:lengthi10e4:name12:testfile.txt12:piece lengthi10e6:pieces20:01234567890123456789e"), 0644)
+
+	stateFilePath := filepath.Join(downloadDir, "."+infoHashHex+".state")
+	_ = os.WriteFile(stateFilePath, []byte("state info"), 0644)
+
+	// Remove session: delete task and files (deleteFiles = true)
+	err = mgr.RemoveSession(infoHashHex, true)
+	if err != nil {
+		t.Fatalf("RemoveSession failed: %v", err)
+	}
+
+	// Verify manager states
+	if len(mgr.ListSessions()) != 0 {
+		t.Error("session still exists in manager list")
+	}
+
+	// Verify cached .torrent file is deleted
+	if _, err := os.Stat(cachedTorrentPath); !os.IsNotExist(err) {
+		t.Error("expected cached .torrent file to be deleted")
+	}
+
+	// Verify fast-resume state file is deleted
+	if _, err := os.Stat(stateFilePath); !os.IsNotExist(err) {
+		t.Error("expected fast-resume state file to be deleted")
+	}
+
+	// Verify downloaded file is deleted
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Error("expected downloaded file to be deleted from disk")
+	}
+
+	mgr.Close()
+}
+
+func TestRemoveSession_DirectoryCleanupBoundaries(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	downloadDir := filepath.Join(tempDir, "download")
+	_ = os.MkdirAll(filepath.Join(configDir, "torrents"), 0755)
+
+	// Create nested structure:
+	// download/my_torrent/sub1/empty/ - should be cleaned up
+	// download/my_torrent/sub2/file_to_keep.txt - should be preserved
+	// download/my_torrent/sub1/file_to_delete.txt - should be deleted, making sub1/empty empty, so both deleted
+	sub1Empty := filepath.Join(downloadDir, "my_torrent", "sub1", "empty")
+	sub2 := filepath.Join(downloadDir, "my_torrent", "sub2")
+	_ = os.MkdirAll(sub1Empty, 0755)
+	_ = os.MkdirAll(sub2, 0755)
+
+	deleteFilePath := filepath.Join(downloadDir, "my_torrent", "sub1", "empty", "file_to_delete.txt")
+	keepFilePath := filepath.Join(sub2, "file_to_keep.txt")
+
+	_ = os.WriteFile(deleteFilePath, []byte("delete me"), 0644)
+	_ = os.WriteFile(keepFilePath, []byte("keep me"), 0644)
+
+	mgr := NewTorrentManager()
+	_, _ = mgr.EnablePersistence(configDir)
+
+	infoHash := sha1.Sum([]byte("dir-cleanup"))
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	tor := &torrent.Torrent{
+		Name:        "my_torrent",
+		InfoHash:    infoHash,
+		PieceLength: 9,
+		Files: []torrent.File{
+			{Length: 9, Path: []string{"my_torrent", "sub1", "empty", "file_to_delete.txt"}},
+		},
+	}
+	st, _ := storage.NewStorage(downloadDir, []storage.FileInfo{{Path: filepath.Join("my_torrent", "sub1", "empty", "file_to_delete.txt"), Length: 9}}, 9)
+	sess, _ := NewSession(tor, st, [20]byte{}, 0, downloadDir)
+	mgr.AddSession(infoHashHex, sess)
+
+	// Remove session with deleteFiles = true
+	err := mgr.RemoveSession(infoHashHex, true)
+	if err != nil {
+		t.Fatalf("RemoveSession failed: %v", err)
+	}
+
+	// 1. file_to_delete.txt is deleted
+	if _, err := os.Stat(deleteFilePath); !os.IsNotExist(err) {
+		t.Error("file_to_delete.txt was not deleted")
+	}
+
+	// 2. Empty directory sub1/empty and sub1 are deleted
+	sub1EmptyDir := filepath.Dir(deleteFilePath)
+	if _, err := os.Stat(sub1EmptyDir); !os.IsNotExist(err) {
+		t.Error("sub1/empty directory was not cleaned up")
+	}
+	sub1Dir := filepath.Dir(sub1EmptyDir)
+	if _, err := os.Stat(sub1Dir); !os.IsNotExist(err) {
+		t.Error("sub1 directory was not cleaned up")
+	}
+
+	// 3. sub2 and keepFilePath are NOT deleted
+	if _, err := os.Stat(keepFilePath); os.IsNotExist(err) {
+		t.Error("file_to_keep.txt was deleted incorrectly")
+	}
+	if _, err := os.Stat(sub2); os.IsNotExist(err) {
+		t.Error("sub2 directory was deleted incorrectly")
+	}
+
+	// 4. Root downloadDir is NOT deleted
+	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
+		t.Error("root downloadDir was deleted incorrectly")
+	}
+
+	mgr.Close()
 }

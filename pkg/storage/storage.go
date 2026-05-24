@@ -79,7 +79,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		currentOffset += file.Length
 
 		// Construct absolute path and verify containment / no symlinks
-		absPath, err := resolveAndValidatePath(baseDir, file.Path)
+		absPath, err := ResolveAndValidatePath(baseDir, file.Path)
 		if err != nil {
 			return nil, err
 		}
@@ -176,7 +176,7 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath, err := resolveAndValidatePath(s.baseDir, file.path)
+			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
 			if err != nil {
 				return 0, err
 			}
@@ -232,7 +232,7 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath, err := resolveAndValidatePath(s.baseDir, file.path)
+			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
 			if err != nil {
 				return err
 			}
@@ -298,7 +298,7 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	statePath, err := resolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
+	statePath, err := ResolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
 	if err != nil {
 		return err
 	}
@@ -308,7 +308,7 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	}
 
 	for _, f := range s.files {
-		absPath, err := resolveAndValidatePath(s.baseDir, f.path)
+		absPath, err := ResolveAndValidatePath(s.baseDir, f.path)
 		if err != nil {
 			return err
 		}
@@ -349,7 +349,7 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	statePath, err := resolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
+	statePath, err := ResolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file path mismatch at index %d", i)
 		}
 
-		absPath, err := resolveAndValidatePath(s.baseDir, f.path)
+		absPath, err := ResolveAndValidatePath(s.baseDir, f.path)
 		if err != nil {
 			return nil, err
 		}
@@ -394,9 +394,9 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 	return state.CompletedPieces, nil
 }
 
-// resolveAndValidatePath canonicalizes the base directory and validates the relative
+// ResolveAndValidatePath canonicalizes the base directory and validates the relative
 // path component by component to ensure it is contained and does not traverse any symlinks.
-func resolveAndValidatePath(baseDir, relPath string) (string, error) {
+func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 	canonicalBase, err := filepath.EvalSymlinks(baseDir)
 	if err != nil {
 		canonicalBase, err = filepath.Abs(baseDir)

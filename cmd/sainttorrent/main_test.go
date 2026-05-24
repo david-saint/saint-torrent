@@ -1,8 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"sainttorrent/pkg/downloader"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -75,5 +79,56 @@ func TestGetSpeedStr(t *testing.T) {
 					tt.isPaused, tt.isCompleted, tt.speed, got, tt.want)
 			}
 		}
+	}
+}
+
+func TestDeleteViewFlow(t *testing.T) {
+	// Initialize a dummy model
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	m := initialModel(mgr, ".", "")
+	m.viewMode = viewDetail
+	m.deleteWithFiles = false
+	m.deleteErr = nil
+
+	// 1. Pressing "x" in viewDetail transitions to viewDeleteConfirm (delete task only)
+	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = mUpdated.(model)
+	if m.viewMode != viewDeleteConfirm {
+		t.Errorf("expected viewMode to be viewDeleteConfirm, got %v", m.viewMode)
+	}
+	if m.deleteWithFiles {
+		t.Error("expected deleteWithFiles to be false on 'x'")
+	}
+	if m.deleteErr != nil {
+		t.Errorf("expected deleteErr to be nil, got %v", m.deleteErr)
+	}
+
+	// 2. Pressing "esc" in viewDeleteConfirm transitions back to viewDetail (no error)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mUpdated.(model)
+	if m.viewMode != viewDetail {
+		t.Errorf("expected viewMode to be viewDetail after cancel, got %v", m.viewMode)
+	}
+
+	// 3. Pressing "X" in viewDetail transitions to viewDeleteConfirm (delete task & files)
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
+	m = mUpdated.(model)
+	if m.viewMode != viewDeleteConfirm {
+		t.Errorf("expected viewMode to be viewDeleteConfirm, got %v", m.viewMode)
+	}
+	if !m.deleteWithFiles {
+		t.Error("expected deleteWithFiles to be true on 'X'")
+	}
+
+	// 4. If deleteErr is present, pressing "esc" transitions to viewList
+	m.deleteErr = fmt.Errorf("some deletion error")
+	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = mUpdated.(model)
+	if m.viewMode != viewList {
+		t.Errorf("expected viewMode to be viewList after error escape, got %v", m.viewMode)
+	}
+	if m.deleteErr != nil {
+		t.Error("expected deleteErr to be cleared after transitioning back to list")
 	}
 }
