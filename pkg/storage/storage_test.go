@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"crypto/sha1"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -340,5 +341,33 @@ func TestStorageRejectsFinalSymlink(t *testing.T) {
 	}
 	if string(content) != "do-not-touch" {
 		t.Fatalf("outside file was modified through symlink: %q", content)
+	}
+}
+
+func TestStorageWriteBlockRepairsMissingFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	files := []FileInfo{{Path: "missing.bin", Length: 32}}
+	s, err := NewStorage(tmpDir, files, 32)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	filePath := filepath.Join(tmpDir, "missing.bin")
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("failed to remove test file: %v", err)
+	}
+
+	data := bytes.Repeat([]byte{'x'}, 32)
+	err = s.WriteBlock(0, 0, data)
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("expected ErrFileRepaired, got %v", err)
+	}
+
+	got, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("failed to read repaired file: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("repaired file data mismatch")
 	}
 }

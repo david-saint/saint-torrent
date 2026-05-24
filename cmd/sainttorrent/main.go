@@ -613,6 +613,9 @@ func (m model) viewTorrentDetails() string {
 		headerStyle.Render("Status"), statusBadge,
 		m.progress.ViewAs(pct),
 	)
+	if err := s.LastError(); err != nil {
+		cardContent += "\n" + headerStyle.Render("Last Issue") + ": " + err.Error()
+	}
 	sb.WriteString(cardStyle.Render(cardContent))
 	sb.WriteString("\n")
 

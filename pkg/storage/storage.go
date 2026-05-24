@@ -3,6 +3,7 @@ package storage
 import (
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -12,6 +13,11 @@ import (
 	"sync"
 	"syscall"
 )
+
+// ErrFileRepaired is returned when a write had to recreate or resize a target
+// file that disappeared or changed after the session started. The write itself
+// has succeeded, but callers should re-verify completed pieces.
+var ErrFileRepaired = errors.New("storage file repaired")
 
 // FileInfo represents a file in the torrent.
 type FileInfo struct {
@@ -221,6 +227,7 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	repaired := false
 
 	if pieceIndex < 0 {
 		return fmt.Errorf("negative piece index: %d", pieceIndex)
@@ -255,8 +262,27 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 				return err
 			}
 			f, err := openNoFollow(absPath, os.O_WRONLY, 0644)
+			if os.IsNotExist(err) {
+				if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+					return fmt.Errorf("failed to recreate directories for file %s: %w", file.path, err)
+				}
+				f, err = openNoFollow(absPath, os.O_CREATE|os.O_RDWR, 0644)
+				if err == nil {
+					repaired = true
+				}
+			}
 			if err != nil {
 				return fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
+			}
+			if fi, err := f.Stat(); err != nil {
+				f.Close()
+				return fmt.Errorf("failed to stat file %s for writing: %w", file.path, err)
+			} else if fi.Size() != file.length {
+				if err := f.Truncate(file.length); err != nil {
+					f.Close()
+					return fmt.Errorf("failed to repair size for file %s: %w", file.path, err)
+				}
+				repaired = true
 			}
 
 			n, err := f.WriteAt(data[bufOffset:bufOffset+nBytes], fileOffset)
@@ -273,6 +299,9 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 		}
 	}
 
+	if repaired {
+		return ErrFileRepaired
+	}
 	return nil
 }
 

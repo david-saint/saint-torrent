@@ -37,6 +37,9 @@ const BlockSize = 16384
 // Keep enough block requests in flight to saturate high-latency peers.
 const maxPendingBlockRequests = 128
 
+const blockRequestTimeout = 20 * time.Second
+const maxBlockRequestRetries = 2
+
 // Large enough to avoid kernel socket buffers becoming the bottleneck on fast peers.
 const peerSocketBufferSize = 4 * 1024 * 1024
 
@@ -130,11 +133,13 @@ type Session struct {
 
 // blockRequest tracks an outstanding block request sent to a peer.
 type blockRequest struct {
-	pieceIndex int64
-	begin      int64
-	length     int64
-	requested  bool
-	received   bool
+	pieceIndex  int64
+	begin       int64
+	length      int64
+	requested   bool
+	received    bool
+	requestedAt time.Time
+	retries     int
 }
 
 // NewSession creates a new download session for a torrent.
@@ -424,6 +429,7 @@ func (s *Session) blocksInPiece(pieceIndex int64) int64 {
 func (s *Session) markPieceCompleted(index int64) {
 	s.mu.Lock()
 	s.PieceStates[index] = PieceCompleted
+	s.lastErr = nil
 	s.saveStateLocked()
 
 	var completedNow bool
@@ -438,6 +444,36 @@ func (s *Session) markPieceCompleted(index int64) {
 	s.mu.Unlock()
 
 	// Notify active peers
+	s.broadcastHave(uint32(index))
+
+	if completedNow {
+		select {
+		case s.resumeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Session) resetProgressAfterStorageRepair(index int64) {
+	s.mu.Lock()
+	for i := range s.PieceStates {
+		s.PieceStates[i] = PieceEmpty
+	}
+	s.PieceStates[index] = PieceCompleted
+	s.lastErr = nil
+	s.saveStateLocked()
+
+	var completedNow bool
+	if !s.completedAnnounced && !s.metadataMode && s.Storage != nil {
+		stats := s.completionStatsLocked()
+		if stats.completedTotalBytes == stats.totalBytes && stats.totalBytes > 0 {
+			s.completedAnnounced = true
+			s.queueTrackerEventLocked("completed")
+			completedNow = true
+		}
+	}
+	s.mu.Unlock()
+
 	s.broadcastHave(uint32(index))
 
 	if completedNow {
@@ -1274,10 +1310,25 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			return
 		}
 		dl := currentDownload
+		now := time.Now()
 		numBlocks := s.blocksInPiece(dl.pieceIndex)
 		pendingCount := 0
 		for _, req := range dl.pending {
 			if req.requested && !req.received {
+				if now.Sub(req.requestedAt) >= blockRequestTimeout {
+					if req.retries >= maxBlockRequestRetries {
+						s.mu.Lock()
+						s.lastErr = fmt.Errorf("timed out downloading piece %d", dl.pieceIndex)
+						s.PieceStates[dl.pieceIndex] = PieceEmpty
+						s.mu.Unlock()
+						currentDownload = nil
+						_ = conn.Close()
+						return
+					}
+					req.requested = false
+					req.retries++
+					continue
+				}
 				pendingCount++
 			}
 		}
@@ -1296,16 +1347,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						blockLen = pieceLen - begin
 					}
 					dl.pending[begin] = &blockRequest{
-						pieceIndex: dl.pieceIndex,
-						begin:      begin,
-						length:     blockLen,
-						requested:  true,
-						received:   false,
+						pieceIndex:  dl.pieceIndex,
+						begin:       begin,
+						length:      blockLen,
+						requested:   true,
+						received:    false,
+						requestedAt: now,
 					}
 					nextBegin = begin
 					break
 				} else if !req.requested && !req.received {
 					req.requested = true
+					req.requestedAt = now
 					nextBegin = begin
 					break
 				}
@@ -1331,6 +1384,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				req.requested = false
 				break
 			}
+			req.requestedAt = now
 			pendingCount++
 		}
 	}
@@ -1632,16 +1686,25 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					}
 
 					if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
-						if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil {
-							s.markPieceCompleted(dl.pieceIndex)
+						if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil || err == storage.ErrFileRepaired {
+							if err == storage.ErrFileRepaired {
+								s.mu.Lock()
+								s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
+								s.mu.Unlock()
+								s.resetProgressAfterStorageRepair(dl.pieceIndex)
+							} else {
+								s.markPieceCompleted(dl.pieceIndex)
+							}
 						} else {
 							s.mu.Lock()
+							s.lastErr = err
 							s.PieceStates[dl.pieceIndex] = PieceEmpty
 							s.mu.Unlock()
 						}
 					} else {
 						// Hash mismatch or incomplete assembly: retry this piece from another peer.
 						s.mu.Lock()
+						s.lastErr = fmt.Errorf("piece %d failed hash verification", dl.pieceIndex)
 						s.PieceStates[dl.pieceIndex] = PieceEmpty
 						s.mu.Unlock()
 					}
