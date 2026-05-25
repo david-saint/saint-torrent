@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -111,6 +112,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 
 	m.sessions[infoHashHex] = sess
 	sess.mu.Lock()
+	if sess.AddedAt.IsZero() {
+		sess.AddedAt = time.Now()
+	}
 	sess.GlobalDownloadLimiter = m.globalDownloadLimiter
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
 	sess.mu.Unlock()
@@ -279,15 +283,55 @@ func (m *TorrentManager) GetSession(infoHashHex string) *Session {
 	return m.sessions[infoHashHex]
 }
 
-// ListSessions returns a slice of all managed sessions.
+// ListSessions returns a slice of all managed sessions, stably sorted.
 func (m *TorrentManager) ListSessions() []*Session {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	list := make([]*Session, 0, len(m.sessions))
 	for _, sess := range m.sessions {
 		list = append(list, sess)
 	}
+	m.mu.RUnlock()
+
+	type sortKey struct {
+		sess        *Session
+		statusScore int
+		addedAt     time.Time
+		name        string
+		infoHashHex string
+	}
+
+	keys := make([]sortKey, len(list))
+	for i, sess := range list {
+		snap := sess.GetSortSnapshot()
+		keys[i] = sortKey{
+			sess:        sess,
+			statusScore: snap.StatusScore,
+			addedAt:     snap.AddedAt,
+			name:        snap.Name,
+			infoHashHex: snap.InfoHashHex,
+		}
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		ki, kj := keys[i], keys[j]
+		if ki.statusScore != kj.statusScore {
+			return ki.statusScore < kj.statusScore
+		}
+		if !ki.addedAt.Equal(kj.addedAt) {
+			return ki.addedAt.Before(kj.addedAt)
+		}
+		nameI := strings.ToLower(ki.name)
+		nameJ := strings.ToLower(kj.name)
+		if nameI != nameJ {
+			return nameI < nameJ
+		}
+		return ki.infoHashHex < kj.infoHashHex
+	})
+
+	for i, k := range keys {
+		list[i] = k.sess
+	}
+
 	return list
 }
 
@@ -501,6 +545,7 @@ type PersistedTorrent struct {
 	DownloadDir    string         `json:"download_dir"`
 	Paused         bool           `json:"paused"`
 	FilePriorities []FilePriority `json:"file_priorities,omitempty"`
+	AddedAt        *time.Time     `json:"added_at,omitempty"`
 }
 
 type PersistedState struct {
@@ -532,7 +577,14 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		magnetURI := sess.MagnetURI
 		downloadDir := sess.downloadDir
 		paused := sess.paused
+		addedAt := sess.AddedAt
 		sess.mu.RUnlock()
+
+		var addedAtPtr *time.Time
+		if !addedAt.IsZero() {
+			addedAtCopy := addedAt
+			addedAtPtr = &addedAtCopy
+		}
 
 		state.Torrents = append(state.Torrents, PersistedTorrent{
 			InfoHashHex:    infoHashHex,
@@ -540,6 +592,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 			DownloadDir:    downloadDir,
 			Paused:         paused,
 			FilePriorities: priorities,
+			AddedAt:        addedAtPtr,
 		})
 	}
 
@@ -763,6 +816,20 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		}
 
 		if sess != nil {
+			// Restore AddedAt
+			if entry.AddedAt != nil && !entry.AddedAt.IsZero() {
+				sess.mu.Lock()
+				sess.AddedAt = *entry.AddedAt
+				sess.mu.Unlock()
+			} else {
+				// Fallback to cached torrent file modification time
+				if stat, statErr := os.Stat(cachedPath); statErr == nil {
+					sess.mu.Lock()
+					sess.AddedAt = stat.ModTime()
+					sess.mu.Unlock()
+				}
+			}
+
 			// Re-apply properties to session
 			sess.OnStateChange = func() {
 				m.saveState()

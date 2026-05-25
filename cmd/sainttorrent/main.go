@@ -160,6 +160,43 @@ func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWar
 	}
 }
 
+func (m *model) refreshSessions() {
+	var selectedHash string
+	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+		s := m.sessions[m.selectedIdx]
+		if s.Torrent != nil {
+			selectedHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
+		}
+	}
+
+	m.sessions = m.manager.ListSessions()
+
+	if selectedHash != "" {
+		newIdx := -1
+		for idx, s := range m.sessions {
+			if s.Torrent != nil && fmt.Sprintf("%x", s.Torrent.InfoHash) == selectedHash {
+				newIdx = idx
+				break
+			}
+		}
+		if newIdx != -1 {
+			m.selectedIdx = newIdx
+		} else if m.selectedIdx >= len(m.sessions) {
+			if len(m.sessions) > 0 {
+				m.selectedIdx = len(m.sessions) - 1
+			} else {
+				m.selectedIdx = 0
+			}
+		}
+	} else if m.selectedIdx >= len(m.sessions) {
+		if len(m.sessions) > 0 {
+			m.selectedIdx = len(m.sessions) - 1
+		} else {
+			m.selectedIdx = 0
+		}
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	// Start all managed sessions
 	for _, s := range m.sessions {
@@ -204,7 +241,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 					sess.Start()
-					m.sessions = m.manager.ListSessions()
+					m.refreshSessions()
 					m.viewMode = viewList
 					m.inputMode = inputNone
 					m.inputErr = ""
@@ -415,21 +452,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					err := m.manager.RemoveSession(m.deleteTargetHash, m.deleteWithFiles)
 					if err != nil {
 						m.deleteErr = err
-						m.sessions = m.manager.ListSessions()
-						if m.selectedIdx >= len(m.sessions) && len(m.sessions) > 0 {
-							m.selectedIdx = len(m.sessions) - 1
-						} else if len(m.sessions) == 0 {
-							m.selectedIdx = 0
-						}
+						m.refreshSessions()
 						return m, nil
 					}
 				}
-				m.sessions = m.manager.ListSessions()
-				if m.selectedIdx >= len(m.sessions) && len(m.sessions) > 0 {
-					m.selectedIdx = len(m.sessions) - 1
-				} else if len(m.sessions) == 0 {
-					m.selectedIdx = 0
-				}
+				m.refreshSessions()
 				m.viewMode = viewList
 			}
 		}
@@ -438,7 +465,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.quitting {
 			return m, nil
 		}
-		m.sessions = m.manager.ListSessions()
+		m.refreshSessions()
 		return m, tickCmd()
 
 	case progress.FrameMsg:

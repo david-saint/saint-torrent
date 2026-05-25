@@ -79,6 +79,7 @@ type Session struct {
 	PeerID    [20]byte
 	Port      uint16
 	StartTime time.Time
+	AddedAt   time.Time
 
 	mu          sync.RWMutex
 	Downloaded  int64
@@ -168,6 +169,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		PeerID:              peerID,
 		Port:                port,
 		StartTime:           time.Now(),
+		AddedAt:             time.Now(),
 		PieceStates:         states,
 		Peers:               make(map[string]*PeerState),
 		activePeers:         make(map[string]*peer.Client),
@@ -1922,11 +1924,7 @@ func (s *Session) IsCompleted() bool {
 	return s.isCompletedLocked()
 }
 
-// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
-func (s *Session) Status() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *Session) statusLocked() string {
 	isCompleted := s.isCompletedLocked()
 	if s.paused {
 		if isCompleted {
@@ -1945,6 +1943,56 @@ func (s *Session) Status() string {
 		return "Seeding"
 	}
 	return "Downloading"
+}
+
+// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
+func (s *Session) Status() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.statusLocked()
+}
+
+// SessionSortSnapshot holds a snapshot of sorting keys.
+type SessionSortSnapshot struct {
+	StatusScore int
+	AddedAt     time.Time
+	Name        string
+	InfoHashHex string
+}
+
+// GetSortSnapshot gathers sorting keys under a single read lock.
+func (s *Session) GetSortSnapshot() SessionSortSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status := s.statusLocked()
+	var statusScore int
+	switch status {
+	case "Downloading", "Metadata":
+		statusScore = 0
+	case "Seeding":
+		statusScore = 1
+	case "Paused", "Stopped":
+		statusScore = 2
+	case "Error":
+		statusScore = 3
+	default:
+		statusScore = 4
+	}
+
+	name := ""
+	infoHashHex := ""
+	if s.Torrent != nil {
+		name = s.Torrent.Name
+		infoHashHex = fmt.Sprintf("%x", s.Torrent.InfoHash)
+	}
+
+	return SessionSortSnapshot{
+		StatusScore: statusScore,
+		AddedAt:     s.AddedAt,
+		Name:        name,
+		InfoHashHex: infoHashHex,
+	}
 }
 
 // IsMetadataMode returns whether the session is currently in metadata download mode.

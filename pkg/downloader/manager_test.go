@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -891,4 +892,273 @@ func TestRemoveSession_DirectoryCleanupBoundaries(t *testing.T) {
 	}
 
 	mgr.Close()
+}
+
+func createMockSession(t *testing.T, tempDir, name string, hash [20]byte, addedAt time.Time, paused bool, completed bool) *Session {
+	tor := &torrent.Torrent{
+		Name:        name,
+		InfoHash:    hash,
+		PieceLength: 32768,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("data"))},
+		Files: []torrent.File{
+			{Length: 32768, Path: []string{name}},
+		},
+	}
+
+	files := []storage.FileInfo{
+		{Path: filepath.Join(tor.Files[0].Path...), Length: tor.Files[0].Length},
+	}
+	st, err := storage.NewStorage(tempDir, files, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	peerID := [20]byte{1, 2, 3}
+	sess, err := NewSession(tor, st, peerID, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.AddedAt = addedAt
+	sess.paused = paused
+	if completed {
+		sess.PieceStates[0] = PieceCompleted
+	}
+	sess.mu.Unlock()
+
+	return sess
+}
+
+func TestListSessionsSorting(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	now := time.Now()
+
+	// Create sessions in random order
+	// 1. Stopped (paused & completed), added now, name "Z", hash [20]byte{5} -> Priority 2
+	s1 := createMockSession(t, tempDir, "Z", [20]byte{5}, now, true, true)
+
+	// 2. Seeding (not paused & completed), added 1 hour ago, name "Y", hash [20]byte{4} -> Priority 1
+	s2 := createMockSession(t, tempDir, "Y", [20]byte{4}, now.Add(-time.Hour), false, true)
+
+	// 3. Downloading (not paused & not completed), added 2 hours ago, name "X", hash [20]byte{3} -> Priority 0
+	s3 := createMockSession(t, tempDir, "X", [20]byte{3}, now.Add(-2*time.Hour), false, false)
+
+	// 4. Downloading (not paused & not completed), added 3 hours ago, name "W", hash [20]byte{2} -> Priority 0
+	s4 := createMockSession(t, tempDir, "W", [20]byte{2}, now.Add(-3*time.Hour), false, false)
+
+	// 5. Downloading (not paused & not completed), added 3 hours ago, name "W", hash [20]byte{1} -> Priority 0 (same name and time as s4, but smaller hash)
+	s5 := createMockSession(t, tempDir, "W", [20]byte{1}, now.Add(-3*time.Hour), false, false)
+
+	// Add them to manager in a random order
+	mgr.AddSession("05", s1)
+	mgr.AddSession("04", s2)
+	mgr.AddSession("03", s3)
+	mgr.AddSession("02", s4)
+	mgr.AddSession("01", s5)
+
+	sessions := mgr.ListSessions()
+	if len(sessions) != 5 {
+		t.Fatalf("expected 5 sessions, got %d", len(sessions))
+	}
+
+	// Expected sorted order:
+	// 1st: s5 (Priority 0/Downloading, added 3h ago, name "W", hash 01) -> oldest downloading, first by hash tiebreaker
+	// 2nd: s4 (Priority 0/Downloading, added 3h ago, name "W", hash 02) -> oldest downloading, second by hash tiebreaker
+	// 3rd: s3 (Priority 0/Downloading, added 2h ago, name "X")
+	// 4th: s2 (Priority 1/Seeding, added 1h ago, name "Y")
+	// 5th: s1 (Priority 2/Stopped, added now, name "Z")
+
+	expectedOrder := []*Session{s5, s4, s3, s2, s1}
+	for i, expected := range expectedOrder {
+		if sessions[i] != expected {
+			t.Errorf("at index %d: expected session %s (hash %v), got %s (hash %v)",
+				i, expected.Torrent.Name, expected.Torrent.InfoHash,
+				sessions[i].Torrent.Name, sessions[i].Torrent.InfoHash)
+		}
+	}
+}
+
+func TestPersistenceAddedAt(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	_ = os.MkdirAll(filepath.Join(configDir, "torrents"), 0755)
+
+	mgr := NewTorrentManager()
+
+	// 1. Create a dummy torrent file in cache
+	infoBytes := []byte("d6:lengthi100e4:name9:dummy.txt12:piece lengthi32768e6:pieces20:12345678901234567890e")
+	dummyTorrent := []byte("d8:announce27:http://tracker.org/announce4:infod6:lengthi100e4:name9:dummy.txt12:piece lengthi32768e6:pieces20:12345678901234567890ee")
+	infoHash := sha1.Sum(infoBytes)
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+
+	cachedPath := filepath.Join(configDir, "torrents", infoHashHex+".torrent")
+	if err := os.WriteFile(cachedPath, dummyTorrent, 0644); err != nil {
+		t.Fatalf("failed to write cached torrent: %v", err)
+	}
+
+	// 2. Set the modification time of cachedPath to a specific time
+	modTime := time.Date(2025, 5, 20, 10, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(cachedPath, modTime, modTime); err != nil {
+		t.Fatalf("failed to set mod times: %v", err)
+	}
+
+	// 3. Write session.json with three torrent entries:
+	// Entry 1: infoHashHex (has cached torrent file), added_at is zero/nil (fallback to cached file modTime)
+	// Entry 2: magnet-only info hash, added_at is non-nil (persisted time)
+	// Entry 3: magnet-only info hash, added_at is zero/nil (fallback to now)
+	persistedTime := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	magnetHash := sha1.Sum([]byte("magnet-only"))
+	magnetHashHex := fmt.Sprintf("%x", magnetHash)
+	magnetURI := "magnet:?xt=urn:btih:" + magnetHashHex + "&dn=MagnetTorrent"
+
+	magnetNoTimeHash := sha1.Sum([]byte("magnet-no-time"))
+	magnetNoTimeHashHex := fmt.Sprintf("%x", magnetNoTimeHash)
+	magnetNoTimeURI := "magnet:?xt=urn:btih:" + magnetNoTimeHashHex + "&dn=MagnetNoTimeTorrent"
+
+	state := PersistedState{
+		Version: 1,
+		Torrents: []PersistedTorrent{
+			{
+				InfoHashHex: infoHashHex,
+				DownloadDir: tempDir,
+				Paused:      true,
+			},
+			{
+				InfoHashHex: magnetHashHex,
+				MagnetURI:   magnetURI,
+				DownloadDir: tempDir,
+				Paused:      true,
+				AddedAt:     &persistedTime,
+			},
+			{
+				InfoHashHex: magnetNoTimeHashHex,
+				MagnetURI:   magnetNoTimeURI,
+				DownloadDir: tempDir,
+				Paused:      true,
+			},
+		},
+	}
+
+	data, _ := json.Marshal(state)
+	if err := os.WriteFile(filepath.Join(configDir, "session.json"), data, 0644); err != nil {
+		t.Fatalf("failed to write session.json: %v", err)
+	}
+
+	// Enable persistence to restore
+	_, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+
+	// Retrieve session 1 and verify AddedAt is the file's modification time (modTime)
+	s1 := mgr.GetSession(infoHashHex)
+	if s1 == nil {
+		t.Fatal("session 1 was not restored")
+	}
+	s1.mu.RLock()
+	s1AddedAt := s1.AddedAt
+	s1.mu.RUnlock()
+	if !s1AddedAt.Equal(modTime) {
+		t.Errorf("expected session 1 AddedAt to fallback to cached file modTime %v, got %v", modTime, s1AddedAt)
+	}
+
+	// Retrieve session 2 and verify AddedAt is the persisted time
+	s2 := mgr.GetSession(magnetHashHex)
+	if s2 == nil {
+		t.Fatal("session 2 was not restored")
+	}
+	s2.mu.RLock()
+	s2AddedAt := s2.AddedAt
+	s2.mu.RUnlock()
+	if !s2AddedAt.Equal(persistedTime) {
+		t.Errorf("expected session 2 AddedAt to be %v, got %v", persistedTime, s2AddedAt)
+	}
+
+	// Retrieve session 3 and verify AddedAt is non-zero (fallback to now)
+	s3 := mgr.GetSession(magnetNoTimeHashHex)
+	if s3 == nil {
+		t.Fatal("session 3 was not restored")
+	}
+	s3.mu.RLock()
+	s3AddedAt := s3.AddedAt
+	s3.mu.RUnlock()
+	if s3AddedAt.IsZero() {
+		t.Error("expected session 3 AddedAt to be non-zero (fallback to now)")
+	}
+	if time.Since(s3AddedAt) > 10*time.Second {
+		t.Errorf("expected session 3 AddedAt to be close to current time, got %v", s3AddedAt)
+	}
+
+	// 4. Close manager and check that session.json is rewritten with correct AddedAt values
+	mgr.Close()
+
+	restoredData, err := os.ReadFile(filepath.Join(configDir, "session.json"))
+	if err != nil {
+		t.Fatalf("failed to read written session.json: %v", err)
+	}
+
+	var restoredState PersistedState
+	if err := json.Unmarshal(restoredData, &restoredState); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	// Verify entries now have correct added_at persisted in JSON
+	foundS1 := false
+	foundS2 := false
+	foundS3 := false
+	for _, entry := range restoredState.Torrents {
+		if entry.InfoHashHex == infoHashHex {
+			foundS1 = true
+			if entry.AddedAt == nil || !entry.AddedAt.Equal(modTime) {
+				t.Errorf("expected persisted s1 AddedAt to be %v, got %v", modTime, entry.AddedAt)
+			}
+		} else if entry.InfoHashHex == magnetHashHex {
+			foundS2 = true
+			if entry.AddedAt == nil || !entry.AddedAt.Equal(persistedTime) {
+				t.Errorf("expected persisted s2 AddedAt to be %v, got %v", persistedTime, entry.AddedAt)
+			}
+		} else if entry.InfoHashHex == magnetNoTimeHashHex {
+			foundS3 = true
+			if entry.AddedAt == nil || entry.AddedAt.IsZero() {
+				t.Errorf("expected persisted s3 AddedAt to be non-zero, got %v", entry.AddedAt)
+			}
+		}
+	}
+	if !foundS1 || !foundS2 || !foundS3 {
+		t.Errorf("did not find all sessions in written session.json (foundS1=%v, foundS2=%v, foundS3=%v)", foundS1, foundS2, foundS3)
+	}
+}
+
+func TestAddSessionBackfillsAddedAt(t *testing.T) {
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	sess := &Session{
+		Torrent: &torrent.Torrent{
+			InfoHash: [20]byte{1, 2, 3},
+		},
+	}
+
+	// sess.AddedAt is zero time
+	if !sess.AddedAt.IsZero() {
+		t.Fatalf("expected initial AddedAt to be zero")
+	}
+
+	mgr.AddSession("010203", sess)
+
+	sess.mu.RLock()
+	addedAt := sess.AddedAt
+	sess.mu.RUnlock()
+
+	if addedAt.IsZero() {
+		t.Errorf("expected AddedAt to be backfilled, got zero time")
+	}
+	if time.Since(addedAt) > 10*time.Second {
+		t.Errorf("expected AddedAt to be close to time.Now(), got %v", addedAt)
+	}
 }
