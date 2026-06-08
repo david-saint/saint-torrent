@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -104,7 +105,9 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 		d.readLoop()
 	})
 
-	d.bootstrap()
+	// Bootstrap (DNS resolution + queries) off the constructor path so NewDHT returns
+	// immediately even when the network or DNS resolver is slow.
+	d.goTracked(d.bootstrap)
 
 	// Periodic bootstrapping to maintain DHT connectivity if count is low
 	d.goTracked(func() {
@@ -827,12 +830,24 @@ func (d *DHT) bootstrap() {
 		"dht.transmissionbt.com:6881",
 	}
 
+	var resolver net.Resolver
 	for _, host := range bootstrapHosts {
-		addr, err := net.ResolveUDPAddr("udp", host)
+		hostName, portStr, err := net.SplitHostPort(host)
 		if err != nil {
 			continue
 		}
-		targetAddr := addr
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
+		}
+		// Cancellable, IPv4-only DNS: a hung resolver must not keep this bootstrap goroutine
+		// — and therefore DHT.Close, which waits on it — blocked past context cancellation,
+		// and the DHT socket is IPv4-bound, so an IPv6 result would be unusable.
+		ips, err := resolver.LookupIP(d.ctx, "ip4", hostName)
+		if err != nil || len(ips) == 0 {
+			continue
+		}
+		targetAddr := &net.UDPAddr{IP: ips[0], Port: port}
 		d.goTracked(func() {
 			select {
 			case <-d.ctx.Done():

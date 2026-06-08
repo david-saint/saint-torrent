@@ -321,6 +321,10 @@ func TestSessionFastResume(t *testing.T) {
 		t.Fatalf("failed to create second session: %v", err)
 	}
 
+	// Fast-resume verification now runs in the background; trigger and await it.
+	sess2.maybeStartVerification()
+	sess2.WaitVerified()
+
 	sess2.mu.RLock()
 	state := sess2.PieceStates[0]
 	sess2.mu.RUnlock()
@@ -393,12 +397,17 @@ func TestSessionFastResumeCorrupt(t *testing.T) {
 		t.Fatalf("failed to create second session: %v", err)
 	}
 
+	// Background verification must catch the corruption and reset the piece for
+	// re-download — the "never trust resume data blindly" invariant.
+	sess2.maybeStartVerification()
+	sess2.WaitVerified()
+
 	sess2.mu.RLock()
 	state := sess2.PieceStates[0]
 	sess2.mu.RUnlock()
 
-	if state == PieceCompleted {
-		t.Errorf("expected piece 0 to NOT be completed due to corruption, but it was marked as completed")
+	if state != PieceEmpty {
+		t.Errorf("expected corrupt piece 0 to be reset to PieceEmpty after verification, got %v", state)
 	}
 }
 

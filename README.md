@@ -115,6 +115,31 @@ The terminal used for that fallback is configurable. Edit
 This file is **not** overwritten when you re-run `register_magnet.sh`, so your
 choice persists across upgrades.
 
+### Startup, verification & performance
+
+Resumed torrents appear **instantly** on startup: fast-resume state is loaded
+without hashing, and each torrent's downloaded pieces are re-verified in the
+background (shown as a **Checking** status that settles to Seeding/Downloading
+once confirmed). Unverified pieces are never served to peers or counted toward
+seeding until they pass the hash check, so corrupt resume data is still caught
+and re-downloaded. DHT bootstrapping and the tracker "stopped" announces on quit
+are off the critical path, so start and close stay responsive on a slow network.
+
+To measure startup/close time:
+
+```bash
+# Per-phase breakdown, printed after the UI exits (also appended to
+# $SAINTTORRENT_TIMING_LOG when that variable is set):
+SAINTTORRENT_TIMING=1 ./sainttorrent -d /path/to/downloads
+
+# Headless: run the real startup + shutdown without the TUI and print
+# startup_ms / shutdown_ms (scriptable with `time`):
+SAINTTORRENT_BENCH=1 ./sainttorrent -d /path/to/downloads
+
+# Deterministic micro-benchmarks (cold restore + shutdown):
+go test -bench='BenchmarkColdStartup|BenchmarkShutdown' -benchmem ./pkg/downloader
+```
+
 ---
 
 ## Project Structure

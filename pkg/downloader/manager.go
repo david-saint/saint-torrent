@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -408,13 +409,72 @@ func (m *TorrentManager) Close() {
 	m.dht = nil
 	m.mu.Unlock()
 
+	// H1: best-effort, parallel, bounded "stopped" announces. Pre-marks every session as
+	// announced so the per-session Close() below never re-attempts a blocking announce.
+	m.announceStoppedAll(sessions)
+
+	// H2: close sessions concurrently — teardown becomes ~max(session) instead of the sum.
+	var closeWG sync.WaitGroup
 	for _, sess := range sessions {
-		sess.Close()
+		closeWG.Add(1)
+		go func(s *Session) {
+			defer closeWG.Done()
+			s.Close()
+		}(sess)
 	}
+	closeWG.Wait()
+
 	if d != nil {
 		d.Close()
 	}
 	m.wg.Wait()
+}
+
+// stopAnnounceBudget bounds how long shutdown waits for "stopped" tracker announces.
+// Responsive trackers answer well within this; a dead one can't stall the exit.
+const stopAnnounceBudget = 750 * time.Millisecond
+
+// announceStoppedAll fires "stopped" to every started session's trackers concurrently and
+// waits at most stopAnnounceBudget. It is best-effort: a slow or dead tracker can never
+// delay shutdown. Every started session is then marked announced so the subsequent
+// per-session Close() does not re-attempt a (potentially blocking) announce.
+func (m *TorrentManager) announceStoppedAll(sessions []*Session) {
+	ctx, cancel := context.WithTimeout(context.Background(), stopAnnounceBudget)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, sess := range sessions {
+		sess.mu.RLock()
+		started := sess.started
+		already := sess.stoppedAnnounced
+		sess.mu.RUnlock()
+		if !started || already {
+			continue
+		}
+		wg.Add(1)
+		go func(s *Session) {
+			defer wg.Done()
+			_ = s.announceWithEvent(ctx, "stopped")
+		}(sess)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+
+	for _, sess := range sessions {
+		sess.mu.Lock()
+		if sess.started {
+			sess.stoppedAnnounced = true
+		}
+		sess.mu.Unlock()
+	}
 }
 
 // AddMagnet parses a magnet URI and adds it to the manager as a metadata session.
@@ -796,7 +856,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	m.SetGlobalDownloadLimit(savedState.GlobalDownloadLimit)
 	m.SetGlobalUploadLimit(savedState.GlobalUploadLimit)
 
-	for _, entry := range savedState.Torrents {
+	restoreOne := func(entry PersistedTorrent) {
 		absoluteDownloadDir, err := filepath.Abs(entry.DownloadDir)
 		if err != nil {
 			absoluteDownloadDir = entry.DownloadDir
@@ -879,6 +939,50 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			m.mu.Unlock()
 		}
 	}
+
+	// De-duplicate by info hash before restoring concurrently: the check-and-insert in
+	// AddTorrentFile is not atomic, so two entries with the same hash could otherwise
+	// build and insert two sessions and apply persisted properties to the detached one.
+	uniqueEntries := make([]PersistedTorrent, 0, len(savedState.Torrents))
+	seenHashes := make(map[string]bool, len(savedState.Torrents))
+	for _, entry := range savedState.Torrents {
+		key := strings.ToLower(entry.InfoHashHex)
+		if key != "" {
+			if seenHashes[key] {
+				continue
+			}
+			seenHashes[key] = true
+		}
+		uniqueEntries = append(uniqueEntries, entry)
+	}
+
+	// Restore torrents concurrently (bounded by GOMAXPROCS). The heavy per-torrent work
+	// — parsing the cached .torrent and opening storage — runs off the critical path;
+	// manager mutations are mutex-protected and display order comes from a later sort,
+	// so insertion order does not matter.
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(uniqueEntries) {
+		workers = len(uniqueEntries)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	entryCh := make(chan PersistedTorrent)
+	var restoreWG sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		restoreWG.Add(1)
+		go func() {
+			defer restoreWG.Done()
+			for entry := range entryCh {
+				restoreOne(entry)
+			}
+		}()
+	}
+	for _, entry := range uniqueEntries {
+		entryCh <- entry
+	}
+	close(entryCh)
+	restoreWG.Wait()
 
 	// 5. Turn off restoring and save initial state
 	m.mu.Lock()
