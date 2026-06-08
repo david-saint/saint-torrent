@@ -691,11 +691,11 @@ func TestAnnounceSucceedsWhenOneTrackerFails(t *testing.T) {
 	sess.announceAndConnect()
 
 	sess.mu.RLock()
-	lastErr := sess.lastErr
+	lastTrackerErr := sess.lastTrackerErr
 	events := append([]string(nil), sess.trackerEvents...)
 	sess.mu.RUnlock()
-	if lastErr != nil {
-		t.Fatalf("expected successful tracker announce to clear lastErr, got %v", lastErr)
+	if lastTrackerErr != nil {
+		t.Fatalf("expected successful tracker announce to clear lastTrackerErr, got %v", lastTrackerErr)
 	}
 	if len(events) != 0 {
 		t.Fatalf("expected successful tracker announce to consume started event, got %v", events)
@@ -965,14 +965,45 @@ func TestSessionAnnounceFailureRetainsQueue(t *testing.T) {
 
 	sess.mu.RLock()
 	events := sess.trackerEvents
-	lastErr := sess.lastErr
+	lastTrackerErr := sess.lastTrackerErr
 	sess.mu.RUnlock()
 
 	if len(events) != 1 || events[0] != "started" {
 		t.Errorf("expected event 'started' to be retained on failure, got %v", events)
 	}
-	if lastErr == nil {
-		t.Error("expected lastErr to be set after failed announce")
+	if lastTrackerErr == nil {
+		t.Error("expected lastTrackerErr to be set after failed announce")
+	}
+	if sess.LastError() == nil {
+		t.Error("expected tracker failure to remain visible as the last issue")
+	}
+	if status := sess.Status(); status != "Metadata" {
+		t.Errorf("expected active magnet to remain in Metadata status, got %q", status)
+	}
+}
+
+func TestTrackerFailureDoesNotOverrideDownloadingStatus(t *testing.T) {
+	tor := &torrent.Torrent{
+		Name:        "active-download",
+		InfoHash:    sha1.Sum([]byte("active-download")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("x"))},
+		Files:       []torrent.File{{Length: 1, Path: []string{"x"}}},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.lastTrackerErr = fmt.Errorf("tracker unavailable")
+	sess.mu.Unlock()
+
+	if status := sess.Status(); status != "Downloading" {
+		t.Errorf("expected tracker failure not to override Downloading status, got %q", status)
+	}
+	if sess.LastError() == nil {
+		t.Error("expected tracker failure to remain visible as the last issue")
 	}
 }
 

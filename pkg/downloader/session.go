@@ -96,6 +96,7 @@ type Session struct {
 	listener           net.Listener
 	currentSpeed       float64
 	lastErr            error
+	lastTrackerErr     error
 	paused             bool
 	closed             bool
 	started            bool
@@ -921,7 +922,7 @@ func (s *Session) announceAndConnect() int {
 	}
 
 	s.mu.Lock()
-	s.lastErr = trackerErr
+	s.lastTrackerErr = trackerErr
 	if trackerErr != nil {
 		if event != "" {
 			s.trackerEvents = append([]string{event}, s.trackerEvents...)
@@ -1896,6 +1897,9 @@ func (s *Session) IsPaused() bool {
 func (s *Session) LastError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.lastErr == nil {
+		return s.lastTrackerErr
+	}
 	return s.lastErr
 }
 
