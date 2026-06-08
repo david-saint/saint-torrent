@@ -1995,6 +1995,23 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	}
 }
 
+// Name returns the torrent name, protected by a read lock.
+func (s *Session) Name() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Torrent != nil {
+		return s.Torrent.Name
+	}
+	return ""
+}
+
+// DownloadDir returns the download directory of the session, protected by a read lock.
+func (s *Session) DownloadDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.downloadDir
+}
+
 // IsMetadataMode returns whether the session is currently in metadata download mode.
 func (s *Session) IsMetadataMode() bool {
 	s.mu.RLock()

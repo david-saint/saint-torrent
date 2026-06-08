@@ -2,12 +2,17 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -15,6 +20,14 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/torrent"
+)
+
+var (
+	errLockContention = errors.New("lock contention")
+
+	programMu  sync.RWMutex
+	teaProgram *tea.Program
 )
 
 // Styles using Lipgloss
@@ -106,7 +119,37 @@ const (
 	viewFiles
 	viewInput
 	viewDeleteConfirm
+	viewAddConfirm
 )
+
+type pendingItem struct {
+	rawURL      string
+	displayName string
+	infoHashHex string
+	downloadDir string
+	isDuplicate bool
+	respChan    chan addTorrentResponse
+}
+
+type addTorrentMsg struct {
+	msg      socketMessage
+	respChan chan addTorrentResponse
+}
+
+type addTorrentResponse struct {
+	err error
+}
+
+type socketMessage struct {
+	Items       []string `json:"items"`
+	Confirm     bool     `json:"confirm"`
+	DownloadDir string   `json:"download_dir"`
+}
+
+type socketResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
 
 type inputMode int
 
@@ -140,23 +183,33 @@ type model struct {
 	sessions         []*downloader.Session
 	deleteWithFiles  bool
 	deleteErr        error
+	addConfirmErr    error
 	deleteTargetName string
 	deleteTargetHash string
+	pendingItems     []pendingItem
+	pendingIdx       int
 }
 
-func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string) model {
+func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string, pending []pendingItem) model {
 	p := progress.New(progress.WithDefaultGradient())
 	ti := textinput.New()
 	ti.Width = 50
 
+	mode := viewList
+	if len(pending) > 0 {
+		mode = viewAddConfirm
+	}
+
 	return model{
-		manager:     mgr,
-		downloadDir: downloadDir,
-		progress:    p,
-		textInput:   ti,
-		viewMode:    viewList,
-		startupWarn: startupWarn,
-		sessions:    mgr.ListSessions(),
+		manager:      mgr,
+		downloadDir:  downloadDir,
+		progress:     p,
+		textInput:    ti,
+		viewMode:     mode,
+		startupWarn:  startupWarn,
+		sessions:     mgr.ListSessions(),
+		pendingItems: pending,
+		pendingIdx:   0,
 	}
 }
 
@@ -215,6 +268,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc":
 				m.viewMode = viewList
+				if m.pendingIdx < len(m.pendingItems) {
+					m.viewMode = viewAddConfirm
+				}
 				m.inputMode = inputNone
 				m.inputErr = ""
 				m.textInput.Blur()
@@ -243,6 +299,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					sess.Start()
 					m.refreshSessions()
 					m.viewMode = viewList
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -259,6 +318,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.manager.SetGlobalDownloadLimit(limitKb * 1024)
 					m.viewMode = viewList
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -275,6 +337,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.manager.SetGlobalUploadLimit(limitKb * 1024)
 					m.viewMode = viewList
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -289,7 +354,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.quitting = true
-				m.manager.Close()
+				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "up", "k":
 				if m.selectedIdx > 0 {
@@ -339,10 +404,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.quitting = true
-				m.manager.Close()
+				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "esc":
 				m.viewMode = viewList
+				if m.pendingIdx < len(m.pendingItems) {
+					m.viewMode = viewAddConfirm
+				}
 			case " ":
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
 					s := m.sessions[m.selectedIdx]
@@ -366,7 +434,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deleteErr = nil
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
 					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = s.Torrent.Name
+					m.deleteTargetName = sanitizeText(s.Name())
 					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 				} else {
 					m.deleteTargetName = ""
@@ -378,7 +446,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deleteErr = nil
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
 					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = s.Torrent.Name
+					m.deleteTargetName = sanitizeText(s.Name())
 					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 				} else {
 					m.deleteTargetName = ""
@@ -389,6 +457,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case viewFiles:
 			if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
 				m.viewMode = viewList
+				if m.pendingIdx < len(m.pendingItems) {
+					m.viewMode = viewAddConfirm
+				}
 				return m, nil
 			}
 			s := m.sessions[m.selectedIdx]
@@ -397,7 +468,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.quitting = true
-				m.manager.Close()
+				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "esc":
 				m.viewMode = viewDetail
@@ -433,11 +504,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.quitting = true
-				m.manager.Close()
+				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "esc", "n", "N":
 				if m.deleteErr != nil {
 					m.viewMode = viewList
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 					m.deleteErr = nil
 				} else {
 					m.viewMode = viewDetail
@@ -445,6 +519,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "y", "Y":
 				if m.deleteErr != nil {
 					m.viewMode = viewList
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 					m.deleteErr = nil
 					return m, nil
 				}
@@ -458,8 +535,158 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.refreshSessions()
 				m.viewMode = viewList
+				if m.pendingIdx < len(m.pendingItems) {
+					m.viewMode = viewAddConfirm
+				}
+			}
+
+		case viewAddConfirm:
+			if m.addConfirmErr != nil {
+				switch msg.String() {
+				case "esc", "n", "N", "y", "Y":
+					m.addConfirmErr = nil
+					m.pendingIdx++
+					if m.pendingIdx >= len(m.pendingItems) {
+						m.pendingItems = nil
+						m.pendingIdx = 0
+						m.viewMode = viewList
+					}
+				}
+				return m, nil
+			}
+
+			switch msg.String() {
+			case "q", "ctrl+c":
+				m.quitting = true
+				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
+				return m, tea.Quit
+			case "y", "Y":
+				if m.pendingIdx < len(m.pendingItems) {
+					item := m.pendingItems[m.pendingIdx]
+					var addErr error
+					if !item.isDuplicate {
+						var sess *downloader.Session
+						if strings.HasPrefix(item.rawURL, "magnet:?") {
+							sess, addErr = m.manager.AddMagnet(item.rawURL, item.downloadDir)
+						} else {
+							sess, addErr = m.manager.AddTorrentFile(item.rawURL, item.downloadDir)
+						}
+						if addErr == nil {
+							sess.Start()
+						}
+					} else {
+						sess := m.manager.GetSession(item.infoHashHex)
+						if sess != nil {
+							sess.Resume()
+						}
+					}
+					m.refreshSessions()
+					if addErr != nil {
+						m.addConfirmErr = addErr
+					} else {
+						m.addConfirmErr = nil
+						m.pendingIdx++
+						if m.pendingIdx >= len(m.pendingItems) {
+							m.pendingItems = nil
+							m.pendingIdx = 0
+							m.viewMode = viewList
+						}
+					}
+				}
+				return m, nil
+			case "n", "N":
+				if m.pendingIdx < len(m.pendingItems) {
+					m.addConfirmErr = nil
+					m.pendingIdx++
+					if m.pendingIdx >= len(m.pendingItems) {
+						m.pendingItems = nil
+						m.pendingIdx = 0
+						m.viewMode = viewList
+					}
+				}
+				return m, nil
 			}
 		}
+
+	case addTorrentMsg:
+		if !msg.msg.Confirm {
+			var addErr error
+			pDir := m.downloadDir
+			if msg.msg.DownloadDir != "" {
+				pDir = msg.msg.DownloadDir
+			}
+			for _, item := range msg.msg.Items {
+				var sess *downloader.Session
+				var err error
+				if strings.HasPrefix(item, "magnet:?") {
+					sess, err = m.manager.AddMagnet(item, pDir)
+				} else {
+					sess, err = m.manager.AddTorrentFile(item, pDir)
+				}
+				if err == nil {
+					sess.Start()
+				} else {
+					addErr = err
+				}
+			}
+			m.refreshSessions()
+			if msg.respChan != nil {
+				select {
+				case msg.respChan <- addTorrentResponse{err: addErr}:
+				default:
+				}
+			}
+			return m, nil
+		}
+
+		// Convert msg.msg.Items to pendingItems
+		var newPending []pendingItem
+		pDir := m.downloadDir
+		if msg.msg.DownloadDir != "" {
+			pDir = msg.msg.DownloadDir
+		}
+		for _, item := range msg.msg.Items {
+			name, hashHex, err := parseItem(item)
+			isDuplicate := false
+			if err == nil && hashHex != "" {
+				if m.manager.GetSession(hashHex) != nil {
+					isDuplicate = true
+				}
+			}
+			displayName := item
+			if err == nil && name != "" {
+				displayName = name
+			}
+			displayName = sanitizeText(displayName)
+
+			pItem := pendingItem{
+				rawURL:      item,
+				displayName: displayName,
+				infoHashHex: hashHex,
+				downloadDir: pDir,
+				isDuplicate: isDuplicate,
+			}
+			newPending = append(newPending, pItem)
+		}
+
+		if len(newPending) > 0 {
+			if m.pendingIdx >= len(m.pendingItems) {
+				m.pendingItems = nil
+				m.pendingIdx = 0
+			}
+			m.pendingItems = append(m.pendingItems, newPending...)
+			if m.viewMode == viewList || m.viewMode == viewDetail {
+				m.viewMode = viewAddConfirm
+			}
+		}
+
+		if msg.respChan != nil {
+			select {
+			case msg.respChan <- addTorrentResponse{}:
+			default:
+			}
+		}
+		return m, nil
 
 	case tickMsg:
 		if m.quitting {
@@ -497,6 +724,8 @@ func (m model) View() string {
 		sb.WriteString(m.viewInputBox())
 	case viewDeleteConfirm:
 		sb.WriteString(m.viewDeleteConfirm())
+	case viewAddConfirm:
+		sb.WriteString(m.viewAddConfirm())
 	}
 
 	return sb.String()
@@ -514,7 +743,7 @@ func (m model) viewTorrentList() string {
 		for i, s := range m.sessions {
 			indicator := getIndicator(s.IsPaused(), s.IsCompleted())
 
-			name := s.Torrent.Name
+			name := sanitizeText(s.Name())
 			if len(name) > 23 {
 				name = name[:20] + "..."
 			}
@@ -561,7 +790,7 @@ func (m model) viewTorrentList() string {
 		sb.WriteString("\n")
 	}
 	if m.startupWarn != "" {
-		sb.WriteString("  " + warnStyle.Render(m.startupWarn) + "\n\n")
+		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.startupWarn)) + "\n\n")
 	}
 
 	dhtNodes := 0
@@ -611,7 +840,7 @@ func (m model) viewTorrentDetails() string {
 	s := m.sessions[m.selectedIdx]
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Torrent Details:"), s.Torrent.Name))
+	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Torrent Details:"), sanitizeText(s.Name())))
 
 	pct := s.PercentComplete() / 100.0
 	status := s.Status()
@@ -641,7 +870,7 @@ func (m model) viewTorrentDetails() string {
 		m.progress.ViewAs(pct),
 	)
 	if err := s.LastError(); err != nil {
-		cardContent += "\n" + headerStyle.Render("Last Issue") + ": " + err.Error()
+		cardContent += "\n" + headerStyle.Render("Last Issue") + ": " + sanitizeText(err.Error())
 	}
 	sb.WriteString(cardStyle.Render(cardContent))
 	sb.WriteString("\n")
@@ -709,7 +938,7 @@ func (m model) viewFileExplorer() string {
 	files := s.Files()
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("File Explorer:"), s.Torrent.Name))
+	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("File Explorer:"), sanitizeText(s.Name())))
 
 	if len(files) == 0 {
 		sb.WriteString("  No files in metadata.\n\n")
@@ -731,7 +960,7 @@ func (m model) viewFileExplorer() string {
 				prioBadge = priorityNormalStyle.Render("NORMAL")
 			}
 
-			path := filepath.Join(f.Path...)
+			path := sanitizeText(filepath.Join(f.Path...))
 			if len(path) > 40 {
 				path = "..." + path[len(path)-37:]
 			}
@@ -769,7 +998,7 @@ func (m model) viewInputBox() string {
 	sb.WriteString("  " + m.textInput.View() + "\n\n")
 
 	if m.inputErr != "" {
-		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render(m.inputErr)))
+		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render(sanitizeText(m.inputErr))))
 	}
 
 	sb.WriteString(helpStyle.Render("  [enter] Confirm | [esc] Cancel") + "\n")
@@ -805,10 +1034,365 @@ func generatePeerID() [20]byte {
 	return id
 }
 
+type appConfig struct {
+	BinaryPath         string `json:"binaryPath"`
+	SocketPath         string `json:"socketPath"`
+	DefaultDownloadDir string `json:"defaultDownloadDir"`
+}
+
+func sanitizeText(s string) string {
+	var sb strings.Builder
+	for _, r := range s {
+		if r < 32 || r == 127 || (r >= 0x80 && r <= 0x9F) {
+			sb.WriteRune(' ')
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	res := sb.String()
+	for strings.Contains(res, "  ") {
+		res = strings.ReplaceAll(res, "  ", " ")
+	}
+	return strings.TrimSpace(res)
+}
+
+func parseItem(item string) (name string, hashHex string, err error) {
+	if strings.HasPrefix(item, "magnet:?") {
+		mag, err := torrent.ParseMagnet(item)
+		if err != nil {
+			return "", "", err
+		}
+		return mag.Name, fmt.Sprintf("%x", mag.InfoHash), nil
+	}
+	data, err := os.ReadFile(item)
+	if err != nil {
+		return "", "", err
+	}
+	tor, err := torrent.Parse(data)
+	if err != nil {
+		return "", "", err
+	}
+	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
+}
+
+func resolveIPCDir() (string, error) {
+	if envDir := os.Getenv("SAINTTORRENT_IPC_DIR"); envDir != "" {
+		absDir, err := filepath.Abs(envDir)
+		if err != nil {
+			return "", fmt.Errorf("failed to get absolute path for SAINTTORRENT_IPC_DIR: %w", err)
+		}
+		if err := os.MkdirAll(absDir, 0700); err != nil {
+			return "", fmt.Errorf("failed to create IPC directory: %w", err)
+		}
+		if err := os.Chmod(absDir, 0700); err != nil {
+			return "", fmt.Errorf("failed to chmod IPC directory: %w", err)
+		}
+		sockPath := filepath.Join(absDir, "sainttorrent.sock")
+		if len(sockPath) >= 104 {
+			return "", fmt.Errorf("resolved socket path %q too long (%d bytes, max 103)", sockPath, len(sockPath))
+		}
+		return absDir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get user home directory: %w", err)
+	}
+	dir := filepath.Join(home, ".config", "sainttorrent")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create IPC directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to chmod IPC directory: %w", err)
+	}
+	sockPath := filepath.Join(dir, "sainttorrent.sock")
+	if len(sockPath) >= 104 {
+		return "", fmt.Errorf("resolved socket path %q too long (%d bytes, max 103)", sockPath, len(sockPath))
+	}
+	return dir, nil
+}
+
+func acquireLock(lockPath string) (*os.File, error) {
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open lock file: %w", err)
+	}
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		file.Close()
+		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+			return nil, errLockContention
+		}
+		return nil, fmt.Errorf("failed to flock file: %w", err)
+	}
+	return file, nil
+}
+
+var activeConns struct {
+	sync.Mutex
+	conns map[net.Conn]struct{}
+}
+
+func registerConn(conn net.Conn) {
+	activeConns.Lock()
+	if activeConns.conns == nil {
+		activeConns.conns = make(map[net.Conn]struct{})
+	}
+	activeConns.conns[conn] = struct{}{}
+	activeConns.Unlock()
+}
+
+func unregisterConn(conn net.Conn) {
+	activeConns.Lock()
+	if activeConns.conns != nil {
+		delete(activeConns.conns, conn)
+	}
+	activeConns.Unlock()
+}
+
+func closeActiveConns() {
+	activeConns.Lock()
+	var conns []net.Conn
+	for conn := range activeConns.conns {
+		conns = append(conns, conn)
+	}
+	activeConns.Unlock()
+
+	for _, conn := range conns {
+		conn.Close()
+	}
+}
+
+func writeFrame(conn net.Conn, payload []byte) error {
+	data := append(payload, '\n')
+	written := 0
+	for written < len(data) {
+		n, err := conn.Write(data[written:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+		written += n
+	}
+	return nil
+}
+
+func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup) {
+	defer handlersWG.Done()
+	defer unregisterConn(conn)
+	defer conn.Close()
+
+	programMu.RLock()
+	p := teaProgram
+	programMu.RUnlock()
+
+	if p == nil {
+		sendResponse(conn, "starting", "saintTorrent is starting up")
+		return
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		sendResponse(conn, "error", fmt.Sprintf("set read deadline error: %v", err))
+		return
+	}
+
+	var requestData []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			sendResponse(conn, "error", fmt.Sprintf("read error: %v", err))
+			return
+		}
+		if n > 0 {
+			if buf[0] == '\n' {
+				break
+			}
+			requestData = append(requestData, buf[0])
+			if len(requestData) > 65536 {
+				sendResponse(conn, "error", "request frame too large (max 65536 bytes)")
+				return
+			}
+		}
+	}
+
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		sendResponse(conn, "error", fmt.Sprintf("clear read deadline error: %v", err))
+		return
+	}
+
+	var msg socketMessage
+	if err := json.Unmarshal(requestData, &msg); err != nil {
+		sendResponse(conn, "error", fmt.Sprintf("invalid JSON payload: %v", err))
+		return
+	}
+
+	respChan := make(chan addTorrentResponse, 1)
+	select {
+	case <-shutdownChan:
+		sendResponse(conn, "error", "application is shutting down")
+		return
+	default:
+		p.Send(addTorrentMsg{msg: msg, respChan: respChan})
+	}
+
+	select {
+	case resp := <-respChan:
+		if resp.err != nil {
+			sendResponse(conn, "error", resp.err.Error())
+		} else {
+			sendResponse(conn, "ok", "torrent request handled")
+		}
+	case <-shutdownChan:
+		sendResponse(conn, "error", "application is shutting down")
+	case <-time.After(3 * time.Second):
+		sendResponse(conn, "error", "TUI processing timeout")
+	}
+}
+
+func sendResponse(conn net.Conn, status string, message string) {
+	resp := socketResponse{
+		Status:  status,
+		Message: message,
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return
+	}
+	_ = writeFrame(conn, data)
+}
+
+func (m *model) resolveRemainingPending(err error) {
+	for i := m.pendingIdx; i < len(m.pendingItems); i++ {
+		item := m.pendingItems[i]
+		if item.respChan != nil {
+			select {
+			case item.respChan <- addTorrentResponse{err: err}:
+			default:
+			}
+		}
+	}
+}
+
+func (m model) viewAddConfirm() string {
+	if m.pendingIdx >= len(m.pendingItems) {
+		return ""
+	}
+	item := m.pendingItems[m.pendingIdx]
+
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("  %s\n", headerStyle.Render("Confirm Add Torrent")))
+	sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 60)) + "\n\n")
+
+	if m.addConfirmErr != nil {
+		sb.WriteString(fmt.Sprintf("  %s: %s\n\n", errorStyle.Render("Error adding torrent"), sanitizeText(m.addConfirmErr.Error())))
+		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Dismiss and continue") + "\n")
+		return sb.String()
+	}
+
+	sb.WriteString(fmt.Sprintf("  %s: %s\n", headerStyle.Render("Torrent Name"), item.displayName))
+	sb.WriteString(fmt.Sprintf("  %s: %s\n\n", headerStyle.Render("Download Dir"), item.downloadDir))
+
+	if item.isDuplicate {
+		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render("Warning: This torrent is already in the download list. Confirming will resume it.")))
+	}
+
+	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Download | [n] No, Skip | [q] Quit") + "\n")
+	return sb.String()
+}
+
+func (m model) viewDeleteConfirm() string {
+	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		if m.deleteErr != nil {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), sanitizeText(m.deleteTargetName)))
+			sb.WriteString(cardStyle.Render(errorStyle.Render(sanitizeText(m.deleteErr.Error()))))
+			sb.WriteString("\n\n")
+			sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
+			return sb.String()
+		}
+		return ""
+	}
+
+	var sb strings.Builder
+	if m.deleteErr != nil {
+		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), sanitizeText(m.deleteTargetName)))
+		sb.WriteString(cardStyle.Render(errorStyle.Render(sanitizeText(m.deleteErr.Error()))))
+		sb.WriteString("\n\n")
+		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
+		return sb.String()
+	}
+
+	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Confirm Delete:"), sanitizeText(m.deleteTargetName)))
+
+	var warnMsg string
+	if m.deleteWithFiles {
+		warnMsg = errorStyle.Render("WARNING: This will permanently delete the task, state, and ALL downloaded files from disk!")
+	} else {
+		warnMsg = warnStyle.Render("This will delete the task state and fast-resume file, but keep downloaded files on disk.")
+	}
+
+	cardContent := fmt.Sprintf(
+		"Are you sure you want to delete this torrent?\n\n%s",
+		warnMsg,
+	)
+	sb.WriteString(cardStyle.Render(cardContent))
+	sb.WriteString("\n\n")
+	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Delete | [n]/[esc] Cancel") + "\n")
+	return sb.String()
+}
+
 func main() {
+	for i := 1; i < len(os.Args); i++ {
+		if os.Args[i] == "--write-config" {
+			if i+1 >= len(os.Args) {
+				fmt.Fprintln(os.Stderr, "Error: --write-config requires an output file path")
+				os.Exit(1)
+			}
+			outputPath := os.Args[i+1]
+			ipcDir, err := resolveIPCDir()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving IPC directory: %v\n", err)
+				os.Exit(1)
+			}
+			socketPath := filepath.Join(ipcDir, "sainttorrent.sock")
+			execPath, err := os.Executable()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting executable path: %v\n", err)
+				os.Exit(1)
+			}
+			home, err := os.UserHomeDir()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting user home directory: %v\n", err)
+				os.Exit(1)
+			}
+			cfg := appConfig{
+				BinaryPath:         execPath,
+				SocketPath:         socketPath,
+				DefaultDownloadDir: filepath.Join(home, "Downloads"),
+			}
+			data, err := json.MarshalIndent(cfg, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling config: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(outputPath, data, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing config file: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+	}
+
 	downloadDir := "."
 	configDir := ""
 	persist := true
+	confirmFlag := true
 	var filesToAdd []string
 
 	for i := 1; i < len(os.Args); i++ {
@@ -825,10 +1409,166 @@ func main() {
 			}
 		} else if arg == "--no-persist" {
 			persist = false
+		} else if arg == "--confirm" {
+			confirmFlag = true
+		} else if arg == "--no-confirm" {
+			confirmFlag = false
 		} else {
 			filesToAdd = append(filesToAdd, arg)
 		}
 	}
+
+	ipcDir, err := resolveIPCDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving IPC directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	lockPath := filepath.Join(ipcDir, "sainttorrent.lock")
+	socketPath := filepath.Join(ipcDir, "sainttorrent.sock")
+	lockFile, lockErr := acquireLock(lockPath)
+	if lockErr != nil {
+		if !errors.Is(lockErr, errLockContention) {
+			fmt.Fprintf(os.Stderr, "Fatal lock error: %v\n", lockErr)
+			os.Exit(1)
+		}
+
+		if len(filesToAdd) == 0 {
+			fmt.Println("saintTorrent is already running.")
+			os.Exit(0)
+		}
+
+		var normalizedItems []string
+		for _, item := range filesToAdd {
+			if strings.HasPrefix(item, "magnet:?") {
+				normalizedItems = append(normalizedItems, item)
+			} else {
+				absPath, err := filepath.Abs(item)
+				if err != nil {
+					normalizedItems = append(normalizedItems, item)
+				} else {
+					normalizedItems = append(normalizedItems, absPath)
+				}
+			}
+		}
+
+		var absDownloadDir string
+		if downloadDir != "" {
+			var err error
+			absDownloadDir, err = filepath.Abs(downloadDir)
+			if err != nil {
+				absDownloadDir = downloadDir
+			}
+		}
+
+		var conn net.Conn
+		var connErr error
+		var resp socketResponse
+		success := false
+
+		for retry := 0; retry < 120; retry++ {
+			conn, connErr = net.Dial("unix", socketPath)
+			if connErr != nil {
+				time.Sleep(250 * time.Millisecond)
+				continue
+			}
+
+			msg := socketMessage{
+				Items:       normalizedItems,
+				Confirm:     confirmFlag,
+				DownloadDir: absDownloadDir,
+			}
+			data, err := json.Marshal(msg)
+			if err != nil {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Error encoding request: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Error setting write deadline: %v\n", err)
+				os.Exit(1)
+			}
+			if err := writeFrame(conn, data); err != nil {
+				conn.Close()
+				time.Sleep(250 * time.Millisecond)
+				continue
+			}
+
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Error setting read deadline: %v\n", err)
+				os.Exit(1)
+			}
+
+			var respData []byte
+			buf := make([]byte, 1)
+			readErr := error(nil)
+			for {
+				n, err := conn.Read(buf)
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					readErr = err
+					break
+				}
+				if n > 0 {
+					if buf[0] == '\n' {
+						break
+					}
+					respData = append(respData, buf[0])
+				}
+			}
+
+			if readErr != nil {
+				conn.Close()
+				time.Sleep(250 * time.Millisecond)
+				continue
+			}
+
+			if err := json.Unmarshal(respData, &resp); err != nil {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
+				os.Exit(1)
+			}
+
+			if resp.Status == "starting" {
+				conn.Close()
+				time.Sleep(250 * time.Millisecond)
+				continue
+			}
+
+			if resp.Status != "ok" {
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "Error from running instance: %s\n", resp.Message)
+				os.Exit(1)
+			}
+
+			conn.Close()
+			success = true
+			break
+		}
+
+		if !success {
+			if connErr != nil {
+				fmt.Fprintf(os.Stderr, "Error connecting to running instance: %v\n", connErr)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error from running instance: client timed out waiting for server startup\n")
+			}
+			os.Exit(1)
+		}
+
+		fmt.Println("Torrents forwarded successfully.")
+		os.Exit(0)
+	}
+
+	defer func() {
+		if lockFile != nil {
+			lockFile.Close()
+		}
+	}()
 
 	var startupWarns []string
 
@@ -837,7 +1577,40 @@ func main() {
 	}
 
 	mgr := downloader.NewTorrentManager()
-	defer mgr.Close()
+
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Error removing stale socket file: %v\n", err)
+		os.Exit(1)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error starting socket listener: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		listener.Close()
+		fmt.Fprintf(os.Stderr, "Error setting socket file permissions: %v\n", err)
+		os.Exit(1)
+	}
+
+	shutdownChan := make(chan struct{})
+	var handlersWG sync.WaitGroup
+	var acceptLoopWG sync.WaitGroup
+
+	acceptLoopWG.Add(1)
+	go func() {
+		defer acceptLoopWG.Done()
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			registerConn(conn)
+			handlersWG.Add(1)
+			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG)
+		}
+	}()
 
 	if err := mgr.StartDHT(downloadDir, 6881); err != nil {
 		startupWarns = append(startupWarns, fmt.Sprintf("DHT unavailable: %v", err))
@@ -860,19 +1633,27 @@ func main() {
 		}
 	}
 
+	var initialPending []pendingItem
 	for _, item := range filesToAdd {
-		var sess *downloader.Session
-		var err error
-		if strings.HasPrefix(item, "magnet:?") {
-			sess, err = mgr.AddMagnet(item, downloadDir)
-		} else {
-			sess, err = mgr.AddTorrentFile(item, downloadDir)
+		name, hashHex, err := parseItem(item)
+		isDuplicate := false
+		if err == nil && hashHex != "" {
+			if mgr.GetSession(hashHex) != nil {
+				isDuplicate = true
+			}
 		}
-		if err == nil {
-			sess.Start()
-		} else {
-			startupWarns = append(startupWarns, fmt.Sprintf("Failed to add %s: %v", filepath.Base(item), err))
+		displayName := item
+		if err == nil && name != "" {
+			displayName = name
 		}
+		displayName = sanitizeText(displayName)
+		initialPending = append(initialPending, pendingItem{
+			rawURL:      item,
+			displayName: displayName,
+			infoHashHex: hashHex,
+			downloadDir: downloadDir,
+			isDuplicate: isDuplicate,
+		})
 	}
 
 	startupWarn := ""
@@ -880,49 +1661,23 @@ func main() {
 		startupWarn = strings.Join(startupWarns, "; ")
 	}
 
-	p := tea.NewProgram(initialModel(mgr, downloadDir, startupWarn))
+	p := tea.NewProgram(initialModel(mgr, downloadDir, startupWarn, initialPending))
+
+	programMu.Lock()
+	teaProgram = p
+	programMu.Unlock()
+
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running UI: %v\n", err)
 	}
-}
 
-func (m model) viewDeleteConfirm() string {
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-		if m.deleteErr != nil {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), m.deleteTargetName))
-			sb.WriteString(cardStyle.Render(errorStyle.Render(m.deleteErr.Error())))
-			sb.WriteString("\n\n")
-			sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
-			return sb.String()
-		}
-		return ""
+	listener.Close()
+	acceptLoopWG.Wait()
+	close(shutdownChan)
+	closeActiveConns()
+	handlersWG.Wait()
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Error removing socket file: %v\n", err)
 	}
-
-	var sb strings.Builder
-	if m.deleteErr != nil {
-		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), m.deleteTargetName))
-		sb.WriteString(cardStyle.Render(errorStyle.Render(m.deleteErr.Error())))
-		sb.WriteString("\n\n")
-		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
-		return sb.String()
-	}
-
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Confirm Delete:"), m.deleteTargetName))
-
-	var warnMsg string
-	if m.deleteWithFiles {
-		warnMsg = errorStyle.Render("WARNING: This will permanently delete the task, state, and ALL downloaded files from disk!")
-	} else {
-		warnMsg = warnStyle.Render("This will delete the task state and fast-resume file, but keep downloaded files on disk.")
-	}
-
-	cardContent := fmt.Sprintf(
-		"Are you sure you want to delete this torrent?\n\n%s",
-		warnMsg,
-	)
-	sb.WriteString(cardStyle.Render(cardContent))
-	sb.WriteString("\n\n")
-	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Delete | [n]/[esc] Cancel") + "\n")
-	return sb.String()
+	mgr.Close()
 }
