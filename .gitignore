@@ -16,4 +16,5 @@ Thumbs.db
 out/
 *.state
 *.torrent
+.dht_nodes
 .gemini_rules.md
