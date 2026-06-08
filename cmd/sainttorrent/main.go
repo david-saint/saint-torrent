@@ -30,6 +30,68 @@ var (
 	teaProgram *tea.Program
 )
 
+// --- startup/shutdown timing ---
+// Enabled via SAINTTORRENT_TIMING=1 (and implicitly under SAINTTORRENT_BENCH=1).
+// Marks are buffered and printed after the TUI releases the terminal, so they never
+// corrupt the display. This is the "where do the milliseconds go" view used to drive
+// and verify the startup/close optimizations.
+type perfMark struct {
+	label string
+	at    time.Duration
+}
+
+var (
+	perfEnabled bool
+	perfStart   time.Time
+	perfMu      sync.Mutex
+	perfMarks   []perfMark
+)
+
+// perfInit records the process start time and reads the timing env switches.
+// Call it as the very first statement in main().
+func perfInit() {
+	perfStart = time.Now()
+	perfEnabled = os.Getenv("SAINTTORRENT_TIMING") == "1" || os.Getenv("SAINTTORRENT_BENCH") == "1"
+}
+
+// perfMarkf records elapsed time since process start under a label. Cheap no-op when disabled.
+func perfMarkf(label string) {
+	if !perfEnabled {
+		return
+	}
+	perfMu.Lock()
+	perfMarks = append(perfMarks, perfMark{label: label, at: time.Since(perfStart)})
+	perfMu.Unlock()
+}
+
+func msOf(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+
+// perfReport prints the recorded phase breakdown (cumulative + per-phase delta) to w,
+// and appends it to SAINTTORRENT_TIMING_LOG if set.
+func perfReport(w io.Writer) {
+	if !perfEnabled {
+		return
+	}
+	perfMu.Lock()
+	defer perfMu.Unlock()
+	writeRows := func(out io.Writer) {
+		var prev time.Duration
+		for _, m := range perfMarks {
+			fmt.Fprintf(out, "  %-22s %8.1fms (Δ %.1fms)\n", m.label, msOf(m.at), msOf(m.at-prev))
+			prev = m.at
+		}
+	}
+	fmt.Fprintln(w, "── saintTorrent timing ──")
+	writeRows(w)
+	if logPath := os.Getenv("SAINTTORRENT_TIMING_LOG"); logPath != "" {
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			fmt.Fprintf(f, "── %s ──\n", time.Now().Format(time.RFC3339))
+			writeRows(f)
+			f.Close()
+		}
+	}
+}
+
 // Styles using Lipgloss
 var (
 	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4"))
@@ -259,6 +321,7 @@ func (m *model) refreshSessions() {
 }
 
 func (m model) Init() tea.Cmd {
+	perfMarkf("ui-ready")
 	// Start all managed sessions
 	for _, s := range m.sessions {
 		s.Start()
@@ -780,6 +843,8 @@ func (m model) viewTorrentList() string {
 				statusBadge = statusMetadataStyle.Render("METADATA")
 			case "Error":
 				statusBadge = statusErrorStyle.Render("ERROR")
+			case "Checking":
+				statusBadge = statusMetadataStyle.Render("CHECKING")
 			default:
 				statusBadge = statusDownloadingStyle.Render("DOWNLOADING")
 			}
@@ -865,6 +930,8 @@ func (m model) viewTorrentDetails() string {
 		statusBadge = statusMetadataStyle.Render("METADATA")
 	case "Error":
 		statusBadge = statusErrorStyle.Render("ERROR")
+	case "Checking":
+		statusBadge = statusMetadataStyle.Render("CHECKING")
 	default:
 		statusBadge = statusDownloadingStyle.Render("DOWNLOADING")
 	}
@@ -1405,6 +1472,7 @@ func (m model) viewDeleteConfirm() string {
 }
 
 func main() {
+	perfInit()
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--write-config" {
 			if i+1 >= len(os.Args) {
@@ -1601,6 +1669,7 @@ func main() {
 	}
 
 	mgr := downloader.NewTorrentManager()
+	perfMarkf("manager")
 
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Error removing stale socket file: %v\n", err)
@@ -1639,6 +1708,7 @@ func main() {
 	if err := mgr.StartDHT(downloadDir, 6881); err != nil {
 		startupWarns = append(startupWarns, fmt.Sprintf("DHT unavailable: %v", err))
 	}
+	perfMarkf("dht")
 
 	if persist {
 		if configDir == "" {
@@ -1656,6 +1726,7 @@ func main() {
 			startupWarns = append(startupWarns, warning)
 		}
 	}
+	perfMarkf("persistence")
 
 	var initialPending []pendingItem
 	for _, item := range filesToAdd {
@@ -1686,15 +1757,30 @@ func main() {
 	}
 
 	p := tea.NewProgram(initialModel(mgr, downloadDir, startupWarn, initialPending))
+	perfMarkf("tui-build")
 
 	programMu.Lock()
 	teaProgram = p
 	programMu.Unlock()
 
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running UI: %v\n", err)
+	benchMode := os.Getenv("SAINTTORRENT_BENCH") == "1"
+	if benchMode {
+		// Headless measurement: run the real startup work and emulate UI bring-up
+		// (start sessions exactly like model.Init), then fall through to the real
+		// teardown below — no interactive TUI. Makes start+close scriptable with `time`.
+		for _, s := range mgr.ListSessions() {
+			s.Start()
+		}
+		perfMarkf("ui-ready")
+		fmt.Printf("startup_ms=%.1f\n", msOf(time.Since(perfStart)))
+	} else {
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("Error running UI: %v\n", err)
+		}
+		perfMarkf("quit")
 	}
 
+	shutdownStart := time.Now()
 	listener.Close()
 	acceptLoopWG.Wait()
 	close(shutdownChan)
@@ -1703,5 +1789,28 @@ func main() {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Error removing socket file: %v\n", err)
 	}
-	mgr.Close()
+	// H3: hard ceiling on close. mgr.Close persists state before any network/teardown,
+	// so if a hung tracker or stuck join blows past the deadline we force-exit safely.
+	const shutdownForceDeadline = 2 * time.Second
+	perfMarkf("close-begin")
+	closeDone := make(chan struct{})
+	go func() {
+		mgr.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		perfMarkf("exit")
+		if benchMode {
+			fmt.Printf("shutdown_ms=%.1f\n", msOf(time.Since(shutdownStart)))
+		}
+		perfReport(os.Stderr)
+	case <-time.After(shutdownForceDeadline):
+		perfMarkf("exit-forced")
+		if benchMode {
+			fmt.Printf("shutdown_ms=%.1f (forced)\n", msOf(time.Since(shutdownStart)))
+		}
+		perfReport(os.Stderr)
+		os.Exit(0)
+	}
 }

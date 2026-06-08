@@ -3,6 +3,7 @@
 package downloader
 
 import (
+	"context"
 	"crypto/sha1"
 	"os"
 	"path/filepath"
@@ -51,9 +52,10 @@ func TestVerifyExistingPiecesDoesNotBlockManagerOrControls(t *testing.T) {
 	mgr.AddSession("verification-lock-test", sess)
 	defer mgr.Close()
 
+	sess.loadResumeState()
 	verifyDone := make(chan struct{})
 	go func() {
-		sess.verifyExistingPieces()
+		sess.verifyResume(context.Background())
 		close(verifyDone)
 	}()
 
@@ -147,6 +149,9 @@ func TestResumedMetadataSessionVerifiesExistingDownload(t *testing.T) {
 		t.Fatalf("metadata completion failed: %v", err)
 	}
 
+	// Verification now runs in the background; wait for it before asserting state.
+	sess.WaitVerified()
+
 	if sess.IsMetadataMode() {
 		t.Fatal("expected metadata mode to finish")
 	}
@@ -157,4 +162,125 @@ func TestResumedMetadataSessionVerifiesExistingDownload(t *testing.T) {
 	if status := sess.Status(); status != "Seeding" {
 		t.Fatalf("expected verified existing download to seed, got %q", status)
 	}
+}
+
+// TestCloseUnblockedByBackgroundVerification ensures Close() returns promptly even when a
+// background piece verification is stuck on slow I/O (here, a FIFO open that blocks until
+// a writer connects). Regression test for verification being decoupled from s.wg.
+func TestCloseUnblockedByBackgroundVerification(t *testing.T) {
+	tempDir := t.TempDir()
+	const fileName = "blocked-piece"
+
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: fileName, Length: 1}}, 1)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+
+	filePath := filepath.Join(tempDir, fileName)
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("failed to replace storage file: %v", err)
+	}
+	if err := syscall.Mkfifo(filePath, 0600); err != nil {
+		t.Fatalf("failed to create verification FIFO: %v", err)
+	}
+
+	tor := &torrent.Torrent{
+		Name:        "close-verify",
+		InfoHash:    sha1.Sum([]byte("close-verify")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte{0})},
+		Files:       []torrent.File{{Length: 1, Path: []string{fileName}}},
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.maybeStartVerification()     // VerifyPiece will block opening the FIFO
+	time.Sleep(50 * time.Millisecond) // let it reach the blocking open
+
+	closed := make(chan struct{})
+	go func() {
+		sess.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked on background verification")
+	}
+	if sess.IsVerifying() {
+		t.Fatal("closed session still reports background verification in progress")
+	}
+	sess.WaitVerified()
+
+	// Unblock the FIFO so the detached verification goroutine can exit, then give it a
+	// moment to observe the closed session and return.
+	if w, err := os.OpenFile(filePath, os.O_WRONLY, 0600); err == nil {
+		_ = w.Close()
+	}
+	time.Sleep(50 * time.Millisecond)
+}
+
+// TestVerificationSlotReclaimedOnClose proves a verification slot held by a wedged
+// VerifyPiece is returned to the global gate when the session closes, so a closed torrent
+// can't permanently consume verification capacity.
+func TestVerificationSlotReclaimedOnClose(t *testing.T) {
+	tempDir := t.TempDir()
+	const fileName = "blocked-piece"
+
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: fileName, Length: 1}}, 1)
+	if err != nil {
+		t.Fatalf("failed to initialize storage: %v", err)
+	}
+
+	filePath := filepath.Join(tempDir, fileName)
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("failed to replace storage file: %v", err)
+	}
+	if err := syscall.Mkfifo(filePath, 0600); err != nil {
+		t.Fatalf("failed to create verification FIFO: %v", err)
+	}
+
+	tor := &torrent.Torrent{
+		Name:        "slot-reclaim",
+		InfoHash:    sha1.Sum([]byte("slot-reclaim")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte{0})},
+		Files:       []torrent.File{{Length: 1, Path: []string{fileName}}},
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	before := len(verifyGate)
+	sess.maybeStartVerification()
+
+	// Wait until the verification goroutine has taken a slot and wedged on the FIFO.
+	deadline := time.Now().Add(time.Second)
+	for len(verifyGate) <= before {
+		if time.Now().After(deadline) {
+			t.Fatal("verification never acquired a gate slot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	sess.Close()
+
+	// The slot must come back even though VerifyPiece is still wedged on the FIFO.
+	deadline = time.Now().Add(time.Second)
+	for len(verifyGate) > before {
+		if time.Now().After(deadline) {
+			t.Fatal("verification slot was not reclaimed after Close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Cleanup: unblock the FIFO so the detached goroutine can exit.
+	if w, err := os.OpenFile(filePath, os.O_WRONLY, 0600); err == nil {
+		_ = w.Close()
+	}
+	time.Sleep(50 * time.Millisecond)
 }

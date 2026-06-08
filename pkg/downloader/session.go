@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -29,7 +30,16 @@ const (
 	PieceEmpty       PieceState = iota
 	PieceDownloading PieceState = iota
 	PieceCompleted   PieceState = iota
+	// PieceUnverified means resume data claims this piece is complete but it has not
+	// yet been hash-checked. The picker treats it as "present" (does not re-download
+	// it), but it is never advertised, served, or counted toward seeding until the
+	// background verification pass promotes it to PieceCompleted.
+	PieceUnverified PieceState = iota
 )
+
+// verifyGate bounds how many piece hash checks run concurrently across all sessions,
+// so background verification saturates available cores without thrashing the disk.
+var verifyGate = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
 
 // BlockSize is the standard block length for BitTorrent transfers (16 KB).
 const BlockSize = 16384
@@ -104,6 +114,14 @@ type Session struct {
 	trackerEvents      []string      // Queue of pending tracker events
 	completedAnnounced bool
 	stoppedAnnounced   bool
+
+	// Background fast-resume verification. Pieces claimed by resume data start as
+	// PieceUnverified and are hash-checked off the startup path (kicked off by Start).
+	verifying         bool
+	verifyStarted     bool
+	verifyFullScan    bool
+	verifyDone        chan struct{}
+	verifyGateRelease func() // releases this session's global verification slot (once)
 
 	OnStateChange         func()
 	MagnetURI             string
@@ -187,73 +205,185 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 	}
 
 	if !metadataMode {
-		// Verify existing files to see if we already have completed pieces
-		sess.verifyExistingPieces()
+		// Cheaply load fast-resume hints (no hashing). Actual hash verification runs in
+		// the background once Start() is called, keeping startup off the hashing path.
+		sess.loadResumeState()
 	}
 
 	return sess, nil
 }
 
-// verifyExistingPieces checks saved state and verifies piece hashes.
-// P1 FIX: Always hash-verify pieces loaded from state, never trust blindly.
-func (s *Session) verifyExistingPieces() {
+// loadResumeState reads the fast-resume hint and marks the pieces it claims complete
+// as PieceUnverified (or schedules a full scan when there is no hint). It does no disk
+// hashing, so it is cheap enough for the startup path; the actual hash verification is
+// deferred to verifyResume, which Start() launches in the background.
+//
+// Invariant preserved from the original synchronous verifier ("never trust resume data
+// blindly"): a PieceUnverified piece is never advertised in a bitfield, served to a
+// peer, or counted toward seeding/completion until it has been hash-verified here.
+func (s *Session) loadResumeState() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.Storage == nil || len(s.Torrent.PieceHashes) == 0 {
-		s.mu.Unlock()
 		return
 	}
+	s.PieceStates = make([]PieceState, len(s.Torrent.PieceHashes))
 
-	st := s.Storage
-	infoHash := s.Torrent.InfoHash
-	pieceHashes := append([][20]byte(nil), s.Torrent.PieceHashes...)
-	s.PieceStates = make([]PieceState, len(pieceHashes))
-	s.mu.Unlock()
-
-	verifiedStates := make([]PieceState, len(pieceHashes))
-	infoHashHex := fmt.Sprintf("%x", infoHash)
-	completedIndices, err := st.LoadState(infoHashHex)
-
+	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
+	completedIndices, err := s.Storage.LoadState(infoHashHex)
 	if err == nil {
-		// State is only a hint. Hash-verify every piece it claims is complete.
 		for _, idx := range completedIndices {
-			if idx >= 0 && idx < len(pieceHashes) {
-				ok, verifyErr := st.VerifyPiece(int64(idx), pieceHashes[idx])
-				if verifyErr == nil && ok {
-					verifiedStates[idx] = PieceCompleted
-				}
+			if idx >= 0 && idx < len(s.PieceStates) {
+				s.PieceStates[idx] = PieceUnverified
 			}
 		}
 	} else {
-		// Without a valid state file, scan all pieces for existing content.
-		for i, expectedHash := range pieceHashes {
-			ok, verifyErr := st.VerifyPiece(int64(i), expectedHash)
-			if verifyErr == nil && ok {
-				verifiedStates[i] = PieceCompleted
-			}
-		}
+		// No valid hint: leave pieces empty (a fresh torrent downloads immediately) and
+		// let the background pass scan for any already-present data on disk.
+		s.verifyFullScan = true
 	}
+	s.verifying = true
+	s.verifyDone = make(chan struct{})
+}
 
+// maybeStartVerification launches the background verification goroutine exactly once.
+// Idempotent; safe to call from Start() for both restored and freshly added torrents.
+func (s *Session) maybeStartVerification() {
 	s.mu.Lock()
-	if s.Storage != st || s.Torrent == nil || s.Torrent.InfoHash != infoHash || len(s.Torrent.PieceHashes) != len(pieceHashes) {
+	if !s.verifying || s.verifyStarted || s.closed {
 		s.mu.Unlock()
 		return
 	}
-	for i, expectedHash := range pieceHashes {
-		if s.Torrent.PieceHashes[i] != expectedHash {
+	s.verifyStarted = true
+	ctx := s.ctx
+	s.mu.Unlock()
+
+	// Deliberately NOT tracked by s.wg: a VerifyPiece read can block on slow I/O, and
+	// Close()/RemoveSession() must never wait on it. The goroutine stops promptly on ctx
+	// cancel (checked between pieces) and never mutates a closed session's state.
+	go s.verifyResume(ctx)
+}
+
+// verifyResume hash-checks the pieces flagged by loadResumeState. On success a piece
+// becomes PieceCompleted (now advertisable and seedable); on failure it returns to
+// PieceEmpty so the downloader re-fetches it.
+func (s *Session) verifyResume(ctx context.Context) {
+	if s.runVerification(ctx) {
+		s.finishVerify()
+	}
+	// If cancelled mid-way the session is shutting down; WaitVerified wakes on ctx.
+}
+
+func (s *Session) runVerification(ctx context.Context) bool {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	if s.Storage == nil || !s.verifying {
+		s.mu.Unlock()
+		return true
+	}
+	st := s.Storage
+	pieceHashes := append([][20]byte(nil), s.Torrent.PieceHashes...)
+	fullScan := s.verifyFullScan
+	toCheck := make([]int, 0, len(s.PieceStates))
+	for i, state := range s.PieceStates {
+		if fullScan {
+			if state == PieceEmpty {
+				toCheck = append(toCheck, i)
+			}
+		} else if state == PieceUnverified {
+			toCheck = append(toCheck, i)
+		}
+	}
+	s.mu.Unlock()
+	if len(toCheck) == 0 {
+		return true
+	}
+
+	// Take one verification slot for this session, bounding concurrent hashing across all
+	// sessions. Acquisition is cancellable, and the slot is reclaimed by Close() even if a
+	// VerifyPiece read is wedged on slow I/O — so a closed session can never permanently
+	// consume verification capacity.
+	select {
+	case verifyGate <- struct{}{}:
+	case <-ctx.Done():
+		return false
+	}
+	var relOnce sync.Once
+	release := func() { relOnce.Do(func() { <-verifyGate }) }
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		release()
+		return false
+	}
+	s.verifyGateRelease = release
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.verifyGateRelease = nil
+		s.mu.Unlock()
+		release()
+	}()
+
+	for _, idx := range toCheck {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		ok, verifyErr := st.VerifyPiece(int64(idx), pieceHashes[idx])
+
+		s.mu.Lock()
+		if s.closed || s.Storage != st || idx >= len(s.PieceStates) {
 			s.mu.Unlock()
-			return
+			return false
+		}
+		var nowCompleted bool
+		if fullScan {
+			// Adopt only positively-verified pieces, and only if the downloader has not
+			// already claimed the slot in the meantime.
+			if verifyErr == nil && ok && s.PieceStates[idx] == PieceEmpty {
+				s.PieceStates[idx] = PieceCompleted
+				nowCompleted = true
+			}
+		} else if s.PieceStates[idx] == PieceUnverified {
+			if verifyErr == nil && ok {
+				s.PieceStates[idx] = PieceCompleted
+				nowCompleted = true
+			} else {
+				s.PieceStates[idx] = PieceEmpty
+			}
+		}
+		s.mu.Unlock()
+
+		if nowCompleted {
+			s.broadcastHave(uint32(idx))
 		}
 	}
-	s.PieceStates = verifiedStates
+	return true
+}
 
-	var completed []int
-	for i, state := range verifiedStates {
-		if state == PieceCompleted {
-			completed = append(completed, i)
-		}
+// finishVerify clears the verifying flag, persists the verified piece set, fires the
+// completion announce if the torrent is now done, and wakes WaitVerified callers.
+func (s *Session) finishVerify() {
+	s.mu.Lock()
+	if !s.verifying {
+		s.mu.Unlock()
+		return
+	}
+	s.verifying = false
+	s.verifyFullScan = false
+	// Skip the state write if the session is closing so a late finish can't resurrect a
+	// .state file that RemoveSession is deleting.
+	if !s.closed {
+		s.saveStateLocked()
 	}
 
-	completedNow := false
+	var completedNow bool
 	if !s.completedAnnounced && !s.metadataMode && s.Storage != nil {
 		stats := s.completionStatsLocked()
 		if stats.completedTotalBytes == stats.totalBytes && stats.totalBytes > 0 {
@@ -262,15 +392,42 @@ func (s *Session) verifyExistingPieces() {
 			completedNow = true
 		}
 	}
+	done := s.verifyDone
+	s.verifyDone = nil
 	s.mu.Unlock()
-
-	_ = st.SaveState(infoHashHex, completed)
 
 	if completedNow {
 		select {
 		case s.resumeCh <- struct{}{}:
 		default:
 		}
+	}
+	if done != nil {
+		close(done)
+	}
+}
+
+// IsVerifying reports whether background fast-resume verification is still pending.
+func (s *Session) IsVerifying() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.verifying
+}
+
+// WaitVerified blocks until background verification finishes or the session is closed.
+// Intended for tests and the headless benchmark path.
+func (s *Session) WaitVerified() {
+	s.mu.RLock()
+	done := s.verifyDone
+	verifying := s.verifying
+	ctx := s.ctx
+	s.mu.RUnlock()
+	if !verifying || done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }
 
@@ -281,7 +438,9 @@ func (s *Session) saveStateLocked() {
 	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
 	var completed []int
 	for i, state := range s.PieceStates {
-		if state == PieceCompleted {
+		// Include PieceUnverified so a quit mid-verification keeps the resume hint;
+		// those pieces are re-checked (not re-downloaded) on the next start.
+		if state == PieceCompleted || state == PieceUnverified {
 			completed = append(completed, i)
 		}
 	}
@@ -629,11 +788,20 @@ func (s *Session) Start() {
 	if hasDHT {
 		go s.dhtLoop()
 	}
+
+	// Kick off background fast-resume verification (no-op if nothing to verify).
+	s.maybeStartVerification()
 }
 
-// Close shuts down the session and waits for all goroutines to exit.
+// Close shuts down the session and waits for its lifecycle goroutines (tracker, peer,
+// choke, listener, and DHT loops) to exit. Background piece verification is intentionally
+// NOT awaited — a VerifyPiece read can be wedged on slow I/O — but its global verification
+// slot is reclaimed here so capacity is never permanently lost, and it stops mutating the
+// session once s.closed is set.
 func (s *Session) Close() {
 	s.lifecycleMu.Lock()
+	var gateRelease func()
+	var verifyDone chan struct{}
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		wasStarted := s.started
@@ -647,6 +815,12 @@ func (s *Session) Close() {
 
 		s.mu.Lock()
 		s.closed = true
+		s.verifying = false
+		s.verifyFullScan = false
+		verifyDone = s.verifyDone
+		s.verifyDone = nil
+		gateRelease = s.verifyGateRelease
+		s.verifyGateRelease = nil
 		if s.listener != nil {
 			s.listener.Close()
 			s.listener = nil
@@ -663,6 +837,14 @@ func (s *Session) Close() {
 		s.mu.Unlock()
 	})
 	s.lifecycleMu.Unlock()
+
+	// Reclaim a verification slot held by a wedged VerifyPiece (outside any lock).
+	if gateRelease != nil {
+		gateRelease()
+	}
+	if verifyDone != nil {
+		close(verifyDone)
+	}
 
 	s.wg.Wait()
 }
@@ -1967,6 +2149,11 @@ func (s *Session) statusLocked() string {
 	if s.metadataMode {
 		return "Metadata"
 	}
+	// Only resume-hint verification shows "Checking"; a no-hint background scan runs
+	// opportunistically and the torrent shows its normal (downloading/seeding) status.
+	if s.verifying && !s.verifyFullScan {
+		return "Checking"
+	}
 
 	if isCompleted {
 		return "Seeding"
@@ -1997,7 +2184,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	status := s.statusLocked()
 	var statusScore int
 	switch status {
-	case "Downloading", "Metadata":
+	case "Downloading", "Metadata", "Checking":
 		statusScore = 0
 	case "Seeding":
 		statusScore = 1
@@ -2384,8 +2571,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	storageToVerify := st
 	s.mu.Unlock()
 
-	// Verify existing pieces in case we have some
-	s.verifyExistingPieces()
+	// Load any fast-resume hint and verify in the background (metadata just arrived, so
+	// most pieces are not on disk yet; verification stays off the hot path).
+	s.loadResumeState()
+	s.maybeStartVerification()
 
 	s.mu.Lock()
 	if s.Storage != storageToVerify {
