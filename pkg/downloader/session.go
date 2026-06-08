@@ -197,53 +197,78 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 // P1 FIX: Always hash-verify pieces loaded from state, never trust blindly.
 func (s *Session) verifyExistingPieces() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.Storage == nil || len(s.Torrent.PieceHashes) == 0 {
+		s.mu.Unlock()
 		return
 	}
 
-	// Initialize all pieces to empty
-	for i := 0; i < len(s.Torrent.PieceHashes); i++ {
-		s.PieceStates[i] = PieceEmpty
-	}
+	st := s.Storage
+	infoHash := s.Torrent.InfoHash
+	pieceHashes := append([][20]byte(nil), s.Torrent.PieceHashes...)
+	s.PieceStates = make([]PieceState, len(pieceHashes))
+	s.mu.Unlock()
 
-	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	completedIndices, err := s.Storage.LoadState(infoHashHex)
+	verifiedStates := make([]PieceState, len(pieceHashes))
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	completedIndices, err := st.LoadState(infoHashHex)
 
 	if err == nil {
-		// State file exists — use it as a HINT only, hash-verify each claimed piece
+		// State is only a hint. Hash-verify every piece it claims is complete.
 		for _, idx := range completedIndices {
-			if idx >= 0 && idx < len(s.PieceStates) {
-				expectedHash := s.Torrent.PieceHashes[idx]
-				ok, verifyErr := s.Storage.VerifyPiece(int64(idx), expectedHash)
+			if idx >= 0 && idx < len(pieceHashes) {
+				ok, verifyErr := st.VerifyPiece(int64(idx), pieceHashes[idx])
 				if verifyErr == nil && ok {
-					s.PieceStates[idx] = PieceCompleted
+					verifiedStates[idx] = PieceCompleted
 				}
-				// If verification fails, leave as PieceEmpty — state was stale/corrupt
 			}
 		}
 	} else {
-		// No state file — do a full scan
-		for i := 0; i < len(s.Torrent.PieceHashes); i++ {
-			expectedHash := s.Torrent.PieceHashes[i]
-			ok, verifyErr := s.Storage.VerifyPiece(int64(i), expectedHash)
+		// Without a valid state file, scan all pieces for existing content.
+		for i, expectedHash := range pieceHashes {
+			ok, verifyErr := st.VerifyPiece(int64(i), expectedHash)
 			if verifyErr == nil && ok {
-				s.PieceStates[i] = PieceCompleted
+				verifiedStates[i] = PieceCompleted
 			}
 		}
 	}
-	s.saveStateLocked()
 
+	s.mu.Lock()
+	if s.Storage != st || s.Torrent == nil || s.Torrent.InfoHash != infoHash || len(s.Torrent.PieceHashes) != len(pieceHashes) {
+		s.mu.Unlock()
+		return
+	}
+	for i, expectedHash := range pieceHashes {
+		if s.Torrent.PieceHashes[i] != expectedHash {
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.PieceStates = verifiedStates
+
+	var completed []int
+	for i, state := range verifiedStates {
+		if state == PieceCompleted {
+			completed = append(completed, i)
+		}
+	}
+
+	completedNow := false
 	if !s.completedAnnounced && !s.metadataMode && s.Storage != nil {
 		stats := s.completionStatsLocked()
 		if stats.completedTotalBytes == stats.totalBytes && stats.totalBytes > 0 {
 			s.completedAnnounced = true
 			s.queueTrackerEventLocked("completed")
-			select {
-			case s.resumeCh <- struct{}{}:
-			default:
-			}
+			completedNow = true
+		}
+	}
+	s.mu.Unlock()
+
+	_ = st.SaveState(infoHashHex, completed)
+
+	if completedNow {
+		select {
+		case s.resumeCh <- struct{}{}:
+		default:
 		}
 	}
 }

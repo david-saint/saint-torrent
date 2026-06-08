@@ -24,13 +24,16 @@ func loadConfig() -> Config {
 func loadFallbackConfig() -> Config {
     let homeDir = NSHomeDirectory()
     let fallbackBinary = "\(homeDir)/go/bin/sainttorrent"
-    let fallbackSocket = "\(homeDir)/Library/Application Support/sainttorrent/sainttorrent.sock"
+    let fallbackSocket = "\(homeDir)/.config/sainttorrent/sainttorrent.sock"
     let fallbackDownload = "\(homeDir)/Downloads"
     return Config(binaryPath: fallbackBinary, socketPath: fallbackSocket, defaultDownloadDir: fallbackDownload)
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    private let maxStartingRetries = 120
+    private let startingRetryDelay = 0.25
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
         NSAppleEventManager.shared().setEventHandler(
             self,
             andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
@@ -41,11 +44,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
         if let urlString = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue {
-            handleURL(urlString)
+            handleURL(urlString, startingRetry: 0)
         }
     }
     
-    func handleURL(_ urlString: String) {
+    func handleURL(_ urlString: String, startingRetry: Int) {
         let config = loadConfig()
         
         // Construct the framed JSON message using JSONSerialization for safe escaping
@@ -228,6 +231,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let response = try decoder.decode(SocketResponse.self, from: responseData)
             if response.status == "ok" {
                 NSApp.terminate(nil)
+            } else if response.status == "starting" {
+                if startingRetry >= maxStartingRetries {
+                    showNSAlertAndExit(message: "Timed out waiting for saintTorrent to finish starting.")
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + startingRetryDelay) { [weak self] in
+                    self?.handleURL(urlString, startingRetry: startingRetry + 1)
+                }
             } else {
                 let errMsg = response.message ?? "Unknown error"
                 showNSAlertAndExit(message: "saintTorrent running instance reported an error: \(errMsg)")
@@ -248,9 +258,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         osascriptProcess.launchPath = "/usr/bin/osascript"
         osascriptProcess.arguments = [
             "-e", "on run argv",
+            "-e", "    set terminalWasRunning to application \"Terminal\" is running",
             "-e", "    tell application \"Terminal\"",
+            "-e", "        if terminalWasRunning then",
+            "-e", "            do script (item 1 of argv)",
+            "-e", "        else",
+            "-e", "            activate",
+            "-e", "            repeat 100 times",
+            "-e", "                if (count of windows) > 0 then exit repeat",
+            "-e", "                delay 0.05",
+            "-e", "            end repeat",
+            "-e", "            if (count of windows) > 0 then",
+            "-e", "                do script (item 1 of argv) in front window",
+            "-e", "            else",
+            "-e", "                do script (item 1 of argv)",
+            "-e", "            end if",
+            "-e", "        end if",
             "-e", "        activate",
-            "-e", "        do script (item 1 of argv)",
             "-e", "    end tell",
             "-e", "end run",
             "--",

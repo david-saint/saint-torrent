@@ -151,6 +151,14 @@ type socketResponse struct {
 	Message string `json:"message"`
 }
 
+type cliOptions struct {
+	downloadDir string
+	configDir   string
+	persist     bool
+	confirm     bool
+	items       []string
+}
+
 type inputMode int
 
 const (
@@ -1075,6 +1083,54 @@ func parseItem(item string) (name string, hashHex string, err error) {
 	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
 }
 
+func normalizeForwardedItems(items []string) []string {
+	normalized := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.HasPrefix(item, "magnet:?") {
+			normalized = append(normalized, item)
+			continue
+		}
+		absPath, err := filepath.Abs(item)
+		if err != nil {
+			normalized = append(normalized, item)
+			continue
+		}
+		normalized = append(normalized, absPath)
+	}
+	return normalized
+}
+
+func parseCLIArgs(args []string) cliOptions {
+	opts := cliOptions{
+		downloadDir: ".",
+		persist:     true,
+		confirm:     true,
+	}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-d", "--dir":
+			if i+1 < len(args) {
+				opts.downloadDir = args[i+1]
+				i++
+			}
+		case "-c", "--config":
+			if i+1 < len(args) {
+				opts.configDir = args[i+1]
+				i++
+			}
+		case "--no-persist":
+			opts.persist = false
+		case "--confirm":
+			opts.confirm = true
+		case "--no-confirm":
+			opts.confirm = false
+		default:
+			opts.items = append(opts.items, args[i])
+		}
+	}
+	return opts
+}
+
 func resolveIPCDir() (string, error) {
 	if envDir := os.Getenv("SAINTTORRENT_IPC_DIR"); envDir != "" {
 		absDir, err := filepath.Abs(envDir)
@@ -1296,7 +1352,7 @@ func (m model) viewAddConfirm() string {
 	}
 
 	sb.WriteString(fmt.Sprintf("  %s: %s\n", headerStyle.Render("Torrent Name"), item.displayName))
-	sb.WriteString(fmt.Sprintf("  %s: %s\n\n", headerStyle.Render("Download Dir"), item.downloadDir))
+	sb.WriteString(fmt.Sprintf("  %s: %s\n\n", headerStyle.Render("Download Dir"), sanitizeText(item.downloadDir)))
 
 	if item.isDuplicate {
 		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render("Warning: This torrent is already in the download list. Confirming will resume it.")))
@@ -1389,34 +1445,12 @@ func main() {
 		}
 	}
 
-	downloadDir := "."
-	configDir := ""
-	persist := true
-	confirmFlag := true
-	var filesToAdd []string
-
-	for i := 1; i < len(os.Args); i++ {
-		arg := os.Args[i]
-		if arg == "-d" || arg == "--dir" {
-			if i+1 < len(os.Args) {
-				downloadDir = os.Args[i+1]
-				i++
-			}
-		} else if arg == "-c" || arg == "--config" {
-			if i+1 < len(os.Args) {
-				configDir = os.Args[i+1]
-				i++
-			}
-		} else if arg == "--no-persist" {
-			persist = false
-		} else if arg == "--confirm" {
-			confirmFlag = true
-		} else if arg == "--no-confirm" {
-			confirmFlag = false
-		} else {
-			filesToAdd = append(filesToAdd, arg)
-		}
-	}
+	opts := parseCLIArgs(os.Args[1:])
+	downloadDir := opts.downloadDir
+	configDir := opts.configDir
+	persist := opts.persist
+	confirmFlag := opts.confirm
+	filesToAdd := opts.items
 
 	ipcDir, err := resolveIPCDir()
 	if err != nil {
@@ -1438,19 +1472,7 @@ func main() {
 			os.Exit(0)
 		}
 
-		var normalizedItems []string
-		for _, item := range filesToAdd {
-			if strings.HasPrefix(item, "magnet:?") {
-				normalizedItems = append(normalizedItems, item)
-			} else {
-				absPath, err := filepath.Abs(item)
-				if err != nil {
-					normalizedItems = append(normalizedItems, item)
-				} else {
-					normalizedItems = append(normalizedItems, absPath)
-				}
-			}
-		}
+		normalizedItems := normalizeForwardedItems(filesToAdd)
 
 		var absDownloadDir string
 		if downloadDir != "" {

@@ -503,29 +503,49 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 	handlersWG.Wait()
 
 	// 2. EOF before \n
-	serverConn2, clientConn2 := net.Pipe()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create malformed-frame listener: %v", err)
+	}
+	defer listener.Close()
+
 	handlersWG.Add(1)
 	go func() {
+		serverConn2, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			handlersWG.Done()
+			return
+		}
 		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG)
 	}()
 
-	go func() {
-		_, _ = clientConn2.Write([]byte(`{"items":["test"]}`))
-		clientConn2.Close()
-	}()
-
-	n, err = clientConn2.Read(buf)
-	// We expect this read to fail (io.EOF or closed pipe) because the client closed the connection.
-	// If it somehow succeeds (due to timing), assert it's an error status.
-	if err == nil {
-		var resp2 socketResponse
-		if err := json.Unmarshal(buf[:n], &resp2); err == nil {
-			if resp2.Status != "error" {
-				t.Errorf("expected error for EOF before newline, got %s: %s", resp2.Status, resp2.Message)
-			}
-		}
+	rawClientConn2, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial malformed-frame listener: %v", err)
 	}
-	serverConn2.Close()
+	clientConn2 := rawClientConn2.(*net.TCPConn)
+	defer clientConn2.Close()
+
+	if _, err := clientConn2.Write([]byte(`{"items":["test"]}`)); err != nil {
+		t.Fatalf("failed to write malformed frame: %v", err)
+	}
+	if err := clientConn2.CloseWrite(); err != nil {
+		t.Fatalf("failed to half-close malformed frame connection: %v", err)
+	}
+	if err := clientConn2.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("failed to set malformed-frame read deadline: %v", err)
+	}
+	n, err = clientConn2.Read(buf)
+	if err != nil {
+		t.Fatalf("failed to read malformed-frame response: %v", err)
+	}
+	var resp2 socketResponse
+	if err := json.Unmarshal(buf[:n], &resp2); err != nil {
+		t.Fatalf("failed to unmarshal malformed-frame response: %v", err)
+	}
+	if resp2.Status != "error" || !strings.Contains(resp2.Message, "EOF") {
+		t.Errorf("expected EOF framing error, got %s: %s", resp2.Status, resp2.Message)
+	}
 	handlersWG.Wait()
 }
 
@@ -633,6 +653,12 @@ func TestSocketShutdownUnblocksRead(t *testing.T) {
 
 func TestCustomConfigSingleInstance(t *testing.T) {
 	if os.Getenv("BE_SINGLE_INSTANCE_PRIMARY") == "1" {
+		configDir := os.Getenv("PRIMARY_CONFIG_DIR")
+		opts := parseCLIArgs([]string{"-c", configDir})
+		if opts.configDir != configDir {
+			os.Exit(6)
+		}
+
 		ipcDir, err := resolveIPCDir()
 		if err != nil {
 			os.Exit(1)
@@ -712,6 +738,7 @@ func TestCustomConfigSingleInstance(t *testing.T) {
 	cmdPrimary.Env = append(os.Environ(),
 		"BE_SINGLE_INSTANCE_PRIMARY=1",
 		"SAINTTORRENT_IPC_DIR="+ipcDir,
+		"PRIMARY_CONFIG_DIR="+dir1,
 		"PRIMARY_OUT_FILE="+outFile,
 	)
 	if err := cmdPrimary.Start(); err != nil {
@@ -732,7 +759,7 @@ func TestCustomConfigSingleInstance(t *testing.T) {
 		"SECONDARY_CONFIG_DIR="+dir2,
 		"SECONDARY_MAGNET=magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626&dn=ForwardedTest",
 	)
-	
+
 	out, err := cmdSecondary.CombinedOutput()
 	if err != nil {
 		t.Fatalf("secondary process failed: %v. Output:\n%s", err, string(out))
@@ -805,20 +832,8 @@ func TestForwardedDownloadDir(t *testing.T) {
 
 func TestRelativeTorrentPathNormalization(t *testing.T) {
 	files := []string{"magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626", "some/relative/path.torrent"}
-	
-	var normalized []string
-	for _, item := range files {
-		if strings.HasPrefix(item, "magnet:?") {
-			normalized = append(normalized, item)
-		} else {
-			absPath, err := filepath.Abs(item)
-			if err != nil {
-				normalized = append(normalized, item)
-			} else {
-				normalized = append(normalized, absPath)
-			}
-		}
-	}
+
+	normalized := normalizeForwardedItems(files)
 
 	if normalized[0] != files[0] {
 		t.Errorf("magnet link should not be changed, got %s", normalized[0])
