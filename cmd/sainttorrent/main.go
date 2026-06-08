@@ -1046,6 +1046,7 @@ type appConfig struct {
 	BinaryPath         string `json:"binaryPath"`
 	SocketPath         string `json:"socketPath"`
 	DefaultDownloadDir string `json:"defaultDownloadDir"`
+	TerminalApp        string `json:"terminalApp"`
 }
 
 func sanitizeText(s string) string {
@@ -1431,6 +1432,7 @@ func main() {
 				BinaryPath:         execPath,
 				SocketPath:         socketPath,
 				DefaultDownloadDir: filepath.Join(home, "Downloads"),
+				TerminalApp:        "Terminal",
 			}
 			data, err := json.MarshalIndent(cfg, "", "  ")
 			if err != nil {

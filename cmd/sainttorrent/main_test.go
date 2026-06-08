@@ -381,6 +381,7 @@ func TestWriteConfigSubprocess(t *testing.T) {
 		BinaryPath         string `json:"binaryPath"`
 		SocketPath         string `json:"socketPath"`
 		DefaultDownloadDir string `json:"defaultDownloadDir"`
+		TerminalApp        string `json:"terminalApp"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("Failed to unmarshal output config: %v", err)
@@ -388,6 +389,10 @@ func TestWriteConfigSubprocess(t *testing.T) {
 
 	if cfg.SocketPath == "" || cfg.DefaultDownloadDir == "" {
 		t.Errorf("Config values empty: %+v", cfg)
+	}
+
+	if cfg.TerminalApp != "Terminal" {
+		t.Errorf("Expected default terminalApp %q, got %q", "Terminal", cfg.TerminalApp)
 	}
 }
 

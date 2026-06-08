@@ -31,6 +31,16 @@ DEFAULT_DOWNLOAD_DIR="$HOME/Downloads"
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 
+# Seed a persistent, user-editable override config (only if it doesn't exist, so
+# manual edits are never clobbered on re-registration). The launcher reads this
+# file and lets its terminalApp value override the bundled default.
+USER_CONFIG="$CONFIG_DIR/config.json"
+if [ ! -f "$USER_CONFIG" ]; then
+    printf '{\n  "terminalApp": "Terminal"\n}\n' > "$USER_CONFIG"
+    echo "Created user config at $USER_CONFIG"
+    echo "  Set \"terminalApp\" there to your preferred terminal (e.g. \"iTerm\", \"Ghostty\")."
+fi
+
 mkdir -p "$HOME/Applications"
 APP_DIR="$HOME/Applications/saintTorrent.app"
 mkdir -p "$APP_DIR/Contents/MacOS"

@@ -5,20 +5,51 @@ struct Config: Decodable {
     let binaryPath: String
     let socketPath: String
     let defaultDownloadDir: String
+    let terminalApp: String
+}
+
+// PartialConfig decodes config files tolerantly: every field is optional, so a
+// user override file that only sets `terminalApp` (or a stale bundled config
+// missing a field) still parses and is overlaid onto the defaults.
+struct PartialConfig: Decodable {
+    let binaryPath: String?
+    let socketPath: String?
+    let defaultDownloadDir: String?
+    let terminalApp: String?
+}
+
+func overlay(base: Config, partial: PartialConfig) -> Config {
+    return Config(
+        binaryPath: partial.binaryPath ?? base.binaryPath,
+        socketPath: partial.socketPath ?? base.socketPath,
+        defaultDownloadDir: partial.defaultDownloadDir ?? base.defaultDownloadDir,
+        terminalApp: partial.terminalApp ?? base.terminalApp
+    )
+}
+
+func decodePartialConfig(at path: String) -> PartialConfig? {
+    guard let data = FileManager.default.contents(atPath: path) else {
+        return nil
+    }
+    return try? JSONDecoder().decode(PartialConfig.self, from: data)
 }
 
 func loadConfig() -> Config {
-    guard let url = Bundle.main.url(forResource: "config", withExtension: "json") else {
-        return loadFallbackConfig()
+    // Layer the config: built-in defaults, then the bundled config.json, then
+    // the user override at ~/.config/sainttorrent/config.json (terminalApp wins).
+    var config = loadFallbackConfig()
+
+    if let url = Bundle.main.url(forResource: "config", withExtension: "json"),
+       let bundled = decodePartialConfig(at: url.path) {
+        config = overlay(base: config, partial: bundled)
     }
-    guard let data = try? Data(contentsOf: url) else {
-        return loadFallbackConfig()
+
+    let userConfigPath = "\(NSHomeDirectory())/.config/sainttorrent/config.json"
+    if let userConfig = decodePartialConfig(at: userConfigPath) {
+        config = overlay(base: config, partial: userConfig)
     }
-    do {
-        return try JSONDecoder().decode(Config.self, from: data)
-    } catch {
-        return loadFallbackConfig()
-    }
+
+    return config
 }
 
 func loadFallbackConfig() -> Config {
@@ -26,7 +57,7 @@ func loadFallbackConfig() -> Config {
     let fallbackBinary = "\(homeDir)/go/bin/sainttorrent"
     let fallbackSocket = "\(homeDir)/.config/sainttorrent/sainttorrent.sock"
     let fallbackDownload = "\(homeDir)/Downloads"
-    return Config(binaryPath: fallbackBinary, socketPath: fallbackSocket, defaultDownloadDir: fallbackDownload)
+    return Config(binaryPath: fallbackBinary, socketPath: fallbackSocket, defaultDownloadDir: fallbackDownload, terminalApp: "Terminal")
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -251,9 +282,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let escapedBinary = escapeForShell(config.binaryPath)
         let escapedDir = escapeForShell(config.defaultDownloadDir)
         let escapedURL = escapeForShell(urlString)
-        
+
         let command = "exec \(escapedBinary) -d \(escapedDir) --confirm \(escapedURL)"
-        
+
+        let app = config.terminalApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch app.lowercased() {
+        case "", "terminal", "terminal.app":
+            launchInTerminalApp(command: command)
+        case "iterm", "iterm2", "iterm.app":
+            launchInITerm(command: command)
+        default:
+            launchInGenericTerminal(appName: app, command: command)
+        }
+        NSApp.terminate(nil)
+    }
+
+    func launchInTerminalApp(command: String) {
         let osascriptProcess = Process()
         osascriptProcess.launchPath = "/usr/bin/osascript"
         osascriptProcess.arguments = [
@@ -282,9 +326,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ]
         osascriptProcess.launch()
         osascriptProcess.waitUntilExit()
-        NSApp.terminate(nil)
     }
-    
+
+    func launchInITerm(command: String) {
+        let osascriptProcess = Process()
+        osascriptProcess.launchPath = "/usr/bin/osascript"
+        osascriptProcess.arguments = [
+            "-e", "on run argv",
+            "-e", "    tell application \"iTerm\"",
+            "-e", "        activate",
+            "-e", "        set newWindow to (create window with default profile)",
+            "-e", "        tell current session of newWindow",
+            "-e", "            write text (item 1 of argv)",
+            "-e", "        end tell",
+            "-e", "    end tell",
+            "-e", "end run",
+            "--",
+            command
+        ]
+        osascriptProcess.launch()
+        osascriptProcess.waitUntilExit()
+    }
+
+    // Generic fallback for terminals without dedicated AppleScript support: write
+    // a self-deleting .command script and ask the named app to open it. This only
+    // runs the command in terminals registered to handle .command documents.
+    func launchInGenericTerminal(appName: String, command: String) {
+        let scriptBody = "#!/bin/bash\nrm -f -- \"$0\"\n\(command)\n"
+        let tmpDir = NSTemporaryDirectory() as NSString
+        let scriptPath = tmpDir.appendingPathComponent("sainttorrent-\(UUID().uuidString).command")
+
+        do {
+            try scriptBody.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+        } catch {
+            // Fall back to Terminal.app if we can't stage the script.
+            launchInTerminalApp(command: command)
+            return
+        }
+        chmod(scriptPath, 0o700)
+
+        let openProcess = Process()
+        openProcess.launchPath = "/usr/bin/open"
+        openProcess.arguments = ["-a", appName, scriptPath]
+        openProcess.launch()
+        openProcess.waitUntilExit()
+    }
+
     func escapeForShell(_ s: String) -> String {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }

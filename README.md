@@ -79,6 +79,42 @@ Start the client and automatically queue a torrent or magnet link:
 ./sainttorrent -d /path/to/downloads my_awesome_file.torrent
 ```
 
+### macOS Magnet Handler
+
+On macOS you can register saintTorrent as the default handler for `magnet:`
+links:
+
+```bash
+./register_magnet.sh
+```
+
+This builds the CLI, installs a small launcher app to
+`~/Applications/saintTorrent.app`, and sets it as the `magnet:` handler. When a
+magnet link is opened, the launcher hands it to a running saintTorrent instance
+over its IPC socket; if none is running, it opens a terminal and starts one.
+
+#### Choosing your terminal
+
+The terminal used for that fallback is configurable. Edit
+`~/.config/sainttorrent/config.json` (created on first registration) and set
+`terminalApp`:
+
+```json
+{
+  "terminalApp": "iTerm"
+}
+```
+
+- **`Terminal`** (default) and **`iTerm`** get first-class support and are
+  driven directly via AppleScript.
+- Any other value (e.g. `Ghostty`, `kitty`) is launched generically by opening
+  a temporary `.command` script with that app. This only runs the command in
+  terminals registered to open `.command` files; apps that ignore document-open
+  arguments may launch without starting the CLI.
+
+This file is **not** overwritten when you re-run `register_magnet.sh`, so your
+choice persists across upgrades.
+
 ---
 
 ## Project Structure
