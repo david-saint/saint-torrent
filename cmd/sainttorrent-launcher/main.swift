@@ -255,12 +255,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         struct SocketResponse: Decodable {
             let status: String
             let message: String?
+            let terminalTTY: String?
+            let terminalProgram: String?
+            let terminalTitle: String?
+
+            enum CodingKeys: String, CodingKey {
+                case status
+                case message
+                case terminalTTY = "terminal_tty"
+                case terminalProgram = "terminal_program"
+                case terminalTitle = "terminal_title"
+            }
         }
         
         do {
             let decoder = JSONDecoder()
             let response = try decoder.decode(SocketResponse.self, from: responseData)
             if response.status == "ok" {
+                focusRunningTerminal(
+                    config: config,
+                    tty: response.terminalTTY,
+                    terminalProgram: response.terminalProgram,
+                    terminalTitle: response.terminalTitle
+                )
                 NSApp.terminate(nil)
             } else if response.status == "starting" {
                 if startingRetry >= maxStartingRetries {
@@ -295,6 +312,142 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             launchInGenericTerminal(appName: app, command: command)
         }
         NSApp.terminate(nil)
+    }
+
+    func focusRunningTerminal(
+        config: Config,
+        tty: String?,
+        terminalProgram: String?,
+        terminalTitle: String?
+    ) {
+        let configuredApp = config.terminalApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        let app: String
+
+        switch terminalProgram?.lowercased() {
+        case "apple_terminal":
+            app = "Terminal"
+        case "iterm.app", "iterm2":
+            app = "iTerm"
+        case "ghostty":
+            app = "Ghostty"
+        default:
+            app = configuredApp.isEmpty ? "Terminal" : configuredApp
+        }
+
+        let targetTTY = tty ?? ""
+        switch app.lowercased() {
+        case "terminal", "terminal.app":
+            focusTerminalApp(tty: targetTTY)
+        case "iterm", "iterm2", "iterm.app":
+            focusITerm(tty: targetTTY)
+        case "ghostty", "ghostty.app":
+            focusGhostty(title: terminalTitle ?? "saintTorrent")
+        default:
+            activateApplication(named: app)
+        }
+    }
+
+    func focusTerminalApp(tty: String) {
+        let focused = runAppleScript(arguments: [
+            "-e", "on run argv",
+            "-e", "    set targetTTY to item 1 of argv",
+            "-e", "    tell application \"Terminal\"",
+            "-e", "        if targetTTY is not \"\" then",
+            "-e", "            repeat with terminalWindow in windows",
+            "-e", "                repeat with terminalTab in tabs of terminalWindow",
+            "-e", "                    if (tty of terminalTab as text) is targetTTY then",
+            "-e", "                        set selected of terminalTab to true",
+            "-e", "                        set miniaturized of terminalWindow to false",
+            "-e", "                        set index of terminalWindow to 1",
+            "-e", "                        activate",
+            "-e", "                        return",
+            "-e", "                    end if",
+            "-e", "                end repeat",
+            "-e", "            end repeat",
+            "-e", "        end if",
+            "-e", "        activate",
+            "-e", "    end tell",
+            "-e", "end run",
+            "--",
+            tty
+        ])
+        if !focused {
+            activateApplication(named: "Terminal")
+        }
+    }
+
+    func focusGhostty(title: String) {
+        let focused = runAppleScript(arguments: [
+            "-e", "on run argv",
+            "-e", "    set targetTitle to item 1 of argv",
+            "-e", "    tell application \"Ghostty\"",
+            "-e", "        repeat with terminalWindow in windows",
+            "-e", "            repeat with terminalTab in tabs of terminalWindow",
+            "-e", "                repeat with terminalSession in terminals of terminalTab",
+            "-e", "                    if (name of terminalSession as text) is targetTitle then",
+            "-e", "                        focus (contents of terminalSession)",
+            "-e", "                        return",
+            "-e", "                    end if",
+            "-e", "                end repeat",
+            "-e", "            end repeat",
+            "-e", "        end repeat",
+            "-e", "        activate",
+            "-e", "    end tell",
+            "-e", "end run",
+            "--",
+            title
+        ])
+        if !focused {
+            activateApplication(named: "Ghostty")
+        }
+    }
+
+    func focusITerm(tty: String) {
+        let focused = runAppleScript(arguments: [
+            "-e", "on run argv",
+            "-e", "    set targetTTY to item 1 of argv",
+            "-e", "    tell application \"iTerm\"",
+            "-e", "        if targetTTY is not \"\" then",
+            "-e", "            repeat with terminalWindow in windows",
+            "-e", "                repeat with terminalTab in tabs of terminalWindow",
+            "-e", "                    repeat with terminalSession in sessions of terminalTab",
+            "-e", "                        if (tty of terminalSession as text) is targetTTY then",
+            "-e", "                            tell terminalSession to select",
+            "-e", "                            tell terminalTab to select",
+            "-e", "                            tell terminalWindow to select",
+            "-e", "                            activate",
+            "-e", "                            return",
+            "-e", "                        end if",
+            "-e", "                    end repeat",
+            "-e", "                end repeat",
+            "-e", "            end repeat",
+            "-e", "        end if",
+            "-e", "        activate",
+            "-e", "    end tell",
+            "-e", "end run",
+            "--",
+            tty
+        ])
+        if !focused {
+            activateApplication(named: "iTerm")
+        }
+    }
+
+    func runAppleScript(arguments: [String]) -> Bool {
+        let osascriptProcess = Process()
+        osascriptProcess.launchPath = "/usr/bin/osascript"
+        osascriptProcess.arguments = arguments
+        osascriptProcess.launch()
+        osascriptProcess.waitUntilExit()
+        return osascriptProcess.terminationStatus == 0
+    }
+
+    func activateApplication(named appName: String) {
+        let openProcess = Process()
+        openProcess.launchPath = "/usr/bin/open"
+        openProcess.arguments = ["-a", appName]
+        openProcess.launch()
+        openProcess.waitUntilExit()
     }
 
     func launchInTerminalApp(command: String) {

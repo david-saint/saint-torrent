@@ -92,6 +92,8 @@ func perfReport(w io.Writer) {
 	}
 }
 
+const terminalWindowTitle = "saintTorrent"
+
 // Styles using Lipgloss
 var (
 	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4"))
@@ -209,8 +211,17 @@ type socketMessage struct {
 }
 
 type socketResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Status          string `json:"status"`
+	Message         string `json:"message"`
+	TerminalTTY     string `json:"terminal_tty,omitempty"`
+	TerminalProgram string `json:"terminal_program,omitempty"`
+	TerminalTitle   string `json:"terminal_title,omitempty"`
+}
+
+type terminalIdentity struct {
+	TTY     string
+	Program string
+	Title   string
 }
 
 type cliOptions struct {
@@ -326,7 +337,7 @@ func (m model) Init() tea.Cmd {
 	for _, s := range m.sessions {
 		s.Start()
 	}
-	return tea.Batch(tickCmd(), textinput.Blink)
+	return tea.Batch(tickCmd(), textinput.Blink, tea.SetWindowTitle(terminalWindowTitle))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1302,7 +1313,7 @@ func writeFrame(conn net.Conn, payload []byte) error {
 	return nil
 }
 
-func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup) {
+func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup, terminal terminalIdentity) {
 	defer handlersWG.Done()
 	defer unregisterConn(conn)
 	defer conn.Close()
@@ -1312,12 +1323,12 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	programMu.RUnlock()
 
 	if p == nil {
-		sendResponse(conn, "starting", "saintTorrent is starting up")
+		sendResponse(conn, "starting", "saintTorrent is starting up", terminal)
 		return
 	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		sendResponse(conn, "error", fmt.Sprintf("set read deadline error: %v", err))
+		sendResponse(conn, "error", fmt.Sprintf("set read deadline error: %v", err), terminal)
 		return
 	}
 
@@ -1326,7 +1337,7 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			sendResponse(conn, "error", fmt.Sprintf("read error: %v", err))
+			sendResponse(conn, "error", fmt.Sprintf("read error: %v", err), terminal)
 			return
 		}
 		if n > 0 {
@@ -1335,27 +1346,27 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 			}
 			requestData = append(requestData, buf[0])
 			if len(requestData) > 65536 {
-				sendResponse(conn, "error", "request frame too large (max 65536 bytes)")
+				sendResponse(conn, "error", "request frame too large (max 65536 bytes)", terminal)
 				return
 			}
 		}
 	}
 
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		sendResponse(conn, "error", fmt.Sprintf("clear read deadline error: %v", err))
+		sendResponse(conn, "error", fmt.Sprintf("clear read deadline error: %v", err), terminal)
 		return
 	}
 
 	var msg socketMessage
 	if err := json.Unmarshal(requestData, &msg); err != nil {
-		sendResponse(conn, "error", fmt.Sprintf("invalid JSON payload: %v", err))
+		sendResponse(conn, "error", fmt.Sprintf("invalid JSON payload: %v", err), terminal)
 		return
 	}
 
 	respChan := make(chan addTorrentResponse, 1)
 	select {
 	case <-shutdownChan:
-		sendResponse(conn, "error", "application is shutting down")
+		sendResponse(conn, "error", "application is shutting down", terminal)
 		return
 	default:
 		p.Send(addTorrentMsg{msg: msg, respChan: respChan})
@@ -1364,21 +1375,24 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	select {
 	case resp := <-respChan:
 		if resp.err != nil {
-			sendResponse(conn, "error", resp.err.Error())
+			sendResponse(conn, "error", resp.err.Error(), terminal)
 		} else {
-			sendResponse(conn, "ok", "torrent request handled")
+			sendResponse(conn, "ok", "torrent request handled", terminal)
 		}
 	case <-shutdownChan:
-		sendResponse(conn, "error", "application is shutting down")
+		sendResponse(conn, "error", "application is shutting down", terminal)
 	case <-time.After(3 * time.Second):
-		sendResponse(conn, "error", "TUI processing timeout")
+		sendResponse(conn, "error", "TUI processing timeout", terminal)
 	}
 }
 
-func sendResponse(conn net.Conn, status string, message string) {
+func sendResponse(conn net.Conn, status string, message string, terminal terminalIdentity) {
 	resp := socketResponse{
-		Status:  status,
-		Message: message,
+		Status:          status,
+		Message:         message,
+		TerminalTTY:     terminal.TTY,
+		TerminalProgram: terminal.Program,
+		TerminalTitle:   terminal.Title,
 	}
 	data, err := json.Marshal(resp)
 	if err != nil {
@@ -1388,6 +1402,40 @@ func sendResponse(conn net.Conn, status string, message string) {
 		return
 	}
 	_ = writeFrame(conn, data)
+}
+
+func detectTerminalTTY(input *os.File) string {
+	return findTerminalTTY(input, []string{"/dev/ttys*", "/dev/pts/*"})
+}
+
+func findTerminalTTY(input *os.File, patterns []string) string {
+	info, err := input.Stat()
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return ""
+	}
+	inputStat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+
+	for _, pattern := range patterns {
+		paths, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, path := range paths {
+			ttyInfo, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			ttyStat, ok := ttyInfo.Sys().(*syscall.Stat_t)
+			if ok && ttyStat.Rdev == inputStat.Rdev {
+				return path
+			}
+		}
+	}
+
+	return ""
 }
 
 func (m *model) resolveRemainingPending(err error) {
@@ -1690,6 +1738,11 @@ func main() {
 	shutdownChan := make(chan struct{})
 	var handlersWG sync.WaitGroup
 	var acceptLoopWG sync.WaitGroup
+	terminal := terminalIdentity{
+		TTY:     detectTerminalTTY(os.Stdin),
+		Program: os.Getenv("TERM_PROGRAM"),
+		Title:   terminalWindowTitle,
+	}
 
 	acceptLoopWG.Add(1)
 	go func() {
@@ -1701,7 +1754,7 @@ func main() {
 			}
 			registerConn(conn)
 			handlersWG.Add(1)
-			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG)
+			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG, terminal)
 		}
 	}()
 

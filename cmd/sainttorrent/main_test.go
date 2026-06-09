@@ -273,6 +273,29 @@ func TestSanitizeText(t *testing.T) {
 	}
 }
 
+func TestFindTerminalTTY(t *testing.T) {
+	input, err := os.Open("/dev/null")
+	if err != nil {
+		t.Fatalf("failed to open character device: %v", err)
+	}
+	defer input.Close()
+
+	if got := findTerminalTTY(input, []string{"/dev/null"}); got != "/dev/null" {
+		t.Fatalf("expected matching device path, got %q", got)
+	}
+
+	tempFile, err := os.CreateTemp("", "sainttorrent-not-a-tty-*")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+
+	if got := findTerminalTTY(tempFile, []string{tempFile.Name()}); got != "" {
+		t.Fatalf("expected regular file to be rejected, got %q", got)
+	}
+}
+
 func TestLockHeldAndSocketNotReadyRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "sainttorrent-test-*")
 	if err != nil {
@@ -429,7 +452,11 @@ func TestHandleSocketConnection(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{
+			TTY:     "/dev/ttys042",
+			Program: "Apple_Terminal",
+			Title:   terminalWindowTitle,
+		})
 	}()
 
 	msg := socketMessage{
@@ -453,6 +480,11 @@ func TestHandleSocketConnection(t *testing.T) {
 	// TUI processes this successfully, so we expect status == "ok"
 	if resp.Status != "ok" {
 		t.Errorf("expected status=ok, got status=%s message=%s", resp.Status, resp.Message)
+	}
+	if resp.TerminalTTY != "/dev/ttys042" ||
+		resp.TerminalProgram != "Apple_Terminal" ||
+		resp.TerminalTitle != terminalWindowTitle {
+		t.Errorf("unexpected terminal identity in response: %+v", resp)
 	}
 }
 
@@ -479,7 +511,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG)
+		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG, terminalIdentity{})
 	}()
 
 	largeData := make([]byte, 70000)
@@ -521,7 +553,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 			handlersWG.Done()
 			return
 		}
-		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG)
+		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG, terminalIdentity{})
 	}()
 
 	rawClientConn2, err := net.Dial("tcp", listener.Addr().String())
@@ -576,7 +608,7 @@ func TestSocketPartialFailures(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{})
 	}()
 
 	msg := socketMessage{
@@ -641,7 +673,7 @@ func TestSocketShutdownUnblocksRead(t *testing.T) {
 
 	handlerDone := make(chan struct{})
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{})
 		close(handlerDone)
 	}()
 
