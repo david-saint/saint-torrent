@@ -29,6 +29,10 @@ const MaxMetadataSize = 16 * 1024 * 1024
 
 const maxMetadataPieces = MaxMetadataSize / MetadataBlockSize
 
+// maxBencodeDepth bounds bencode container nesting when locating the dictionary
+// boundary in ut_metadata messages, preventing stack exhaustion from a malicious peer.
+const maxBencodeDepth = 100
+
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
 // the total metadata size, and an optional client identifier.
@@ -277,15 +281,18 @@ func bencodedDictSpan(data []byte) (int, error) {
 	if len(data) == 0 || data[0] != 'd' {
 		return 0, errors.New("not a bencoded dictionary")
 	}
-	return bencodedValueSpan(data)
+	return bencodedValueSpan(data, 0)
 }
 
 // bencodedValueSpan returns the byte length of the next bencoded value at
 // the start of data. It mirrors the logic in bencode.findValueSpan (which
 // is unexported) and handles integers, strings, lists, and dictionaries.
-func bencodedValueSpan(data []byte) (int, error) {
+func bencodedValueSpan(data []byte, depth int) (int, error) {
 	if len(data) == 0 {
 		return 0, errors.New("empty input")
+	}
+	if depth > maxBencodeDepth {
+		return 0, errors.New("bencode value nested too deeply")
 	}
 
 	switch {
@@ -302,7 +309,7 @@ func bencodedValueSpan(data []byte) (int, error) {
 		// List: l<elements>e
 		pos := 1
 		for pos < len(data) && data[pos] != 'e' {
-			span, err := bencodedValueSpan(data[pos:])
+			span, err := bencodedValueSpan(data[pos:], depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -318,7 +325,7 @@ func bencodedValueSpan(data []byte) (int, error) {
 		pos := 1
 		for pos < len(data) && data[pos] != 'e' {
 			// Key
-			keySpan, err := bencodedValueSpan(data[pos:])
+			keySpan, err := bencodedValueSpan(data[pos:], depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -327,7 +334,7 @@ func bencodedValueSpan(data []byte) (int, error) {
 				return 0, errors.New("dictionary key without value")
 			}
 			// Value
-			valSpan, err := bencodedValueSpan(data[pos:])
+			valSpan, err := bencodedValueSpan(data[pos:], depth+1)
 			if err != nil {
 				return 0, err
 			}

@@ -11,6 +11,11 @@ import (
 	"strconv"
 )
 
+// maxDepth bounds how deeply bencode containers (lists/dicts) may nest. Real
+// torrent, tracker, and DHT payloads nest only a few levels; this guard stops a
+// maliciously deep input from exhausting the goroutine stack via recursion.
+const maxDepth = 100
+
 // Decode reads bencoded data from an io.Reader and returns the parsed value.
 func Decode(r io.Reader) (interface{}, error) {
 	data, err := io.ReadAll(r)
@@ -22,7 +27,7 @@ func Decode(r io.Reader) (interface{}, error) {
 
 // Unmarshal decodes a bencoded byte slice and returns the parsed value.
 func Unmarshal(data []byte) (interface{}, error) {
-	val, rest, err := parse(data)
+	val, rest, err := parse(data, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -32,9 +37,12 @@ func Unmarshal(data []byte) (interface{}, error) {
 	return val, nil
 }
 
-func parse(data []byte) (interface{}, []byte, error) {
+func parse(data []byte, depth int) (interface{}, []byte, error) {
 	if len(data) == 0 {
 		return nil, nil, errors.New("empty input")
+	}
+	if depth > maxDepth {
+		return nil, nil, errors.New("bencode value nested too deeply")
 	}
 
 	switch data[0] {
@@ -52,7 +60,8 @@ func parse(data []byte) (interface{}, []byte, error) {
 		// Enforce spec constraints:
 		// - "i-0e" is invalid.
 		// - "i03e" (leading zeros) is invalid, unless it is "i0e".
-		if numBytes[0] == '-' {
+		switch numBytes[0] {
+		case '-':
 			if len(numBytes) == 1 {
 				return nil, nil, errors.New("invalid integer: sign only")
 			}
@@ -62,7 +71,7 @@ func parse(data []byte) (interface{}, []byte, error) {
 			if numBytes[1] == '-' {
 				return nil, nil, errors.New("multiple negative signs")
 			}
-		} else if numBytes[0] == '0' {
+		case '0':
 			if len(numBytes) > 1 {
 				return nil, nil, errors.New("leading zero in integer")
 			}
@@ -92,7 +101,7 @@ func parse(data []byte) (interface{}, []byte, error) {
 		for len(rest) > 0 && rest[0] != 'e' {
 			var val interface{}
 			var err error
-			val, rest, err = parse(rest)
+			val, rest, err = parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -111,7 +120,7 @@ func parse(data []byte) (interface{}, []byte, error) {
 			// Key MUST be a string
 			var keyVal interface{}
 			var err error
-			keyVal, rest, err = parse(rest)
+			keyVal, rest, err = parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -122,7 +131,7 @@ func parse(data []byte) (interface{}, []byte, error) {
 
 			// Value
 			var val interface{}
-			val, rest, err = parse(rest)
+			val, rest, err = parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -257,9 +266,12 @@ func Marshal(val interface{}) ([]byte, error) {
 }
 
 // findValueSpan returns the number of bytes that the bencoded value at the start of data occupies.
-func findValueSpan(data []byte) (int, error) {
+func findValueSpan(data []byte, depth int) (int, error) {
 	if len(data) == 0 {
 		return 0, errors.New("empty input")
+	}
+	if depth > maxDepth {
+		return 0, errors.New("bencode value nested too deeply")
 	}
 	switch data[0] {
 	case 'i':
@@ -272,7 +284,7 @@ func findValueSpan(data []byte) (int, error) {
 		rest := data[1:]
 		consumed := 1
 		for len(rest) > 0 && rest[0] != 'e' {
-			span, err := findValueSpan(rest)
+			span, err := findValueSpan(rest, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -288,7 +300,7 @@ func findValueSpan(data []byte) (int, error) {
 		consumed := 1
 		for len(rest) > 0 && rest[0] != 'e' {
 			// Key (must be a string)
-			keySpan, err := findValueSpan(rest)
+			keySpan, err := findValueSpan(rest, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -298,7 +310,7 @@ func findValueSpan(data []byte) (int, error) {
 				return 0, errors.New("dictionary key without value")
 			}
 			// Value
-			valSpan, err := findValueSpan(rest)
+			valSpan, err := findValueSpan(rest, depth+1)
 			if err != nil {
 				return 0, err
 			}
@@ -364,7 +376,7 @@ func FindRawValue(data []byte, targetKey string) ([]byte, error) {
 		rest = rest[keyEnd:]
 
 		// Value starts here
-		valSpan, err := findValueSpan(rest)
+		valSpan, err := findValueSpan(rest, 0)
 		if err != nil {
 			return nil, err
 		}
