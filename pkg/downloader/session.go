@@ -55,6 +55,29 @@ const peerSocketBufferSize = 4 * 1024 * 1024
 
 const trackerDefaultNumWant = 200
 
+// maxTrackerResponse caps how many bytes of an HTTP tracker's announce response we
+// buffer. Legitimate replies (a compact peer list plus a little metadata) are a few KB
+// even at numwant=200; this ceiling stops a malicious or MITM'd tracker from streaming
+// unbounded data into memory.
+const maxTrackerResponse = 2 * 1024 * 1024
+
+// maxOutboundPeers bounds how many peers a single session dials concurrently. This is
+// the download engine: it governs throughput on swarms made of many slow peers, so it
+// is set generously (mainline/libtorrent use ~200 per torrent). An attacker cannot
+// occupy these slots — they are only ever filled by peers we chose to connect to.
+const maxOutboundPeers = 200
+
+// maxInboundPeers bounds how many incoming peer connections a session accepts at once.
+// The listen port is public (announced to trackers/DHT), so this is the real abuse
+// surface: the cap stops a flood of inbound connections from exhausting file descriptors.
+// It is a SEPARATE budget from outbound, so an inbound flood can never starve downloads.
+const maxInboundPeers = 100
+
+// maxKnownPeers bounds the size of the Peers map so a tracker/DHT feeding an endless
+// stream of unique addresses cannot grow it without limit. Active peers are retained;
+// inactive entries are evicted oldest-first.
+const maxKnownPeers = 2048
+
 var trackerAnnounceTimeout = 15 * time.Second
 
 // PeerState holds per-peer state visible to the TUI.
@@ -98,24 +121,28 @@ type Session struct {
 	Peers       map[string]*PeerState
 	activePeers map[string]*peer.Client // for sending Have messages
 
-	lifecycleMu        sync.Mutex
-	ctx                context.Context
-	cancel             context.CancelFunc
-	wg                 sync.WaitGroup
-	closeOnce          sync.Once
-	listener           net.Listener
-	currentSpeed       float64
-	lastErr            error
-	statusErr          error // current blocking failure; drives Error status
-	lastTrackerErr     error
-	paused             bool
-	pauseEpoch         uint64 // increments when active connections are closed for pause
-	closed             bool
-	started            bool
-	resumeCh           chan struct{} // signal to wake tracker loop on resume
-	trackerEvents      []string      // Queue of pending tracker events
-	completedAnnounced bool
-	stoppedAnnounced   bool
+	lifecycleMu         sync.Mutex
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	wg                  sync.WaitGroup
+	closeOnce           sync.Once
+	listener            net.Listener
+	outboundSlots       chan struct{} // semaphore bounding concurrent outbound dials (lock-free)
+	inboundSlots        chan struct{} // semaphore bounding concurrent inbound connections (lock-free)
+	globalOutboundSlots chan struct{} // manager-wide outbound cap shared across sessions (nil if standalone)
+	globalInboundSlots  chan struct{} // manager-wide inbound cap shared across sessions (nil if standalone)
+	currentSpeed        float64
+	lastErr             error
+	statusErr           error // current blocking failure; drives Error status
+	lastTrackerErr      error
+	paused              bool
+	pauseEpoch          uint64 // increments when active connections are closed for pause
+	closed              bool
+	started             bool
+	resumeCh            chan struct{} // signal to wake tracker loop on resume
+	trackerEvents       []string      // Queue of pending tracker events
+	completedAnnounced  bool
+	stoppedAnnounced    bool
 
 	// Background fast-resume verification. Pieces claimed by resume data start as
 	// PieceUnverified and are hash-checked off the startup path (kicked off by Start).
@@ -204,6 +231,8 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		metadataCompletedCh: make(chan struct{}),
 		downloadDir:         resolvedDir,
 		trackerEvents:       []string{"started"},
+		outboundSlots:       make(chan struct{}, maxOutboundPeers),
+		inboundSlots:        make(chan struct{}, maxInboundPeers),
 	}
 
 	if !metadataMode {
@@ -595,6 +624,33 @@ func maxInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
+// maxKnownPeers, oldest-attempt-first; active peers are never evicted. Caller holds s.mu.
+func (s *Session) prunePeersLocked() {
+	if len(s.Peers) <= maxKnownPeers {
+		return
+	}
+	type agedPeer struct {
+		addr string
+		at   time.Time
+	}
+	inactive := make([]agedPeer, 0, len(s.Peers))
+	for addr, ps := range s.Peers {
+		if ps.Active {
+			continue
+		}
+		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt})
+	}
+	sort.Slice(inactive, func(i, j int) bool {
+		return inactive[i].at.Before(inactive[j].at)
+	})
+	// Evict down to ~75% of the cap so pruning isn't triggered on every insert.
+	evict := len(s.Peers) - (maxKnownPeers * 3 / 4)
+	for i := 0; i < evict && i < len(inactive); i++ {
+		delete(s.Peers, inactive[i].addr)
+	}
 }
 
 func tunePeerConn(conn net.Conn) {
@@ -1007,10 +1063,17 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		}
 
 		buf := new(bytes.Buffer)
-		_, err = io.Copy(buf, resp.Body)
+		// Bound how much we buffer: a tracker announce reply is a few KB even at
+		// numwant=200. The cap stops a malicious or MITM'd tracker from streaming
+		// unbounded data into memory. Reading one byte past the cap lets us detect
+		// and reject an over-limit response rather than silently truncating it.
+		_, err = io.Copy(buf, io.LimitReader(resp.Body, maxTrackerResponse+1))
 		resp.Body.Close()
 		if err != nil {
 			return trackerAnnounceResult{err: err}
+		}
+		if buf.Len() > maxTrackerResponse {
+			return trackerAnnounceResult{err: fmt.Errorf("tracker response exceeds %d bytes", maxTrackerResponse)}
 		}
 
 		trackerResp, err := tracker.ParseTrackerResponse(buf.Bytes())
@@ -1133,45 +1196,58 @@ func (s *Session) announceAndConnect() int {
 		return interval
 	}
 
-	// Connect to new peers
+	// Connect to new peers. The outbound semaphore in connectToPeer is the hard cap on
+	// concurrent connections; this loop additionally bounds how many new dials we start
+	// in one announce cycle so a tracker returning a huge peer list can't spawn a
+	// goroutine storm. slotsHeld is snapshotted once before the loop (len() is a safe,
+	// lock-free read, 0 for nil test sessions) so goroutines that acquire a slot mid-loop
+	// are not double-counted against launched — double-counting previously throttled
+	// connection ramp-up under load.
+	slotsHeld := len(s.outboundSlots)
+	launched := 0
 	for _, p := range peers {
 		if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
 			continue
 		}
 		peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
-		s.mu.RLock()
+		s.mu.Lock()
+		if s.closed || s.paused {
+			s.mu.Unlock()
+			break
+		}
+		if slotsHeld+launched >= maxOutboundPeers {
+			s.mu.Unlock()
+			break
+		}
 		pState, exists := s.Peers[peerAddr]
-		var shouldDial bool
+		shouldDial := false
 		if !exists {
 			shouldDial = true
 		} else if !pState.Active && time.Since(pState.LastAttempt) > 60*time.Second {
 			shouldDial = true
 		}
-		s.mu.RUnlock()
-
 		if shouldDial {
-			s.mu.Lock()
-			if !s.closed && !s.paused {
-				if !exists {
-					s.Peers[peerAddr] = &PeerState{
-						IP:          p.IP.String(),
-						Port:        p.Port,
-						Choked:      true,
-						Active:      false,
-						AmChoking:   true,
-						LastAttempt: time.Now(),
-					}
-				} else {
-					s.Peers[peerAddr].LastAttempt = time.Now()
+			if !exists {
+				s.prunePeersLocked()
+				s.Peers[peerAddr] = &PeerState{
+					IP:          p.IP.String(),
+					Port:        p.Port,
+					Choked:      true,
+					Active:      false,
+					AmChoking:   true,
+					LastAttempt: time.Now(),
 				}
-				s.wg.Add(1)
-				go func(tp tracker.Peer) {
-					defer s.wg.Done()
-					s.connectToPeer(tp)
-				}(p)
+			} else {
+				s.Peers[peerAddr].LastAttempt = time.Now()
 			}
-			s.mu.Unlock()
+			s.wg.Add(1)
+			launched++
+			go func(tp tracker.Peer) {
+				defer s.wg.Done()
+				s.connectToPeer(tp)
+			}(p)
 		}
+		s.mu.Unlock()
 	}
 
 	return interval
@@ -1181,6 +1257,30 @@ func (s *Session) announceAndConnect() int {
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
 	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+
+	// Acquire an outbound slot so concurrent dials stay bounded (see maxOutboundPeers).
+	// outboundSlots is nil only for sessions built outside NewSession (tests), which
+	// stay unbounded. Bail without opening a socket when at capacity; the peer is
+	// retried after its normal backoff.
+	if s.outboundSlots != nil {
+		select {
+		case s.outboundSlots <- struct{}{}:
+			defer func() { <-s.outboundSlots }()
+		default:
+			return
+		}
+	}
+	// Also hold a manager-wide outbound slot so many torrents can't collectively
+	// exhaust file descriptors. If the global budget is full, the per-session slot
+	// above is released by its deferred receive when we return.
+	if s.globalOutboundSlots != nil {
+		select {
+		case s.globalOutboundSlots <- struct{}{}:
+			defer func() { <-s.globalOutboundSlots }()
+		default:
+			return
+		}
+	}
 
 	var dialErr error
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -1292,6 +1392,29 @@ func (s *Session) inboundListenerLoop() {
 
 func (s *Session) handleIncomingConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Bound concurrent inbound connections (see maxInboundPeers); drop new ones once
+	// we're at capacity. This is a separate budget from outbound dials, so an inbound
+	// flood can never starve our own downloads.
+	if s.inboundSlots != nil {
+		select {
+		case s.inboundSlots <- struct{}{}:
+			defer func() { <-s.inboundSlots }()
+		default:
+			return
+		}
+	}
+	// Also hold a manager-wide inbound slot (released by the per-session deferred
+	// receive if the global budget is full).
+	if s.globalInboundSlots != nil {
+		select {
+		case s.globalInboundSlots <- struct{}{}:
+			defer func() { <-s.globalInboundSlots }()
+		default:
+			return
+		}
+	}
+
 	tunePeerConn(conn)
 
 	s.mu.RLock()
@@ -2728,8 +2851,14 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 		shouldDial = true
 	}
 
+	// Don't exceed the outbound connection cap.
+	if shouldDial && len(s.outboundSlots) >= maxOutboundPeers {
+		shouldDial = false
+	}
+
 	if shouldDial {
 		if !exists {
+			s.prunePeersLocked()
 			s.Peers[peerAddr] = &PeerState{
 				IP:          host,
 				Port:        uint16(port),

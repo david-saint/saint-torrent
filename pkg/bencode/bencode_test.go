@@ -118,3 +118,33 @@ func TestEncodeWriter(t *testing.T) {
 		t.Errorf("Encode() wrote %q, want %q", buf.String(), "4:spam")
 	}
 }
+
+// TestUnmarshalDepthLimit verifies that a pathologically nested input is rejected
+// with an error instead of recursing until the goroutine stack is exhausted (which
+// would crash the whole process — a remote DoS via a malicious peer/tracker).
+func TestUnmarshalDepthLimit(t *testing.T) {
+	const n = 5000 // well above maxDepth
+
+	// n nested lists: lll...l (no terminators needed; the depth guard trips first).
+	if _, err := Unmarshal([]byte(bytes.Repeat([]byte("l"), n))); err == nil {
+		t.Error("Unmarshal(deeply nested lists) = nil error, want depth-limit error")
+	}
+
+	// n nested dicts via repeated "d1:a" (each opens a dict and its single key).
+	deepDict := append(bytes.Repeat([]byte("d1:a"), n), bytes.Repeat([]byte("e"), n)...)
+	if _, err := Unmarshal(deepDict); err == nil {
+		t.Error("Unmarshal(deeply nested dicts) = nil error, want depth-limit error")
+	}
+
+	// FindRawValue walks the same recursive span finder; it must also stay bounded.
+	deepInfo := append([]byte("d4:info"), bytes.Repeat([]byte("l"), n)...)
+	if _, err := FindRawValue(deepInfo, "info"); err == nil {
+		t.Error("FindRawValue(deeply nested value) = nil error, want depth-limit error")
+	}
+
+	// A modestly nested structure (within the limit) must still parse fine.
+	ok := append(bytes.Repeat([]byte("l"), 50), bytes.Repeat([]byte("e"), 50)...)
+	if _, err := Unmarshal(ok); err != nil {
+		t.Errorf("Unmarshal(50 nested lists) = %v, want success", err)
+	}
+}

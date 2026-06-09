@@ -29,6 +29,10 @@ type TrackerResponse struct {
 
 const defaultNumWant = 200
 
+// maxBencodeDepth bounds bencode container nesting when parsing tracker responses,
+// preventing a malicious tracker from exhausting the goroutine stack via deep recursion.
+const maxBencodeDepth = 100
+
 // BuildTrackerURL constructs the tracker announce URL with the proper parameters.
 // Specifically, it escapes infoHash and peerID exactly as required by the BitTorrent spec.
 func BuildTrackerURL(baseURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, compact bool, event string, numWant ...int) (string, error) {
@@ -92,9 +96,12 @@ func escapeBinary(b []byte) string {
 
 type bencodeValue interface{}
 
-func parseBencode(data []byte) (bencodeValue, []byte, error) {
+func parseBencode(data []byte, depth int) (bencodeValue, []byte, error) {
 	if len(data) == 0 {
 		return nil, nil, fmt.Errorf("empty data")
+	}
+	if depth > maxBencodeDepth {
+		return nil, nil, fmt.Errorf("bencode value nested too deeply")
 	}
 	switch data[0] {
 	case 'i':
@@ -115,7 +122,7 @@ func parseBencode(data []byte) (bencodeValue, []byte, error) {
 		for len(rest) > 0 && rest[0] != 'e' {
 			var val bencodeValue
 			var err error
-			val, rest, err = parseBencode(rest)
+			val, rest, err = parseBencode(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -133,7 +140,7 @@ func parseBencode(data []byte) (bencodeValue, []byte, error) {
 			// Key must be a string
 			var keyVal bencodeValue
 			var err error
-			keyVal, rest, err = parseBencode(rest)
+			keyVal, rest, err = parseBencode(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -142,7 +149,7 @@ func parseBencode(data []byte) (bencodeValue, []byte, error) {
 				return nil, nil, fmt.Errorf("dict key must be string")
 			}
 			var val bencodeValue
-			val, rest, err = parseBencode(rest)
+			val, rest, err = parseBencode(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -175,7 +182,7 @@ func parseBencode(data []byte) (bencodeValue, []byte, error) {
 
 // ParseTrackerResponse decodes a bencoded tracker response.
 func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
-	val, rest, err := parseBencode(data)
+	val, rest, err := parseBencode(data, 0)
 	if err != nil {
 		return nil, fmt.Errorf("bencode parsing error: %w", err)
 	}

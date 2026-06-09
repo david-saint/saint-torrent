@@ -31,6 +31,8 @@ type TorrentManager struct {
 	sessions              map[string]*Session
 	globalDownloadLimiter *RateLimiter
 	globalUploadLimiter   *RateLimiter
+	globalOutboundSlots   chan struct{}
+	globalInboundSlots    chan struct{}
 	dht                   *dht.DHT
 	ctx                   context.Context
 	cancel                context.CancelFunc
@@ -43,6 +45,15 @@ type TorrentManager struct {
 	failedTorrents []PersistedTorrent
 }
 
+// maxGlobalOutboundPeers caps total concurrent outbound dials across ALL sessions, so a
+// user running many torrents at once cannot exhaust file descriptors. It sits above the
+// per-session maxOutboundPeers; a dial must hold both a per-session and a global slot.
+const maxGlobalOutboundPeers = 500
+
+// maxGlobalInboundPeers caps total concurrent inbound connections across ALL sessions,
+// bounding the file descriptors an inbound flood can consume process-wide.
+const maxGlobalInboundPeers = 500
+
 // NewTorrentManager creates and initializes a TorrentManager.
 func NewTorrentManager() *TorrentManager {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -50,6 +61,8 @@ func NewTorrentManager() *TorrentManager {
 		sessions:              make(map[string]*Session),
 		globalDownloadLimiter: NewRateLimiter(0), // unlimited by default
 		globalUploadLimiter:   NewRateLimiter(0), // unlimited by default
+		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
+		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
 		ctx:                   ctx,
 		cancel:                cancel,
 	}
@@ -120,6 +133,8 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	}
 	sess.GlobalDownloadLimiter = m.globalDownloadLimiter
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
+	sess.globalOutboundSlots = m.globalOutboundSlots
+	sess.globalInboundSlots = m.globalInboundSlots
 	sess.mu.Unlock()
 
 	if m.dht != nil {
