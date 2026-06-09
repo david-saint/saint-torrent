@@ -59,6 +59,7 @@ type DHT struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	goMu        sync.Mutex
+	closed      bool
 	closeOnce   sync.Once
 	downloadDir string
 }
@@ -132,10 +133,8 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 func (d *DHT) goTracked(fn func()) {
 	d.goMu.Lock()
 	defer d.goMu.Unlock()
-	select {
-	case <-d.ctx.Done():
+	if d.closed {
 		return
-	default:
 	}
 	d.wg.Add(1)
 	go func() {
@@ -168,6 +167,7 @@ func (d *DHT) Close() {
 		d.cancel()
 		_ = d.conn.Close()
 		d.goMu.Lock()
+		d.closed = true
 		d.goMu.Unlock()
 		d.wg.Wait()
 		close(d.peerChan)
