@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,6 +20,14 @@ import (
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 )
+
+type delayedCloseConn struct {
+	net.Conn
+}
+
+func (c *delayedCloseConn) Close() error {
+	return nil
+}
 
 func TestSessionInitAndBlockCalculations(t *testing.T) {
 	// Create temporary directory for storage
@@ -739,6 +748,139 @@ func TestPauseClosesHandshakingPeerBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestQuickResumeMakesTearingDownPeerImmediatelyRetryable(t *testing.T) {
+	tor := &torrent.Torrent{
+		Name:     "quick-resume",
+		InfoHash: sha1.Sum([]byte("quick-resume")),
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, tempDirOrDot(t))
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	wrappedConn := &delayedCloseConn{Conn: clientConn}
+	client := peer.NewClient(wrappedConn, tor.InfoHash, sess.PeerID)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, wrappedConn, "127.0.0.1:4444", "127.0.0.1", 4444, [8]byte{})
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(sess.GetActivePeers()) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(sess.GetActivePeers()) != 1 {
+		t.Fatal("peer did not become active")
+	}
+
+	// Pause closes the wrapped connection, but delayedCloseConn keeps the read loop
+	// alive until after Resume returns. This reproduces the teardown ordering that
+	// previously imposed a 60-second redial cooldown.
+	sess.Pause()
+	sess.Resume()
+	_ = serverConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+	_ = clientConn.Close()
+
+	sess.mu.RLock()
+	lastAttempt := sess.Peers["127.0.0.1:4444"].LastAttempt
+	sess.mu.RUnlock()
+	if !lastAttempt.IsZero() {
+		t.Fatalf("expected peer to be immediately retryable after quick resume, got %v", lastAttempt)
+	}
+}
+
+func TestHashFailureDisconnectsPeerWithoutErrorStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	goodData := []byte("good")
+	tor := &torrent.Torrent{
+		Name:        "hash-retry",
+		InfoHash:    sha1.Sum([]byte("hash-retry")),
+		PieceLength: int64(len(goodData)),
+		PieceHashes: [][20]byte{sha1.Sum(goodData)},
+		Files:       []torrent.File{{Length: int64(len(goodData)), Path: []string{"hash-retry.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "hash-retry.bin",
+		Length: int64(len(goodData)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:5555", "127.0.0.1", 5555, [8]byte{})
+		close(done)
+	}()
+
+	_ = serverConn.SetDeadline(time.Now().Add(time.Second))
+	msg, err := peer.ParseMessage(serverConn)
+	if err != nil {
+		t.Fatalf("failed to read interested message: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested message, got %#v", msg)
+	}
+	if _, err := serverConn.Write((&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}}).Serialize()); err != nil {
+		t.Fatalf("failed to send bitfield: %v", err)
+	}
+	if _, err := serverConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send unchoke: %v", err)
+	}
+
+	request, err := peer.ParseMessage(serverConn)
+	if err != nil {
+		t.Fatalf("failed to read piece request: %v", err)
+	}
+	if request == nil || request.ID != peer.MsgRequest || len(request.Payload) != 12 {
+		t.Fatalf("expected piece request, got %#v", request)
+	}
+	index := binary.BigEndian.Uint32(request.Payload[0:4])
+	begin := binary.BigEndian.Uint32(request.Payload[4:8])
+	payload := make([]byte, 8+len(goodData))
+	binary.BigEndian.PutUint32(payload[0:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	copy(payload[8:], []byte("bad!"))
+	if _, err := serverConn.Write((&peer.Message{ID: peer.MsgPiece, Payload: payload}).Serialize()); err != nil {
+		t.Fatalf("failed to send corrupt piece: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("session retried the corrupt piece on the same peer")
+	}
+
+	if status := sess.Status(); status != "Downloading" {
+		t.Fatalf("expected recoverable hash failure to keep Downloading status, got %q", status)
+	}
+	if err := sess.LastError(); err == nil || !strings.Contains(err.Error(), "failed hash verification") {
+		t.Fatalf("expected hash failure to remain visible as the last issue, got %v", err)
+	}
+	if state := sess.GetPieceStates()[0]; state != PieceEmpty {
+		t.Fatalf("expected corrupt piece to return to the pool, got state %v", state)
+	}
+}
+
 func tempDirOrDot(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "sainttorrent_magnet_announce")
@@ -1016,6 +1158,33 @@ func TestTrackerFailureDoesNotOverrideDownloadingStatus(t *testing.T) {
 	}
 }
 
+func TestBlockingStorageIssueUsesErrorStatus(t *testing.T) {
+	tor := &torrent.Torrent{
+		Name:        "storage-error",
+		InfoHash:    sha1.Sum([]byte("storage-error")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("x"))},
+		Files:       []torrent.File{{Length: 1, Path: []string{"x"}}},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	storageErr := fmt.Errorf("write failed")
+	sess.mu.Lock()
+	sess.lastErr = storageErr
+	sess.statusErr = storageErr
+	sess.mu.Unlock()
+
+	if status := sess.Status(); status != "Error" {
+		t.Fatalf("expected blocking storage issue to use Error status, got %q", status)
+	}
+	if err := sess.LastError(); err != storageErr {
+		t.Fatalf("expected storage issue to be reported, got %v", err)
+	}
+}
+
 func TestSessionAnnounceNoTrackersQueue(t *testing.T) {
 	// No trackers configured
 	tor := &torrent.Torrent{
@@ -1083,9 +1252,11 @@ func TestSessionStatusStoppedPrecedence(t *testing.T) {
 	sess.PieceStates[0] = PieceCompleted
 	sess.mu.Unlock()
 
-	// 2. Set an error
+	// 2. Set a blocking storage error
 	sess.mu.Lock()
-	sess.lastErr = fmt.Errorf("some tracker error")
+	storageErr := fmt.Errorf("storage unavailable")
+	sess.lastErr = storageErr
+	sess.statusErr = storageErr
 	sess.mu.Unlock()
 
 	// 3. Pause
@@ -1155,4 +1326,80 @@ func TestSessionStartResumesQueue(t *testing.T) {
 	// Start again (resumes, queues and sends "started")
 	sess.Start()
 	waitForEvent("started", 2)
+}
+
+func TestSessionContentPath(t *testing.T) {
+	peerID := [20]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+
+	t.Run("single-file torrent points at the file", func(t *testing.T) {
+		tempDir := t.TempDir()
+		tor := &torrent.Torrent{
+			Name:        "movie.mp4",
+			PieceLength: 65536,
+			PieceHashes: [][20]byte{sha1.Sum([]byte("p0"))},
+			Files:       []torrent.File{{Length: 1000, Path: []string{"movie.mp4"}}},
+		}
+		st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "movie.mp4", Length: 1000}}, tor.PieceLength)
+		if err != nil {
+			t.Fatalf("failed to init storage: %v", err)
+		}
+		sess, err := NewSession(tor, st, peerID, 0, tempDir)
+		if err != nil {
+			t.Fatalf("failed to create session: %v", err)
+		}
+		path, ok := sess.ContentPath()
+		if !ok {
+			t.Fatal("expected ContentPath to be available")
+		}
+		if want := filepath.Join(tempDir, "movie.mp4"); path != want {
+			t.Errorf("ContentPath = %q, want %q", path, want)
+		}
+	})
+
+	t.Run("multi-file torrent points at the top-level folder", func(t *testing.T) {
+		tempDir := t.TempDir()
+		tor := &torrent.Torrent{
+			Name:        "MyShow",
+			PieceLength: 65536,
+			PieceHashes: [][20]byte{sha1.Sum([]byte("p0"))},
+			Files: []torrent.File{
+				{Length: 500, Path: []string{"MyShow", "ep1.mkv"}},
+				{Length: 500, Path: []string{"MyShow", "ep2.mkv"}},
+			},
+		}
+		files := []storage.FileInfo{
+			{Path: filepath.Join("MyShow", "ep1.mkv"), Length: 500},
+			{Path: filepath.Join("MyShow", "ep2.mkv"), Length: 500},
+		}
+		st, err := storage.NewStorage(tempDir, files, tor.PieceLength)
+		if err != nil {
+			t.Fatalf("failed to init storage: %v", err)
+		}
+		sess, err := NewSession(tor, st, peerID, 0, tempDir)
+		if err != nil {
+			t.Fatalf("failed to create session: %v", err)
+		}
+		path, ok := sess.ContentPath()
+		if !ok {
+			t.Fatal("expected ContentPath to be available")
+		}
+		if want := filepath.Join(tempDir, "MyShow"); path != want {
+			t.Errorf("ContentPath = %q, want %q", path, want)
+		}
+	})
+
+	t.Run("metadata-mode magnet has no content path yet", func(t *testing.T) {
+		tempDir := t.TempDir()
+		tor := &torrent.Torrent{
+			Name:        "magnet-pending",
+			PieceLength: 0, // zero piece length puts the session in metadata mode
+		}
+		sess, err := NewSession(tor, nil, peerID, 0, tempDir)
+		if err != nil {
+			t.Fatalf("failed to create session: %v", err)
+		}
+		if path, ok := sess.ContentPath(); ok {
+			t.Errorf("expected no ContentPath in metadata mode, got %q", path)
+		}
+	})
 }

@@ -260,6 +260,7 @@ type model struct {
 	selectedFileIdx  int
 	quitting         bool
 	inputErr         string
+	flash            string
 	startupWarn      string
 	sessions         []*downloader.Session
 	deleteWithFiles  bool
@@ -331,6 +332,25 @@ func (m *model) refreshSessions() {
 	}
 }
 
+// openSelectedLocation reveals the currently selected torrent's content in the
+// OS file manager (Finder on macOS). It records a flash message when the
+// location is not yet known (e.g. a magnet still fetching metadata) or the file
+// manager could not be launched.
+func (m *model) openSelectedLocation() {
+	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		return
+	}
+	s := m.sessions[m.selectedIdx]
+	path, ok := s.ContentPath()
+	if !ok {
+		m.flash = "Location not available yet (still fetching metadata)"
+		return
+	}
+	if err := revealInFileManager(path); err != nil {
+		m.flash = fmt.Sprintf("Couldn't open location: %v", err)
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	perfMarkf("ui-ready")
 	// Start all managed sessions
@@ -345,6 +365,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		// A flash message lives until the next keypress, so any key clears the
+		// previous one before this key's handler optionally sets a new one.
+		m.flash = ""
 		switch m.viewMode {
 		case viewInput:
 			switch msg.String() {
@@ -480,6 +503,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Reset()
 				m.textInput.Focus()
 				m.textInput.Placeholder = "Upload limit in KB/s (0 for unlimited)"
+			case "o":
+				m.openSelectedLocation()
 			}
 
 		case viewDetail:
@@ -510,6 +535,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.selectedFileIdx = 0
 					}
 				}
+			case "o":
+				m.openSelectedLocation()
 			case "x":
 				m.viewMode = viewDeleteConfirm
 				m.deleteWithFiles = false
@@ -913,7 +940,10 @@ func (m model) viewTorrentList() string {
 		s := m.sessions[m.selectedIdx]
 		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
 	}
-	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [enter] Details | [space] %s | [a] Add | [d] Down Limit | [u] Up Limit | [q] Quit", spaceActionHelp)) + "\n")
+	if m.flash != "" {
+		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.flash)) + "\n")
+	}
+	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [enter] Details | [space] %s | [o] Open Folder | [a] Add | [d] Down Limit | [u] Up Limit | [q] Quit", spaceActionHelp)) + "\n")
 	return sb.String()
 }
 
@@ -1012,7 +1042,10 @@ func (m model) viewTorrentDetails() string {
 	}
 
 	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
-	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back | [space] %s | [f] Files | [x] Delete Task | [X] Delete Task & Files | [q] Quit", spaceActionHelp)) + "\n")
+	if m.flash != "" {
+		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.flash)) + "\n")
+	}
+	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back | [space] %s | [f] Files | [o] Open Folder | [x] Delete Task | [X] Delete Task & Files | [q] Quit", spaceActionHelp)) + "\n")
 	return sb.String()
 }
 

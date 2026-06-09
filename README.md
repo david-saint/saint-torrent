@@ -23,6 +23,7 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 - `up`/`down` or `k`/`j` - Navigate the torrent list
 - `space` - Pause or resume the selected torrent
 - `enter` - Open the detailed view for the selected torrent
+- `o` - Open the selected torrent's file/folder location in your file manager (Finder on macOS)
 - `a` - Add a new torrent (prompt accepts local filepath or Magnet URI)
 - `d` - Set a global download speed limit (in KB/s)
 - `u` - Set a global upload speed limit (in KB/s)
@@ -31,6 +32,7 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 - `esc` - Go back to the Torrent List view
 - `space` - Pause or resume the torrent
 - `f` - Open the File Explorer for this torrent
+- `o` - Open this torrent's file/folder location in your file manager (Finder on macOS)
 - `q` or `Ctrl+C` - Quit
 
 ### File Explorer View

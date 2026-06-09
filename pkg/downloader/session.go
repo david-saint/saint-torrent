@@ -106,8 +106,10 @@ type Session struct {
 	listener           net.Listener
 	currentSpeed       float64
 	lastErr            error
+	statusErr          error // current blocking failure; drives Error status
 	lastTrackerErr     error
 	paused             bool
+	pauseEpoch         uint64 // increments when active connections are closed for pause
 	closed             bool
 	started            bool
 	resumeCh           chan struct{} // signal to wake tracker loop on resume
@@ -617,6 +619,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	s.mu.Lock()
 	s.PieceStates[index] = PieceCompleted
 	s.lastErr = nil
+	s.statusErr = nil
 	s.saveStateLocked()
 
 	var completedNow bool
@@ -648,6 +651,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	}
 	s.PieceStates[index] = PieceCompleted
 	s.lastErr = nil
+	s.statusErr = nil
 	s.saveStateLocked()
 
 	var completedNow bool
@@ -1421,6 +1425,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Unlock()
 		return
 	}
+	connectionPauseEpoch := s.pauseEpoch
 	pState, ok := s.Peers[peerAddr]
 	if !ok {
 		pState = &PeerState{
@@ -1439,13 +1444,25 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	defer func() {
 		s.mu.Lock()
-		if ps, ok := s.Peers[peerAddr]; ok {
-			ps.Active = false
-			ps.Choked = true
-			ps.LastAttempt = time.Now()
+		reconnectAfterResume := false
+		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
+			if ps, ok := s.Peers[peerAddr]; ok {
+				ps.Active = false
+				ps.Choked = true
+				if s.pauseEpoch != connectionPauseEpoch && !s.paused && !s.closed {
+					ps.LastAttempt = time.Time{}
+					reconnectAfterResume = true
+				} else {
+					ps.LastAttempt = time.Now()
+				}
+			}
+			delete(s.activePeers, peerAddr)
 		}
-		delete(s.activePeers, peerAddr)
 		s.mu.Unlock()
+
+		if reconnectAfterResume {
+			s.AddPeerFromDiscovery(peerAddr)
+		}
 	}()
 
 	s.mu.RLock()
@@ -1895,6 +1912,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						offset += int64(len(block))
 					}
 
+					disconnectPeer := false
 					if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
 						if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil || err == storage.ErrFileRepaired {
 							if err == storage.ErrFileRepaired {
@@ -1908,18 +1926,23 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						} else {
 							s.mu.Lock()
 							s.lastErr = err
+							s.statusErr = err
 							s.PieceStates[dl.pieceIndex] = PieceEmpty
 							s.mu.Unlock()
 						}
 					} else {
-						// Hash mismatch or incomplete assembly: retry this piece from another peer.
+						// Do not immediately retry corrupt data from the same peer.
 						s.mu.Lock()
 						s.lastErr = fmt.Errorf("piece %d failed hash verification", dl.pieceIndex)
 						s.PieceStates[dl.pieceIndex] = PieceEmpty
 						s.mu.Unlock()
+						disconnectPeer = true
 					}
 
 					currentDownload = nil
+					if disconnectPeer {
+						return
+					}
 				}
 			}
 
@@ -2079,6 +2102,9 @@ func (s *Session) IsPaused() bool {
 func (s *Session) LastError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.statusErr != nil {
+		return s.statusErr
+	}
 	if s.lastErr == nil {
 		return s.lastTrackerErr
 	}
@@ -2143,7 +2169,7 @@ func (s *Session) statusLocked() string {
 		}
 		return "Paused"
 	}
-	if s.lastErr != nil {
+	if s.statusErr != nil {
 		return "Error"
 	}
 	if s.metadataMode {
@@ -2228,6 +2254,27 @@ func (s *Session) DownloadDir() string {
 	return s.downloadDir
 }
 
+// ContentPath returns the absolute on-disk path to this torrent's root item:
+// the file itself for single-file torrents, or the top-level folder for
+// multi-file torrents. ok is false when the path is not yet known, e.g. a
+// magnet still fetching metadata with no file list.
+//
+// For both layouts the torrent name is the first component of every file path
+// (see torrent.Parse), so joining it onto the download directory yields the
+// item a user expects to be revealed in their file manager.
+func (s *Session) ContentPath() (path string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Torrent == nil || len(s.Torrent.Files) == 0 {
+		return "", false
+	}
+	root := s.Torrent.Files[0].Path
+	if len(root) == 0 || root[0] == "" {
+		return "", false
+	}
+	return filepath.Join(s.downloadDir, root[0]), true
+}
+
 // IsMetadataMode returns whether the session is currently in metadata download mode.
 func (s *Session) IsMetadataMode() bool {
 	s.mu.RLock()
@@ -2243,6 +2290,7 @@ func (s *Session) Pause() {
 		return
 	}
 	s.paused = true
+	s.pauseEpoch++
 	s.queueTrackerEventLocked("stopped")
 	for _, client := range s.activePeers {
 		if client.Conn != nil {
@@ -2564,10 +2612,14 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	}
 	st, err := storage.NewStorage(s.downloadDir, fileInfos, s.Torrent.PieceLength)
 	if err != nil {
+		statusErr := fmt.Errorf("failed to initialize storage: %w", err)
+		s.lastErr = statusErr
+		s.statusErr = statusErr
 		s.mu.Unlock()
-		return fmt.Errorf("failed to initialize storage: %w", err)
+		return statusErr
 	}
 	s.Storage = st
+	s.statusErr = nil
 	storageToVerify := st
 	s.mu.Unlock()
 
