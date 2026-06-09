@@ -140,7 +140,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	failedRemoved := false
 	var failedEntry PersistedTorrent
 	for _, failed := range m.failedTorrents {
-		if strings.ToLower(failed.InfoHashHex) != strings.ToLower(infoHashHex) {
+		if !strings.EqualFold(failed.InfoHashHex, infoHashHex) {
 			newFailed = append(newFailed, failed)
 		} else {
 			failedRemoved = true
@@ -658,9 +658,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		})
 	}
 
-	for _, failed := range m.failedTorrents {
-		state.Torrents = append(state.Torrents, failed)
-	}
+	state.Torrents = append(state.Torrents, m.failedTorrents...)
 
 	return state
 }

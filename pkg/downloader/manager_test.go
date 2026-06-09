@@ -669,7 +669,7 @@ func TestPersistenceCloseReconstructsMagnet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to parse reconstructed torrent: %v", err)
 		}
-		if bytes.Compare(parsed.InfoHash[:], infoHash[:]) != 0 {
+		if !bytes.Equal(parsed.InfoHash[:], infoHash[:]) {
 			t.Errorf("info hash mismatch: expected %v, got %v", infoHash, parsed.InfoHash)
 		}
 	}
