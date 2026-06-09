@@ -1,3 +1,4 @@
+// Package main implements the CLI and TUI entry point for the saintTorrent client.
 package main
 
 import (

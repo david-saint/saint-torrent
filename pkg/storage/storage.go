@@ -1,3 +1,5 @@
+// Package storage handles thread-safe read/write operations and verification
+// of torrent files on disk.
 package storage
 
 import (

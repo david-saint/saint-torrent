@@ -1,3 +1,4 @@
+// Package peer implements the BitTorrent peer wire protocol.
 package peer
 
 import (

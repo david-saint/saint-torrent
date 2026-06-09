@@ -1,3 +1,5 @@
+// Package downloader implements torrent session management, state persistence,
+// and speed rate limiting.
 package downloader
 
 import (

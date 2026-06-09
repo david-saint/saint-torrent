@@ -1,3 +1,4 @@
+// Package dht implements a BEP 5 Kademlia DHT client.
 package dht
 
 import (

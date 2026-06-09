@@ -1,3 +1,4 @@
+// Package torrent parses and processes bencoded torrent metadata and magnet URIs.
 package torrent
 
 import (

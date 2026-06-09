@@ -1,3 +1,4 @@
+// Package bencode implements encoding and decoding of bencoded data.
 package bencode
 
 import (

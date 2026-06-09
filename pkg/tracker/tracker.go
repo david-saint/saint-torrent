@@ -1,3 +1,4 @@
+// Package tracker implements BitTorrent tracker announcement protocols over HTTP and UDP.
 package tracker
 
 import (
