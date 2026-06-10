@@ -2673,11 +2673,17 @@ func (s *Session) recalculateOptimistic(optimisticPeer *string) {
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	defer func() {
 		if err != nil {
+			// A full assembly that fails the infohash check means the size/blocks we
+			// locked onto were bad — most likely a peer that won the race to advertise
+			// metadata_size handed us a poisoned (but in-range) value. Discard the whole
+			// accumulator, not just the completion flag, so metadataSize resets to 0 and
+			// the next peer's advertised size can take over instead of every honest peer
+			// being rejected forever by the size-mismatch guard.
 			s.mu.Lock()
 			s.metadataCompleted = false
-			for i := range s.metadataPieces {
-				s.metadataPieces[i] = false
-			}
+			s.metadataSize = 0
+			s.metadataBuf = nil
+			s.metadataPieces = nil
 			s.mu.Unlock()
 		}
 	}()

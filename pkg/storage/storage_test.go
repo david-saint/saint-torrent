@@ -307,6 +307,34 @@ func TestStorageRejectsDuplicatePaths(t *testing.T) {
 	}
 }
 
+func TestStorageRejectsReservedInternalNames(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"dht routing table", ".dht_nodes"},
+		{"fast-resume state", ".abc123.state"},
+		{"reserved top-level dir", filepath.Join(".dht_nodes", "inner.bin")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			if _, err := NewStorage(tmpDir, []FileInfo{{Path: tc.path, Length: 1}}, 1); err == nil {
+				t.Fatalf("expected reserved name %q to be rejected", tc.path)
+			}
+		})
+	}
+}
+
+func TestStorageAllowsNestedReservedNames(t *testing.T) {
+	// The collision only exists at the download-dir root, so a reserved name nested
+	// under a normal top-level directory must remain allowed.
+	tmpDir := t.TempDir()
+	if _, err := NewStorage(tmpDir, []FileInfo{{Path: filepath.Join("movie", ".dht_nodes"), Length: 1}}, 1); err != nil {
+		t.Fatalf("nested reserved-like name should be allowed, got: %v", err)
+	}
+}
+
 func TestStorageRejectsSymlinkPathComponents(t *testing.T) {
 	tmpDir := t.TempDir()
 	outside := t.TempDir()
