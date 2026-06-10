@@ -325,11 +325,23 @@ func (d *DHT) sendResponse(t string, r map[string]interface{}, addr *net.UDPAddr
 	}
 }
 
+// nextTransactionID returns an unpredictable transaction ID for an outgoing
+// query. A sequential counter would let an off-path attacker who can spoof the
+// queried node's UDP source address forge responses (injecting bogus peers/nodes)
+// by guessing the next ID, so we draw it from crypto/rand instead. 32 random bits
+// also make accidental collisions among concurrently outstanding transactions
+// negligible. The counter is retained only as a fallback for the astronomically
+// unlikely RNG read failure.
 func (d *DHT) nextTransactionID() string {
-	d.txMu.Lock()
-	defer d.txMu.Unlock()
-	d.txCounter++
-	return fmt.Sprintf("%04x", d.txCounter)
+	var buf [4]byte
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		d.txMu.Lock()
+		d.txCounter++
+		v := d.txCounter
+		d.txMu.Unlock()
+		return fmt.Sprintf("c%07x", v)
+	}
+	return fmt.Sprintf("%x", buf)
 }
 
 func (d *DHT) registerTransaction(t string, addr *net.UDPAddr, ch chan interface{}) {

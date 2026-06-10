@@ -69,6 +69,20 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
 		}
+		// Reject torrent-declared paths whose top-level component collides with an
+		// internal file we keep alongside the content in the download dir: the DHT
+		// routing table (.dht_nodes) and the per-torrent fast-resume state
+		// (.<infohash>.state). Without this, a single-file torrent named ".dht_nodes"
+		// could overwrite the routing table with attacker-chosen bytes (DHT poisoning
+		// on next launch), or a ".<hash>.state" file could clobber resume data. Nested
+		// uses (e.g. "movie/.dht_nodes") never reach the root, so they stay allowed.
+		topComponent := filepath.Clean(file.Path)
+		if i := strings.IndexRune(topComponent, filepath.Separator); i >= 0 {
+			topComponent = topComponent[:i]
+		}
+		if isReservedStorageName(topComponent) {
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
@@ -509,4 +523,18 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 
 func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
 	return os.OpenFile(path, flag|syscall.O_NOFOLLOW, perm)
+}
+
+// isReservedStorageName reports whether a top-level path component would collide
+// with one of the internal files saintTorrent stores in the download directory.
+// These names are produced only by our own code (dht.saveNodes writes ".dht_nodes";
+// SaveState writes ".<infohash>.state"), so torrent content must never be allowed
+// to claim them. The check mirrors those literal names rather than importing them,
+// to avoid a storage -> dht import cycle.
+func isReservedStorageName(name string) bool {
+	if name == ".dht_nodes" {
+		return true
+	}
+	// Per-torrent fast-resume files: a leading dot plus a ".state" suffix.
+	return strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".state")
 }
