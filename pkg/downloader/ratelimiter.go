@@ -9,8 +9,8 @@ import (
 
 // RateLimiter provides token-bucket rate limiting for bandwidth control.
 // Tokens accumulate at the configured bytes-per-second rate, capped at a
-// burst size equal to the rate (i.e. 1 second worth of tokens). A limit
-// of 0 disables rate limiting entirely: Wait always returns immediately.
+// burst of at least one BitTorrent block (and otherwise one second worth of
+// tokens). A limit of 0 disables rate limiting entirely.
 //
 // limit is an atomic so the unlimited fast path in Wait never touches the
 // mutex. This matters because a single global limiter is shared by every peer
@@ -23,8 +23,27 @@ type RateLimiter struct {
 	mu         sync.Mutex
 	limit      atomic.Int64 // bytes per second; 0 = unlimited
 	tokens     float64      // current available tokens
-	maxTokens  float64      // burst cap (== limit)
+	maxTokens  float64      // burst cap (at least one block for positive limits)
 	lastRefill time.Time    // last time tokens were refilled
+}
+
+// burstFor returns the token-bucket capacity (burst cap) for a given limit.
+//
+// The cap must be able to hold at least one full block: every Wait call requests
+// up to BlockSize bytes, refillLocked caps accumulated tokens at maxTokens, and if
+// maxTokens < needed the bucket can NEVER reach `needed` — Wait would spin forever
+// (until ctx cancellation), wedging the peer goroutine. A naive cap of `limit`
+// therefore deadlocks any limit set below one block (< 16 KB/s). Flooring the burst
+// at BlockSize lets a sub-block limit still pass one block every BlockSize/limit
+// seconds instead of hanging, while a normal (>= BlockSize) limit is unchanged.
+func burstFor(limit int64) float64 {
+	if limit <= 0 {
+		return 0 // unlimited: burst is unused (Wait short-circuits before refill)
+	}
+	if limit < BlockSize {
+		return float64(BlockSize)
+	}
+	return float64(limit)
 }
 
 // NewRateLimiter creates a rate limiter with the given bytes-per-second limit.
@@ -33,9 +52,10 @@ func NewRateLimiter(bytesPerSec int64) *RateLimiter {
 	if bytesPerSec < 0 {
 		bytesPerSec = 0
 	}
+	burst := burstFor(bytesPerSec)
 	r := &RateLimiter{
-		tokens:     float64(bytesPerSec),
-		maxTokens:  float64(bytesPerSec),
+		tokens:     burst,
+		maxTokens:  burst,
 		lastRefill: time.Now(),
 	}
 	r.limit.Store(bytesPerSec)
@@ -52,7 +72,7 @@ func (r *RateLimiter) SetLimit(bytesPerSec int64) {
 	defer r.mu.Unlock()
 
 	r.limit.Store(bytesPerSec)
-	r.maxTokens = float64(bytesPerSec)
+	r.maxTokens = burstFor(bytesPerSec)
 
 	// Refill before capping so we don't lose accrued tokens unnecessarily.
 	r.refillLocked()
@@ -124,13 +144,7 @@ func (r *RateLimiter) Wait(ctx context.Context, n int) error {
 		// Calculate how long we need to wait for enough tokens.
 		// Cap at 100ms so we re-check frequently for dynamic limit changes.
 		deficit := needed - r.tokens
-		waitDur := time.Duration(deficit / float64(limit) * float64(time.Second))
-		if waitDur < 10*time.Millisecond {
-			waitDur = 10 * time.Millisecond
-		}
-		if waitDur > 100*time.Millisecond {
-			waitDur = 100 * time.Millisecond
-		}
+		waitDur := limiterRetryDelay(deficit, limit)
 
 		r.mu.Unlock()
 
@@ -143,6 +157,57 @@ func (r *RateLimiter) Wait(ctx context.Context, n int) error {
 			// Loop back to refill and re-check.
 		}
 	}
+}
+
+// tryReserve attempts to consume n bytes without blocking. charged reports whether
+// tokens were actually deducted (unlimited mode succeeds without charging), and
+// retryAfter estimates when a failed reservation should be tried again.
+func (r *RateLimiter) tryReserve(n int) (ok, charged bool, retryAfter time.Duration) {
+	if n <= 0 {
+		return true, false, 0
+	}
+	if r.limit.Load() == 0 {
+		return true, false, 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	limit := r.limit.Load()
+	if limit == 0 {
+		return true, false, 0
+	}
+	r.refillLocked()
+	needed := float64(n)
+	if r.tokens >= needed {
+		r.tokens -= needed
+		return true, true, 0
+	}
+	return false, false, limiterRetryDelay(needed-r.tokens, limit)
+}
+
+// refund returns a charged reservation to the bucket, capped at the current burst.
+func (r *RateLimiter) refund(n int) {
+	if n <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tokens += float64(n)
+	if r.tokens > r.maxTokens {
+		r.tokens = r.maxTokens
+	}
+}
+
+func limiterRetryDelay(deficit float64, limit int64) time.Duration {
+	waitDur := time.Duration(deficit / float64(limit) * float64(time.Second))
+	if waitDur < 10*time.Millisecond {
+		return 10 * time.Millisecond
+	}
+	if waitDur > 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	return waitDur
 }
 
 // refillLocked adds tokens based on elapsed time since the last refill.

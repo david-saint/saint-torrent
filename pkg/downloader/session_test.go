@@ -581,7 +581,7 @@ func TestSessionServesRequestedPieceAndCountsUpload(t *testing.T) {
 	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
 	done := make(chan struct{})
 	go func() {
-		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6000", "127.0.0.1", 6000, [8]byte{})
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6000", "127.0.0.1", 6000, [8]byte{}, true)
 		close(done)
 	}()
 
@@ -841,7 +841,7 @@ func TestPauseClosesHandshakingPeerBeforeActivation(t *testing.T) {
 	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
 
 	sess.Pause()
-	sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:4444", "127.0.0.1", 4444, [8]byte{})
+	sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:4444", "127.0.0.1", 4444, [8]byte{}, true)
 
 	sess.mu.RLock()
 	_, active := sess.activePeers["127.0.0.1:4444"]
@@ -866,7 +866,7 @@ func TestQuickResumeMakesTearingDownPeerImmediatelyRetryable(t *testing.T) {
 	client := peer.NewClient(wrappedConn, tor.InfoHash, sess.PeerID)
 	done := make(chan struct{})
 	go func() {
-		sess.runPeerMessageLoop(client, wrappedConn, "127.0.0.1:4444", "127.0.0.1", 4444, [8]byte{})
+		sess.runPeerMessageLoop(client, wrappedConn, "127.0.0.1:4444", "127.0.0.1", 4444, [8]byte{}, true)
 		close(done)
 	}()
 
@@ -931,7 +931,7 @@ func TestHashFailureDisconnectsPeerWithoutErrorStatus(t *testing.T) {
 	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
 	done := make(chan struct{})
 	go func() {
-		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:5555", "127.0.0.1", 5555, [8]byte{})
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:5555", "127.0.0.1", 5555, [8]byte{}, true)
 		close(done)
 	}()
 

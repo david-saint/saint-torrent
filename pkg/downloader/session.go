@@ -61,8 +61,40 @@ const maxPendingBlockRequests = 256
 // buffer memory stays ≈ window×16 KB per peer regardless of piece size.
 const maxConcurrentPiecesPerPeer = 16
 
-const blockRequestTimeout = 20 * time.Second
+// blockRequestTimeout is how long an outstanding block request may go unanswered
+// before pump re-arms it (and, after maxBlockRequestRetries, drops the peer). A var
+// (not const) so tests can shorten it; treat it as a constant in production.
+var blockRequestTimeout = 20 * time.Second
+
 const maxBlockRequestRetries = 2
+
+// peerStallTimeout bounds how long an outbound peer may hold its connection slot
+// without delivering a single block of data we want. A connection's slot is held
+// for the whole life of its read loop, and a peer that chokes us forever — or
+// trickles only keep-alives/Have messages — resets the socket read deadline
+// without ever giving us data, so without this it would occupy a slot indefinitely.
+// In a slow swarm those dead-weight connections accumulate until the (shared,
+// manager-wide) outbound pool is full and NO session can dial a fresh peer, which
+// flatlines every torrent at once until a restart clears the pools. Any single
+// received block resets the timer, so a genuinely-slow-but-working peer survives;
+// only one delivering < one block per peerStallTimeout (≈273 B/s at 60 s) is
+// reaped, freeing the slot for a productive peer. Reaping never applies while we
+// are seeding (we want no data) — see the reaper in runPeerMessageLoop.
+// A var (not const) so tests can shorten it; treat it as a constant in production.
+var peerStallTimeout = 60 * time.Second
+
+// peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
+// outbound connection set. New dials previously happened ONLY on a tracker
+// announce (interval up to an hour) or a 30 s DHT lookup, so a slot freed by a
+// dropped/reaped peer could sit idle for a long time even with known peers on
+// hand. The maintenance tick refills from the known-peer set as soon as slots
+// open, decoupling connection churn from the announce cadence.
+var peerMaintenanceInterval = 5 * time.Second
+
+// peerRedialBackoff is the minimum gap before peerMaintenanceLoop re-dials a known
+// peer that is not currently connected, so a peer that just dropped (or that we
+// just reaped) is not hammered in a tight loop.
+var peerRedialBackoff = 60 * time.Second
 
 // Large enough to avoid kernel socket buffers becoming the bottleneck on fast peers.
 const peerSocketBufferSize = 4 * 1024 * 1024
@@ -112,6 +144,12 @@ type PeerState struct {
 	Active      bool
 	AmChoking   bool
 	LastAttempt time.Time
+	// Dialable means IP:Port came from tracker/DHT discovery or an outbound dial,
+	// rather than only from an inbound connection's usually-ephemeral source port.
+	Dialable bool
+	// Dialing prevents tracker, DHT, maintenance, and resume paths from launching
+	// duplicate concurrent attempts to the same endpoint.
+	Dialing bool
 }
 
 // FilePriority controls download ordering for files.
@@ -1184,9 +1222,9 @@ func (s *Session) Start() {
 		}
 	}
 
-	goroutineCount := 3 // tracker + speed monitor + choke loop
+	goroutineCount := 4 // tracker + speed monitor + choke loop + peer maintenance
 	if listener != nil {
-		goroutineCount = 4 // + inbound listener
+		goroutineCount = 5 // + inbound listener
 	}
 	s.mu.RLock()
 	hasDHT := s.DHT != nil
@@ -1200,6 +1238,7 @@ func (s *Session) Start() {
 	go s.trackerLoop()
 	go s.speedMonitorLoop()
 	go s.chokeLoop()
+	go s.peerMaintenanceLoop()
 	if listener != nil {
 		go s.inboundListenerLoop()
 	}
@@ -1613,8 +1652,13 @@ func (s *Session) announceAndConnect() int {
 		shouldDial := false
 		if !exists {
 			shouldDial = true
-		} else if !pState.Active && time.Since(pState.LastAttempt) > 60*time.Second {
-			shouldDial = true
+		} else {
+			// A tracker response is authoritative evidence that this endpoint is
+			// dialable, even if the same address was first seen as an inbound peer.
+			pState.Dialable = true
+			if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
+				shouldDial = true
+			}
 		}
 		if shouldDial {
 			if !exists {
@@ -1626,9 +1670,12 @@ func (s *Session) announceAndConnect() int {
 					Active:      false,
 					AmChoking:   true,
 					LastAttempt: time.Now(),
+					Dialable:    true,
+					Dialing:     true,
 				}
 			} else {
 				s.Peers[peerAddr].LastAttempt = time.Now()
+				s.Peers[peerAddr].Dialing = true
 			}
 			s.wg.Add(1)
 			launched++
@@ -1643,10 +1690,108 @@ func (s *Session) announceAndConnect() int {
 	return interval
 }
 
+// peerMaintenanceLoop periodically refills the outbound connection set from the
+// known-peer map, so a slot freed by a dropped or reaped peer is reused promptly
+// instead of waiting for the next tracker announce (up to an hour out) or DHT
+// lookup. This is what keeps a slow swarm churning toward productive peers rather
+// than wedging at zero once the initial connections go stale.
+func (s *Session) peerMaintenanceLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(peerMaintenanceInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.maintainPeerConnections()
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// maintainPeerConnections dials known-but-disconnected peers up to the outbound cap
+// while we still need data (pieces or metadata). It mirrors the dial gating in
+// announceAndConnect: it respects the per-session slot count and the per-peer redial
+// backoff, and launches connectToPeer (which acquires the real per-session and
+// manager-wide slots) in its own goroutine so the dial never blocks under s.mu.
+func (s *Session) maintainPeerConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.paused || s.closed || !s.started {
+		return
+	}
+	// Only maintain download connections while there is still something to fetch.
+	// When seeding, inbound connections and the normal announce flow cover uploads;
+	// isCompletedLocked is false in metadata mode, so metadata fetches still churn.
+	if s.isCompletedLocked() {
+		return
+	}
+
+	slotsHeld := len(s.outboundSlots)
+	// Also bound launches by the manager-wide pool's free room (a lock-free hint): if
+	// the global pool is full, connectToPeer would acquire nothing and return without
+	// dialing, yet the pre-set LastAttempt below would still suppress the peer for a
+	// full backoff. Gating here avoids burning the backoff on dials that can't happen.
+	globalRoom := maxOutboundPeers
+	if s.globalOutboundSlots != nil {
+		globalRoom = cap(s.globalOutboundSlots) - len(s.globalOutboundSlots)
+	}
+
+	launched := 0
+	now := time.Now()
+	for _, ps := range s.Peers {
+		if slotsHeld+launched >= maxOutboundPeers || launched >= globalRoom {
+			break
+		}
+		// Skip connected peers, attempts already in flight, and inbound-only source
+		// endpoints whose ports were never advertised as listening ports.
+		if ps.Active || ps.Dialing || !ps.Dialable {
+			continue
+		}
+		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
+		// "dial now" (e.g. Resume clears it on every inactive peer); the dedup against a
+		// concurrent dial is the LastAttempt = now set below, under the lock.
+		if !ps.LastAttempt.IsZero() && now.Sub(ps.LastAttempt) <= peerRedialBackoff {
+			continue
+		}
+		ip := net.ParseIP(ps.IP)
+		if ip == nil || ip.IsUnspecified() || ps.Port == 0 {
+			continue
+		}
+		ps.LastAttempt = now
+		ps.Dialing = true
+		launched++
+		s.wg.Add(1)
+		go func(tp tracker.Peer) {
+			defer s.wg.Done()
+			s.connectToPeer(tp)
+		}(tracker.Peer{IP: ip, Port: ps.Port})
+	}
+}
+
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
 	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+	s.mu.RLock()
+	dialPauseEpoch := s.pauseEpoch
+	s.mu.RUnlock()
+	acquiredSlots := false
+	defer func() {
+		s.mu.Lock()
+		if ps, ok := s.Peers[peerAddr]; ok && ps.Dialing {
+			ps.Dialing = false
+			// A full per-session or manager-wide pool means no network attempt was
+			// made. Keep the peer immediately eligible instead of burning a full
+			// redial backoff because a lock-free capacity hint raced another session.
+			resumedDuringDial := s.pauseEpoch != dialPauseEpoch && !s.paused && !s.closed
+			if (!acquiredSlots || resumedDuringDial) && !ps.Active {
+				ps.LastAttempt = time.Time{}
+			}
+		}
+		s.mu.Unlock()
+	}()
 
 	// Acquire an outbound slot so concurrent dials stay bounded (see maxOutboundPeers).
 	// outboundSlots is nil only for sessions built outside NewSession (tests), which
@@ -1671,6 +1816,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 			return
 		}
 	}
+	acquiredSlots = true
 
 	var dialErr error
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -1735,10 +1881,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	s.mu.Lock()
 	if ps, ok := s.Peers[peerAddr]; ok {
 		ps.LastAttempt = time.Now()
+		ps.Dialable = true
+		ps.Dialing = false
 	}
 	s.mu.Unlock()
 
-	s.runPeerMessageLoop(client, conn, peerAddr, p.IP.String(), p.Port, handshake.Reserved)
+	s.runPeerMessageLoop(client, conn, peerAddr, p.IP.String(), p.Port, handshake.Reserved, true)
 }
 
 // inboundListenerLoop accepts incoming peer connections on the already-bound listener.
@@ -1888,7 +2036,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		return
 	}
 
-	s.runPeerMessageLoop(client, conn, peerAddr, host, uint16(portVal), handshake.Reserved)
+	s.runPeerMessageLoop(client, conn, peerAddr, host, uint16(portVal), handshake.Reserved, false)
 }
 
 // isPieceWanted checks if a piece should be downloaded based on file selection.
@@ -1954,7 +2102,7 @@ func (s *Session) piecePriority(pieceIndex int64) FilePriority {
 	return maxPri
 }
 
-func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte) {
+func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte, outbound bool) {
 	s.mu.Lock()
 	if s.paused || s.closed {
 		s.mu.Unlock()
@@ -1972,6 +2120,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			LastAttempt: time.Now(),
 		}
 		s.Peers[peerAddr] = pState
+	}
+	// An outbound connection confirms this is a listening endpoint. An inbound
+	// connection does not erase prior tracker/DHT evidence for the same endpoint.
+	if outbound {
+		pState.Dialable = true
 	}
 	pState.Active = true
 	s.activePeers[peerAddr] = client
@@ -2200,22 +2353,36 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
 	}
 
+	// These timestamps are owned by this peer goroutine. A request gives the peer a
+	// fresh stall-timeout window even if rate limiting delayed issuing it; a received
+	// block records actual forward progress.
+	lastProgressAt := time.Now()
+	lastRequestAt := time.Time{}
+	waitingForBandwidth := false
+
 	// pump re-arms timed-out requests, then fills the request window across all
 	// active pieces, opening new pieces as needed. Called after each inbound
-	// message so the pipeline stays full across piece boundaries.
-	pump := func() {
+	// message — INCLUDING keep-alives — so the pipeline stays full across piece
+	// boundaries and, crucially, so the timeout sweep below still runs when a peer
+	// that already took our requests goes quiet but keeps the socket warm with
+	// keep-alives (which otherwise reset the read deadline and skipped pump).
+	pump := func() time.Duration {
 		s.mu.RLock()
 		paused := s.paused
 		choked := pState.Choked
 		s.mu.RUnlock()
-		if paused || choked {
-			return
+		if paused {
+			waitingForBandwidth = false
+			return 0
 		}
 
 		now := time.Now()
 
 		// Re-arm timed-out requests, or drop a peer that has stalled past its retry
-		// budget, and count what is still outstanding.
+		// budget, and count what is still outstanding. This sweep runs even when the
+		// peer is choking us: a peer that unchoked us, took a window of requests, then
+		// re-choked (or simply stopped responding) still has outstanding requests that
+		// must be timed out so the connection is dropped instead of held forever.
 		outstanding := 0
 		for _, dl := range activeDownloads {
 			for begin, req := range dl.pending {
@@ -2228,7 +2395,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						s.lastErr = fmt.Errorf("timed out downloading piece %d", dl.pieceIndex)
 						s.mu.Unlock()
 						_ = conn.Close() // pieces are released by the disconnect cleanup
-						return
+						return 0
 					}
 					req.requested = false
 					req.retries++
@@ -2237,6 +2404,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				}
 				outstanding++
 			}
+		}
+
+		// A choked peer won't fulfill new requests, so don't open pieces or send;
+		// the timeout sweep above has already run, which is the part that matters
+		// for not leaking a stalled connection.
+		if choked {
+			waitingForBandwidth = false
+			return 0
 		}
 
 		// Fill the window, opening pieces on demand.
@@ -2265,22 +2440,33 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 
 			req := chosen.pending[begin]
-			// Rate limiting (no lock held). An error means ctx is done — bail.
-			if err := s.DownloadLimiter.Wait(s.ctx, int(req.length)); err != nil {
-				return
-			}
-			if s.GlobalDownloadLimiter != nil {
-				if err := s.GlobalDownloadLimiter.Wait(s.ctx, int(req.length)); err != nil {
-					return
-				}
+			// Never wait for bandwidth in the peer event loop: even with an empty
+			// request window, blocking here lets many rate-limited peers occupy every
+			// manager-wide connection slot while none of their sockets are drained.
+			// The event loop schedules another pump when the limiter says tokens should
+			// be available, while the dedicated reader below remains responsive.
+			if reserved, retryAfter := s.reserveDownload(int(req.length)); !reserved {
+				req.requested = false
+				chosen.retry = append(chosen.retry, begin)
+				// With no request in flight, this idle period is intentional: the
+				// limiter is accumulating enough tokens for one full block. If other
+				// requests are outstanding, the peer still owes us data and remains
+				// subject to the normal stall and request timeouts.
+				waitingForBandwidth = outstanding == 0
+				return retryAfter
 			}
 			if err := client.SendRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
 				req.requested = false
-				return // dead connection; cleanup releases the pieces
+				return 0 // dead connection; cleanup releases the pieces
 			}
-			req.requestedAt = now
+			sentAt := time.Now()
+			req.requestedAt = sentAt
+			lastRequestAt = sentAt
+			waitingForBandwidth = false
 			outstanding++
 		}
+		waitingForBandwidth = false
+		return 0
 	}
 
 	// dropCompletedElsewhere is the endgame "cancel on receipt" path: it drops any
@@ -2315,7 +2501,68 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 	}
 
-	// Reduced read deadline for faster shutdown (P2 fix)
+	type peerReadResult struct {
+		msg *peer.Message
+		err error
+	}
+	readCh := make(chan peerReadResult, 1)
+	readDone := make(chan struct{})
+	readStop := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			msg, err := client.ReadMessage()
+			select {
+			case readCh <- peerReadResult{msg: msg, err: err}:
+			case <-s.ctx.Done():
+				return
+			case <-readStop:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(readStop)
+		_ = conn.Close()
+		<-readDone
+	}()
+
+	var rateTimer *time.Timer
+	var rateRetry <-chan time.Time
+	scheduleRateRetry := func(delay time.Duration) {
+		if rateTimer != nil {
+			if !rateTimer.Stop() {
+				select {
+				case <-rateTimer.C:
+				default:
+				}
+			}
+		}
+		rateRetry = nil
+		if delay <= 0 {
+			return
+		}
+		if rateTimer == nil {
+			rateTimer = time.NewTimer(delay)
+		} else {
+			rateTimer.Reset(delay)
+		}
+		rateRetry = rateTimer.C
+	}
+	defer func() {
+		if rateTimer != nil {
+			rateTimer.Stop()
+		}
+	}()
+
+	// Read and scheduling event loop. Socket parsing stays in one dedicated goroutine,
+	// while limiter retry timers can wake the request pump without interrupting a
+	// partially-read peer-wire message.
+peerLoop:
 	for {
 		s.mu.RLock()
 		paused := s.paused
@@ -2324,14 +2571,51 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			break
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		msg, err := client.ReadMessage()
-		if err != nil {
-			break
+		// Reap an unproductive peer: drop a connection that hasn't delivered a block
+		// within peerStallTimeout so its outbound slot can be reused for a peer that
+		// will. Gated by cheap checks that keep the O(pieces) completion check off the
+		// per-message hot path: only OUTBOUND connections (an inbound peer holds an
+		// inbound slot, not an outbound one, and is keyed by an ephemeral port we can't
+		// redial — reaping it just drops a productive uploader). A recently issued
+		// request also grants a fresh timeout window, which prevents an intentionally
+		// slow limiter wait from making the request look stale before it is sent.
+		lastUsefulAt := lastProgressAt
+		if lastRequestAt.After(lastUsefulAt) {
+			lastUsefulAt = lastRequestAt
+		}
+		if outbound && !waitingForBandwidth && time.Since(lastUsefulAt) > peerStallTimeout {
+			s.mu.RLock()
+			seeding := s.isCompletedLocked()
+			// Background resume verification can hold pieces PieceUnverified, so there
+			// may be nothing to request yet through no fault of the peer; don't reap
+			// while verifying.
+			verifying := s.verifying
+			s.mu.RUnlock()
+			if !seeding && !verifying {
+				break
+			}
+		}
+
+		var msg *peer.Message
+		select {
+		case result := <-readCh:
+			if result.err != nil {
+				break peerLoop
+			}
+			msg = result.msg
+		case <-rateRetry:
+			rateRetry = nil
+			scheduleRateRetry(pump())
+			continue
+		case <-s.ctx.Done():
+			break peerLoop
 		}
 
 		if msg == nil {
-			// Keep alive
+			// Keep alive: still run pump so outstanding requests to a now-silent peer
+			// time out (and the peer is dropped after its retry budget) instead of the
+			// keep-alive merely resetting the read deadline and stalling forever.
+			scheduleRateRetry(pump())
 			continue
 		}
 
@@ -2469,6 +2753,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 							if expectedLen > 0 && len(metaMsg.Data) == expectedLen && offset+len(metaMsg.Data) <= len(s.metadataBuf) {
 								copy(s.metadataBuf[offset:], metaMsg.Data)
 								s.metadataPieces[metaMsg.Piece] = true
+								lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
 
 								allCompleted := true
 								for _, done := range s.metadataPieces {
@@ -2613,6 +2898,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			dl.blocks[blockIndex] = blockData
 			req.received = true
 			dl.blocksReceived++
+			lastProgressAt = time.Now() // forward progress; keeps the stall reaper off
 
 			// Counters are bumped lock-free on this hot path; s.mu would
 			// otherwise be taken per 16 KB block by every peer goroutine.
@@ -2712,7 +2998,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		// request pipeline full across all active pieces, opening new pieces as
 		// needed (pump no-ops when paused, choked, or seeding).
 		dropCompletedElsewhere()
-		pump()
+		scheduleRateRetry(pump())
 	}
 
 	// If we disconnected while holding pieces, return them to empty so other
@@ -3125,6 +3411,26 @@ func (s *Session) SetUploadLimit(bytesPerSec int64) {
 	s.UploadLimiter.SetLimit(bytesPerSec)
 }
 
+// reserveDownload non-blockingly reserves n bytes from the per-session and (if set)
+// manager-wide limiter. retryAfter estimates when a failed reservation should be
+// retried; a charged per-session reservation is refunded if the global limiter fails.
+func (s *Session) reserveDownload(n int) (reserved bool, retryAfter time.Duration) {
+	localOK, localCharged, localRetry := s.DownloadLimiter.tryReserve(n)
+	if !localOK {
+		return false, localRetry
+	}
+	if s.GlobalDownloadLimiter != nil {
+		globalOK, _, globalRetry := s.GlobalDownloadLimiter.tryReserve(n)
+		if !globalOK {
+			if localCharged {
+				s.DownloadLimiter.refund(n)
+			}
+			return false, globalRetry
+		}
+	}
+	return true, 0
+}
+
 func (s *Session) chokeLoop() {
 	defer s.wg.Done()
 	s.mu.Lock()
@@ -3480,8 +3786,13 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 	var shouldDial bool
 	if !exists {
 		shouldDial = true
-	} else if !pState.Active && time.Since(pState.LastAttempt) > 60*time.Second {
-		shouldDial = true
+	} else {
+		// Discovery supplies a listening endpoint, so an inbound-only entry with the
+		// same address becomes eligible for maintenance retries.
+		pState.Dialable = true
+		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
+			shouldDial = true
+		}
 	}
 
 	// Don't exceed the outbound connection cap.
@@ -3498,9 +3809,12 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 				AmChoking:   true,
 				Choked:      true,
 				LastAttempt: time.Now(),
+				Dialable:    true,
+				Dialing:     true,
 			}
 		} else {
 			s.Peers[peerAddr].LastAttempt = time.Now()
+			s.Peers[peerAddr].Dialing = true
 		}
 		s.wg.Add(1)
 		go func(tp tracker.Peer) {
