@@ -277,7 +277,7 @@ func TestSessionProgressTracking(t *testing.T) {
 	}
 
 	// Calculate speed
-	sess.Downloaded += int64(len(data0))
+	sess.Downloaded.Add(int64(len(data0)))
 	time.Sleep(10 * time.Millisecond) // brief sleep to ensure elapsed time > 0
 	speed := sess.DownloadSpeed()
 	if speed <= 0 {
@@ -529,7 +529,7 @@ func TestSessionUploadSpeedIsCalculated(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.Peers["127.0.0.1:1"] = &PeerState{Active: true, Uploaded: 2048}
-	sess.Uploaded = 2048
+	sess.Uploaded.Store(2048)
 	sess.mu.Unlock()
 
 	time.Sleep(1200 * time.Millisecond)

@@ -204,6 +204,68 @@ func TestRateLimiterConcurrentAccess(t *testing.T) {
 	// Test passes if no race detector complaints.
 }
 
+// TestRateLimiterUnlimitedHonorsCancelledContext verifies that the lock-free
+// unlimited fast path still reports a cancelled context (preserving the old
+// semantics where Wait checked the context before returning).
+func TestRateLimiterUnlimitedHonorsCancelledContext(t *testing.T) {
+	rl := NewRateLimiter(0) // unlimited
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	if err := rl.Wait(ctx, 1024); err != context.Canceled {
+		t.Fatalf("expected context.Canceled on the unlimited fast path, got %v", err)
+	}
+
+	// With a live context the unlimited fast path returns nil immediately.
+	if err := rl.Wait(context.Background(), 1<<20); err != nil {
+		t.Fatalf("expected nil on live-context unlimited wait, got %v", err)
+	}
+}
+
+// TestRateLimiterUnlimitedConcurrentLockFree hammers the unlimited path from
+// many goroutines while the limit is toggled. The point is that unlimited Wait
+// no longer serializes on the limiter mutex; correctness is checked by -race
+// and by the calls all returning promptly.
+func TestRateLimiterUnlimitedConcurrentLockFree(t *testing.T) {
+	rl := NewRateLimiter(0) // unlimited
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	const goroutines = 32
+	const iters = 1000
+
+	start := time.Now()
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				if err := rl.Wait(ctx, 16384); err != nil {
+					t.Errorf("unexpected error on unlimited wait: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Concurrently flip the limit to exercise the atomic store vs. the
+	// lock-free load in Wait.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 200; j++ {
+			rl.SetLimit(0)
+			_ = rl.Limit()
+		}
+	}()
+
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("unlimited concurrent waits took too long (%v); fast path may be locking", elapsed)
+	}
+}
+
 func TestRateLimiterZeroBytes(t *testing.T) {
 	rl := NewRateLimiter(100)
 

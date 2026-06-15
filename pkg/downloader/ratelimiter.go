@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -10,12 +11,20 @@ import (
 // Tokens accumulate at the configured bytes-per-second rate, capped at a
 // burst size equal to the rate (i.e. 1 second worth of tokens). A limit
 // of 0 disables rate limiting entirely: Wait always returns immediately.
+//
+// limit is an atomic so the unlimited fast path in Wait never touches the
+// mutex. This matters because a single global limiter is shared by every peer
+// of every session: with the old design each in-flight block took the mutex
+// even when no limit was configured, serializing the whole swarm on one lock.
+// The token-bucket state (tokens/maxTokens/lastRefill) is still mutex-guarded;
+// SetLimit holds the mutex while it updates both limit and maxTokens so the
+// slow path always reads a consistent pair.
 type RateLimiter struct {
 	mu         sync.Mutex
-	limit      int64     // bytes per second; 0 = unlimited
-	tokens     float64   // current available tokens
-	maxTokens  float64   // burst cap (== limit)
-	lastRefill time.Time // last time tokens were refilled
+	limit      atomic.Int64 // bytes per second; 0 = unlimited
+	tokens     float64      // current available tokens
+	maxTokens  float64      // burst cap (== limit)
+	lastRefill time.Time    // last time tokens were refilled
 }
 
 // NewRateLimiter creates a rate limiter with the given bytes-per-second limit.
@@ -24,12 +33,13 @@ func NewRateLimiter(bytesPerSec int64) *RateLimiter {
 	if bytesPerSec < 0 {
 		bytesPerSec = 0
 	}
-	return &RateLimiter{
-		limit:      bytesPerSec,
+	r := &RateLimiter{
 		tokens:     float64(bytesPerSec),
 		maxTokens:  float64(bytesPerSec),
 		lastRefill: time.Now(),
 	}
+	r.limit.Store(bytesPerSec)
+	return r
 }
 
 // SetLimit changes the rate limit dynamically. 0 = unlimited.
@@ -41,7 +51,7 @@ func (r *RateLimiter) SetLimit(bytesPerSec int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.limit = bytesPerSec
+	r.limit.Store(bytesPerSec)
 	r.maxTokens = float64(bytesPerSec)
 
 	// Refill before capping so we don't lose accrued tokens unnecessarily.
@@ -54,9 +64,7 @@ func (r *RateLimiter) SetLimit(bytesPerSec int64) {
 
 // Limit returns the current limit in bytes per second. 0 = unlimited.
 func (r *RateLimiter) Limit() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.limit
+	return r.limit.Load()
 }
 
 // Wait blocks until n bytes of bandwidth are available, or ctx is cancelled.
@@ -72,8 +80,21 @@ func (r *RateLimiter) Wait(ctx context.Context, n int) error {
 		return nil
 	}
 
+	// Lock-free fast path: unlimited mode lets everything through without ever
+	// touching the mutex, so the shared global limiter is not a contention point
+	// when no limit is configured. Context is still honored to preserve the
+	// original semantics (a cancelled ctx returns its error even when unlimited).
+	if r.limit.Load() == 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+
 	for {
-		// Fast path: check context first.
+		// Check context first.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -82,8 +103,11 @@ func (r *RateLimiter) Wait(ctx context.Context, n int) error {
 
 		r.mu.Lock()
 
-		// Unlimited mode — let everything through.
-		if r.limit == 0 {
+		// Re-read under the lock so limit and maxTokens are a consistent pair
+		// (SetLimit updates both while holding the mutex). A late switch to
+		// unlimited still short-circuits here.
+		limit := r.limit.Load()
+		if limit == 0 {
 			r.mu.Unlock()
 			return nil
 		}
@@ -100,7 +124,7 @@ func (r *RateLimiter) Wait(ctx context.Context, n int) error {
 		// Calculate how long we need to wait for enough tokens.
 		// Cap at 100ms so we re-check frequently for dynamic limit changes.
 		deficit := needed - r.tokens
-		waitDur := time.Duration(deficit / float64(r.limit) * float64(time.Second))
+		waitDur := time.Duration(deficit / float64(limit) * float64(time.Second))
 		if waitDur < 10*time.Millisecond {
 			waitDur = 10 * time.Millisecond
 		}
@@ -130,7 +154,7 @@ func (r *RateLimiter) refillLocked() {
 		return
 	}
 	r.lastRefill = now
-	r.tokens += elapsed * float64(r.limit)
+	r.tokens += elapsed * float64(r.limit.Load())
 	if r.tokens > r.maxTokens {
 		r.tokens = r.maxTokens
 	}
