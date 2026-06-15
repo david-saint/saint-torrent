@@ -23,9 +23,10 @@ func TestRateLimiterUnlimited(t *testing.T) {
 }
 
 func TestRateLimiterThrottles(t *testing.T) {
-	// 10,000 bytes/sec limit. Request 10,000 bytes (the full burst),
-	// then request another 5,000 which must wait ~500ms.
-	const rate = 10_000
+	// rate bytes/sec limit. Request the full burst, then request another half-burst
+	// which must wait ~500ms. The rate is kept above BlockSize so burst == rate (a
+	// limit below one block floors the burst at BlockSize; see TestRateLimiterSubBlockLimitDoesNotHang).
+	const rate = 2 * BlockSize // 32,768 B/s, above one 16 KB block
 	rl := NewRateLimiter(rate)
 
 	ctx := context.Background()
@@ -35,7 +36,7 @@ func TestRateLimiterThrottles(t *testing.T) {
 		t.Fatalf("initial burst wait failed: %v", err)
 	}
 
-	// Now the bucket is empty; requesting 5,000 more should take ~500ms.
+	// Now the bucket is empty; requesting half the rate should take ~500ms.
 	start := time.Now()
 	if err := rl.Wait(ctx, rate/2); err != nil {
 		t.Fatalf("throttled wait failed: %v", err)
@@ -48,6 +49,76 @@ func TestRateLimiterThrottles(t *testing.T) {
 	}
 	if elapsed > 900*time.Millisecond {
 		t.Fatalf("throttling took too long: %v (expected ~500ms)", elapsed)
+	}
+}
+
+// TestRateLimiterSubBlockLimitDoesNotHang pins the fix for a limit set below one
+// block. Previously the burst cap equalled the limit, so a full BlockSize request
+// could never accumulate enough tokens (maxTokens < needed) and Wait spun forever
+// until the context was cancelled — wedging the peer goroutine that called it. The
+// burst is now floored at BlockSize, so a single block always eventually fits while
+// the configured rate still throttles.
+func TestRateLimiterSubBlockLimitDoesNotHang(t *testing.T) {
+	const rate = BlockSize / 4 // 4 KB/s, well below one 16 KB block
+	rl := NewRateLimiter(rate)
+
+	// A fresh limiter starts with a full burst, so the first full-block request must
+	// return promptly rather than hanging. The context timeout is the regression
+	// guard: the old code would block here until it expired.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := rl.Wait(ctx, BlockSize); err != nil {
+		t.Fatalf("full-block request under a sub-block limit hung/failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("first full-block request should be immediate (full burst), took %v", elapsed)
+	}
+
+	// The initial burst is now drained. A further request must still be throttled by
+	// the configured rate (proving the floored burst didn't turn the limiter into a
+	// no-op) yet complete in bounded time (proving the bucket can refill past the
+	// request size). rate bytes take ~1s at rate B/s.
+	start = time.Now()
+	if err := rl.Wait(ctx, rate); err != nil {
+		t.Fatalf("throttled refill under a sub-block limit failed: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 300*time.Millisecond {
+		t.Fatalf("expected the sub-block limit to still throttle (~1s), but waited only %v", elapsed)
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("sub-block-limit refill took too long: %v", elapsed)
+	}
+}
+
+func TestRateLimiterTryReserveAndRefund(t *testing.T) {
+	rl := NewRateLimiter(BlockSize)
+
+	ok, charged, retryAfter := rl.tryReserve(BlockSize)
+	if !ok || !charged || retryAfter != 0 {
+		t.Fatalf("initial reservation = (%v, %v, %v), want (true, true, 0)", ok, charged, retryAfter)
+	}
+
+	ok, charged, retryAfter = rl.tryReserve(BlockSize)
+	if ok || charged {
+		t.Fatalf("empty bucket reservation = (%v, %v), want (false, false)", ok, charged)
+	}
+	if retryAfter < 10*time.Millisecond || retryAfter > 100*time.Millisecond {
+		t.Fatalf("retry delay %v outside bounded scheduler range", retryAfter)
+	}
+
+	rl.refund(BlockSize)
+	ok, charged, retryAfter = rl.tryReserve(BlockSize)
+	if !ok || !charged || retryAfter != 0 {
+		t.Fatalf("refunded reservation = (%v, %v, %v), want (true, true, 0)", ok, charged, retryAfter)
+	}
+
+	unlimited := NewRateLimiter(0)
+	ok, charged, retryAfter = unlimited.tryReserve(BlockSize)
+	if !ok || charged || retryAfter != 0 {
+		t.Fatalf("unlimited reservation = (%v, %v, %v), want (true, false, 0)", ok, charged, retryAfter)
 	}
 }
 
