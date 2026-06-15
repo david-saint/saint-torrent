@@ -34,6 +34,12 @@ type TorrentManager struct {
 	globalUploadLimiter   *RateLimiter
 	globalOutboundSlots   chan struct{}
 	globalInboundSlots    chan struct{}
+	peerListener          net.Listener
+	peerListenPort        uint16
+	advertisedPeerPort    uint16
+	natGateway            portMapper
+	natStarted            bool
+	natStatus             NATStatus
 	dht                   *dht.DHT
 	ctx                   context.Context
 	cancel                context.CancelFunc
@@ -121,6 +127,16 @@ func (m *TorrentManager) DHT() *dht.DHT {
 	return m.dht
 }
 
+// DHTListenPort returns the UDP port used by the global DHT listener.
+func (m *TorrentManager) DHTListenPort() uint16 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.dht == nil {
+		return 0
+	}
+	return m.dht.Port()
+}
+
 // AddSession adds a session to the manager. If global rate limiters or DHT are set on the manager,
 // they are automatically linked to the session.
 func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
@@ -136,6 +152,10 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
+	if m.peerListener != nil {
+		sess.sharedInbound = true
+		sess.Port = m.advertisedPeerPort
+	}
 	sess.mu.Unlock()
 
 	if m.dht != nil {
@@ -423,7 +443,12 @@ func (m *TorrentManager) Close() {
 	}
 	m.closed = true
 	m.cancel()
+	peerListener := m.peerListener
+	m.peerListener = nil
 	m.mu.Unlock()
+	if peerListener != nil {
+		_ = peerListener.Close()
+	}
 
 	m.saveStateInternal(true)
 
@@ -538,7 +563,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 	copy(peerID[:8], "-ST0001-")
 	_, _ = rand.Read(peerID[8:])
 
-	sess, err := NewSession(tor, nil, peerID, 0, downloadDir) // port 0 for dynamic
+	sess, err := NewSession(tor, nil, peerID, m.AdvertisedPeerPort(), downloadDir)
 	if err != nil {
 		return nil, err
 	}
@@ -597,7 +622,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 	copy(peerID[:8], "-ST0001-")
 	_, _ = rand.Read(peerID[8:])
 
-	sess, err := NewSession(tor, st, peerID, 0, downloadDir) // port 0 for dynamic
+	sess, err := NewSession(tor, st, peerID, m.AdvertisedPeerPort(), downloadDir)
 	if err != nil {
 		st.Close()
 		return nil, err

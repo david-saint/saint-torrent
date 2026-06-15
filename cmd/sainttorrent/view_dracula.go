@@ -29,14 +29,15 @@ func renderListDracula(m *model) string {
 		prefix += dividerLine(st, m.width) + "\n"
 	}
 
-	var suffix strings.Builder
-	suffix.WriteString("\n")
+	// head holds the always-shown footer rows; help is the clippable key list.
+	var head strings.Builder
+	head.WriteString("\n")
 	if m.startupWarn != "" {
-		suffix.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.startupWarn), bw)) + "\n\n")
+		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.startupWarn), bw)) + "\n\n")
 	}
 
-	suffix.WriteString(dividerLine(st, m.width) + "\n")
-	suffix.WriteString(g + dracFooter(m, st) + "\n\n")
+	head.WriteString(dividerLine(st, m.width) + "\n")
+	head.WriteString(g + dracFooter(m, st) + "\n\n")
 
 	spaceActionHelp := "Pause/Resume"
 	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
@@ -44,25 +45,25 @@ func renderListDracula(m *model) string {
 		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
 	}
 	if m.flash != "" {
-		suffix.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
+		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
 	}
-	suffix.WriteString(renderHelp([][2]string{
+	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open Folder"},
 		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width))
-	suffix.WriteString("\n")
+	}, st, m.width)
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
 	if len(m.sessions) > 0 {
-		capacity := visibleSessionCapacity(m.height, prefix+suffix.String(), 1, len(m.sessions))
+		capacity := dashboardCapacity(m.height, prefix, head.String(), help, 1, len(m.sessions))
 		start, end := visibleSessionRange(len(m.sessions), m.selectedIdx, capacity)
 		for i := start; i < end; i++ {
 			sb.WriteString(g + dracRow(m, st, col, i, m.sessions[i]) + "\n")
 		}
 	}
-	sb.WriteString(suffix.String())
+	sb.WriteString(head.String())
+	sb.WriteString(help + "\n")
 	return sb.String()
 }
 
@@ -101,7 +102,8 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 		pctStr = "0.0%"
 	}
 	statusLabel, statusSt := statusLabelStyle(st, s.Status())
-	speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), s.CurrentSpeed())
+	speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), currentTransferSpeed(s))
+	spdSt := speedStyle(st, s.Status() == "Downloading")
 
 	if i == m.selectedIdx {
 		// Solid highlight across the whole row (single style).
@@ -140,7 +142,7 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 		b.WriteString(" " + statusSt.Render(cell(statusLabel, col.statusW)))
 	}
 	if col.showSpeed {
-		b.WriteString(" " + st.NormalRow.Render(cell(speedStr, col.speedW)))
+		b.WriteString(" " + spdSt.Render(cell(speedStr, col.speedW)))
 	}
 	return b.String()
 }
@@ -150,9 +152,11 @@ func dracFooter(m *model, st styles) string {
 	if d := m.manager.DHT(); d != nil {
 		dhtNodes = d.NodesCount()
 	}
-	var totalSpeed float64
+	var totalDown float64
+	var totalUp float64
 	for _, s := range m.sessions {
-		totalSpeed += s.CurrentSpeed()
+		totalDown += s.CurrentSpeed()
+		totalUp += s.CurrentUploadSpeed()
 	}
 	downLimitStr := "Unlimited"
 	if v := m.manager.GlobalDownloadLimit(); v > 0 {
@@ -162,8 +166,8 @@ func dracFooter(m *model, st styles) string {
 	if v := m.manager.GlobalUploadLimit(); v > 0 {
 		upLimitStr = formatSpeed(float64(v))
 	}
-	return "DHT: " + st.Info.Render(strconv.Itoa(dhtNodes)) + " nodes | Speed: " +
-		st.Info.Render(formatSpeed(totalSpeed)) + " | Limits: ↓ " +
+	return "DHT: " + st.Info.Render(strconv.Itoa(dhtNodes)) + " nodes | Speed: ↓ " +
+		st.Info.Render(formatSpeed(totalDown)) + " / ↑ " + st.Info.Render(formatSpeed(totalUp)) + " | Limits: ↓ " +
 		st.Warn.Render(downLimitStr) + " / ↑ " + st.Warn.Render(upLimitStr)
 }
 
@@ -193,11 +197,20 @@ func renderDetailsDracula(m *model) string {
 	}
 	m.progress.Width = inner
 	card := cardWidth(st.Card, m.width)
+	uploadPeers := s.GetUploadPeerStats()
+	seeders, leechers := s.TrackerSwarmStats()
 
 	cardContent := st.Header.Render("Hash") + ": " + fmt.Sprintf("%x", s.Torrent.InfoHash) + "\n" +
 		st.Header.Render("Total Size") + ": " + formatBytes(s.TotalSize()) + "\n" +
 		st.Header.Render("Complete") + ": " + fmt.Sprintf("%.2f%%", pct*100) + "\n" +
-		st.Header.Render("Status") + ": " + statusSt.Render(statusLabel) + "\n\n" +
+		st.Header.Render("Status") + ": " + statusSt.Render(statusLabel) + "\n" +
+		st.Header.Render("Speed") + ": ↓ " + formatSpeed(s.CurrentSpeed()) +
+		" / ↑ " + formatSpeed(s.CurrentUploadSpeed()) + "\n" +
+		st.Header.Render("Upload Demand") + ": " +
+		fmt.Sprintf("%d interested / %d slots", uploadPeers.Interested, uploadPeers.Unchoked) + "\n" +
+		st.Header.Render("Tracker Swarm") + ": " +
+		fmt.Sprintf("%d seeds / %d leechers", seeders, leechers) + "\n" +
+		st.Header.Render("Peer Port") + ": " + peerPortStatus(m.manager) + "\n\n" +
 		m.progress.ViewAs(pct)
 	if err := s.LastError(); err != nil {
 		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + sanitizeText(err.Error())
@@ -219,11 +232,20 @@ func renderDetailsDracula(m *model) string {
 		}
 	} else {
 		for _, p := range active {
-			chokeStr := "Unchoked"
+			chokeStr := "they allow"
 			if p.Choked {
-				chokeStr = "Choked"
+				chokeStr = "they choke"
 			}
-			line := fmt.Sprintf("  - %s:%-5d | %-8s | Speed: %s", p.IP, p.Port, chokeStr, formatSpeed(p.DownloadSpeed))
+			uploadState := "not interested"
+			if p.Interested {
+				if p.AmChoking {
+					uploadState = "wants, we choke"
+				} else {
+					uploadState = "wants, upload open"
+				}
+			}
+			line := fmt.Sprintf("  - %s:%-5d | %s | %s | ↓ %s | ↑ %s",
+				p.IP, p.Port, chokeStr, uploadState, formatSpeed(p.DownloadSpeed), formatSpeed(p.UploadSpeed))
 			peers.WriteString(truncateRight(line, inner) + "\n")
 		}
 	}

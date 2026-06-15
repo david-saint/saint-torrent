@@ -127,11 +127,15 @@ type Session struct {
 	wg                  sync.WaitGroup
 	closeOnce           sync.Once
 	listener            net.Listener
+	sharedInbound       bool
 	outboundSlots       chan struct{} // semaphore bounding concurrent outbound dials (lock-free)
 	inboundSlots        chan struct{} // semaphore bounding concurrent inbound connections (lock-free)
 	globalOutboundSlots chan struct{} // manager-wide outbound cap shared across sessions (nil if standalone)
 	globalInboundSlots  chan struct{} // manager-wide inbound cap shared across sessions (nil if standalone)
 	currentSpeed        float64
+	currentUploadSpeed  float64
+	trackerSeeders      int
+	trackerLeechers     int
 	lastErr             error
 	statusErr           error // current blocking failure; drives Error status
 	lastTrackerErr      error
@@ -804,26 +808,35 @@ func (s *Session) Start() {
 		}
 	}()
 
-	// Bind listener SYNCHRONOUSLY so Port is set before first announce
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
-	if err != nil {
-		s.mu.Lock()
-		s.lastErr = fmt.Errorf("inbound listener failed: %w", err)
-		s.mu.Unlock()
-		// Continue without listener — outbound connections still work
-	} else {
-		s.mu.Lock()
-		s.lastErr = nil
-		s.listener = listener
-		_, portStr, parseErr := net.SplitHostPort(listener.Addr().String())
-		if parseErr == nil {
-			var p int
-			_, _ = fmt.Sscanf(portStr, "%d", &p)
-			if p > 0 && p <= 65535 {
-				s.Port = uint16(p)
+	s.mu.RLock()
+	sharedInbound := s.sharedInbound
+	s.mu.RUnlock()
+
+	var listener net.Listener
+	if !sharedInbound {
+		// Standalone sessions own their listener. Managed sessions use the
+		// manager's shared listener and already have their advertised port set.
+		var err error
+		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
+		if err != nil {
+			s.mu.Lock()
+			s.lastErr = fmt.Errorf("inbound listener failed: %w", err)
+			s.mu.Unlock()
+			// Continue without listener — outbound connections still work.
+		} else {
+			s.mu.Lock()
+			s.lastErr = nil
+			s.listener = listener
+			_, portStr, parseErr := net.SplitHostPort(listener.Addr().String())
+			if parseErr == nil {
+				var p int
+				_, _ = fmt.Sscanf(portStr, "%d", &p)
+				if p > 0 && p <= 65535 {
+					s.Port = uint16(p)
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 
 	goroutineCount := 3 // tracker + speed monitor + choke loop
@@ -975,6 +988,7 @@ func (s *Session) speedMonitorLoop() {
 	defer ticker.Stop()
 
 	var lastGlobalDownloaded int64
+	var lastGlobalUploaded int64
 	lastPeerDownloaded := make(map[string]int64)
 	lastPeerUploaded := make(map[string]int64)
 
@@ -984,6 +998,9 @@ func (s *Session) speedMonitorLoop() {
 			s.mu.Lock()
 			if s.paused {
 				s.currentSpeed = 0
+				s.currentUploadSpeed = 0
+				lastGlobalDownloaded = s.Downloaded
+				lastGlobalUploaded = s.Uploaded
 				for _, pState := range s.Peers {
 					pState.DownloadSpeed = 0
 					pState.UploadSpeed = 0
@@ -995,6 +1012,9 @@ func (s *Session) speedMonitorLoop() {
 			globalDiff := s.Downloaded - lastGlobalDownloaded
 			s.currentSpeed = float64(globalDiff)
 			lastGlobalDownloaded = s.Downloaded
+			globalUploadDiff := s.Uploaded - lastGlobalUploaded
+			s.currentUploadSpeed = float64(globalUploadDiff)
+			lastGlobalUploaded = s.Uploaded
 
 			for addr, pState := range s.Peers {
 				if pState.Active {
@@ -1017,6 +1037,7 @@ func (s *Session) speedMonitorLoop() {
 		case <-s.ctx.Done():
 			s.mu.Lock()
 			s.currentSpeed = 0
+			s.currentUploadSpeed = 0
 			for _, pState := range s.Peers {
 				pState.DownloadSpeed = 0
 				pState.UploadSpeed = 0
@@ -1028,9 +1049,11 @@ func (s *Session) speedMonitorLoop() {
 }
 
 type trackerAnnounceResult struct {
-	peers    []tracker.Peer
-	interval int
-	err      error
+	peers      []tracker.Peer
+	interval   int
+	complete   int
+	incomplete int
+	err        error
 }
 
 func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, timeout time.Duration) trackerAnnounceResult {
@@ -1042,7 +1065,12 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		if err != nil {
 			return trackerAnnounceResult{err: err}
 		}
-		return trackerAnnounceResult{peers: resp.Peers, interval: resp.Interval}
+		return trackerAnnounceResult{
+			peers:      resp.Peers,
+			interval:   resp.Interval,
+			complete:   resp.Complete,
+			incomplete: resp.Incomplete,
+		}
 	}
 
 	if bytes.HasPrefix([]byte(tr), []byte("http")) {
@@ -1081,7 +1109,12 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 			return trackerAnnounceResult{err: err}
 		}
 
-		return trackerAnnounceResult{peers: trackerResp.Peers, interval: trackerResp.Interval}
+		return trackerAnnounceResult{
+			peers:      trackerResp.Peers,
+			interval:   trackerResp.Interval,
+			complete:   trackerResp.Complete,
+			incomplete: trackerResp.Incomplete,
+		}
 	}
 
 	return trackerAnnounceResult{err: fmt.Errorf("unsupported tracker scheme: %s", tr)}
@@ -1132,6 +1165,8 @@ func (s *Session) announceAndConnect() int {
 	var peers []tracker.Peer
 	var interval int
 	var trackerErr error
+	var trackerSeeders int
+	var trackerLeechers int
 
 	results := make(chan trackerAnnounceResult, len(trackers))
 	for _, tr := range trackers {
@@ -1157,6 +1192,8 @@ func (s *Session) announceAndConnect() int {
 		if result.interval > 0 && (interval == 0 || result.interval < interval) {
 			interval = result.interval
 		}
+		trackerSeeders = max(trackerSeeders, result.complete)
+		trackerLeechers = max(trackerLeechers, result.incomplete)
 		for _, p := range result.peers {
 			if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
 				continue
@@ -1172,6 +1209,10 @@ func (s *Session) announceAndConnect() int {
 
 	s.mu.Lock()
 	s.lastTrackerErr = trackerErr
+	if trackerSuccess {
+		s.trackerSeeders = trackerSeeders
+		s.trackerLeechers = trackerLeechers
+	}
 	if trackerErr != nil {
 		if event != "" {
 			s.trackerEvents = append([]string{event}, s.trackerEvents...)
@@ -1415,12 +1456,32 @@ func (s *Session) handleIncomingConnection(conn net.Conn) {
 		}
 	}
 
+	s.serveIncomingConnection(conn, nil)
+}
+
+// handleRoutedIncomingConnection serves a connection whose handshake was parsed
+// by the manager's shared listener. The manager already holds the global inbound
+// slot, so only the per-session budget is acquired here.
+func (s *Session) handleRoutedIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
+	if s.inboundSlots != nil {
+		select {
+		case s.inboundSlots <- struct{}{}:
+			defer func() { <-s.inboundSlots }()
+		default:
+			return
+		}
+	}
+	s.serveIncomingConnection(conn, handshake)
+}
+
+func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
 	tunePeerConn(conn)
 
 	s.mu.RLock()
 	paused := s.paused
+	closed := s.closed
 	s.mu.RUnlock()
-	if paused {
+	if paused || closed {
 		return
 	}
 
@@ -1442,9 +1503,12 @@ func (s *Session) handleIncomingConnection(conn net.Conn) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
-	handshake, err := peer.ParseHandshake(conn)
-	if err != nil {
-		return
+	if handshake == nil {
+		var err error
+		handshake, err = peer.ParseHandshake(conn)
+		if err != nil {
+			return
+		}
 	}
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
@@ -1457,8 +1521,7 @@ func (s *Session) handleIncomingConnection(conn net.Conn) {
 		PeerID:   s.PeerID,
 	}
 	respHs.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
-	_, err = conn.Write(respHs.Serialize())
-	if err != nil {
+	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}
 
@@ -1599,6 +1662,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.RLock()
 		bf := make([]byte, (numPieces+7)/8)
 		hasAny := false
+		isComplete := s.isCompletedLocked()
 		for i, state := range s.PieceStates {
 			if state == PieceCompleted {
 				bf[i/8] |= 1 << (7 - (i % 8))
@@ -1610,7 +1674,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if hasAny {
 			_ = client.SendBitfield(bf)
 		}
-		_ = client.SendInterested()
+		if isComplete {
+			_ = client.SendNotInterested()
+		} else {
+			_ = client.SendInterested()
+		}
 		initializedPeersAndBitfield = true
 	}
 
@@ -1769,6 +1837,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.RLock()
 			bf := make([]byte, (numPiecesNow+7)/8)
 			hasAny := false
+			isComplete := s.isCompletedLocked()
 			for i, state := range s.PieceStates {
 				if state == PieceCompleted {
 					bf[i/8] |= 1 << (7 - (i % 8))
@@ -1780,7 +1849,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if hasAny {
 				_ = client.SendBitfield(bf)
 			}
-			_ = client.SendInterested()
+			if isComplete {
+				_ = client.SendNotInterested()
+			} else {
+				_ = client.SendInterested()
+			}
 
 			peerBitfield = make([]byte, (numPiecesNow+7)/8)
 			initializedPeersAndBitfield = true
@@ -1943,7 +2016,20 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		case peer.MsgInterested:
 			s.mu.Lock()
 			pState.Interested = true
+			unchokedInterested := 0
+			for _, candidate := range s.Peers {
+				if candidate.Active && candidate.Interested && !candidate.AmChoking {
+					unchokedInterested++
+				}
+			}
+			shouldUnchoke := pState.AmChoking && unchokedInterested < 4
+			if shouldUnchoke {
+				pState.AmChoking = false
+			}
 			s.mu.Unlock()
+			if shouldUnchoke {
+				_ = client.SendUnchoke()
+			}
 
 		case peer.MsgNotInterested:
 			s.mu.Lock()
@@ -2104,11 +2190,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					buf := make([]byte, length)
 					_, err := s.Storage.ReadBlock(index, begin, buf)
 					if err == nil {
-						_ = client.SendPiece(uint32(index), uint32(begin), buf)
-						s.mu.Lock()
-						s.Uploaded += length
-						pState.Uploaded += length
-						s.mu.Unlock()
+						if err := client.SendPiece(uint32(index), uint32(begin), buf); err == nil {
+							s.mu.Lock()
+							s.Uploaded += length
+							pState.Uploaded += length
+							s.mu.Unlock()
+						}
 					}
 				}
 			}
@@ -2190,6 +2277,41 @@ func (s *Session) GetActivePeers() []PeerState {
 	return list
 }
 
+// UploadPeerStats summarizes whether connected peers currently want data from us.
+type UploadPeerStats struct {
+	Connected  int
+	Interested int
+	Unchoked   int
+}
+
+func (s *Session) GetUploadPeerStats() UploadPeerStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var stats UploadPeerStats
+	for _, p := range s.Peers {
+		if !p.Active {
+			continue
+		}
+		stats.Connected++
+		if p.Interested {
+			stats.Interested++
+			if !p.AmChoking {
+				stats.Unchoked++
+			}
+		}
+	}
+	return stats
+}
+
+// TrackerSwarmStats returns the largest seed/leecher counts from the latest
+// successful tracker announce cycle.
+func (s *Session) TrackerSwarmStats() (seeders, leechers int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.trackerSeeders, s.trackerLeechers
+}
+
 // GetPieceStates returns a copy of the current piece states.
 func (s *Session) GetPieceStates() []PieceState {
 	s.mu.RLock()
@@ -2241,8 +2363,39 @@ func (s *Session) CurrentSpeed() float64 {
 	return s.currentSpeed
 }
 
+// CurrentUploadSpeed returns the rolling 1-second upload speed in bytes/sec.
+func (s *Session) CurrentUploadSpeed() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentUploadSpeed
+}
+
 func (s *Session) hasInboundListenerLocked() bool {
-	return s.listener != nil && s.Port != 0
+	return (s.listener != nil || s.sharedInbound) && s.Port != 0
+}
+
+func (s *Session) setAdvertisedPort(port uint16) {
+	if port == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.Port == port {
+		s.mu.Unlock()
+		return
+	}
+	s.Port = port
+	started := s.started && !s.closed
+	if started {
+		s.queueTrackerEventLocked("started")
+	}
+	s.mu.Unlock()
+
+	if started {
+		select {
+		case s.resumeCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // sendPeerControlLocked queues a peer control message while s.mu is held.

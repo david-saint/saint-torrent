@@ -40,6 +40,23 @@ func TestGetSpaceActionHelp(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
+	defaults := parseCLIArgs(nil)
+	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.err != nil {
+		t.Fatalf("unexpected networking defaults: %+v", defaults)
+	}
+
+	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat"})
+	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.err != nil {
+		t.Fatalf("unexpected networking overrides: %+v", overrides)
+	}
+
+	invalid := parseCLIArgs([]string{"--port", "70000"})
+	if invalid.err == nil {
+		t.Fatal("expected invalid port error")
+	}
+}
+
 func TestGetIndicator(t *testing.T) {
 	tests := []struct {
 		isPaused    bool
@@ -72,7 +89,7 @@ func TestGetSpeedStr(t *testing.T) {
 		{isPaused: true, isCompleted: true, speed: 0, want: "stopped"},
 		{isPaused: false, isCompleted: false, speed: 0, want: "↓ 0 B/s"},
 		{isPaused: false, isCompleted: false, speed: 1024, want: "↓ 1.0 KB/s"},
-		{isPaused: false, isCompleted: true, speed: 50 * 1024, want: "↓ 50.0 KB/s"},
+		{isPaused: false, isCompleted: true, speed: 50 * 1024, want: "↑ 50.0 KB/s"},
 	}
 
 	for _, tt := range tests {
@@ -84,7 +101,12 @@ func TestGetSpeedStr(t *testing.T) {
 					tt.isPaused, tt.isCompleted, tt.speed, got, tt.want)
 			}
 		} else {
-			if !strings.Contains(got, "↓") || !strings.Contains(got, strings.TrimPrefix(tt.want, "↓ ")) {
+			direction := "↓"
+			if tt.isCompleted {
+				direction = "↑"
+			}
+			wantSpeed := strings.TrimSpace(strings.TrimPrefix(tt.want, direction))
+			if !strings.Contains(got, direction) || !strings.Contains(got, wantSpeed) {
 				t.Errorf("getSpeedStr(paused=%v, completed=%v, speed=%f) = %q; want containing %q",
 					tt.isPaused, tt.isCompleted, tt.speed, got, tt.want)
 			}

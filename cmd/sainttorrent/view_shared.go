@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,24 @@ const (
 	gutter        = 2
 	maxOuterWidth = 100
 )
+
+func peerPortStatus(manager *downloader.TorrentManager) string {
+	listenPort := manager.PeerListenPort()
+	if listenPort == 0 {
+		return "unavailable"
+	}
+	status := manager.NATStatus()
+	if status.TCPMapped {
+		if status.AdvertisedPort != 0 && status.AdvertisedPort != listenPort {
+			return fmt.Sprintf("%d→%d %s", listenPort, status.AdvertisedPort, status.Protocol)
+		}
+		return fmt.Sprintf("%d %s", listenPort, status.Protocol)
+	}
+	if status.Enabled && status.LastError == "" {
+		return fmt.Sprintf("%d mapping", listenPort)
+	}
+	return fmt.Sprintf("%d manual", listenPort)
+}
 
 func clamp(v, lo, hi int) int {
 	if v < lo {
@@ -122,32 +141,72 @@ func dividerLine(st styles, termWidth int) string {
 	return gutterStr(termWidth) + st.Hairline.Render(strings.Repeat("─", bodyWidth(termWidth)))
 }
 
-// renderHelp lays out [key] Label pairs, greedily packing them into rows no
-// wider than the body and wrapping to more rows as needed (gutter-prefixed).
+// helpColumns is the preferred number of footer columns; the layout drops to
+// fewer when the body is too narrow to fit them.
+const helpColumns = 2
+
+// renderHelp lays out [key] Label pairs in an aligned grid of up to helpColumns
+// columns (row-major), each row gutter-prefixed. Lines never overrun the body
+// width: the column count is chosen to fit, and clampLines is the final net.
 func renderHelp(items [][2]string, st styles, termWidth int) string {
 	g := gutterStr(termWidth)
 	bw := bodyWidth(termWidth)
+	if len(items) == 0 {
+		return ""
+	}
+
+	pieces := make([]string, len(items))
+	for i, it := range items {
+		pieces[i] = "[" + it[0] + "] " + it[1]
+	}
+
+	const gap = 2
+	// Pick the widest column count (<= helpColumns) whose grid fits the body.
+	cols := 1
+	for c := min(helpColumns, len(pieces)); c > 1; c-- {
+		if helpGridWidth(pieces, c, gap) <= bw {
+			cols = c
+			break
+		}
+	}
+
+	// Per-column maxima so cells align across rows (row-major fill).
+	colW := make([]int, cols)
+	for i, p := range pieces {
+		if c := i % cols; dispWidth(p) > colW[c] {
+			colW[c] = dispWidth(p)
+		}
+	}
 
 	var lines []string
-	var cur []string
-	curW := 0
-	for _, it := range items {
-		piece := "[" + it[0] + "] " + it[1]
-		w := dispWidth(piece)
-		if len(cur) > 0 && curW+2+w > bw {
-			lines = append(lines, g+strings.Join(cur, "  "))
-			cur, curW = nil, 0
+	for r := 0; r*cols < len(pieces); r++ {
+		var cells []string
+		for c := 0; c < cols && r*cols+c < len(pieces); c++ {
+			p := pieces[r*cols+c]
+			if c < cols-1 {
+				p = padTo(p, colW[c]) // align inner columns; trailing cell stays ragged
+			}
+			cells = append(cells, st.Help.Render(p))
 		}
-		if len(cur) > 0 {
-			curW += 2
-		}
-		cur = append(cur, st.Help.Render(piece))
-		curW += w
-	}
-	if len(cur) > 0 {
-		lines = append(lines, g+strings.Join(cur, "  "))
+		lines = append(lines, g+strings.Join(cells, strings.Repeat(" ", gap)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// helpGridWidth returns the worst-case display width of a row-major grid with the
+// given column count (sum of per-column maxima plus inter-column gaps).
+func helpGridWidth(pieces []string, cols, gap int) int {
+	colW := make([]int, cols)
+	for i, p := range pieces {
+		if c := i % cols; dispWidth(p) > colW[c] {
+			colW[c] = dispWidth(p)
+		}
+	}
+	total := gap * (cols - 1)
+	for _, w := range colW {
+		total += w
+	}
+	return total
 }
 
 // clampLines is the final safety net: it truncates every line of a rendered
@@ -168,6 +227,19 @@ func renderedLineCount(s string) int {
 		return 0
 	}
 	return len(strings.Split(s, "\n"))
+}
+
+// lineCount reports how many visible lines s occupies, treating a trailing
+// newline as terminating the last line rather than starting a new empty one.
+func lineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
 }
 
 func maxVerticalOffset(s string, height int) int {
@@ -207,13 +279,24 @@ func visibleSessionRange(total, selected, maxItems int) (start, end int) {
 	return start, end
 }
 
-func visibleSessionCapacity(height int, fixedView string, linesPerItem, total int) int {
+// dashboardCapacity reports how many session rows the list should render below
+// the prefix. When the terminal is tall enough it reserves the entire footer
+// (head + help) so the help block stays fully visible; when space is tight it
+// keeps the head and lets the help block clip from the bottom (via the height
+// clamp in View), giving the torrent list priority. It always returns at least 1
+// so the selected torrent stays on screen.
+func dashboardCapacity(height int, prefix, head, help string, linesPerItem, total int) int {
 	if total <= 0 || height <= 0 {
 		return total
 	}
-	available := height - renderedLineCount(fixedView)
-	capacity := available / max(1, linesPerItem)
-	return clamp(capacity, 1, total)
+	budget := height - lineCount(prefix)
+	available := budget - lineCount(head) - lineCount(help)
+	if available < linesPerItem {
+		// Not enough room for the full footer plus a row: drop the help block
+		// from the reservation and let it clip instead of squeezing the list.
+		available = budget - lineCount(head)
+	}
+	return clamp(available/max(1, linesPerItem), 1, total)
 }
 
 // statusLabelStyle maps a session status to its uppercase badge label and the

@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -528,16 +529,118 @@ func TestSessionUploadSpeedIsCalculated(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.Peers["127.0.0.1:1"] = &PeerState{Active: true, Uploaded: 2048}
+	sess.Uploaded = 2048
 	sess.mu.Unlock()
 
 	time.Sleep(1200 * time.Millisecond)
 	sess.mu.RLock()
-	got := sess.Peers["127.0.0.1:1"].UploadSpeed
+	peerSpeed := sess.Peers["127.0.0.1:1"].UploadSpeed
+	sessionSpeed := sess.currentUploadSpeed
 	sess.mu.RUnlock()
 	sess.Close()
 
-	if got <= 0 {
-		t.Fatalf("expected upload speed to be calculated, got %.2f", got)
+	if peerSpeed <= 0 {
+		t.Fatalf("expected peer upload speed to be calculated, got %.2f", peerSpeed)
+	}
+	if sessionSpeed <= 0 {
+		t.Fatalf("expected session upload speed to be calculated, got %.2f", sessionSpeed)
+	}
+}
+
+func TestSessionServesRequestedPieceAndCountsUpload(t *testing.T) {
+	data := []byte("seed block")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "seed.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"seed.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "seed.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	if err := st.WriteBlock(0, 0, data); err != nil {
+		t.Fatalf("failed to seed storage: %v", err)
+	}
+
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.mu.Unlock()
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6000", "127.0.0.1", 6000, [8]byte{})
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	bitfield, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read bitfield: %v", err)
+	}
+	if bitfield == nil || bitfield.ID != peer.MsgBitfield {
+		t.Fatalf("expected bitfield, got %#v", bitfield)
+	}
+	notInterested, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read not-interested message: %v", err)
+	}
+	if notInterested == nil || notInterested.ID != peer.MsgNotInterested {
+		t.Fatalf("expected not-interested message, got %#v", notInterested)
+	}
+
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgInterested}).Serialize()); err != nil {
+		t.Fatalf("failed to send interested message: %v", err)
+	}
+	unchoke, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read unchoke: %v", err)
+	}
+	if unchoke == nil || unchoke.ID != peer.MsgUnchoke {
+		t.Fatalf("expected unchoke, got %#v", unchoke)
+	}
+	stats := sess.GetUploadPeerStats()
+	if stats.Connected != 1 || stats.Interested != 1 || stats.Unchoked != 1 {
+		t.Fatalf("unexpected upload peer stats: %+v", stats)
+	}
+
+	requestPayload := make([]byte, 12)
+	binary.BigEndian.PutUint32(requestPayload[8:12], uint32(len(data)))
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgRequest, Payload: requestPayload}).Serialize()); err != nil {
+		t.Fatalf("failed to request piece: %v", err)
+	}
+	pieceMsg, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read piece: %v", err)
+	}
+	if pieceMsg == nil || pieceMsg.ID != peer.MsgPiece || !bytes.Equal(pieceMsg.Payload[8:], data) {
+		t.Fatalf("unexpected piece response: %#v", pieceMsg)
+	}
+	deadline := time.Now().Add(time.Second)
+	for sess.UploadedBytes() != int64(len(data)) {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d uploaded bytes, got %d", len(data), sess.UploadedBytes())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
 	}
 }
 

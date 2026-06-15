@@ -78,12 +78,7 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		// Fallback to random available port
-		addr, _ = net.ResolveUDPAddr("udp", "0.0.0.0:0")
-		conn, err = net.ListenUDP("udp", addr)
-		if err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,6 +123,18 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 	})
 
 	return d, nil
+}
+
+// Port returns the local UDP port used by the DHT listener.
+func (d *DHT) Port() uint16 {
+	if d == nil || d.conn == nil {
+		return 0
+	}
+	addr, ok := d.conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.Port <= 0 || addr.Port > 65535 {
+		return 0
+	}
+	return uint16(addr.Port)
 }
 
 func (d *DHT) goTracked(fn func()) {

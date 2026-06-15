@@ -1,6 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+
+	"sainttorrent/pkg/downloader"
+)
 
 func getSpaceActionHelp(isPaused, isCompleted bool) string {
 	if isCompleted {
@@ -32,5 +36,15 @@ func getSpeedStr(isPaused, isCompleted bool, speed float64) string {
 		}
 		return "paused"
 	}
+	if isCompleted {
+		return fmt.Sprintf("↑ %-6s", formatSpeed(speed))
+	}
 	return fmt.Sprintf("↓ %-6s", formatSpeed(speed))
+}
+
+func currentTransferSpeed(s *downloader.Session) float64 {
+	if s.IsCompleted() {
+		return s.CurrentUploadSpeed()
+	}
+	return s.CurrentSpeed()
 }

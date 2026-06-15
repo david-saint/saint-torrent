@@ -93,6 +93,7 @@ func perfReport(w io.Writer) {
 }
 
 const terminalWindowTitle = "saintTorrent"
+const defaultPeerPort = 51413
 
 type viewMode int
 
@@ -154,6 +155,9 @@ type cliOptions struct {
 	persist     bool
 	confirm     bool
 	theme       string
+	listenPort  int
+	natEnabled  bool
+	err         error
 	items       []string
 }
 
@@ -225,7 +229,7 @@ func (m *model) recordSpeeds() {
 		}
 		key := fmt.Sprintf("%x", s.Torrent.InfoHash)
 		live[key] = struct{}{}
-		ring := append(m.speedHistory[key], s.CurrentSpeed())
+		ring := append(m.speedHistory[key], currentTransferSpeed(s))
 		if len(ring) > speedHistoryLen {
 			ring = ring[len(ring)-speedHistoryLen:]
 		}
@@ -379,7 +383,7 @@ func (m model) Init() tea.Cmd {
 	for _, s := range m.sessions {
 		s.Start()
 	}
-	return tea.Batch(tickCmd(), textinput.Blink, tea.SetWindowTitle(terminalWindowTitle))
+	return tea.Batch(tickCmd(), animCmd(), textinput.Blink, tea.SetWindowTitle(terminalWindowTitle))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -906,6 +910,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recordSpeeds()
 		return m, tickCmd()
 
+	case animMsg:
+		// Pure re-render to advance time-based animations; no data refresh.
+		if m.quitting {
+			return m, nil
+		}
+		return m, animCmd()
+
 	case progress.FrameMsg:
 		progressModel, cmd := m.progress.Update(msg)
 		m.progress = progressModel.(progress.Model)
@@ -947,8 +958,13 @@ func (m model) View() string {
 
 	// Final safety net: never let any line exceed the width cap.
 	out = clampLines(out, outerWidth(m.width))
-	if m.viewMode == viewDetail {
+	switch m.viewMode {
+	case viewDetail:
 		out = verticalSlice(out, m.detailScroll, m.height)
+	case viewList:
+		// Keep the header + list (incl. the selected torrent) and let the help
+		// block clip from the bottom when the terminal is too short for all of it.
+		out = verticalSlice(out, 0, m.height)
 	}
 	return out
 }
@@ -1051,6 +1067,8 @@ func parseCLIArgs(args []string) cliOptions {
 		downloadDir: ".",
 		persist:     true,
 		confirm:     true,
+		listenPort:  defaultPeerPort,
+		natEnabled:  true,
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1075,6 +1093,20 @@ func parseCLIArgs(args []string) cliOptions {
 				opts.theme = args[i+1]
 				i++
 			}
+		case "-p", "--port":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires a port", args[i])
+				continue
+			}
+			port, err := strconv.Atoi(args[i+1])
+			i++
+			if err != nil || port < 0 || port > 65535 {
+				opts.err = fmt.Errorf("invalid peer port %q", args[i])
+				continue
+			}
+			opts.listenPort = port
+		case "--no-nat":
+			opts.natEnabled = false
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1367,6 +1399,10 @@ func main() {
 	}
 
 	opts := parseCLIArgs(os.Args[1:])
+	if opts.err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", opts.err)
+		os.Exit(2)
+	}
 	downloadDir := opts.downloadDir
 	configDir := opts.configDir
 	persist := opts.persist
@@ -1521,6 +1557,13 @@ func main() {
 
 	mgr := downloader.NewTorrentManager()
 	perfMarkf("manager")
+	if err := mgr.StartPeerListener(uint16(opts.listenPort)); err != nil {
+		fmt.Fprintf(os.Stderr, "Error starting peer listener on port %d: %v\n", opts.listenPort, err)
+		fmt.Fprintln(os.Stderr, "Choose another stable port with --port.")
+		mgr.Close()
+		os.Exit(1)
+	}
+	perfMarkf("peer-listener")
 
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Error removing stale socket file: %v\n", err)
@@ -1561,8 +1604,13 @@ func main() {
 		}
 	}()
 
-	if err := mgr.StartDHT(downloadDir, 6881); err != nil {
+	if err := mgr.StartDHT(downloadDir, int(mgr.PeerListenPort())); err != nil {
 		startupWarns = append(startupWarns, fmt.Sprintf("DHT unavailable: %v", err))
+	}
+	if opts.natEnabled {
+		if err := mgr.StartNATTraversal(mgr.PeerListenPort(), mgr.DHTListenPort()); err != nil {
+			startupWarns = append(startupWarns, fmt.Sprintf("NAT traversal unavailable: %v", err))
+		}
 	}
 	perfMarkf("dht")
 

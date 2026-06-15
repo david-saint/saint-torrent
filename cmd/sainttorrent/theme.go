@@ -31,6 +31,11 @@ type styles struct {
 	Dim, Faint, Muted, Primary, Emphasis, Bold lipgloss.Style
 	Accent, AccentBold, Track, Hairline        lipgloss.Style
 	PieceHave, PieceDownloading, PiecePending  lipgloss.Style
+
+	// AccentHex is the raw accent color. Animated shades (e.g. the pulsing
+	// download speed) derive dimmed variants from it, which a lipgloss.Style
+	// can't expose back as a hex string.
+	AccentHex string
 }
 
 // theme bundles a label, its filled style set, and the renderers for the two
@@ -85,6 +90,7 @@ func draculaStyles() styles {
 		PieceHave:        fg("#50fa7b"),
 		PieceDownloading: fg("#ffb86c"),
 		PiecePending:     fg("#6272a4"),
+		AccentHex:        "#50fa7b",
 	}
 }
 
@@ -140,6 +146,7 @@ func monoStyles() styles {
 		PieceHave:        fg(g5),
 		PieceDownloading: fg(acc),
 		PiecePending:     fg(g3),
+		AccentHex:        acc,
 	}
 }
 

@@ -81,6 +81,16 @@ Start the client and automatically queue a torrent or magnet link:
 ./sainttorrent -d /path/to/downloads my_awesome_file.torrent
 ```
 
+saintTorrent listens for inbound peers on TCP/UDP port `51413` by default.
+The port is stable across runs so it can be forwarded manually, and the client
+also attempts automatic UPnP IGD or NAT-PMP mapping:
+
+```bash
+./sainttorrent --port 51413
+./sainttorrent --no-nat          # keep the stable port, disable automatic mapping
+./sainttorrent --port 0          # explicitly request an ephemeral port
+```
+
 ### macOS Magnet Handler
 
 On macOS you can register saintTorrent as the default handler for `magnet:`
