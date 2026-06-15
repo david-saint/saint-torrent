@@ -21,7 +21,7 @@ import (
 
 const (
 	gutter        = 2
-	maxOuterWidth = 100
+	maxOuterWidth = 115 // +15% over the original 100-cell cap
 )
 
 func peerPortStatus(manager *downloader.TorrentManager) string {
@@ -344,15 +344,15 @@ func cardWidth(st lipgloss.Style, termWidth int) lipgloss.Style {
 
 // --- responsive list columns ---------------------------------------------
 //
-// The wide list shows ACT · NAME(flex) · SIZE · DONE · STATUS · SPEED. NAME
-// absorbs slack; explicit breakpoints progressively remove SPEED, SIZE, STATUS,
+// The wide list shows ACT · NAME(flex) · SIZE · DONE · ETA · STATUS · SPEED. NAME
+// absorbs slack; explicit breakpoints progressively remove ETA, SPEED, SIZE, STATUS,
 // and ACT. At ultra-narrow widths only NAME remains.
 
 type listLayout struct {
 	bodyW                           int
 	actW, nameW, sizeW, doneW       int
-	statusW, speedW                 int
-	showAct, showDone               bool
+	etaW, statusW, speedW           int
+	showAct, showDone, showEta      bool
 	showSize, showStatus, showSpeed bool
 	foldSpeed                       bool
 }
@@ -362,16 +362,21 @@ func listColumns(bw int) listLayout {
 		actW    = 3
 		sizeW   = 9
 		doneW   = 6
+		etaW    = 8
 		statusW = 11
 		speedW  = 11
 	)
 	l := listLayout{
-		bodyW: bw, actW: actW, sizeW: sizeW, doneW: doneW, statusW: statusW, speedW: speedW,
+		bodyW: bw, actW: actW, sizeW: sizeW, doneW: doneW, etaW: etaW, statusW: statusW, speedW: speedW,
 	}
 
-	// Breakpoints use body width (terminal width minus the leading gutter).
-	// They correspond to terminal widths 80, 68, and 52 respectively.
+	// Breakpoints use body width (terminal width minus the leading gutter). ETA only
+	// appears once everything else fits with NAME still comfortable; the lower tiers
+	// match the original 80/68/52-column terminal breakpoints.
 	switch {
+	case bw >= 90:
+		l.showAct, l.showDone, l.showEta = true, true, true
+		l.showSize, l.showStatus, l.showSpeed = true, true, true
 	case bw >= 78:
 		l.showAct, l.showDone = true, true
 		l.showSize, l.showStatus, l.showSpeed = true, true, true
@@ -399,6 +404,10 @@ func listColumns(bw int) listLayout {
 			width += doneW
 			count++
 		}
+		if l.showEta {
+			width += etaW
+			count++
+		}
 		if l.showStatus {
 			width += statusW
 			count++
@@ -417,6 +426,8 @@ func listColumns(bw int) listLayout {
 	// This loop is a defensive fallback for future width changes.
 	for l.nameW < 1 {
 		switch {
+		case l.showEta:
+			l.showEta = false
 		case l.showSpeed:
 			l.showSpeed = false
 		case l.showSize:

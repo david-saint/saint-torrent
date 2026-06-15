@@ -79,6 +79,9 @@ func dracHeaderRow(col listLayout) string {
 	if col.showDone {
 		b.WriteString(" " + padTo("DONE", col.doneW))
 	}
+	if col.showEta {
+		b.WriteString(" " + padTo("ETA", col.etaW))
+	}
 	if col.showStatus {
 		b.WriteString(" " + padTo("STATUS", col.statusW))
 	}
@@ -118,6 +121,9 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 		if col.showDone {
 			b.WriteString(" " + cell(pctStr, col.doneW))
 		}
+		if col.showEta {
+			b.WriteString(" " + cell(sessionETA(s), col.etaW))
+		}
 		if col.showStatus {
 			b.WriteString(" " + cell(statusLabel, col.statusW))
 		}
@@ -137,6 +143,9 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 	}
 	if col.showDone {
 		b.WriteString(" " + st.NormalRow.Render(cell(pctStr, col.doneW)))
+	}
+	if col.showEta {
+		b.WriteString(" " + st.NormalRow.Render(cell(sessionETA(s), col.etaW)))
 	}
 	if col.showStatus {
 		b.WriteString(" " + statusSt.Render(cell(statusLabel, col.statusW)))

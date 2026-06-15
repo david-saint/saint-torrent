@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"sainttorrent/pkg/downloader"
@@ -129,6 +128,9 @@ func monoHeaderRow(col listLayout) string {
 	if col.showDone {
 		b.WriteString(" " + padTo("DONE", col.doneW))
 	}
+	if col.showEta {
+		b.WriteString(" " + padTo("ETA", col.etaW))
+	}
 	if col.showStatus {
 		b.WriteString(" " + padTo("STATUS", col.statusW))
 	}
@@ -176,6 +178,9 @@ func monoRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 	}
 	if col.showDone {
 		b.WriteString(" " + st.Primary.Render(cell(pctStr, col.doneW)))
+	}
+	if col.showEta {
+		b.WriteString(" " + st.Muted.Render(cell(sessionETA(s), col.etaW)))
 	}
 	if col.showStatus {
 		b.WriteString(" " + statusSt.Render(cell(statusLabel, col.statusW)))
@@ -240,7 +245,7 @@ func renderDetailsMono(m *model) string {
 	seeders, leechers := s.TrackerSwarmStats()
 	stats := st.Dim.Render("SIZE") + " " + st.Primary.Render(formatBytes(s.TotalSize())) + "   " +
 		st.Dim.Render("STATUS") + " " + statusSt.Render(statusLabel) + "   " +
-		st.Dim.Render("ETA") + " " + st.Emphasis.Render(monoETA(s)) + "   " +
+		st.Dim.Render("ETA") + " " + st.Emphasis.Render(sessionETA(s)) + "   " +
 		st.Dim.Render("RATIO") + " " + st.Muted.Render(monoRatio(s))
 	sb.WriteString(g + stats + "\n")
 	line2 := st.Dim.Render("PEERS") + " " + st.Primary.Render(strconv.Itoa(len(active))+" connected") + "   " +
@@ -372,29 +377,4 @@ func monoRatio(s *downloader.Session) string {
 		return "—"
 	}
 	return fmt.Sprintf("%.2f", float64(s.UploadedBytes())/float64(downloaded))
-}
-
-func monoETA(s *downloader.Session) string {
-	if s.IsCompleted() {
-		return "—"
-	}
-	speed := s.CurrentSpeed()
-	if speed <= 0 {
-		return "—"
-	}
-	size := s.TotalSize()
-	downloaded := int64(s.PercentComplete() / 100.0 * float64(size))
-	remaining := size - downloaded
-	if remaining <= 0 {
-		return "—"
-	}
-	d := time.Duration(float64(remaining)/speed) * time.Second
-	switch {
-	case d >= time.Hour:
-		return fmt.Sprintf("~%dh %dm", int(d.Hours()), int(d.Minutes())%60)
-	case d >= time.Minute:
-		return fmt.Sprintf("~%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
-	default:
-		return fmt.Sprintf("~%ds", int(d.Seconds()))
-	}
 }
