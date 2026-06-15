@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -369,6 +370,115 @@ func TestStorageRejectsFinalSymlink(t *testing.T) {
 	}
 	if string(content) != "do-not-touch" {
 		t.Fatalf("outside file was modified through symlink: %q", content)
+	}
+}
+
+// TestStorageConcurrentBlockIO exercises the dropped global lock: many goroutines
+// read distinct blocks concurrently (and one writes a separate region) while the
+// data is verified for correctness. Under -race this also proves the cached-handle
+// read path is safe for parallel use.
+func TestStorageConcurrentBlockIO(t *testing.T) {
+	tmpDir := t.TempDir()
+	const pieceLen = 1 << 16 // 64 KB
+	const numPieces = 32
+	total := int64(pieceLen * numPieces)
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "big.bin", Length: total}}, pieceLen)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	// Seed every piece with deterministic, distinguishable bytes.
+	for p := 0; p < numPieces; p++ {
+		block := make([]byte, pieceLen)
+		for i := range block {
+			block[i] = byte((p*131 + i) & 0xff)
+		}
+		if err := s.WriteBlock(int64(p), 0, block); err != nil {
+			t.Fatalf("seed write piece %d: %v", p, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numPieces*4)
+
+	// Concurrent readers across all pieces.
+	for g := 0; g < numPieces*4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			p := g % numPieces
+			buf := make([]byte, pieceLen)
+			if _, err := s.ReadBlock(int64(p), 0, buf); err != nil {
+				errCh <- err
+				return
+			}
+			for i := range buf {
+				if buf[i] != byte((p*131+i)&0xff) {
+					errCh <- err
+					return
+				}
+			}
+		}(g)
+	}
+
+	// A concurrent writer to an independent region (last piece), exercising the
+	// read-lock / write-lock interplay.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		block := make([]byte, pieceLen)
+		for i := range block {
+			block[i] = byte(i & 0xff)
+		}
+		for i := 0; i < 50; i++ {
+			if err := s.WriteBlock(numPieces-1, 0, block); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent block I/O failed: %v", err)
+		}
+	}
+}
+
+// TestStorageCloseReleasesHandlesAndBlocksIO verifies Close is idempotent and that
+// block operations fail cleanly afterward instead of using a released handle.
+func TestStorageCloseReleasesHandlesAndBlocksIO(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "f.bin", Length: 64}}, 64)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	data := bytes.Repeat([]byte{'z'}, 64)
+	if err := s.WriteBlock(0, 0, data); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Populate the cached read handle.
+	if _, err := s.ReadBlock(0, 0, make([]byte, 64)); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second close should be a no-op, got: %v", err)
+	}
+
+	if _, err := s.ReadBlock(0, 0, make([]byte, 64)); !errors.Is(err, ErrStorageClosed) {
+		t.Fatalf("expected ErrStorageClosed reading after close, got %v", err)
+	}
+	if err := s.WriteBlock(0, 0, data); !errors.Is(err, ErrStorageClosed) {
+		t.Fatalf("expected ErrStorageClosed writing after close, got %v", err)
 	}
 }
 

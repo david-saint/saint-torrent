@@ -21,28 +21,79 @@ import (
 // has succeeded, but callers should re-verify completed pieces.
 var ErrFileRepaired = errors.New("storage file repaired")
 
+// ErrStorageClosed is returned by block operations after Close has released the
+// storage's cached file handles.
+var ErrStorageClosed = errors.New("storage is closed")
+
 // FileInfo represents a file in the torrent.
 type FileInfo struct {
 	Path   string // Relative path from the base directory
 	Length int64  // Size of the file in bytes
 }
 
+// fileLayout holds a file's byte range within the torrent plus a lazily-opened,
+// cached read handle. The absolute path is validated once at construction (see
+// NewStorage) so the hot read path never re-walks/EvalSymlinks the path.
 type fileLayout struct {
-	path        string
+	path        string // relative path (torrent-declared)
+	absPath     string // validated absolute path, resolved once at construction
 	length      int64
 	startOffset int64
 	endOffset   int64
+
+	// readHandle is an O_RDONLY handle opened on first read and reused for every
+	// subsequent block read of this file — eliminating the open/close syscall pair
+	// per 16 KB block on the seed path. Guarded by rmu. Invalidated when a write
+	// recreates/resizes the file so a stale handle to an orphaned inode is dropped.
+	rmu        sync.Mutex
+	readHandle *os.File
+}
+
+// reader returns the cached O_RDONLY handle, opening it on first use. Callers must
+// hold the Storage read lock so the handle cannot be closed underneath them.
+func (f *fileLayout) reader() (*os.File, error) {
+	f.rmu.Lock()
+	defer f.rmu.Unlock()
+	if f.readHandle != nil {
+		return f.readHandle, nil
+	}
+	h, err := openNoFollow(f.absPath, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	f.readHandle = h
+	return h, nil
+}
+
+// invalidateReader closes and drops the cached read handle. Called under the
+// Storage write lock (repair/close), so no concurrent reader is using it.
+func (f *fileLayout) invalidateReader() {
+	f.rmu.Lock()
+	if f.readHandle != nil {
+		_ = f.readHandle.Close()
+		f.readHandle = nil
+	}
+	f.rmu.Unlock()
 }
 
 // Storage manages the files on disk for a torrent and provides thread-safe
 // block read/write and piece verification.
+//
+// Concurrency model: mu is an RWMutex. Block reads (ReadBlock/VerifyPiece) take
+// the read lock and run concurrently — positional ReadAt on a cached handle is
+// safe for parallel use, so the seed path is no longer serialized through one
+// mutex. Writes, repair, fast-resume state, and Close take the write lock; they
+// are infrequent (per piece, not per block) and run on the background write pool,
+// so they never block peer goroutines.
 type Storage struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
+	resolver    *PathResolver
 	baseDir     string
-	files       []fileLayout
+	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
 	stateFileMt map[string]int64
+	closed      bool
 }
 
 // NewStorage creates the target directories and pre-allocates files to their
@@ -57,7 +108,14 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		return nil, fmt.Errorf("failed to create base directory: %w", err)
 	}
 
-	var layouts []fileLayout
+	// Resolve the base directory once; every per-file path is validated against
+	// this single canonical base instead of re-running EvalSymlinks per file.
+	resolver, err := NewPathResolver(baseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var layouts []*fileLayout
 	var currentOffset int64
 	seenPaths := make(map[string]bool)
 	stateFileMt := make(map[string]int64, len(files))
@@ -93,8 +151,16 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		}
 		seenPaths[lowerPath] = true
 
-		layout := fileLayout{
+		// Construct absolute path and verify containment / no symlinks. Validated
+		// here once and cached on the layout for the lifetime of the storage.
+		absPath, err := resolver.ResolveAndValidate(file.Path)
+		if err != nil {
+			return nil, err
+		}
+
+		layout := &fileLayout{
 			path:        file.Path,
+			absPath:     absPath,
 			length:      file.Length,
 			startOffset: currentOffset,
 			endOffset:   currentOffset + file.Length,
@@ -102,18 +168,15 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
 
-		// Construct absolute path and verify containment / no symlinks
-		absPath, err := ResolveAndValidatePath(baseDir, file.Path)
-		if err != nil {
-			return nil, err
-		}
-
 		parentDir := filepath.Dir(absPath)
 		if err := os.MkdirAll(parentDir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directories for file %s: %w", file.Path, err)
 		}
 
 		// Open/Create the file and set its size without following a final symlink.
+		// We do not retain this handle: read handles are cached lazily on first read
+		// (see fileLayout.reader) and writes open on demand, which keeps construction
+		// cheap and lets tests that swap a file for a FIFO still block on first access.
 		f, err := openNoFollow(absPath, os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open/create file %s: %w", file.Path, err)
@@ -142,7 +205,8 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 	}
 
 	return &Storage{
-		baseDir:     baseDir,
+		resolver:    resolver,
+		baseDir:     resolver.BaseDir(),
 		files:       layouts,
 		pieceLength: pieceLength,
 		totalSize:   currentOffset,
@@ -185,9 +249,6 @@ func (s *Storage) PieceLength(pieceIndex int64) int64 {
 // ReadBlock reads a block of data from the storage.
 // It returns the number of bytes read, or an error.
 func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if pieceIndex < 0 {
 		return 0, fmt.Errorf("negative piece index: %d", pieceIndex)
 	}
@@ -203,6 +264,14 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 		return 0, fmt.Errorf("block exceeds piece boundaries: pieceLen=%d, offset=%d, readLen=%d", pieceLen, offset, len(buf))
 	}
 
+	// Read lock only: positional ReadAt on the cached handles is concurrency-safe,
+	// so many block reads (the hot seed path) run in parallel without serializing.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrStorageClosed
+	}
+
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(buf))
 
@@ -216,17 +285,12 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
-			if err != nil {
-				return 0, err
-			}
-			f, err := openNoFollow(absPath, os.O_RDONLY, 0)
+			f, err := file.reader()
 			if err != nil {
 				return 0, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
 			}
 
 			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
-			f.Close()
 			if err != nil && err != io.EOF {
 				return 0, fmt.Errorf("read error on file %s: %w", file.path, err)
 			}
@@ -241,10 +305,6 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 
 // WriteBlock writes a block of data to the storage, spanning across files if necessary.
 func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	repaired := false
-
 	if pieceIndex < 0 {
 		return fmt.Errorf("negative piece index: %d", pieceIndex)
 	}
@@ -260,6 +320,16 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 		return fmt.Errorf("block exceeds piece boundaries: pieceLen=%d, offset=%d, writeLen=%d", pieceLen, offset, len(data))
 	}
 
+	// Writes take the exclusive lock. They happen once per completed piece (on the
+	// background write pool, never on a peer's read loop), so serializing them — and
+	// briefly excluding concurrent reads — does not throttle the per-block seed path.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrStorageClosed
+	}
+	repaired := false
+
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
 
@@ -273,10 +343,7 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
-			if err != nil {
-				return err
-			}
+			absPath := file.absPath
 			f, err := openNoFollow(absPath, os.O_WRONLY, 0644)
 			if os.IsNotExist(err) {
 				if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
@@ -285,6 +352,9 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 				f, err = openNoFollow(absPath, os.O_CREATE|os.O_RDWR, 0644)
 				if err == nil {
 					repaired = true
+					// The file was recreated as a fresh inode; any cached read handle
+					// now points at the orphaned old inode and must be dropped.
+					file.invalidateReader()
 				}
 			}
 			if err != nil {
@@ -299,6 +369,7 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 					return fmt.Errorf("failed to repair size for file %s: %w", file.path, err)
 				}
 				repaired = true
+				file.invalidateReader()
 			}
 
 			n, err := f.WriteAt(data[bufOffset:bufOffset+nBytes], fileOffset)
@@ -323,12 +394,15 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
 func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	pieceLen := s.PieceLength(pieceIndex)
 	if pieceLen == 0 {
 		return false, fmt.Errorf("invalid piece index: %d", pieceIndex)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return false, ErrStorageClosed
 	}
 
 	buf := make([]byte, pieceLen)
@@ -344,17 +418,12 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath, err := ResolveAndValidatePath(s.baseDir, file.path)
-			if err != nil {
-				return false, err
-			}
-			f, err := openNoFollow(absPath, os.O_RDONLY, 0)
+			f, err := file.reader()
 			if err != nil {
 				return false, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
 			}
 
 			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
-			f.Close()
 			if err != nil && err != io.EOF {
 				return false, fmt.Errorf("read error on file %s: %w", file.path, err)
 			}
@@ -368,9 +437,18 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 	return actualHash == expectedHash, nil
 }
 
-// Close closes the storage. For this implementation it does not maintain open file handles,
-// but it is provided to satisfy any lifecycle interface.
+// Close releases the storage's cached file handles. It is idempotent. After Close,
+// block operations return ErrStorageClosed.
 func (s *Storage) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	for _, file := range s.files {
+		file.invalidateReader()
+	}
 	return nil
 }
 
@@ -390,7 +468,7 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	statePath, err := ResolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
+	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {
 		return err
 	}
@@ -431,7 +509,7 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	statePath, err := ResolveAndValidatePath(s.baseDir, "."+infoHashHex+".state")
+	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {
 		return nil, err
 	}
@@ -459,11 +537,7 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file path mismatch at index %d", i)
 		}
 
-		absPath, err := ResolveAndValidatePath(s.baseDir, f.path)
-		if err != nil {
-			return nil, err
-		}
-		fi, err := os.Stat(absPath)
+		fi, err := os.Stat(f.absPath)
 		if err != nil {
 			return nil, fmt.Errorf("file stat error: %w", err)
 		}

@@ -140,8 +140,26 @@ type Session struct {
 	Downloaded  atomic.Int64
 	Uploaded    atomic.Int64
 	PieceStates []PieceState
-	Peers       map[string]*PeerState
-	activePeers map[string]*peer.Client // for sending Have messages
+	// neededPieces is the incrementally-maintained set of pieces that are still
+	// PieceEmpty and wanted (file priority != skip). The picker scans only this set
+	// instead of all pieces on every pick, so selection cost is O(remaining-needed)
+	// — which shrinks toward zero as the download completes — rather than O(total).
+	// It is a hint: the picker re-verifies state==PieceEmpty before claiming, so a
+	// stale entry (e.g. a test mutating PieceStates directly) is harmless. Guarded
+	// by s.mu like PieceStates.
+	neededPieces map[int]struct{}
+	Peers        map[string]*PeerState
+	activePeers  map[string]*peer.Client // for sending Have messages
+
+	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
+	// background worker pool that verifies the SHA-1, writes to storage, and persists
+	// fast-resume state — keeping that disk/CPU work off the peer read loop so the
+	// socket keeps draining and new requests keep flowing. Created lazily on the
+	// first completed piece; workers stop on ctx cancellation and are intentionally
+	// not tracked by s.wg (like background verification) so Close never blocks on a
+	// disk write wedged on slow I/O.
+	pieceWriteCh   chan pieceWriteJob
+	pieceWriteOnce sync.Once
 
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
@@ -215,6 +233,167 @@ type blockRequest struct {
 	received    bool
 	requestedAt time.Time
 	retries     int
+}
+
+// pieceWriteJob is a completed piece handed off to the async hash/write pool.
+type pieceWriteJob struct {
+	index int64
+	hash  [20]byte
+	data  []byte
+	// conn is the connection of the peer that supplied the piece. If the assembled
+	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
+	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
+	// disconnect-on-corruption.
+	conn net.Conn
+}
+
+// pieceWriteQueueDepth bounds how many completed-piece buffers can be queued for the
+// write pool. Each entry holds a full piece, so this caps the pool's memory; once
+// full, submitting applies backpressure to the peer goroutine, which is the intended
+// bound (a peer can't outrun the disk without limit).
+const pieceWriteQueueDepth = 8
+
+// ensurePieceWritePool lazily starts the background hash/write workers. Idempotent.
+func (s *Session) ensurePieceWritePool() {
+	s.pieceWriteOnce.Do(func() {
+		s.pieceWriteCh = make(chan pieceWriteJob, pieceWriteQueueDepth)
+		workers := runtime.GOMAXPROCS(0)
+		if workers < 1 {
+			workers = 1
+		}
+		for i := 0; i < workers; i++ {
+			go s.pieceWriteWorker()
+		}
+	})
+}
+
+func (s *Session) pieceWriteWorker() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case job := <-s.pieceWriteCh:
+			s.processCompletedPiece(job)
+		}
+	}
+}
+
+// processCompletedPiece verifies, writes, and records a completed piece off the peer
+// read loop. On a hash mismatch it returns the piece to the pool and disconnects the
+// feeding peer; on a storage repair it resets progress; otherwise it marks the piece
+// complete (which persists fast-resume state and advertises Have).
+func (s *Session) processCompletedPiece(job pieceWriteJob) {
+	// Drop the write if the session is shutting down: the piece will be re-fetched on
+	// the next run, and a late state persist must not resurrect a .state file a remove
+	// is deleting.
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		return
+	}
+
+	if sha1.Sum(job.data) != job.hash {
+		s.mu.Lock()
+		s.lastErr = fmt.Errorf("piece %d failed hash verification", job.index)
+		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
+			s.PieceStates[job.index] = PieceEmpty
+			s.addNeededLocked(int(job.index))
+		}
+		s.mu.Unlock()
+		if job.conn != nil {
+			_ = job.conn.Close()
+		}
+		return
+	}
+
+	err := s.Storage.WriteBlock(job.index, 0, job.data)
+	switch err {
+	case nil:
+		s.markPieceCompleted(job.index)
+	case storage.ErrFileRepaired:
+		s.mu.Lock()
+		s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
+		s.mu.Unlock()
+		s.resetProgressAfterStorageRepair(job.index)
+	case storage.ErrStorageClosed:
+		// Session is tearing down; nothing to record.
+		return
+	default:
+		s.mu.Lock()
+		s.lastErr = err
+		s.statusErr = err
+		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
+			s.PieceStates[job.index] = PieceEmpty
+			s.addNeededLocked(int(job.index))
+		}
+		s.mu.Unlock()
+	}
+}
+
+// recomputeNeededLocked rebuilds the needed-piece set from scratch. Used after bulk
+// state changes (resume load, metadata arrival, storage repair, priority changes).
+// Caller holds s.mu.
+func (s *Session) recomputeNeededLocked() {
+	if s.neededPieces == nil {
+		s.neededPieces = make(map[int]struct{}, len(s.PieceStates))
+	} else {
+		clear(s.neededPieces)
+	}
+	for i, state := range s.PieceStates {
+		if state == PieceEmpty && s.isPieceWanted(int64(i)) {
+			s.neededPieces[i] = struct{}{}
+		}
+	}
+}
+
+// addNeededLocked records a piece as needed when it (re)enters PieceEmpty, if wanted.
+// Caller holds s.mu.
+func (s *Session) addNeededLocked(idx int) {
+	if idx < 0 || idx >= len(s.PieceStates) {
+		return
+	}
+	if !s.isPieceWanted(int64(idx)) {
+		return
+	}
+	if s.neededPieces == nil {
+		s.neededPieces = make(map[int]struct{}, len(s.PieceStates))
+	}
+	s.neededPieces[idx] = struct{}{}
+}
+
+// removeNeededLocked drops a piece from the needed set when it leaves PieceEmpty.
+// Caller holds s.mu.
+func (s *Session) removeNeededLocked(idx int) {
+	delete(s.neededPieces, idx)
+}
+
+// selectNeededPieceLocked returns the index of the piece to fetch next: the
+// highest-priority, lowest-index PieceEmpty wanted piece for which hasPiece reports
+// the peer has it, or -1 if none. It scans only the incrementally-maintained needed
+// set (empty & wanted) rather than every piece, so cost is O(remaining-needed) —
+// shrinking toward zero as the download finishes — instead of O(total) per pick.
+// The set is a hint: entries that are no longer empty (e.g. completed out-of-band)
+// are pruned in-line, and membership is re-verified against PieceStates, so a stale
+// entry is never mis-selected. Caller holds s.mu.
+func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) int {
+	bestIdx := -1
+	bestPriority := PrioritySkip
+	for i := range s.neededPieces {
+		if i < 0 || i >= len(s.PieceStates) || s.PieceStates[i] != PieceEmpty {
+			delete(s.neededPieces, i)
+			continue
+		}
+		idx := int64(i)
+		if !hasPiece(idx) || !s.isPieceWanted(idx) {
+			continue
+		}
+		pri := s.piecePriority(idx)
+		if bestIdx == -1 || pri > bestPriority || (pri == bestPriority && i < bestIdx) {
+			bestIdx, bestPriority = i, pri
+		}
+	}
+	return bestIdx
 }
 
 // NewSession creates a new download session for a torrent.
@@ -299,6 +478,7 @@ func (s *Session) loadResumeState() {
 		// let the background pass scan for any already-present data on disk.
 		s.verifyFullScan = true
 	}
+	s.recomputeNeededLocked()
 	s.verifying = true
 	s.verifyDone = make(chan struct{})
 }
@@ -405,6 +585,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 			// already claimed the slot in the meantime.
 			if verifyErr == nil && ok && s.PieceStates[idx] == PieceEmpty {
 				s.PieceStates[idx] = PieceCompleted
+				s.removeNeededLocked(idx)
 				nowCompleted = true
 			}
 		} else if s.PieceStates[idx] == PieceUnverified {
@@ -412,7 +593,9 @@ func (s *Session) runVerification(ctx context.Context) bool {
 				s.PieceStates[idx] = PieceCompleted
 				nowCompleted = true
 			} else {
+				// Resume data was wrong: return the piece to the pool for re-download.
 				s.PieceStates[idx] = PieceEmpty
+				s.addNeededLocked(idx)
 			}
 		}
 		s.mu.Unlock()
@@ -700,9 +883,15 @@ func (s *Session) blocksInPiece(pieceIndex int64) int64 {
 func (s *Session) markPieceCompleted(index int64) {
 	s.mu.Lock()
 	s.PieceStates[index] = PieceCompleted
+	s.removeNeededLocked(int(index))
 	s.lastErr = nil
 	s.statusErr = nil
-	s.saveStateLocked()
+	// Skip the resume persist if the session is closing so a late piece write (the
+	// async pool is not awaited by Close) cannot recreate a .state file a remove is
+	// deleting — mirroring finishVerify.
+	if !s.closed {
+		s.saveStateLocked()
+	}
 
 	var completedNow bool
 	if !s.completedAnnounced && !s.metadataMode && s.Storage != nil {
@@ -732,9 +921,12 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 		s.PieceStates[i] = PieceEmpty
 	}
 	s.PieceStates[index] = PieceCompleted
+	s.recomputeNeededLocked()
 	s.lastErr = nil
 	s.statusErr = nil
-	s.saveStateLocked()
+	if !s.closed {
+		s.saveStateLocked()
+	}
 
 	var completedNow bool
 	if !s.completedAnnounced && !s.metadataMode && s.Storage != nil {
@@ -1767,6 +1959,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
 				s.PieceStates[dl.pieceIndex] == PieceDownloading {
 				s.PieceStates[dl.pieceIndex] = PieceEmpty
+				s.addNeededLocked(int(dl.pieceIndex))
 			}
 		}
 		s.mu.Unlock()
@@ -1786,31 +1979,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	// openNewPiece claims the highest-priority empty wanted piece this peer has and
 	// marks it PieceDownloading. Returns nil when the peer has nothing left for us.
-	// Single linear pass (no allocation or sort); ties break toward the lowest index.
 	openNewPiece := func() *activeDownload {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.paused || s.closed {
 			return nil
 		}
-		bestIdx := -1
-		bestPriority := PrioritySkip
-		for i, state := range s.PieceStates {
-			if state != PieceEmpty {
-				continue
-			}
-			idx := int64(i)
-			if !hasPiece(idx) || !s.isPieceWanted(idx) {
-				continue
-			}
-			if pri := s.piecePriority(idx); bestIdx == -1 || pri > bestPriority {
-				bestIdx, bestPriority = i, pri
-			}
-		}
+		bestIdx := s.selectNeededPieceLocked(hasPiece)
 		if bestIdx == -1 {
 			return nil
 		}
 		s.PieceStates[bestIdx] = PieceDownloading
+		s.removeNeededLocked(bestIdx)
 		numBlocks := s.blocksInPiece(int64(bestIdx))
 		return &activeDownload{
 			pieceIndex: int64(bestIdx),
@@ -2246,7 +2426,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				break // piece not complete yet; pump tops up at the loop bottom
 			}
 
-			// Piece complete: assemble, verify, and persist it.
+			// Piece complete: assemble the buffer and hand it to the async hash/write
+			// pool. The peer goroutine keeps draining the socket and requesting instead
+			// of stalling on sha1 + WriteBlock + the fast-resume persist. The pool
+			// verifies the hash, writes, persists state, and — on a hash failure —
+			// disconnects this peer (via its conn) and returns the piece to the pool.
 			pieceData := make([]byte, dl.length)
 			var offset int64
 			validPiece := true
@@ -2260,35 +2444,25 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				offset += int64(len(block))
 			}
 
-			disconnectPeer := false
-			if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
-				if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil || err == storage.ErrFileRepaired {
-					if err == storage.ErrFileRepaired {
-						s.mu.Lock()
-						s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
-						s.mu.Unlock()
-						s.resetProgressAfterStorageRepair(dl.pieceIndex)
-					} else {
-						s.markPieceCompleted(dl.pieceIndex)
-					}
-				} else {
-					s.mu.Lock()
-					s.lastErr = err
-					s.statusErr = err
-					s.PieceStates[dl.pieceIndex] = PieceEmpty
-					s.mu.Unlock()
-				}
-			} else {
-				// Do not immediately retry corrupt data from the same peer.
+			pieceIdx := dl.pieceIndex
+			pieceHash := dl.hash
+			removeDownload(dl.pieceIndex)
+
+			if !validPiece || offset != int64(len(pieceData)) {
+				// Assembly invariant violated (shouldn't happen): return to the pool.
 				s.mu.Lock()
-				s.lastErr = fmt.Errorf("piece %d failed hash verification", dl.pieceIndex)
-				s.PieceStates[dl.pieceIndex] = PieceEmpty
+				if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
+					s.PieceStates[pieceIdx] = PieceEmpty
+					s.addNeededLocked(int(pieceIdx))
+				}
 				s.mu.Unlock()
-				disconnectPeer = true
+				break
 			}
 
-			removeDownload(dl.pieceIndex)
-			if disconnectPeer {
+			s.ensurePieceWritePool()
+			select {
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, conn: conn}:
+			case <-s.ctx.Done():
 				return
 			}
 
@@ -2721,6 +2895,9 @@ func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 		if s.FilePriorities[fileIndex] != priority {
 			s.FilePriorities[fileIndex] = priority
 			changed = true
+			// Wanted-ness of the pieces overlapping this file may have flipped, so
+			// rebuild the needed set (rare, user-initiated — O(pieces) is fine here).
+			s.recomputeNeededLocked()
 		}
 	}
 	s.mu.Unlock()
