@@ -205,6 +205,11 @@ type addTorrentResponse struct {
 	err error
 }
 
+type deleteFinishedMsg struct {
+	infoHashHex string
+	err         error
+}
+
 type socketMessage struct {
 	Items       []string `json:"items"`
 	Confirm     bool     `json:"confirm"`
@@ -265,6 +270,7 @@ type model struct {
 	startupWarn      string
 	sessions         []*downloader.Session
 	deleteWithFiles  bool
+	deleteInProgress bool
 	deleteErr        error
 	addConfirmErr    error
 	deleteTargetName string
@@ -611,6 +617,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case viewDeleteConfirm:
+			if m.deleteInProgress {
+				return m, nil
+			}
 			switch msg.String() {
 			case "q", "ctrl+c":
 				m.quitting = true
@@ -636,11 +645,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.deleteTargetHash != "" {
-					err := m.manager.RemoveSession(m.deleteTargetHash, m.deleteWithFiles)
-					if err != nil {
-						m.deleteErr = err
-						m.refreshSessions()
-						return m, nil
+					infoHashHex := m.deleteTargetHash
+					deleteFiles := m.deleteWithFiles
+					m.deleteInProgress = true
+					return m, func() tea.Msg {
+						return deleteFinishedMsg{
+							infoHashHex: infoHashHex,
+							err:         m.manager.RemoveSession(infoHashHex, deleteFiles),
+						}
 					}
 				}
 				m.refreshSessions()
@@ -795,6 +807,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case msg.respChan <- addTorrentResponse{}:
 			default:
 			}
+		}
+		return m, nil
+
+	case deleteFinishedMsg:
+		if msg.infoHashHex != m.deleteTargetHash {
+			return m, nil
+		}
+		m.deleteInProgress = false
+		m.refreshSessions()
+		if msg.err != nil {
+			m.deleteErr = msg.err
+			m.viewMode = viewDeleteConfirm
+			return m, nil
+		}
+		m.viewMode = viewList
+		if m.pendingIdx < len(m.pendingItems) {
+			m.viewMode = viewAddConfirm
 		}
 		return m, nil
 
@@ -1513,6 +1542,19 @@ func (m model) viewAddConfirm() string {
 }
 
 func (m model) viewDeleteConfirm() string {
+	if m.deleteInProgress {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deleting:"), sanitizeText(m.deleteTargetName)))
+		status := "Stopping torrent and removing task state..."
+		if m.deleteWithFiles {
+			status = "Stopping torrent and deleting downloaded files..."
+		}
+		sb.WriteString(cardStyle.Render(status))
+		sb.WriteString("\n\n")
+		sb.WriteString(helpStyle.Render("  Deletion is running in the background") + "\n")
+		return sb.String()
+	}
+
 	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
 		if m.deleteErr != nil {
 			var sb strings.Builder

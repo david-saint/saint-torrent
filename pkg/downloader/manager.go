@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -172,7 +173,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 
 	var downloadDir string
 	var torrentFiles []torrent.File
-	var closeSession func()
+	var sessionToClose *Session
 
 	if ok {
 		sess.mu.RLock()
@@ -185,7 +186,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 			torrentFiles = sess.Torrent.Files
 		}
 		sess.mu.RUnlock()
-		closeSession = sess.Close
+		sessionToClose = sess
 	} else if failedRemoved {
 		downloadDir = failedEntry.DownloadDir
 	}
@@ -193,8 +194,11 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	var errs []error
 
 	// 1. Close session if active (this will block until all goroutines exit)
-	if closeSession != nil {
-		closeSession()
+	if sessionToClose != nil {
+		// Bound the best-effort stopped announce before Close so an unreachable
+		// tracker cannot add the session-level two-second timeout to deletion.
+		m.announceStoppedAll([]*Session{sessionToClose})
+		sessionToClose.Close()
 	}
 
 	// 2. Delete the fast-resume state file
@@ -226,9 +230,18 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		if downloadDir == "" {
 			errs = append(errs, fmt.Errorf("cannot delete files: download directory is empty"))
 		} else if len(torrentFiles) > 0 {
+			resolver, err := storage.NewPathResolver(downloadDir)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("failed to resolve download directory: %w", err))
+			}
+			dirsToRemove := make(map[string]struct{})
+
 			for _, f := range torrentFiles {
 				relPath := filepath.Join(f.Path...)
-				absPath, err := storage.ResolveAndValidatePath(downloadDir, relPath)
+				if resolver == nil {
+					continue
+				}
+				absPath, err := resolver.ResolveAndValidate(relPath)
 				if err != nil {
 					errs = append(errs, fmt.Errorf("safe path validation failed for %s: %w", relPath, err))
 					continue
@@ -238,36 +251,25 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 					errs = append(errs, fmt.Errorf("failed to delete file %s: %w", relPath, err))
 				}
 
-				// Clean up empty parent folders up to downloadDir
-				parent := filepath.Dir(absPath)
-				canonicalDownloadDir, err := filepath.EvalSymlinks(downloadDir)
-				if err != nil {
-					canonicalDownloadDir, err = filepath.Abs(downloadDir)
-					if err != nil {
-						canonicalDownloadDir = downloadDir
-					}
+				for parent := filepath.Dir(absPath); parent != resolver.BaseDir() && parent != "." && parent != "/"; parent = filepath.Dir(parent) {
+					dirsToRemove[parent] = struct{}{}
 				}
-				cleanDownloadDir := filepath.Clean(canonicalDownloadDir)
+			}
 
-				for parent != cleanDownloadDir && parent != "." && parent != "/" {
-					if err := os.Remove(parent); err != nil {
-						if pe, ok := err.(*os.PathError); ok {
-							if errno, ok := pe.Err.(syscall.Errno); ok {
-								// ENOTEMPTY (Unix) or 145 (Windows ERROR_DIR_NOT_EMPTY) is expected behavior for non-empty dirs.
-								if errno == syscall.ENOTEMPTY || errno == 145 {
-									break
-								}
-							}
-						}
-						if os.IsNotExist(err) {
-							parent = filepath.Dir(parent)
-							continue
-						}
-						// Aggregate other unexpected errors (like permission issues) and stop propagating
-						errs = append(errs, fmt.Errorf("failed to clean up empty directory %s: %w", parent, err))
-						break
+			dirs := make([]string, 0, len(dirsToRemove))
+			for dir := range dirsToRemove {
+				dirs = append(dirs, dir)
+			}
+			sort.Slice(dirs, func(i, j int) bool {
+				return strings.Count(dirs[i], string(filepath.Separator)) >
+					strings.Count(dirs[j], string(filepath.Separator))
+			})
+			for _, dir := range dirs {
+				if err := os.Remove(dir); err != nil {
+					if os.IsNotExist(err) || isDirectoryNotEmpty(err) {
+						continue
 					}
-					parent = filepath.Dir(parent)
+					errs = append(errs, fmt.Errorf("failed to clean up empty directory %s: %w", dir, err))
 				}
 			}
 		}
@@ -292,6 +294,15 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	}
 
 	return nil
+}
+
+func isDirectoryNotEmpty(err error) bool {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		return false
+	}
+	errno, ok := pathErr.Err.(syscall.Errno)
+	return ok && (errno == syscall.ENOTEMPTY || errno == 145)
 }
 
 // GetSession retrieves a session by its info hash hex string.

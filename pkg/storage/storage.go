@@ -479,26 +479,40 @@ func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
 	return state.CompletedPieces, nil
 }
 
-// ResolveAndValidatePath canonicalizes the base directory and validates the relative
-// path component by component to ensure it is contained and does not traverse any symlinks.
-func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
+// PathResolver validates many paths against one canonical base directory without
+// repeating the base-directory filesystem lookup for every path.
+type PathResolver struct {
+	canonicalBase string
+}
+
+// NewPathResolver canonicalizes baseDir for repeated path validation.
+func NewPathResolver(baseDir string) (*PathResolver, error) {
 	canonicalBase, err := filepath.EvalSymlinks(baseDir)
 	if err != nil {
 		canonicalBase, err = filepath.Abs(baseDir)
 		if err != nil {
-			return "", fmt.Errorf("failed to get absolute path of base directory: %w", err)
+			return nil, fmt.Errorf("failed to get absolute path of base directory: %w", err)
 		}
 	}
-	canonicalBase = filepath.Clean(canonicalBase)
+	return &PathResolver{canonicalBase: filepath.Clean(canonicalBase)}, nil
+}
 
-	absPath := filepath.Clean(filepath.Join(canonicalBase, relPath))
-	rel, err := filepath.Rel(canonicalBase, absPath)
+// BaseDir returns the canonical base directory used by the resolver.
+func (r *PathResolver) BaseDir() string {
+	return r.canonicalBase
+}
+
+// ResolveAndValidate validates relPath component by component to ensure it is
+// contained by the base directory and does not traverse any symlinks.
+func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
+	absPath := filepath.Clean(filepath.Join(r.canonicalBase, relPath))
+	rel, err := filepath.Rel(r.canonicalBase, absPath)
 	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", relPath)
 	}
 
 	// Verify that no component of the path is a symlink
-	current := canonicalBase
+	current := r.canonicalBase
 	components := strings.Split(rel, string(filepath.Separator))
 	for _, comp := range components {
 		if comp == "" || comp == "." || comp == ".." {
@@ -519,6 +533,16 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 	}
 
 	return absPath, nil
+}
+
+// ResolveAndValidatePath canonicalizes the base directory and validates the relative
+// path component by component to ensure it is contained and does not traverse any symlinks.
+func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
+	resolver, err := NewPathResolver(baseDir)
+	if err != nil {
+		return "", err
+	}
+	return resolver.ResolveAndValidate(relPath)
 }
 
 func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {

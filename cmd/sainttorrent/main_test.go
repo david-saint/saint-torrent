@@ -143,6 +143,57 @@ func TestDeleteViewFlow(t *testing.T) {
 	}
 }
 
+func TestDeleteConfirmationRunsInBackground(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+
+	const infoHashHex = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
+	_, err := mgr.AddMagnet("magnet:?xt=urn:btih:"+infoHashHex+"&dn=BackgroundDelete", t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to add session: %v", err)
+	}
+
+	m := initialModel(mgr, ".", "", nil)
+	m.viewMode = viewDetail
+
+	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = mUpdated.(model)
+	mUpdated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = mUpdated.(model)
+
+	if cmd == nil {
+		t.Fatal("expected deletion to return a background command")
+	}
+	if !m.deleteInProgress {
+		t.Fatal("expected deletion progress state immediately after confirmation")
+	}
+	if mgr.GetSession(infoHashHex) == nil {
+		t.Fatal("session was removed synchronously before the background command ran")
+	}
+	if view := m.View(); !strings.Contains(view, "Deletion is running in the background") {
+		t.Fatalf("expected deletion progress view, got:\n%s", view)
+	}
+	mUpdated, duplicateCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = mUpdated.(model)
+	if duplicateCmd != nil {
+		t.Fatal("expected repeated confirmation to be ignored while deletion is running")
+	}
+
+	msg := cmd()
+	mUpdated, _ = m.Update(msg)
+	m = mUpdated.(model)
+
+	if m.deleteInProgress {
+		t.Fatal("expected deletion progress state to clear after completion")
+	}
+	if m.viewMode != viewList {
+		t.Fatalf("expected list view after deletion, got %v", m.viewMode)
+	}
+	if mgr.GetSession(infoHashHex) != nil {
+		t.Fatal("expected session to be removed after background command completed")
+	}
+}
+
 func TestConfirmViewFlow(t *testing.T) {
 	mgr := downloader.NewTorrentManager()
 	defer mgr.Close()
