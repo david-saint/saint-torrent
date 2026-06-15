@@ -92,8 +92,9 @@ func addMockTorrents(t *testing.T, mgr *downloader.TorrentManager, count int) {
 
 func TestOuterBodyWidth(t *testing.T) {
 	cases := []struct{ term, wantOuter, wantBody int }{
-		{0, 100, 98},   // default before first resize
-		{200, 100, 98}, // capped
+		{0, 115, 113},   // default before first resize
+		{200, 115, 113}, // capped at the +15% ceiling
+		{115, 115, 113},
 		{100, 100, 98},
 		{80, 80, 78},
 		{50, 50, 48},
@@ -125,6 +126,9 @@ func TestListColumnsFit(t *testing.T) {
 		if l.showDone {
 			total += 1 + l.doneW
 		}
+		if l.showEta {
+			total += 1 + l.etaW
+		}
 		if l.showStatus {
 			total += 1 + l.statusW
 		}
@@ -136,24 +140,28 @@ func TestListColumnsFit(t *testing.T) {
 		}
 
 		switch {
+		case bw >= 90:
+			if !l.showAct || !l.showDone || !l.showEta || !l.showSize || !l.showStatus || !l.showSpeed || l.foldSpeed {
+				t.Fatalf("bw=%d unexpected ultrawide layout: %+v", bw, l)
+			}
 		case bw >= 78:
-			if !l.showAct || !l.showDone || !l.showSize || !l.showStatus || !l.showSpeed || l.foldSpeed {
+			if !l.showAct || !l.showDone || l.showEta || !l.showSize || !l.showStatus || !l.showSpeed || l.foldSpeed {
 				t.Fatalf("bw=%d unexpected wide layout: %+v", bw, l)
 			}
 		case bw >= 66:
-			if !l.showAct || !l.showDone || !l.showSize || !l.showStatus || l.showSpeed || !l.foldSpeed {
+			if !l.showAct || !l.showDone || l.showEta || !l.showSize || !l.showStatus || l.showSpeed || !l.foldSpeed {
 				t.Fatalf("bw=%d unexpected medium layout: %+v", bw, l)
 			}
 		case bw >= 50:
-			if !l.showAct || !l.showDone || l.showSize || !l.showStatus || l.showSpeed || l.foldSpeed {
+			if !l.showAct || !l.showDone || l.showEta || l.showSize || !l.showStatus || l.showSpeed || l.foldSpeed {
 				t.Fatalf("bw=%d unexpected compact layout: %+v", bw, l)
 			}
 		case bw >= 8:
-			if l.showAct || !l.showDone || l.showSize || l.showStatus || l.showSpeed || l.foldSpeed {
+			if l.showAct || !l.showDone || l.showEta || l.showSize || l.showStatus || l.showSpeed || l.foldSpeed {
 				t.Fatalf("bw=%d unexpected narrow layout: %+v", bw, l)
 			}
 		default:
-			if l.showAct || l.showDone || l.showSize || l.showStatus || l.showSpeed || l.foldSpeed {
+			if l.showAct || l.showDone || l.showEta || l.showSize || l.showStatus || l.showSpeed || l.foldSpeed {
 				t.Fatalf("bw=%d unexpected tiny layout: %+v", bw, l)
 			}
 		}
@@ -165,6 +173,26 @@ func TestListColumnsFit(t *testing.T) {
 
 // TestViewMaxLineWidth is the core invariant: across both themes, every view and
 // a wide range of terminal sizes, no rendered line may exceed outerWidth.
+// TestListETAColumnIsResponsive proves the ETA column appears in the list header at
+// wide widths (only reachable now that the cap is +15%) and folds away when narrow.
+func TestListETAColumnIsResponsive(t *testing.T) {
+	mgr, _ := newResponsiveTestManager(t)
+	for _, th := range themes {
+		m := initialModel(mgr, ".", "", nil)
+		m.theme = th
+
+		wide, _ := m.Update(tea.WindowSizeMsg{Width: 115, Height: 40})
+		if out := ansi.Strip(wide.View()); !strings.Contains(out, "ETA") {
+			t.Fatalf("theme=%s wide list (w=115) missing ETA column:\n%s", th.name, out)
+		}
+
+		narrow, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+		if out := ansi.Strip(narrow.View()); strings.Contains(out, "ETA") {
+			t.Fatalf("theme=%s narrow list (w=80) should not show the ETA column:\n%s", th.name, out)
+		}
+	}
+}
+
 func TestViewMaxLineWidth(t *testing.T) {
 	widths := []int{1, 2, 5, 10, 20, 30, 50, 68, 80, 100, 200}
 	modes := []viewMode{viewList, viewDetail, viewFiles, viewInput, viewAddConfirm, viewDeleteConfirm}

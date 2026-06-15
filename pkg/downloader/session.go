@@ -148,8 +148,13 @@ type Session struct {
 	// stale entry (e.g. a test mutating PieceStates directly) is harmless. Guarded
 	// by s.mu like PieceStates.
 	neededPieces map[int]struct{}
-	Peers        map[string]*PeerState
-	activePeers  map[string]*peer.Client // for sending Have messages
+	// pieceAvailability[i] counts how many currently-connected peers advertise piece
+	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
+	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length
+	// as PieceStates; guarded by s.mu.
+	pieceAvailability []int
+	Peers             map[string]*PeerState
+	activePeers       map[string]*peer.Client // for sending Have messages
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
 	// background worker pool that verifies the SHA-1, writes to storage, and persists
@@ -285,11 +290,14 @@ func (s *Session) pieceWriteWorker() {
 func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	// Drop the write if the session is shutting down: the piece will be re-fetched on
 	// the next run, and a late state persist must not resurrect a .state file a remove
-	// is deleting.
+	// is deleting. Also drop a piece already completed by another peer (#8 endgame
+	// produces redundant copies) so we don't re-write storage or re-announce Have.
 	s.mu.RLock()
 	closed := s.closed
+	alreadyDone := job.index >= 0 && job.index < int64(len(s.PieceStates)) &&
+		s.PieceStates[job.index] == PieceCompleted
 	s.mu.RUnlock()
-	if closed {
+	if closed || alreadyDone {
 		return
 	}
 
@@ -369,16 +377,18 @@ func (s *Session) removeNeededLocked(idx int) {
 }
 
 // selectNeededPieceLocked returns the index of the piece to fetch next: the
-// highest-priority, lowest-index PieceEmpty wanted piece for which hasPiece reports
-// the peer has it, or -1 if none. It scans only the incrementally-maintained needed
-// set (empty & wanted) rather than every piece, so cost is O(remaining-needed) —
-// shrinking toward zero as the download finishes — instead of O(total) per pick.
-// The set is a hint: entries that are no longer empty (e.g. completed out-of-band)
-// are pruned in-line, and membership is re-verified against PieceStates, so a stale
-// entry is never mis-selected. Caller holds s.mu.
+// highest-priority, then rarest (lowest swarm availability), then lowest-index
+// PieceEmpty wanted piece for which hasPiece reports the peer has it, or -1 if none.
+// It scans only the incrementally-maintained needed set (empty & wanted) rather than
+// every piece, so cost is O(remaining-needed) — shrinking toward zero as the download
+// finishes — instead of O(total) per pick. The set is a hint: entries that are no
+// longer empty (e.g. completed out-of-band) are pruned in-line, and membership is
+// re-verified against PieceStates, so a stale entry is never mis-selected. Caller
+// holds s.mu.
 func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) int {
 	bestIdx := -1
 	bestPriority := PrioritySkip
+	bestAvail := 0
 	for i := range s.neededPieces {
 		if i < 0 || i >= len(s.PieceStates) || s.PieceStates[i] != PieceEmpty {
 			delete(s.neededPieces, i)
@@ -389,8 +399,128 @@ func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) 
 			continue
 		}
 		pri := s.piecePriority(idx)
-		if bestIdx == -1 || pri > bestPriority || (pri == bestPriority && i < bestIdx) {
-			bestIdx, bestPriority = i, pri
+		avail := s.pieceAvailabilityAt(i)
+		if betterPick(bestIdx, i, bestPriority, pri, bestAvail, avail) {
+			bestIdx, bestPriority, bestAvail = i, pri, avail
+		}
+	}
+	return bestIdx
+}
+
+// betterPick reports whether candidate piece cand (priority cp, availability ca)
+// should beat the current best (priority bp, availability ba). Ordering: highest
+// priority, then rarest (lowest availability), then lowest index. best == -1 means
+// no candidate chosen yet.
+func betterPick(best, cand int, bp, cp FilePriority, ba, ca int) bool {
+	if best == -1 {
+		return true
+	}
+	if cp != bp {
+		return cp > bp
+	}
+	if ca != ba {
+		return ca < ba
+	}
+	return cand < best
+}
+
+// pieceAvailabilityAt returns how many connected peers advertise piece i (0 if out
+// of range). Caller holds s.mu.
+func (s *Session) pieceAvailabilityAt(i int) int {
+	if i >= 0 && i < len(s.pieceAvailability) {
+		return s.pieceAvailability[i]
+	}
+	return 0
+}
+
+// bitfieldHas reports whether bit i is set in a BitTorrent bitfield (MSB-first
+// within each byte).
+func bitfieldHas(bf []byte, i int) bool {
+	byteIdx := i / 8
+	if byteIdx < 0 || byteIdx >= len(bf) {
+		return false
+	}
+	return bf[byteIdx]&(1<<(7-uint(i%8))) != 0
+}
+
+// addPieceAvailability records that a peer now advertises piece idx (a Have).
+func (s *Session) addPieceAvailability(idx int) {
+	s.mu.Lock()
+	if idx >= 0 && idx < len(s.pieceAvailability) {
+		s.pieceAvailability[idx]++
+	}
+	s.mu.Unlock()
+}
+
+// applyBitfieldAvailability folds the delta between a peer's previous and new
+// advertised bitfield into the swarm availability counts. This handles a peer that
+// re-sends or extends its bitfield without double-counting.
+func (s *Session) applyBitfieldAvailability(oldBF, newBF []byte) {
+	s.mu.Lock()
+	for i := range s.pieceAvailability {
+		old := bitfieldHas(oldBF, i)
+		now := bitfieldHas(newBF, i)
+		switch {
+		case now && !old:
+			s.pieceAvailability[i]++
+		case old && !now && s.pieceAvailability[i] > 0:
+			s.pieceAvailability[i]--
+		}
+	}
+	s.mu.Unlock()
+}
+
+// removePeerAvailability drops a disconnecting peer's contribution to the counts,
+// using the bitfield it had accumulated (Haves set bits incrementally, so this is
+// the exact set it added). Caller does not hold s.mu.
+func (s *Session) removePeerAvailability(bf []byte) {
+	if bf == nil {
+		return
+	}
+	s.mu.Lock()
+	for i := range s.pieceAvailability {
+		if bitfieldHas(bf, i) && s.pieceAvailability[i] > 0 {
+			s.pieceAvailability[i]--
+		}
+	}
+	s.mu.Unlock()
+}
+
+// --- #8: endgame mode ---
+//
+// Endgame begins once every empty wanted piece has been claimed (the needed set is
+// empty) while pieces are still in flight. Past that point a peer with nothing fresh
+// to fetch would idle while the final pieces trickle in from the slowest peers, so we
+// let it redundantly fetch a piece another peer already holds open. The first copy to
+// complete wins; the losers cancel their outstanding block requests (see
+// dropCompletedElsewhere in the peer loop).
+
+// endgameActiveLocked reports whether the download has reached the completion tail:
+// no empty wanted pieces are left to hand out, so remaining wanted pieces (if any) are
+// all in flight. O(1). Caller holds s.mu.
+func (s *Session) endgameActiveLocked() bool {
+	return len(s.neededPieces) == 0
+}
+
+// selectEndgamePieceLocked picks the highest-priority, rarest, lowest-index in-progress
+// (PieceDownloading) wanted piece the peer has that it is not already downloading, or
+// -1. Used only in endgame to fetch a piece redundantly. Caller holds s.mu.
+func (s *Session) selectEndgamePieceLocked(hasPiece func(pieceIndex int64) bool, owned map[int64]bool) int {
+	bestIdx := -1
+	bestPriority := PrioritySkip
+	bestAvail := 0
+	for i, state := range s.PieceStates {
+		if state != PieceDownloading {
+			continue
+		}
+		idx := int64(i)
+		if owned[idx] || !hasPiece(idx) || !s.isPieceWanted(idx) {
+			continue
+		}
+		pri := s.piecePriority(idx)
+		avail := s.pieceAvailabilityAt(i)
+		if betterPick(bestIdx, i, bestPriority, pri, bestAvail, avail) {
+			bestIdx, bestPriority, bestAvail = i, pri, avail
 		}
 	}
 	return bestIdx
@@ -424,6 +554,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		StartTime:           time.Now(),
 		AddedAt:             time.Now(),
 		PieceStates:         states,
+		pieceAvailability:   make([]int, numPieces),
 		Peers:               make(map[string]*PeerState),
 		activePeers:         make(map[string]*peer.Client),
 		ctx:                 ctx,
@@ -1914,6 +2045,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if !inMeta {
 		peerBitfield = make([]byte, (numPieces+7)/8)
 	}
+	// Drop this peer's contribution to swarm piece availability on exit. peerBitfield
+	// accumulates exactly the pieces we counted (bitfield delta + Haves), so the
+	// closure reads its final value here. (#7, rarest-first.)
+	defer func() { s.removePeerAvailability(peerBitfield) }()
 
 	// A peer downloads several pieces at once (activeDownloads, filled in slice
 	// order so earlier pieces complete first). The request window spans all of
@@ -1929,6 +2064,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		blocksReceived int64
 		nextBlock      int64   // index of the next never-requested block (cursor)
 		retry          []int64 // begin offsets of timed-out requests awaiting re-send
+		// endgame is set when this is a redundant copy of a piece another peer already
+		// holds open (#8). The piece's PieceDownloading state is owned by that other
+		// peer, so this copy never returns the piece to the pool on release.
+		endgame bool
 	}
 	var activeDownloads []*activeDownload
 
@@ -1956,6 +2095,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		s.mu.Lock()
 		for _, dl := range dls {
+			if dl.endgame {
+				continue // redundant endgame copy; the owning peer holds the piece state
+			}
 			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
 				s.PieceStates[dl.pieceIndex] == PieceDownloading {
 				s.PieceStates[dl.pieceIndex] = PieceEmpty
@@ -1977,20 +2119,36 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return (peerBitfield[byteIndex] & (1 << (7 - bitIndex))) != 0
 	}
 
-	// openNewPiece claims the highest-priority empty wanted piece this peer has and
-	// marks it PieceDownloading. Returns nil when the peer has nothing left for us.
+	// openNewPiece claims the highest-priority, rarest empty wanted piece this peer has
+	// and marks it PieceDownloading. In endgame (no fresh pieces left to claim) it
+	// instead returns a redundant copy of an in-progress piece this peer has, leaving
+	// that piece's state owned by the original downloader. Returns nil when the peer
+	// has nothing left for us.
 	openNewPiece := func() *activeDownload {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.paused || s.closed {
 			return nil
 		}
+		endgame := false
 		bestIdx := s.selectNeededPieceLocked(hasPiece)
 		if bestIdx == -1 {
-			return nil
+			if s.endgameActiveLocked() {
+				owned := make(map[int64]bool, len(activeDownloads))
+				for _, dl := range activeDownloads {
+					owned[dl.pieceIndex] = true
+				}
+				bestIdx = s.selectEndgamePieceLocked(hasPiece, owned)
+				endgame = true
+			}
+			if bestIdx == -1 {
+				return nil
+			}
 		}
-		s.PieceStates[bestIdx] = PieceDownloading
-		s.removeNeededLocked(bestIdx)
+		if !endgame {
+			s.PieceStates[bestIdx] = PieceDownloading
+			s.removeNeededLocked(bestIdx)
+		}
 		numBlocks := s.blocksInPiece(int64(bestIdx))
 		return &activeDownload{
 			pieceIndex: int64(bestIdx),
@@ -1999,6 +2157,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			numBlocks:  numBlocks,
 			blocks:     make([][]byte, numBlocks),
 			pending:    make(map[int64]*blockRequest),
+			endgame:    endgame,
 		}
 	}
 
@@ -2121,6 +2280,38 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 			req.requestedAt = now
 			outstanding++
+		}
+	}
+
+	// dropCompletedElsewhere is the endgame "cancel on receipt" path: it drops any
+	// in-progress piece that another peer has finished (so its state is no longer
+	// PieceDownloading) and sends a Cancel for each of our still-outstanding blocks so
+	// the peer stops feeding us data the swarm no longer needs. Bounded by
+	// maxConcurrentPiecesPerPeer, so it is cheap to run every message.
+	dropCompletedElsewhere := func() {
+		if len(activeDownloads) == 0 {
+			return
+		}
+		var finished []int64
+		s.mu.RLock()
+		for _, dl := range activeDownloads {
+			if dl.pieceIndex < 0 || dl.pieceIndex >= int64(len(s.PieceStates)) ||
+				s.PieceStates[dl.pieceIndex] != PieceDownloading {
+				finished = append(finished, dl.pieceIndex)
+			}
+		}
+		s.mu.RUnlock()
+		for _, idx := range finished {
+			dl := findDownload(idx)
+			if dl == nil {
+				continue
+			}
+			for begin, req := range dl.pending {
+				if req.requested && !req.received {
+					_ = client.SendCancel(uint32(idx), uint32(begin), uint32(req.length))
+				}
+			}
+			removeDownload(idx)
 		}
 	}
 
@@ -2365,7 +2556,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				if byteIndex >= uint32(len(peerBitfield)) {
 					continue
 				}
-				peerBitfield[byteIndex] |= 1 << (7 - bitIndex)
+				mask := byte(1 << (7 - bitIndex))
+				if peerBitfield[byteIndex]&mask == 0 {
+					peerBitfield[byteIndex] |= mask
+					s.addPieceAvailability(int(index))
+				}
 			}
 
 		case peer.MsgBitfield:
@@ -2376,7 +2571,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if len(peerBitfield) != expectedLen {
 				peerBitfield = make([]byte, expectedLen)
 			}
+			oldBF := append([]byte(nil), peerBitfield...)
 			copy(peerBitfield, msg.Payload)
+			s.applyBitfieldAvailability(oldBF, peerBitfield)
 
 		case peer.MsgPiece:
 			if len(msg.Payload) < 8 {
@@ -2511,8 +2708,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 
-		// Keep the request pipeline full across all active pieces, opening new
-		// pieces as needed (pump no-ops when paused, choked, or seeding).
+		// Cancel and drop pieces another peer finished (endgame), then keep the
+		// request pipeline full across all active pieces, opening new pieces as
+		// needed (pump no-ops when paused, choked, or seeding).
+		dropCompletedElsewhere()
 		pump()
 	}
 
@@ -3157,6 +3356,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	for i := range s.PieceStates {
 		s.PieceStates[i] = PieceEmpty
 	}
+	s.pieceAvailability = make([]int, numPieces)
 
 	// Initialize storage now that we know the files
 	var fileInfos []storage.FileInfo
