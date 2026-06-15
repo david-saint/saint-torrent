@@ -18,3 +18,7 @@ out/
 *.torrent
 .dht_nodes
 .gemini_rules.md
+
+# Local TUI design explorations
+/design-proposals/
+/spikes/
