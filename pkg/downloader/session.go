@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sainttorrent/pkg/dht"
@@ -44,8 +45,21 @@ var verifyGate = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
 // BlockSize is the standard block length for BitTorrent transfers (16 KB).
 const BlockSize = 16384
 
-// Keep enough block requests in flight to saturate high-latency peers.
-const maxPendingBlockRequests = 128
+// maxPendingBlockRequests is the per-peer request window: the number of 16 KB
+// block requests we keep in flight to a single peer. Throughput per peer is
+// roughly window÷RTT, so this must cover the bandwidth-delay product of a fast,
+// high-latency peer (256 × 16 KB = 4 MB, e.g. ~50 MB/s at 80 ms RTT). Crucially,
+// the window now spans MULTIPLE pieces (see maxConcurrentPiecesPerPeer): it is no
+// longer capped by a single piece's block count, which previously throttled
+// small-piece torrents to one piece's worth of in-flight data.
+const maxPendingBlockRequests = 256
+
+// maxConcurrentPiecesPerPeer bounds how many pieces a single peer downloads at
+// once. It exists so small-piece torrents can still fill maxPendingBlockRequests
+// (a 256 KB piece is only 16 blocks, so one piece could never fill a 256-block
+// window). Because we open just enough pieces to fill the window, the in-flight
+// buffer memory stays ≈ window×16 KB per peer regardless of piece size.
+const maxConcurrentPiecesPerPeer = 16
 
 const blockRequestTimeout = 20 * time.Second
 const maxBlockRequestRetries = 2
@@ -88,11 +102,16 @@ type PeerState struct {
 	Interested    bool
 	DownloadSpeed float64 // Bytes per second
 	UploadSpeed   float64 // Bytes per second
-	Downloaded    int64
-	Uploaded      int64
-	Active        bool
-	AmChoking     bool
-	LastAttempt   time.Time
+	// Downloaded and Uploaded are cumulative byte counters bumped on the peer's
+	// hot path WITHOUT holding s.mu. They must be accessed only via sync/atomic
+	// (AddInt64/LoadInt64); never read or copy them with a plain struct copy.
+	// (Kept as plain int64 rather than atomic.Int64 so PeerState stays copyable
+	// for the snapshots GetActivePeers hands to the TUI.)
+	Downloaded  int64
+	Uploaded    int64
+	Active      bool
+	AmChoking   bool
+	LastAttempt time.Time
 }
 
 // FilePriority controls download ordering for files.
@@ -114,9 +133,12 @@ type Session struct {
 	StartTime time.Time
 	AddedAt   time.Time
 
-	mu          sync.RWMutex
-	Downloaded  int64
-	Uploaded    int64
+	mu sync.RWMutex
+	// Downloaded and Uploaded are cumulative session byte counters. They are
+	// updated on the peer hot path via atomics (no s.mu), so other accesses use
+	// the atomic methods too rather than taking the lock.
+	Downloaded  atomic.Int64
+	Uploaded    atomic.Int64
 	PieceStates []PieceState
 	Peers       map[string]*PeerState
 	activePeers map[string]*peer.Client // for sending Have messages
@@ -532,7 +554,7 @@ func (s *Session) DownloadSpeed() float64 {
 	if elapsed <= 0 {
 		return 0.0
 	}
-	return float64(s.Downloaded) / elapsed
+	return float64(s.Downloaded.Load()) / elapsed
 }
 
 type byteRange struct {
@@ -999,8 +1021,8 @@ func (s *Session) speedMonitorLoop() {
 			if s.paused {
 				s.currentSpeed = 0
 				s.currentUploadSpeed = 0
-				lastGlobalDownloaded = s.Downloaded
-				lastGlobalUploaded = s.Uploaded
+				lastGlobalDownloaded = s.Downloaded.Load()
+				lastGlobalUploaded = s.Uploaded.Load()
 				for _, pState := range s.Peers {
 					pState.DownloadSpeed = 0
 					pState.UploadSpeed = 0
@@ -1009,24 +1031,28 @@ func (s *Session) speedMonitorLoop() {
 				continue
 			}
 
-			globalDiff := s.Downloaded - lastGlobalDownloaded
+			curDownloaded := s.Downloaded.Load()
+			globalDiff := curDownloaded - lastGlobalDownloaded
 			s.currentSpeed = float64(globalDiff)
-			lastGlobalDownloaded = s.Downloaded
-			globalUploadDiff := s.Uploaded - lastGlobalUploaded
+			lastGlobalDownloaded = curDownloaded
+			curUploaded := s.Uploaded.Load()
+			globalUploadDiff := curUploaded - lastGlobalUploaded
 			s.currentUploadSpeed = float64(globalUploadDiff)
-			lastGlobalUploaded = s.Uploaded
+			lastGlobalUploaded = curUploaded
 
 			for addr, pState := range s.Peers {
 				if pState.Active {
+					peerDownloaded := atomic.LoadInt64(&pState.Downloaded)
 					lastVal := lastPeerDownloaded[addr]
-					peerDiff := pState.Downloaded - lastVal
+					peerDiff := peerDownloaded - lastVal
 					pState.DownloadSpeed = float64(peerDiff)
-					lastPeerDownloaded[addr] = pState.Downloaded
+					lastPeerDownloaded[addr] = peerDownloaded
 
+					peerUploaded := atomic.LoadInt64(&pState.Uploaded)
 					lastUploaded := lastPeerUploaded[addr]
-					uploadDiff := pState.Uploaded - lastUploaded
+					uploadDiff := peerUploaded - lastUploaded
 					pState.UploadSpeed = float64(uploadDiff)
-					lastPeerUploaded[addr] = pState.Uploaded
+					lastPeerUploaded[addr] = peerUploaded
 				} else {
 					delete(lastPeerDownloaded, addr)
 					delete(lastPeerUploaded, addr)
@@ -1151,7 +1177,7 @@ func (s *Session) announceAndConnect() int {
 		}
 	}
 	port := s.Port
-	uploaded := s.Uploaded
+	uploaded := s.Uploaded.Load()
 	infoHash := s.Torrent.InfoHash
 	peerID := s.PeerID
 	var event string
@@ -1697,15 +1723,54 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		peerBitfield = make([]byte, (numPieces+7)/8)
 	}
 
+	// A peer downloads several pieces at once (activeDownloads, filled in slice
+	// order so earlier pieces complete first). The request window spans all of
+	// them, so in-flight depth is bounded by maxPendingBlockRequests rather than
+	// by a single piece's block count — the key throughput fix for small pieces.
 	type activeDownload struct {
 		pieceIndex     int64
 		hash           [20]byte
 		length         int64
-		blocks         [][]byte                // actual block data, nil if not received
+		numBlocks      int64
+		blocks         [][]byte                // received block data, nil until received
 		pending        map[int64]*blockRequest // begin offset -> request
 		blocksReceived int64
+		nextBlock      int64   // index of the next never-requested block (cursor)
+		retry          []int64 // begin offsets of timed-out requests awaiting re-send
 	}
-	var currentDownload *activeDownload
+	var activeDownloads []*activeDownload
+
+	findDownload := func(index int64) *activeDownload {
+		for _, dl := range activeDownloads {
+			if dl.pieceIndex == index {
+				return dl
+			}
+		}
+		return nil
+	}
+	removeDownload := func(index int64) {
+		for i, dl := range activeDownloads {
+			if dl.pieceIndex == index {
+				activeDownloads = append(activeDownloads[:i], activeDownloads[i+1:]...)
+				return
+			}
+		}
+	}
+	// releaseDownloads returns still-in-progress pieces to PieceEmpty so other
+	// peers can re-pick them (used on choke and on disconnect).
+	releaseDownloads := func(dls []*activeDownload) {
+		if len(dls) == 0 {
+			return
+		}
+		s.mu.Lock()
+		for _, dl := range dls {
+			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
+				s.PieceStates[dl.pieceIndex] == PieceDownloading {
+				s.PieceStates[dl.pieceIndex] = PieceEmpty
+			}
+		}
+		s.mu.Unlock()
+	}
 
 	var peerUtMetadataID int = -1
 
@@ -1719,91 +1784,163 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return (peerBitfield[byteIndex] & (1 << (7 - bitIndex))) != 0
 	}
 
-	sendRequests := func() {
+	// openNewPiece claims the highest-priority empty wanted piece this peer has and
+	// marks it PieceDownloading. Returns nil when the peer has nothing left for us.
+	// Single linear pass (no allocation or sort); ties break toward the lowest index.
+	openNewPiece := func() *activeDownload {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.paused || s.closed {
+			return nil
+		}
+		bestIdx := -1
+		bestPriority := PrioritySkip
+		for i, state := range s.PieceStates {
+			if state != PieceEmpty {
+				continue
+			}
+			idx := int64(i)
+			if !hasPiece(idx) || !s.isPieceWanted(idx) {
+				continue
+			}
+			if pri := s.piecePriority(idx); bestIdx == -1 || pri > bestPriority {
+				bestIdx, bestPriority = i, pri
+			}
+		}
+		if bestIdx == -1 {
+			return nil
+		}
+		s.PieceStates[bestIdx] = PieceDownloading
+		numBlocks := s.blocksInPiece(int64(bestIdx))
+		return &activeDownload{
+			pieceIndex: int64(bestIdx),
+			hash:       s.Torrent.PieceHashes[bestIdx],
+			length:     s.Storage.PieceLength(int64(bestIdx)),
+			numBlocks:  numBlocks,
+			blocks:     make([][]byte, numBlocks),
+			pending:    make(map[int64]*blockRequest),
+		}
+	}
+
+	// nextBlockInPiece returns the begin offset of the next block to request from
+	// dl (re-sending timed-out blocks first, then advancing the fresh cursor),
+	// creating/arming its blockRequest, or -1 when the piece is fully requested.
+	nextBlockInPiece := func(dl *activeDownload, now time.Time) int64 {
+		for len(dl.retry) > 0 {
+			begin := dl.retry[len(dl.retry)-1]
+			dl.retry = dl.retry[:len(dl.retry)-1]
+			if req, ok := dl.pending[begin]; ok && !req.requested && !req.received {
+				req.requested = true
+				req.requestedAt = now
+				return begin
+			}
+		}
+		for dl.nextBlock < dl.numBlocks {
+			b := dl.nextBlock
+			dl.nextBlock++
+			begin := b * BlockSize
+			if _, exists := dl.pending[begin]; exists {
+				continue
+			}
+			blockLen := int64(BlockSize)
+			if begin+blockLen > dl.length {
+				blockLen = dl.length - begin
+			}
+			dl.pending[begin] = &blockRequest{
+				pieceIndex:  dl.pieceIndex,
+				begin:       begin,
+				length:      blockLen,
+				requested:   true,
+				requestedAt: now,
+			}
+			return begin
+		}
+		return -1
+	}
+	requestable := func(dl *activeDownload) bool {
+		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
+	}
+
+	// pump re-arms timed-out requests, then fills the request window across all
+	// active pieces, opening new pieces as needed. Called after each inbound
+	// message so the pipeline stays full across piece boundaries.
+	pump := func() {
 		s.mu.RLock()
 		paused := s.paused
 		choked := pState.Choked
 		s.mu.RUnlock()
-		if paused || currentDownload == nil || choked {
+		if paused || choked {
 			return
 		}
-		dl := currentDownload
+
 		now := time.Now()
-		numBlocks := s.blocksInPiece(dl.pieceIndex)
-		pendingCount := 0
-		for _, req := range dl.pending {
-			if req.requested && !req.received {
+
+		// Re-arm timed-out requests, or drop a peer that has stalled past its retry
+		// budget, and count what is still outstanding.
+		outstanding := 0
+		for _, dl := range activeDownloads {
+			for begin, req := range dl.pending {
+				if !req.requested || req.received {
+					continue
+				}
 				if now.Sub(req.requestedAt) >= blockRequestTimeout {
 					if req.retries >= maxBlockRequestRetries {
 						s.mu.Lock()
 						s.lastErr = fmt.Errorf("timed out downloading piece %d", dl.pieceIndex)
-						s.PieceStates[dl.pieceIndex] = PieceEmpty
 						s.mu.Unlock()
-						currentDownload = nil
-						_ = conn.Close()
+						_ = conn.Close() // pieces are released by the disconnect cleanup
 						return
 					}
 					req.requested = false
 					req.retries++
+					dl.retry = append(dl.retry, begin)
 					continue
 				}
-				pendingCount++
+				outstanding++
 			}
 		}
 
-		for pendingCount < maxPendingBlockRequests {
-			// Find next block to request
-			var nextBegin int64 = -1
-			for b := int64(0); b < numBlocks; b++ {
-				begin := b * BlockSize
-				req, exists := dl.pending[begin]
-				if !exists {
-					// New block — create request
-					blockLen := int64(BlockSize)
-					pieceLen := s.Storage.PieceLength(dl.pieceIndex)
-					if begin+blockLen > pieceLen {
-						blockLen = pieceLen - begin
-					}
-					dl.pending[begin] = &blockRequest{
-						pieceIndex:  dl.pieceIndex,
-						begin:       begin,
-						length:      blockLen,
-						requested:   true,
-						received:    false,
-						requestedAt: now,
-					}
-					nextBegin = begin
-					break
-				} else if !req.requested && !req.received {
-					req.requested = true
-					req.requestedAt = now
-					nextBegin = begin
+		// Fill the window, opening pieces on demand.
+		for outstanding < maxPendingBlockRequests {
+			var chosen *activeDownload
+			var begin int64 = -1
+			for _, dl := range activeDownloads {
+				if !requestable(dl) {
+					continue
+				}
+				if b := nextBlockInPiece(dl, now); b != -1 {
+					chosen, begin = dl, b
 					break
 				}
 			}
-
-			if nextBegin == -1 {
-				break // All blocks requested or received
+			if chosen == nil {
+				if len(activeDownloads) >= maxConcurrentPiecesPerPeer {
+					break
+				}
+				newDL := openNewPiece()
+				if newDL == nil {
+					break
+				}
+				activeDownloads = append(activeDownloads, newDL)
+				continue
 			}
 
-			req := dl.pending[nextBegin]
-			// Apply download rate limiting
+			req := chosen.pending[begin]
+			// Rate limiting (no lock held). An error means ctx is done — bail.
 			if err := s.DownloadLimiter.Wait(s.ctx, int(req.length)); err != nil {
-				break
+				return
 			}
 			if s.GlobalDownloadLimiter != nil {
 				if err := s.GlobalDownloadLimiter.Wait(s.ctx, int(req.length)); err != nil {
-					break
+					return
 				}
 			}
-
-			err := client.SendRequest(uint32(dl.pieceIndex), uint32(nextBegin), uint32(req.length))
-			if err != nil {
+			if err := client.SendRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
 				req.requested = false
-				break
+				return // dead connection; cleanup releases the pieces
 			}
 			req.requestedAt = now
-			pendingCount++
+			outstanding++
 		}
 	}
 
@@ -2001,12 +2138,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.Lock()
 			pState.Choked = true
 			s.mu.Unlock()
-			if currentDownload != nil {
-				s.mu.Lock()
-				s.PieceStates[currentDownload.pieceIndex] = PieceEmpty
-				s.mu.Unlock()
-				currentDownload = nil
-			}
+			// A choked peer won't fulfill our requests; return the in-progress
+			// pieces so other peers can grab them. We re-pick on unchoke.
+			releaseDownloads(activeDownloads)
+			activeDownloads = nil
 
 		case peer.MsgUnchoke:
 			s.mu.Lock()
@@ -2071,11 +2206,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			begin := int64(binary.BigEndian.Uint32(msg.Payload[4:8]))
 			blockData := msg.Payload[8:]
 
-			// P1 FIX: Validate against outstanding requests
-			if currentDownload == nil || currentDownload.pieceIndex != index {
-				continue // Not our current piece, discard
+			// Validate against our outstanding requests for this piece.
+			dl := findDownload(index)
+			if dl == nil {
+				continue // not a piece we're currently downloading; discard
 			}
-			dl := currentDownload
 
 			// Validate begin is block-aligned
 			if begin%BlockSize != 0 {
@@ -2095,64 +2230,66 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 			// Accept the block
 			blockIndex := begin / BlockSize
-			if blockIndex < int64(len(dl.blocks)) {
-				dl.blocks[blockIndex] = blockData
-				req.received = true
-				dl.blocksReceived++
+			if blockIndex >= int64(len(dl.blocks)) {
+				continue
+			}
+			dl.blocks[blockIndex] = blockData
+			req.received = true
+			dl.blocksReceived++
 
-				s.mu.Lock()
-				s.Downloaded += int64(len(blockData))
-				pState.Downloaded += int64(len(blockData))
-				s.mu.Unlock()
+			// Counters are bumped lock-free on this hot path; s.mu would
+			// otherwise be taken per 16 KB block by every peer goroutine.
+			s.Downloaded.Add(int64(len(blockData)))
+			atomic.AddInt64(&pState.Downloaded, int64(len(blockData)))
 
-				// Check if piece is complete
-				numBlocks := s.blocksInPiece(dl.pieceIndex)
-				if dl.blocksReceived == numBlocks {
-					pieceData := make([]byte, dl.length)
-					var offset int64
-					validPiece := true
-					for b := int64(0); b < numBlocks; b++ {
-						block := dl.blocks[b]
-						if block == nil || offset+int64(len(block)) > int64(len(pieceData)) {
-							validPiece = false
-							break
-						}
-						copy(pieceData[offset:], block)
-						offset += int64(len(block))
-					}
+			if dl.blocksReceived != dl.numBlocks {
+				break // piece not complete yet; pump tops up at the loop bottom
+			}
 
-					disconnectPeer := false
-					if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
-						if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil || err == storage.ErrFileRepaired {
-							if err == storage.ErrFileRepaired {
-								s.mu.Lock()
-								s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
-								s.mu.Unlock()
-								s.resetProgressAfterStorageRepair(dl.pieceIndex)
-							} else {
-								s.markPieceCompleted(dl.pieceIndex)
-							}
-						} else {
-							s.mu.Lock()
-							s.lastErr = err
-							s.statusErr = err
-							s.PieceStates[dl.pieceIndex] = PieceEmpty
-							s.mu.Unlock()
-						}
-					} else {
-						// Do not immediately retry corrupt data from the same peer.
-						s.mu.Lock()
-						s.lastErr = fmt.Errorf("piece %d failed hash verification", dl.pieceIndex)
-						s.PieceStates[dl.pieceIndex] = PieceEmpty
-						s.mu.Unlock()
-						disconnectPeer = true
-					}
-
-					currentDownload = nil
-					if disconnectPeer {
-						return
-					}
+			// Piece complete: assemble, verify, and persist it.
+			pieceData := make([]byte, dl.length)
+			var offset int64
+			validPiece := true
+			for b := int64(0); b < dl.numBlocks; b++ {
+				block := dl.blocks[b]
+				if block == nil || offset+int64(len(block)) > int64(len(pieceData)) {
+					validPiece = false
+					break
 				}
+				copy(pieceData[offset:], block)
+				offset += int64(len(block))
+			}
+
+			disconnectPeer := false
+			if validPiece && offset == int64(len(pieceData)) && sha1.Sum(pieceData) == dl.hash {
+				if err := s.Storage.WriteBlock(dl.pieceIndex, 0, pieceData); err == nil || err == storage.ErrFileRepaired {
+					if err == storage.ErrFileRepaired {
+						s.mu.Lock()
+						s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
+						s.mu.Unlock()
+						s.resetProgressAfterStorageRepair(dl.pieceIndex)
+					} else {
+						s.markPieceCompleted(dl.pieceIndex)
+					}
+				} else {
+					s.mu.Lock()
+					s.lastErr = err
+					s.statusErr = err
+					s.PieceStates[dl.pieceIndex] = PieceEmpty
+					s.mu.Unlock()
+				}
+			} else {
+				// Do not immediately retry corrupt data from the same peer.
+				s.mu.Lock()
+				s.lastErr = fmt.Errorf("piece %d failed hash verification", dl.pieceIndex)
+				s.PieceStates[dl.pieceIndex] = PieceEmpty
+				s.mu.Unlock()
+				disconnectPeer = true
+			}
+
+			removeDownload(dl.pieceIndex)
+			if disconnectPeer {
+				return
 			}
 
 		case peer.MsgRequest:
@@ -2191,76 +2328,23 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					_, err := s.Storage.ReadBlock(index, begin, buf)
 					if err == nil {
 						if err := client.SendPiece(uint32(index), uint32(begin), buf); err == nil {
-							s.mu.Lock()
-							s.Uploaded += length
-							pState.Uploaded += length
-							s.mu.Unlock()
+							// Lock-free counter update (see the download hot path above).
+							s.Uploaded.Add(length)
+							atomic.AddInt64(&pState.Uploaded, length)
 						}
 					}
 				}
 			}
 		}
 
-		// If unchoked and need work, pick next available piece that the peer has
-		s.mu.Lock()
-		paused = s.paused
-		choked := pState.Choked
-		s.mu.Unlock()
-
-		if !paused && !choked && currentDownload == nil {
-			// Find an empty piece that the peer has, respecting priority ordering
-			type candidate struct {
-				index    int
-				priority FilePriority
-			}
-			var candidates []candidate
-
-			s.mu.Lock()
-			for i, state := range s.PieceStates {
-				if state == PieceEmpty && hasPiece(int64(i)) && s.isPieceWanted(int64(i)) {
-					candidates = append(candidates, candidate{
-						index:    i,
-						priority: s.piecePriority(int64(i)),
-					})
-				}
-			}
-
-			// Sort by priority (highest first)
-			sort.Slice(candidates, func(a, b int) bool {
-				return candidates[a].priority > candidates[b].priority
-			})
-
-			if len(candidates) > 0 {
-				chosen := candidates[0].index
-				s.PieceStates[chosen] = PieceDownloading
-				s.mu.Unlock()
-
-				numBlocks := s.blocksInPiece(int64(chosen))
-				currentDownload = &activeDownload{
-					pieceIndex:     int64(chosen),
-					hash:           s.Torrent.PieceHashes[chosen],
-					length:         s.Storage.PieceLength(int64(chosen)),
-					blocks:         make([][]byte, numBlocks),
-					pending:        make(map[int64]*blockRequest),
-					blocksReceived: 0,
-				}
-			} else {
-				s.mu.Unlock()
-			}
-		}
-
-		// Send requests if we have an active piece download
-		if currentDownload != nil {
-			sendRequests()
-		}
+		// Keep the request pipeline full across all active pieces, opening new
+		// pieces as needed (pump no-ops when paused, choked, or seeding).
+		pump()
 	}
 
-	// If we disconnected while holding a piece, return it to empty
-	if currentDownload != nil {
-		s.mu.Lock()
-		s.PieceStates[currentDownload.pieceIndex] = PieceEmpty
-		s.mu.Unlock()
-	}
+	// If we disconnected while holding pieces, return them to empty so other
+	// peers can fetch them.
+	releaseDownloads(activeDownloads)
 }
 
 // GetActivePeers returns a slice of active peer states for TUI updates.
@@ -2271,7 +2355,24 @@ func (s *Session) GetActivePeers() []PeerState {
 	var list []PeerState
 	for _, p := range s.Peers {
 		if p.Active {
-			list = append(list, *p)
+			// Build the snapshot field-by-field rather than copying *p: the
+			// Downloaded/Uploaded counters are written lock-free on the peer hot
+			// path, so a whole-struct copy would race them (the copy reads those
+			// words non-atomically). Every other field is guarded by s.mu, held
+			// here; the two counters are loaded atomically.
+			list = append(list, PeerState{
+				IP:            p.IP,
+				Port:          p.Port,
+				Choked:        p.Choked,
+				Interested:    p.Interested,
+				DownloadSpeed: p.DownloadSpeed,
+				UploadSpeed:   p.UploadSpeed,
+				Downloaded:    atomic.LoadInt64(&p.Downloaded),
+				Uploaded:      atomic.LoadInt64(&p.Uploaded),
+				Active:        p.Active,
+				AmChoking:     p.AmChoking,
+				LastAttempt:   p.LastAttempt,
+			})
 		}
 	}
 	return list
@@ -2324,16 +2425,12 @@ func (s *Session) GetPieceStates() []PieceState {
 
 // DownloadedBytes returns the number of downloaded bytes.
 func (s *Session) DownloadedBytes() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.Downloaded
+	return s.Downloaded.Load()
 }
 
 // UploadedBytes returns the number of uploaded bytes.
 func (s *Session) UploadedBytes() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.Uploaded
+	return s.Uploaded.Load()
 }
 
 // IsPaused returns whether the session is currently paused.
@@ -3093,7 +3190,7 @@ func (s *Session) announceWithEvent(ctx context.Context, event string) bool {
 		}
 	}
 	port := s.Port
-	uploaded := s.Uploaded
+	uploaded := s.Uploaded.Load()
 	s.mu.RUnlock()
 
 	success := false
