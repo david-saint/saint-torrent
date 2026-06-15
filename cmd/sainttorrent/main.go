@@ -19,7 +19,6 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"sainttorrent/pkg/downloader"
 	"sainttorrent/pkg/torrent"
 )
@@ -95,87 +94,6 @@ func perfReport(w io.Writer) {
 
 const terminalWindowTitle = "saintTorrent"
 
-// Styles using Lipgloss
-var (
-	subtleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6272a4"))
-	infoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#50fa7b"))
-	warnStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffb86c"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff5555"))
-
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#f8f8f2")).
-			Background(lipgloss.Color("#bd93f9")).
-			Padding(0, 1).
-			MarginBottom(1)
-
-	headerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00f0ff")).
-			Bold(true)
-
-	cardStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#6272a4")).
-			Padding(1).
-			Width(68).
-			MarginBottom(1)
-
-	peersCardStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#bd93f9")).
-			Padding(1).
-			Width(68).
-			MarginBottom(1)
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#44475a")).
-			Italic(true)
-
-	statusPausedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#ffb86c")).
-				Bold(true)
-
-	statusDownloadingStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#50fa7b")).
-				Bold(true)
-
-	statusSeedingStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#bd93f9")).
-				Bold(true)
-
-	statusMetadataStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#ff79c6")).
-				Bold(true)
-
-	statusErrorStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#ff5555")).
-				Bold(true)
-
-	selectedRowStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#44475a")).
-				Foreground(lipgloss.Color("#50fa7b")).
-				Bold(true)
-
-	normalRowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#f8f8f2"))
-
-	badgeStyle = lipgloss.NewStyle().
-			Bold(true).
-			Padding(0, 1)
-
-	priorityNormalStyle = badgeStyle.Copy().
-				Background(lipgloss.Color("#6272a4")).
-				Foreground(lipgloss.Color("#f8f8f2"))
-
-	priorityHighStyle = badgeStyle.Copy().
-				Background(lipgloss.Color("#ff5555")).
-				Foreground(lipgloss.Color("#f8f8f2"))
-
-	prioritySkipStyle = badgeStyle.Copy().
-				Background(lipgloss.Color("#44475a")).
-				Foreground(lipgloss.Color("#6272a4"))
-)
-
 type viewMode int
 
 const (
@@ -235,6 +153,7 @@ type cliOptions struct {
 	configDir   string
 	persist     bool
 	confirm     bool
+	theme       string
 	items       []string
 }
 
@@ -264,6 +183,7 @@ type model struct {
 	inputMode        inputMode
 	selectedIdx      int
 	selectedFileIdx  int
+	detailScroll     int
 	quitting         bool
 	inputErr         string
 	flash            string
@@ -277,28 +197,123 @@ type model struct {
 	deleteTargetHash string
 	pendingItems     []pendingItem
 	pendingIdx       int
+
+	// UI/responsiveness + theming
+	width          int
+	height         int
+	theme          *theme
+	configDir      string
+	persistEnabled bool
+	// speedHistory is a UI-only per-torrent ring of recent download speeds
+	// (keyed by info-hash hex), used to draw the Mono throughput sparkline.
+	speedHistory map[string][]float64
+}
+
+// speedHistoryLen bounds the per-torrent speed ring (samples at the tick rate).
+const speedHistoryLen = 60
+
+// recordSpeeds appends the current download speed for each session to its ring
+// (bounded) and prunes rings for sessions that are gone.
+func (m *model) recordSpeeds() {
+	if m.speedHistory == nil {
+		m.speedHistory = make(map[string][]float64)
+	}
+	live := make(map[string]struct{}, len(m.sessions))
+	for _, s := range m.sessions {
+		if s.Torrent == nil {
+			continue
+		}
+		key := fmt.Sprintf("%x", s.Torrent.InfoHash)
+		live[key] = struct{}{}
+		ring := append(m.speedHistory[key], s.CurrentSpeed())
+		if len(ring) > speedHistoryLen {
+			ring = ring[len(ring)-speedHistoryLen:]
+		}
+		m.speedHistory[key] = ring
+	}
+	for key := range m.speedHistory {
+		if _, ok := live[key]; !ok {
+			delete(m.speedHistory, key)
+		}
+	}
+}
+
+// cycleTheme switches to the next theme, flashes the new name, and persists the
+// choice when persistence is enabled.
+func (m *model) cycleTheme() {
+	m.theme = nextTheme(m.theme)
+	m.flash = "Theme: " + m.theme.label
+	m.clampDetailScroll()
+	if m.persistEnabled {
+		if err := saveUIPrefs(m.configDir, m.theme.name); err != nil {
+			m.flash = "Theme: " + m.theme.label + " (not saved: " + err.Error() + ")"
+		}
+	}
+}
+
+func (m *model) detailMaxScroll() int {
+	if m.viewMode != viewDetail || m.height <= 0 {
+		return 0
+	}
+	rendered := clampLines(m.theme.renderDetails(m), outerWidth(m.width))
+	return maxVerticalOffset(rendered, m.height)
+}
+
+func (m *model) clampDetailScroll() {
+	m.detailScroll = clamp(m.detailScroll, 0, m.detailMaxScroll())
+}
+
+func (m *model) scrollDetails(delta int) {
+	m.detailScroll += delta
+	m.clampDetailScroll()
+}
+
+func (m *model) moveListSelection(delta int) {
+	if len(m.sessions) == 0 {
+		return
+	}
+	m.selectedIdx = clamp(m.selectedIdx+delta, 0, len(m.sessions)-1)
+}
+
+func (m *model) moveFileSelection(delta int) {
+	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		return
+	}
+	files := m.sessions[m.selectedIdx].Files()
+	if len(files) == 0 {
+		return
+	}
+	m.selectedFileIdx = clamp(m.selectedFileIdx+delta, 0, len(files)-1)
 }
 
 func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string, pending []pendingItem) model {
 	p := progress.New(progress.WithDefaultGradient())
 	ti := textinput.New()
-	ti.Width = 50
 
 	mode := viewList
 	if len(pending) > 0 {
 		mode = viewAddConfirm
 	}
 
+	// Default to a full-width layout until the first WindowSizeMsg arrives.
+	width := maxOuterWidth
+	p.Width = bodyWidth(width)
+	ti.Width = bodyWidth(width) - dispWidth(ti.Prompt)
+
 	return model{
-		manager:      mgr,
-		downloadDir:  downloadDir,
-		progress:     p,
-		textInput:    ti,
-		viewMode:     mode,
-		startupWarn:  startupWarn,
-		sessions:     mgr.ListSessions(),
-		pendingItems: pending,
-		pendingIdx:   0,
+		manager:        mgr,
+		downloadDir:    downloadDir,
+		progress:       p,
+		textInput:      ti,
+		viewMode:       mode,
+		startupWarn:    startupWarn,
+		sessions:       mgr.ListSessions(),
+		pendingItems:   pending,
+		pendingIdx:     0,
+		width:          width,
+		theme:          themeByName[defaultThemeName],
+		persistEnabled: false,
+		speedHistory:   make(map[string][]float64),
 	}
 }
 
@@ -469,12 +484,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "up", "k":
-				if m.selectedIdx > 0 {
-					m.selectedIdx--
-				}
+				m.moveListSelection(-1)
 			case "down", "j":
-				if m.selectedIdx < len(m.sessions)-1 {
-					m.selectedIdx++
+				m.moveListSelection(1)
+			case "pgup":
+				m.moveListSelection(-max(1, m.height/2))
+			case "pgdown":
+				m.moveListSelection(max(1, m.height/2))
+			case "home":
+				m.selectedIdx = 0
+			case "end":
+				if len(m.sessions) > 0 {
+					m.selectedIdx = len(m.sessions) - 1
 				}
 			case " ":
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
@@ -488,6 +509,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
 					m.viewMode = viewDetail
+					m.detailScroll = 0
 				}
 			case "a":
 				m.viewMode = viewInput
@@ -512,6 +534,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Placeholder = "Upload limit in KB/s (0 for unlimited)"
 			case "o":
 				m.openSelectedLocation()
+			case "t":
+				m.cycleTheme()
 			}
 
 		case viewDetail:
@@ -522,9 +546,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc":
 				m.viewMode = viewList
+				m.detailScroll = 0
 				if m.pendingIdx < len(m.pendingItems) {
 					m.viewMode = viewAddConfirm
 				}
+			case "up", "k":
+				m.scrollDetails(-1)
+			case "down", "j":
+				m.scrollDetails(1)
+			case "pgup":
+				m.scrollDetails(-max(1, m.height-1))
+			case "pgdown":
+				m.scrollDetails(max(1, m.height-1))
+			case "home":
+				m.detailScroll = 0
+			case "end":
+				m.detailScroll = m.detailMaxScroll()
 			case " ":
 				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
 					s := m.sessions[m.selectedIdx]
@@ -568,6 +605,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.deleteTargetName = ""
 					m.deleteTargetHash = ""
 				}
+			case "t":
+				m.cycleTheme()
 			}
 
 		case viewFiles:
@@ -589,13 +628,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.viewMode = viewDetail
 			case "up", "k":
-				if m.selectedFileIdx > 0 {
-					m.selectedFileIdx--
-				}
+				m.moveFileSelection(-1)
 			case "down", "j":
-				if m.selectedFileIdx < len(files)-1 {
-					m.selectedFileIdx++
-				}
+				m.moveFileSelection(1)
 			case " ", "p":
 				if len(files) > 0 && m.selectedFileIdx < len(files) {
 					priorities := s.GetFilePriorities()
@@ -730,6 +765,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseMsg:
+		const wheelStep = 3
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			switch m.viewMode {
+			case viewList:
+				m.moveListSelection(-wheelStep)
+			case viewDetail:
+				m.scrollDetails(-wheelStep)
+			case viewFiles:
+				m.moveFileSelection(-wheelStep)
+			}
+		case tea.MouseButtonWheelDown:
+			switch m.viewMode {
+			case viewList:
+				m.moveListSelection(wheelStep)
+			case viewDetail:
+				m.scrollDetails(wheelStep)
+			case viewFiles:
+				m.moveFileSelection(wheelStep)
+			}
+		}
+		return m, nil
+
 	case addTorrentMsg:
 		if !msg.msg.Confirm {
 			var addErr error
@@ -827,11 +886,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		inner := bodyWidth(m.width)
+		m.progress.Width = inner
+		m.textInput.Width = inner - dispWidth(m.textInput.Prompt)
+		if m.textInput.Width < 1 {
+			m.textInput.Width = 1
+		}
+		m.clampDetailScroll()
+		return m, nil
+
 	case tickMsg:
 		if m.quitting {
 			return m, nil
 		}
 		m.refreshSessions()
+		m.recordSpeeds()
 		return m, tickCmd()
 
 	case progress.FrameMsg:
@@ -848,310 +920,42 @@ func (m model) View() string {
 		return "\nShutting down saintTorrent client...\n"
 	}
 
-	var sb strings.Builder
-	sb.WriteString(titleStyle.Render(" saintTorrent CLI v0.2 "))
-	sb.WriteString("\n")
-
+	st := m.theme.styles
+	var out string
 	switch m.viewMode {
 	case viewList:
-		sb.WriteString(m.viewTorrentList())
+		// list/details own their full screen (incl. theme-specific banner).
+		out = m.theme.renderList(&m)
 	case viewDetail:
-		sb.WriteString(m.viewTorrentDetails())
-	case viewFiles:
-		sb.WriteString(m.viewFileExplorer())
-	case viewInput:
-		sb.WriteString(m.viewInputBox())
-	case viewDeleteConfirm:
-		sb.WriteString(m.viewDeleteConfirm())
-	case viewAddConfirm:
-		sb.WriteString(m.viewAddConfirm())
-	}
-
-	return sb.String()
-}
-
-func (m model) viewTorrentList() string {
-	var sb strings.Builder
-
-	if len(m.sessions) == 0 {
-		sb.WriteString("\n  No active torrents. Press 'a' to add a torrent or magnet link.\n\n")
-	} else {
-		sb.WriteString(fmt.Sprintf("  %-3s %-25s %-9s %-12s %-11s %-15s\n", "ACT", "NAME", "SIZE", "PROGRESS", "STATUS", "SPEED"))
-		sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 78)) + "\n")
-
-		for i, s := range m.sessions {
-			indicator := getIndicator(s.IsPaused(), s.IsCompleted())
-
-			name := sanitizeText(s.Name())
-			if len(name) > 23 {
-				name = name[:20] + "..."
-			}
-
-			sizeStr := formatBytes(s.TotalSize())
-			if s.IsMetadataMode() {
-				sizeStr = "unknown"
-			}
-
-			pct := s.PercentComplete()
-			pctStr := fmt.Sprintf("%.1f%%", pct)
-			if s.IsMetadataMode() {
-				pctStr = "0.0%"
-			}
-
-			status := s.Status()
-			var statusBadge string
-			switch status {
-			case "Paused":
-				statusBadge = statusPausedStyle.Render("PAUSED")
-			case "Stopped":
-				statusBadge = statusPausedStyle.Render("STOPPED")
-			case "Seeding":
-				statusBadge = statusSeedingStyle.Render("SEEDING")
-			case "Metadata":
-				statusBadge = statusMetadataStyle.Render("METADATA")
-			case "Error":
-				statusBadge = statusErrorStyle.Render("ERROR")
-			case "Checking":
-				statusBadge = statusMetadataStyle.Render("CHECKING")
-			default:
-				statusBadge = statusDownloadingStyle.Render("DOWNLOADING")
-			}
-
-			speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), s.CurrentSpeed())
-
-			rowContent := fmt.Sprintf("  %-3s %-25s %-9s %-12s %-11s %-15s",
-				indicator, name, sizeStr, pctStr, statusBadge, speedStr)
-
-			if i == m.selectedIdx {
-				sb.WriteString(selectedRowStyle.Render(rowContent) + "\n")
-			} else {
-				sb.WriteString(normalRowStyle.Render(rowContent) + "\n")
-			}
-		}
-		sb.WriteString("\n")
-	}
-	if m.startupWarn != "" {
-		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.startupWarn)) + "\n\n")
-	}
-
-	dhtNodes := 0
-	if d := m.manager.DHT(); d != nil {
-		dhtNodes = d.NodesCount()
-	}
-
-	var totalSpeed float64
-	for _, s := range m.sessions {
-		totalSpeed += s.CurrentSpeed()
-	}
-
-	downLimit := m.manager.GlobalDownloadLimit()
-	upLimit := m.manager.GlobalUploadLimit()
-
-	downLimitStr := "Unlimited"
-	if downLimit > 0 {
-		downLimitStr = formatSpeed(float64(downLimit))
-	}
-	upLimitStr := "Unlimited"
-	if upLimit > 0 {
-		upLimitStr = formatSpeed(float64(upLimit))
-	}
-
-	sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 78)) + "\n")
-	sb.WriteString(fmt.Sprintf(
-		"  DHT: %s nodes | Speed: %s/s | Limits: ↓ %s / ↑ %s\n\n",
-		infoStyle.Render(strconv.Itoa(dhtNodes)),
-		infoStyle.Render(formatSpeed(totalSpeed)),
-		warnStyle.Render(downLimitStr),
-		warnStyle.Render(upLimitStr),
-	))
-
-	spaceActionHelp := "Pause/Resume"
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
-		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
-	}
-	if m.flash != "" {
-		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.flash)) + "\n")
-	}
-	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [enter] Details | [space] %s | [o] Open Folder | [a] Add | [d] Down Limit | [u] Up Limit | [q] Quit", spaceActionHelp)) + "\n")
-	return sb.String()
-}
-
-func (m model) viewTorrentDetails() string {
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-		return ""
-	}
-	s := m.sessions[m.selectedIdx]
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Torrent Details:"), sanitizeText(s.Name())))
-
-	pct := s.PercentComplete() / 100.0
-	status := s.Status()
-
-	var statusBadge string
-	switch status {
-	case "Paused":
-		statusBadge = statusPausedStyle.Render("PAUSED")
-	case "Stopped":
-		statusBadge = statusPausedStyle.Render("STOPPED")
-	case "Seeding":
-		statusBadge = statusSeedingStyle.Render("SEEDING")
-	case "Metadata":
-		statusBadge = statusMetadataStyle.Render("METADATA")
-	case "Error":
-		statusBadge = statusErrorStyle.Render("ERROR")
-	case "Checking":
-		statusBadge = statusMetadataStyle.Render("CHECKING")
+		out = m.theme.renderDetails(&m)
 	default:
-		statusBadge = statusDownloadingStyle.Render("DOWNLOADING")
-	}
-
-	cardContent := fmt.Sprintf(
-		"%s: %s\n%s: %s\n%s: %.2f%%\n%s: %s\n\n%s",
-		headerStyle.Render("Hash"), fmt.Sprintf("%x", s.Torrent.InfoHash),
-		headerStyle.Render("Total Size"), formatBytes(s.TotalSize()),
-		headerStyle.Render("Complete"), pct*100,
-		headerStyle.Render("Status"), statusBadge,
-		m.progress.ViewAs(pct),
-	)
-	if err := s.LastError(); err != nil {
-		cardContent += "\n" + headerStyle.Render("Last Issue") + ": " + sanitizeText(err.Error())
-	}
-	sb.WriteString(cardStyle.Render(cardContent))
-	sb.WriteString("\n")
-
-	var peersContent strings.Builder
-	peersContent.WriteString(headerStyle.Render("Connected Peers:") + "\n")
-	peers := s.GetActivePeers()
-	if len(peers) == 0 {
-		if s.IsPaused() {
-			if s.IsCompleted() {
-				peersContent.WriteString(subtleStyle.Render("  Session is stopped.") + "\n")
-			} else {
-				peersContent.WriteString(subtleStyle.Render("  Session is paused.") + "\n")
-			}
-		} else {
-			peersContent.WriteString(subtleStyle.Render("  No connected peers. Searching via DHT/Tracker...") + "\n")
+		// secondary screens share a layout under a themed banner.
+		var sb strings.Builder
+		sb.WriteString(st.Title.Render(" saintTorrent CLI v0.2 ") + "\n")
+		switch m.viewMode {
+		case viewFiles:
+			sb.WriteString(m.viewFileExplorer())
+		case viewInput:
+			sb.WriteString(m.viewInputBox())
+		case viewDeleteConfirm:
+			sb.WriteString(m.viewDeleteConfirm())
+		case viewAddConfirm:
+			sb.WriteString(m.viewAddConfirm())
 		}
-	} else {
-		for _, p := range peers {
-			chokeStr := "Unchoked"
-			if p.Choked {
-				chokeStr = "Choked"
-			}
-			peersContent.WriteString(fmt.Sprintf(
-				"  - %s:%-5d | %-8s | Speed: %s/s\n",
-				p.IP, p.Port, chokeStr, formatSpeed(p.DownloadSpeed),
-			))
-		}
-	}
-	sb.WriteString(peersCardStyle.Render(peersContent.String()))
-	sb.WriteString("\n")
-
-	if !s.IsMetadataMode() {
-		sb.WriteString("  " + headerStyle.Render("Pieces Visual Map:") + "\n")
-		var pieceMapStr strings.Builder
-		pieceMapStr.WriteString("  ")
-		pieceMap := s.GetPieceStates()
-		for i, state := range pieceMap {
-			if i > 0 && i%30 == 0 {
-				pieceMapStr.WriteString("\n  ")
-			}
-			switch state {
-			case downloader.PieceCompleted:
-				pieceMapStr.WriteString(infoStyle.Render("█"))
-			case downloader.PieceDownloading:
-				pieceMapStr.WriteString(warnStyle.Render("░"))
-			default:
-				pieceMapStr.WriteString(subtleStyle.Render("."))
-			}
-		}
-		sb.WriteString(pieceMapStr.String())
-		sb.WriteString("\n\n")
+		out = sb.String()
 	}
 
-	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
-	if m.flash != "" {
-		sb.WriteString("  " + warnStyle.Render(sanitizeText(m.flash)) + "\n")
+	// Final safety net: never let any line exceed the width cap.
+	out = clampLines(out, outerWidth(m.width))
+	if m.viewMode == viewDetail {
+		out = verticalSlice(out, m.detailScroll, m.height)
 	}
-	sb.WriteString(helpStyle.Render(fmt.Sprintf("  [esc] Back | [space] %s | [f] Files | [o] Open Folder | [x] Delete Task | [X] Delete Task & Files | [q] Quit", spaceActionHelp)) + "\n")
-	return sb.String()
+	return out
 }
 
-func (m model) viewFileExplorer() string {
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-		return ""
-	}
-	s := m.sessions[m.selectedIdx]
-	files := s.Files()
-
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("File Explorer:"), sanitizeText(s.Name())))
-
-	if len(files) == 0 {
-		sb.WriteString("  No files in metadata.\n\n")
-	} else {
-		priorities := s.GetFilePriorities()
-		for i, f := range files {
-			prio := downloader.PriorityNormal
-			if i < len(priorities) {
-				prio = priorities[i]
-			}
-
-			var prioBadge string
-			switch prio {
-			case downloader.PriorityHigh:
-				prioBadge = priorityHighStyle.Render(" HIGH ")
-			case downloader.PrioritySkip:
-				prioBadge = prioritySkipStyle.Render(" SKIP ")
-			default:
-				prioBadge = priorityNormalStyle.Render("NORMAL")
-			}
-
-			path := sanitizeText(filepath.Join(f.Path...))
-			if len(path) > 40 {
-				path = "..." + path[len(path)-37:]
-			}
-
-			rowContent := fmt.Sprintf("  %-40s %-10s %s", path, formatBytes(f.Length), prioBadge)
-			if i == m.selectedFileIdx {
-				sb.WriteString(selectedRowStyle.Render(rowContent) + "\n")
-			} else {
-				sb.WriteString(normalRowStyle.Render(rowContent) + "\n")
-			}
-		}
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString(helpStyle.Render("  [esc] Back to Details | [space]/[p] Toggle Priority (Normal -> High -> Skip) | [q] Quit") + "\n")
-	return sb.String()
-}
-
-func (m model) viewInputBox() string {
-	var sb strings.Builder
-	var title string
-
-	switch m.inputMode {
-	case inputAddTorrent:
-		title = "Add Torrent / Magnet Link"
-	case inputLimitDownload:
-		title = "Set Global Download Limit (KB/s)"
-	case inputLimitUpload:
-		title = "Set Global Upload Limit (KB/s)"
-	}
-
-	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("  %s\n", headerStyle.Render(title)))
-	sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 60)) + "\n\n")
-	sb.WriteString("  " + m.textInput.View() + "\n\n")
-
-	if m.inputErr != "" {
-		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render(sanitizeText(m.inputErr))))
-	}
-
-	sb.WriteString(helpStyle.Render("  [enter] Confirm | [esc] Cancel") + "\n")
-	return sb.String()
+func newTUIProgram(m tea.Model, opts ...tea.ProgramOption) *tea.Program {
+	opts = append([]tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}, opts...)
+	return tea.NewProgram(m, opts...)
 }
 
 func formatBytes(b int64) string {
@@ -1266,6 +1070,11 @@ func parseCLIArgs(args []string) cliOptions {
 			opts.confirm = true
 		case "--no-confirm":
 			opts.confirm = false
+		case "--theme":
+			if i+1 < len(args) {
+				opts.theme = args[i+1]
+				i++
+			}
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1511,88 +1320,6 @@ func (m *model) resolveRemainingPending(err error) {
 			}
 		}
 	}
-}
-
-func (m model) viewAddConfirm() string {
-	if m.pendingIdx >= len(m.pendingItems) {
-		return ""
-	}
-	item := m.pendingItems[m.pendingIdx]
-
-	var sb strings.Builder
-	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("  %s\n", headerStyle.Render("Confirm Add Torrent")))
-	sb.WriteString(subtleStyle.Render("  "+strings.Repeat("─", 60)) + "\n\n")
-
-	if m.addConfirmErr != nil {
-		sb.WriteString(fmt.Sprintf("  %s: %s\n\n", errorStyle.Render("Error adding torrent"), sanitizeText(m.addConfirmErr.Error())))
-		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Dismiss and continue") + "\n")
-		return sb.String()
-	}
-
-	sb.WriteString(fmt.Sprintf("  %s: %s\n", headerStyle.Render("Torrent Name"), item.displayName))
-	sb.WriteString(fmt.Sprintf("  %s: %s\n\n", headerStyle.Render("Download Dir"), sanitizeText(item.downloadDir)))
-
-	if item.isDuplicate {
-		sb.WriteString(fmt.Sprintf("  %s\n\n", errorStyle.Render("Warning: This torrent is already in the download list. Confirming will resume it.")))
-	}
-
-	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Download | [n] No, Skip | [q] Quit") + "\n")
-	return sb.String()
-}
-
-func (m model) viewDeleteConfirm() string {
-	if m.deleteInProgress {
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deleting:"), sanitizeText(m.deleteTargetName)))
-		status := "Stopping torrent and removing task state..."
-		if m.deleteWithFiles {
-			status = "Stopping torrent and deleting downloaded files..."
-		}
-		sb.WriteString(cardStyle.Render(status))
-		sb.WriteString("\n\n")
-		sb.WriteString(helpStyle.Render("  Deletion is running in the background") + "\n")
-		return sb.String()
-	}
-
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-		if m.deleteErr != nil {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), sanitizeText(m.deleteTargetName)))
-			sb.WriteString(cardStyle.Render(errorStyle.Render(sanitizeText(m.deleteErr.Error()))))
-			sb.WriteString("\n\n")
-			sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
-			return sb.String()
-		}
-		return ""
-	}
-
-	var sb strings.Builder
-	if m.deleteErr != nil {
-		sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Deletion Failure:"), sanitizeText(m.deleteTargetName)))
-		sb.WriteString(cardStyle.Render(errorStyle.Render(sanitizeText(m.deleteErr.Error()))))
-		sb.WriteString("\n\n")
-		sb.WriteString(helpStyle.Render("  [esc]/[n]/[y] Back to Dashboard") + "\n")
-		return sb.String()
-	}
-
-	sb.WriteString(fmt.Sprintf("  %s %s\n\n", headerStyle.Render("Confirm Delete:"), sanitizeText(m.deleteTargetName)))
-
-	var warnMsg string
-	if m.deleteWithFiles {
-		warnMsg = errorStyle.Render("WARNING: This will permanently delete the task, state, and ALL downloaded files from disk!")
-	} else {
-		warnMsg = warnStyle.Render("This will delete the task state and fast-resume file, but keep downloaded files on disk.")
-	}
-
-	cardContent := fmt.Sprintf(
-		"Are you sure you want to delete this torrent?\n\n%s",
-		warnMsg,
-	)
-	sb.WriteString(cardStyle.Render(cardContent))
-	sb.WriteString("\n\n")
-	sb.WriteString(helpStyle.Render("  [y] Yes, Confirm Delete | [n]/[esc] Cancel") + "\n")
-	return sb.String()
 }
 
 func main() {
@@ -1857,6 +1584,9 @@ func main() {
 	}
 	perfMarkf("persistence")
 
+	// Theme: --theme flag overrides persisted preference overrides default.
+	selectedTheme := resolveInitialTheme(opts.theme, persist, configDir, &startupWarns)
+
 	var initialPending []pendingItem
 	for _, item := range filesToAdd {
 		name, hashHex, err := parseItem(item)
@@ -1885,7 +1615,13 @@ func main() {
 		startupWarn = strings.Join(startupWarns, "; ")
 	}
 
-	p := tea.NewProgram(initialModel(mgr, downloadDir, startupWarn, initialPending))
+	startModel := initialModel(mgr, downloadDir, startupWarn, initialPending)
+	startModel.theme = selectedTheme
+	startModel.configDir = configDir
+	startModel.persistEnabled = persist
+	// This is a full-screen TUI. The alternate screen prevents terminal
+	// scrollback reflow during resize from leaving stale copies of prior frames.
+	p := newTUIProgram(startModel)
 	perfMarkf("tui-build")
 
 	programMu.Lock()
