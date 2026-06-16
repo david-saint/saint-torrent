@@ -242,7 +242,7 @@ func renderDetailsMono(m *model) string {
 	statusLabel, statusSt := statusLabelStyle(st, s.Status())
 	upSpeed := s.CurrentUploadSpeed()
 	uploadPeers := s.GetUploadPeerStats()
-	seeders, leechers := s.TrackerSwarmStats()
+	seeders, leechers, completed := s.TrackerSwarmStats()
 	stats := st.Dim.Render("SIZE") + " " + st.Primary.Render(formatBytes(s.TotalSize())) + "   " +
 		st.Dim.Render("STATUS") + " " + statusSt.Render(statusLabel) + "   " +
 		st.Dim.Render("ETA") + " " + st.Emphasis.Render(sessionETA(s)) + "   " +
@@ -255,7 +255,7 @@ func renderDetailsMono(m *model) string {
 	sb.WriteString(g + st.Dim.Render("UPLOAD") + " " +
 		st.Muted.Render(fmt.Sprintf("%d interested / %d slots", uploadPeers.Interested, uploadPeers.Unchoked)) + "   " +
 		st.Dim.Render("SWARM") + " " +
-		st.Muted.Render(fmt.Sprintf("%d seeds / %d leechers", seeders, leechers)) + "\n")
+		st.Muted.Render(fmt.Sprintf("%d seeds / %d leechers / %d completed", seeders, leechers, completed)) + "\n")
 	sb.WriteString(g + st.Dim.Render("PORT") + " " + st.Muted.Render(peerPortStatus(m.manager)) + "\n\n")
 
 	pct := s.PercentComplete()

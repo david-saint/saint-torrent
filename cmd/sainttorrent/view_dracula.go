@@ -207,7 +207,7 @@ func renderDetailsDracula(m *model) string {
 	m.progress.Width = inner
 	card := cardWidth(st.Card, m.width)
 	uploadPeers := s.GetUploadPeerStats()
-	seeders, leechers := s.TrackerSwarmStats()
+	seeders, leechers, completed := s.TrackerSwarmStats()
 
 	cardContent := st.Header.Render("Hash") + ": " + fmt.Sprintf("%x", s.Torrent.InfoHash) + "\n" +
 		st.Header.Render("Total Size") + ": " + formatBytes(s.TotalSize()) + "\n" +
@@ -218,7 +218,7 @@ func renderDetailsDracula(m *model) string {
 		st.Header.Render("Upload Demand") + ": " +
 		fmt.Sprintf("%d interested / %d slots", uploadPeers.Interested, uploadPeers.Unchoked) + "\n" +
 		st.Header.Render("Tracker Swarm") + ": " +
-		fmt.Sprintf("%d seeds / %d leechers", seeders, leechers) + "\n" +
+		fmt.Sprintf("%d seeds / %d leechers / %d completed", seeders, leechers, completed) + "\n" +
 		st.Header.Render("Peer Port") + ": " + peerPortStatus(m.manager) + "\n\n" +
 		m.progress.ViewAs(pct)
 	if err := s.LastError(); err != nil {

@@ -2,9 +2,12 @@
 package tracker
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -214,4 +217,177 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 		Complete:    complete,
 		Incomplete:  incomplete,
 	}, nil
+}
+
+// ScrapeStats holds the swarm-health counts reported by a tracker scrape for a
+// single info hash (BEP 48 "files" entry / BEP 15 scrape response triple).
+type ScrapeStats struct {
+	// Complete is the number of seeders (peers with the complete file).
+	Complete int
+	// Downloaded is the number of times the torrent has been downloaded to
+	// completion, as reported by the tracker.
+	Downloaded int
+	// Incomplete is the number of leechers (peers still downloading).
+	Incomplete int
+}
+
+// maxScrapeResponse caps how many bytes of an HTTP scrape response we buffer. A
+// scrape reply is a small bencoded dictionary; this ceiling stops a malicious or
+// MITM'd tracker from streaming unbounded data into memory.
+const maxScrapeResponse = 1 * 1024 * 1024
+
+// ScrapeURL derives the scrape URL from an announce URL using the BEP 48
+// convention: the final path segment must begin with "announce", and that
+// "announce" prefix is replaced with "scrape" (e.g. "/announce" -> "/scrape",
+// "/x/announce.php" -> "/x/scrape.php"). An error is returned when the URL has
+// no path or the final segment does not begin with "announce", signalling that
+// the tracker does not advertise scrape support.
+func ScrapeURL(announceURL string) (string, error) {
+	u, err := url.Parse(announceURL)
+	if err != nil {
+		return "", err
+	}
+	idx := strings.LastIndex(u.Path, "/")
+	if idx == -1 {
+		return "", fmt.Errorf("announce URL %q has no path segment to derive scrape URL", announceURL)
+	}
+	last := u.Path[idx+1:]
+	if !strings.HasPrefix(last, "announce") {
+		return "", fmt.Errorf("announce URL segment %q does not support scrape", last)
+	}
+	u.Path = u.Path[:idx+1] + "scrape" + last[len("announce"):]
+	return u.String(), nil
+}
+
+// BuildScrapeURL constructs an HTTP scrape request URL, appending one
+// info_hash query parameter per requested hash. The hashes are escaped exactly
+// as required by the BitTorrent spec, mirroring BuildTrackerURL.
+func BuildScrapeURL(scrapeURL string, infoHashes ...[20]byte) (string, error) {
+	base, err := url.Parse(scrapeURL)
+	if err != nil {
+		return "", err
+	}
+	params := base.Query()
+	params.Del("info_hash")
+
+	var sb strings.Builder
+	sb.WriteString(params.Encode())
+	for _, h := range infoHashes {
+		if sb.Len() > 0 {
+			sb.WriteByte('&')
+		}
+		sb.WriteString("info_hash=")
+		sb.WriteString(escapeBinary(h[:]))
+	}
+	base.RawQuery = sb.String()
+	return base.String(), nil
+}
+
+// ParseScrapeResponse decodes a bencoded HTTP scrape response (BEP 48). The
+// returned map is keyed by the raw 20-byte info hash found in the "files"
+// dictionary. Entries whose key is not exactly 20 bytes are skipped.
+func ParseScrapeResponse(data []byte) (map[[20]byte]ScrapeStats, error) {
+	val, rest, err := bencode.DecodePrefix(data)
+	if err != nil {
+		return nil, fmt.Errorf("bencode parsing error: %w", err)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("bencode parsing error: trailing data after scrape response")
+	}
+	dict, ok := val.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("scrape response is not a dictionary")
+	}
+	if failReason, ok := dict["failure reason"].(string); ok {
+		return nil, fmt.Errorf("tracker error: %s", failReason)
+	}
+	filesVal, ok := dict["files"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("scrape response missing files dictionary")
+	}
+
+	result := make(map[[20]byte]ScrapeStats, len(filesVal))
+	for key, v := range filesVal {
+		if len(key) != 20 {
+			continue
+		}
+		fileDict, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		var stats ScrapeStats
+		if c, ok := fileDict["complete"].(int64); ok {
+			stats.Complete = int(c)
+		}
+		if d, ok := fileDict["downloaded"].(int64); ok {
+			stats.Downloaded = int(d)
+		}
+		if i, ok := fileDict["incomplete"].(int64); ok {
+			stats.Incomplete = int(i)
+		}
+		var hash [20]byte
+		copy(hash[:], key)
+		result[hash] = stats
+	}
+	return result, nil
+}
+
+// HTTPScrape performs a full HTTP(S) scrape against the tracker identified by
+// announceURL (BEP 48). It derives the scrape endpoint from the announce URL,
+// issues the request, and parses the swarm-health counts per info hash. The
+// context bounds the request lifetime.
+func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
+	scrapeURL, err := ScrapeURL(announceURL)
+	if err != nil {
+		return nil, err
+	}
+	reqURL, err := BuildScrapeURL(scrapeURL, infoHashes...)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("scrape returned HTTP %d", resp.StatusCode)
+	}
+
+	// Reading one byte past the cap lets us detect and reject an over-limit
+	// response rather than silently truncating it.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeResponse+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxScrapeResponse {
+		return nil, fmt.Errorf("scrape response exceeds %d bytes", maxScrapeResponse)
+	}
+
+	return ParseScrapeResponse(data)
+}
+
+// Scrape queries a tracker's scrape endpoint, dispatching to the HTTP or UDP
+// implementation based on the announce URL scheme. It returns swarm-health
+// counts keyed by raw info hash.
+func Scrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
+	u, err := url.Parse(announceURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing announce URL: %w", err)
+	}
+	switch u.Scheme {
+	case "udp":
+		return UDPScrape(ctx, announceURL, infoHashes...)
+	case "http", "https":
+		return HTTPScrape(ctx, announceURL, infoHashes...)
+	default:
+		return nil, fmt.Errorf("unsupported tracker scheme %q for scrape", u.Scheme)
+	}
 }

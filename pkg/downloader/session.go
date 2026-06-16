@@ -147,6 +147,7 @@ type Session struct {
 	currentUploadSpeed  float64
 	trackerSeeders      int
 	trackerLeechers     int
+	trackerCompleted    int
 	lastErr             error
 	statusErr           error // current blocking failure; drives Error status
 	lastTrackerErr      error

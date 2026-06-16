@@ -34,6 +34,12 @@ func (s *Session) trackerLoop() {
 		var interval int
 		if !paused || hasEvents {
 			interval = s.announceAndConnect()
+			// Best-effort scrape to surface swarm health (seeders / leechers /
+			// completed) for the TUI. The completed count is unavailable from
+			// announce, so it can only come from scrape.
+			if !paused {
+				s.scrapeTrackers()
+			}
 		}
 		select {
 		case <-s.ctx.Done():
@@ -334,12 +340,81 @@ func (s *Session) announceAndConnect() int {
 	return interval
 }
 
-// TrackerSwarmStats returns the largest seed/leecher counts from the latest
-// successful tracker announce cycle.
-func (s *Session) TrackerSwarmStats() (seeders, leechers int) {
+// TrackerSwarmStats returns the largest seed/leecher/completed counts from the
+// latest successful tracker announce or scrape cycle. The completed count
+// (number of times the torrent has been downloaded to completion) is only
+// populated by scrape responses.
+func (s *Session) TrackerSwarmStats() (seeders, leechers, completed int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.trackerSeeders, s.trackerLeechers
+	return s.trackerSeeders, s.trackerLeechers, s.trackerCompleted
+}
+
+// scrapeTracker queries a single tracker's scrape endpoint for this torrent's
+// info hash, returning the swarm-health counts. Trackers that don't advertise
+// scrape (no "announce" path segment) or that fail are surfaced as errors for
+// the caller to ignore best-effort.
+func scrapeTracker(ctx context.Context, tr string, infoHash [20]byte, timeout time.Duration) (tracker.ScrapeStats, error) {
+	scrapeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	stats, err := tracker.Scrape(scrapeCtx, tr, infoHash)
+	if err != nil {
+		return tracker.ScrapeStats{}, err
+	}
+	if st, ok := stats[infoHash]; ok {
+		return st, nil
+	}
+	return tracker.ScrapeStats{}, fmt.Errorf("scrape response did not include requested info hash")
+}
+
+// scrapeTrackers queries every configured tracker's scrape endpoint
+// concurrently and records the largest seeder/leecher/completed counts seen.
+// It is best-effort: trackers that don't support scrape or that fail are
+// ignored, and the stored stats are left untouched when no tracker responds.
+func (s *Session) scrapeTrackers() {
+	s.mu.RLock()
+	trackers := append([]string(nil), s.Torrent.Trackers...)
+	infoHash := s.Torrent.InfoHash
+	s.mu.RUnlock()
+	if len(trackers) == 0 {
+		return
+	}
+
+	results := make(chan tracker.ScrapeStats, len(trackers))
+	for _, tr := range trackers {
+		trackerURL := tr
+		go func() {
+			st, err := scrapeTracker(s.ctx, trackerURL, infoHash, trackerAnnounceTimeout)
+			if err != nil {
+				results <- tracker.ScrapeStats{Complete: -1}
+				return
+			}
+			results <- st
+		}()
+	}
+
+	var seeders, leechers, completed int
+	any := false
+	for range trackers {
+		st := <-results
+		if st.Complete < 0 {
+			continue // sentinel for a failed scrape
+		}
+		any = true
+		seeders = max(seeders, st.Complete)
+		leechers = max(leechers, st.Incomplete)
+		completed = max(completed, st.Downloaded)
+	}
+	if !any {
+		return
+	}
+
+	s.mu.Lock()
+	s.trackerSeeders = max(s.trackerSeeders, seeders)
+	s.trackerLeechers = max(s.trackerLeechers, leechers)
+	s.trackerCompleted = completed
+	s.mu.Unlock()
 }
 
 func (s *Session) queueTrackerEventLocked(event string) {
