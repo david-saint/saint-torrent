@@ -3,7 +3,6 @@ package peer
 import (
 	"errors"
 	"fmt"
-	"strconv"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -28,10 +27,6 @@ const MetadataBlockSize = 16384
 const MaxMetadataSize = 16 * 1024 * 1024
 
 const maxMetadataPieces = MaxMetadataSize / MetadataBlockSize
-
-// maxBencodeDepth bounds bencode container nesting when locating the dictionary
-// boundary in ut_metadata messages, preventing stack exhaustion from a malicious peer.
-const maxBencodeDepth = 100
 
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
@@ -276,103 +271,13 @@ func (c *Client) SendMetadataRequest(extMsgID byte, piece int) error {
 
 // bencodedDictSpan returns the number of bytes occupied by the bencoded
 // dictionary at the start of data. This is needed to split BEP 9 data
-// messages where piece bytes follow the dictionary.
+// messages where piece bytes follow the dictionary. It delegates to the
+// shared bencode.ValueSpan so there is a single span implementation.
 func bencodedDictSpan(data []byte) (int, error) {
 	if len(data) == 0 || data[0] != 'd' {
 		return 0, errors.New("not a bencoded dictionary")
 	}
-	return bencodedValueSpan(data, 0)
-}
-
-// bencodedValueSpan returns the byte length of the next bencoded value at
-// the start of data. It mirrors the logic in bencode.findValueSpan (which
-// is unexported) and handles integers, strings, lists, and dictionaries.
-func bencodedValueSpan(data []byte, depth int) (int, error) {
-	if len(data) == 0 {
-		return 0, errors.New("empty input")
-	}
-	if depth > maxBencodeDepth {
-		return 0, errors.New("bencode value nested too deeply")
-	}
-
-	switch {
-	case data[0] == 'i':
-		// Integer: i<number>e
-		for i := 1; i < len(data); i++ {
-			if data[i] == 'e' {
-				return i + 1, nil
-			}
-		}
-		return 0, errors.New("unterminated integer")
-
-	case data[0] == 'l':
-		// List: l<elements>e
-		pos := 1
-		for pos < len(data) && data[pos] != 'e' {
-			span, err := bencodedValueSpan(data[pos:], depth+1)
-			if err != nil {
-				return 0, err
-			}
-			pos += span
-		}
-		if pos >= len(data) {
-			return 0, errors.New("unterminated list")
-		}
-		return pos + 1, nil // +1 for 'e'
-
-	case data[0] == 'd':
-		// Dictionary: d<key><value>...e
-		pos := 1
-		for pos < len(data) && data[pos] != 'e' {
-			// Key
-			keySpan, err := bencodedValueSpan(data[pos:], depth+1)
-			if err != nil {
-				return 0, err
-			}
-			pos += keySpan
-			if pos >= len(data) || data[pos] == 'e' {
-				return 0, errors.New("dictionary key without value")
-			}
-			// Value
-			valSpan, err := bencodedValueSpan(data[pos:], depth+1)
-			if err != nil {
-				return 0, err
-			}
-			pos += valSpan
-		}
-		if pos >= len(data) {
-			return 0, errors.New("unterminated dictionary")
-		}
-		return pos + 1, nil // +1 for 'e'
-
-	case data[0] >= '0' && data[0] <= '9':
-		// String: <length>:<data>
-		colonIdx := -1
-		for i := 0; i < len(data); i++ {
-			if data[i] == ':' {
-				colonIdx = i
-				break
-			}
-		}
-		if colonIdx == -1 {
-			return 0, errors.New("missing colon in string")
-		}
-		length, err := strconv.Atoi(string(data[:colonIdx]))
-		if err != nil {
-			return 0, fmt.Errorf("invalid string length: %w", err)
-		}
-		if length < 0 {
-			return 0, errors.New("negative string length")
-		}
-		if length > len(data)-colonIdx-1 {
-			return 0, errors.New("string length exceeds data size")
-		}
-		total := colonIdx + 1 + length
-		return total, nil
-
-	default:
-		return 0, fmt.Errorf("unexpected character: %q", data[0])
-	}
+	return bencode.ValueSpan(data)
 }
 
 // SendMetadataData sends a BEP 9 metadata piece message.
