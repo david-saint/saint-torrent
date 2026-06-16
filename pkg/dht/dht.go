@@ -55,6 +55,8 @@ type DHT struct {
 	txMu         sync.Mutex
 	txCounter    uint32
 
+	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
+
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -84,13 +86,14 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := &DHT{
-		conn:         conn,
-		peersMap:     make(map[[20]byte]map[string]time.Time),
-		peerChan:     make(chan DiscoveredPeer, 256),
-		transactions: make(map[string]transaction),
-		ctx:          ctx,
-		cancel:       cancel,
-		downloadDir:  downloadDir,
+		conn:           conn,
+		peersMap:       make(map[[20]byte]map[string]time.Time),
+		peerChan:       make(chan DiscoveredPeer, 256),
+		transactions:   make(map[string]transaction),
+		inFlightProbes: make(map[string]struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		downloadDir:    downloadDir,
 	}
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[0][:])
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[1][:])
@@ -660,7 +663,102 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	}
 }
 
+// HasNodeAddress returns true if a node with the given IP and UDP port exists in the routing table.
+func (d *DHT) HasNodeAddress(ip net.IP, port uint16) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for _, b := range d.buckets {
+		if b == nil {
+			continue
+		}
+		for _, n := range b.nodes {
+			if n.Addr != nil && n.Addr.IP.Equal(ip) && n.Addr.Port == int(port) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// AddNode ingests a DHT node advertised by a BitTorrent peer via the BEP 5 PORT
+// message. That message carries only the node's IP and UDP port — not its
+// Kademlia node ID — so we ping the endpoint to learn its ID and, on a valid
+// reply, insert it into the routing table. Live peers are one of the richest
+// sources of fresh DHT nodes, so this grows the table beyond bootstrap nodes and
+// lookups. The probe runs on a tracked goroutine so the caller (the peer message
+// loop) never blocks on the network.
+// Note: Since the DHT socket is IPv4-bound, IPv6 addresses are silently ignored.
+func (d *DHT) AddNode(ip net.IP, port uint16) {
+	if d == nil {
+		return
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		// Silently ignore IPv6 addresses as the DHT UDP socket is IPv4-bound.
+		return
+	}
+	if port == 0 {
+		return
+	}
+
+	addr := &net.UDPAddr{IP: append(net.IP(nil), ip4...), Port: int(port)}
+
+	// Skip if the node is already in our routing table
+	if d.HasNodeAddress(ip4, port) {
+		return
+	}
+
+	addrStr := addr.String()
+	d.txMu.Lock()
+	if d.inFlightProbes == nil {
+		d.inFlightProbes = make(map[string]struct{})
+	}
+	// Deduplicate: don't spawn multiple queries to the same address concurrently
+	if _, active := d.inFlightProbes[addrStr]; active {
+		d.txMu.Unlock()
+		return
+	}
+	// Rate-limit: bound maximum concurrent unsolicited AddNode probes to 100
+	if len(d.inFlightProbes) >= 100 {
+		d.txMu.Unlock()
+		return
+	}
+	d.inFlightProbes[addrStr] = struct{}{}
+	d.txMu.Unlock()
+
+	d.goTracked(func() {
+		defer func() {
+			d.txMu.Lock()
+			delete(d.inFlightProbes, addrStr)
+			d.txMu.Unlock()
+		}()
+
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+		}
+		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		defer cancel()
+		id, err := d.queryNodeID(ctx, addr)
+		if err != nil {
+			return
+		}
+		d.addNode(id, addr)
+	})
+}
+
 func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
+	_, err := d.queryNodeID(ctx, addr)
+	return err
+}
+
+// queryNodeID pings addr and returns the responder's 20-byte Kademlia node ID.
+func (d *DHT) queryNodeID(ctx context.Context, addr *net.UDPAddr) ([20]byte, error) {
+	var id [20]byte
 	t := d.nextTransactionID()
 	query := map[string]interface{}{
 		"t": t,
@@ -673,7 +771,7 @@ func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
 
 	payload, err := bencode.Marshal(query)
 	if err != nil {
-		return err
+		return id, err
 	}
 
 	ch := make(chan interface{}, 1)
@@ -682,22 +780,23 @@ func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
 
 	_, err = d.conn.WriteToUDP(payload, addr)
 	if err != nil {
-		return err
+		return id, err
 	}
 
 	select {
 	case resp := <-ch:
 		rDict, ok := resp.(map[string]interface{})
 		if !ok {
-			return errors.New("invalid response")
+			return id, errors.New("invalid response")
 		}
 		idStr, _ := rDict["id"].(string)
 		if len(idStr) != 20 {
-			return errors.New("invalid responder id")
+			return id, errors.New("invalid responder id")
 		}
-		return nil
+		copy(id[:], idStr)
+		return id, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return id, ctx.Err()
 	}
 }
 
@@ -843,15 +942,17 @@ func (d *DHT) announcePeerQuery(ctx context.Context, infoHash [20]byte, port uin
 	}
 }
 
-func (d *DHT) bootstrap() {
-	bootstrapHosts := []string{
-		"router.bittorrent.com:6881",
-		"router.utorrent.com:6881",
-		"dht.transmissionbt.com:6881",
-	}
+// DefaultBootstrapHosts is the list of public DHT bootstrap routers.
+// Modified in unit tests to prevent hitting the real network.
+var DefaultBootstrapHosts = []string{
+	"router.bittorrent.com:6881",
+	"router.utorrent.com:6881",
+	"dht.transmissionbt.com:6881",
+}
 
+func (d *DHT) bootstrap() {
 	var resolver net.Resolver
-	for _, host := range bootstrapHosts {
+	for _, host := range DefaultBootstrapHosts {
 		hostName, portStr, err := net.SplitHostPort(host)
 		if err != nil {
 			continue

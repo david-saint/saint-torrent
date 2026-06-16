@@ -307,6 +307,9 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	// Handshake with deadline
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	s.mu.RLock()
+	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
 	handshake, err := client.Handshake()
 	if err != nil {
 		s.mu.Lock()
@@ -463,12 +466,19 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		return
 	}
 
+	s.mu.RLock()
+	allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
+
 	respHs := &peer.Handshake{
 		Pstr:     "BitTorrent protocol",
 		InfoHash: s.Torrent.InfoHash,
 		PeerID:   s.PeerID,
 	}
-	respHs.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
+	respHs.Reserved[5] = 0x10  // Support extension protocol (BEP 10)
+	if allowDHT {
+		respHs.Reserved[7] |= 0x01 // Support DHT (BEP 5)
+	}
 	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}
@@ -579,6 +589,21 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.RUnlock()
 		// Local ut_metadata ID is 1
 		_ = client.SendExtHandshake(1, infoLen)
+	}
+
+	// Advertise our DHT UDP port to DHT-capable peers (BEP 5 PORT message). This
+	// lets live peers add us to their routing tables and is a counterpart to
+	// ingesting their PORT messages below.
+	if peerReserved[7]&0x01 != 0 {
+		s.mu.RLock()
+		d := s.DHT
+		allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+		s.mu.RUnlock()
+		if allowDHT && d != nil {
+			if dhtPort := d.Port(); dhtPort != 0 {
+				_ = client.SendPort(dhtPort)
+			}
+		}
 	}
 
 	// Read peer wire loop
@@ -1562,6 +1587,23 @@ peerLoop:
 					}
 				}
 			}
+
+		case peer.MsgPort:
+			// BEP 5: the peer advertises its DHT UDP port. Combine it with the
+			// peer's source IP and feed it into the routing table so live peers
+			// grow our DHT beyond bootstrap nodes and lookups.
+			if len(msg.Payload) == 2 {
+				dhtPort := binary.BigEndian.Uint16(msg.Payload)
+				s.mu.RLock()
+				d := s.DHT
+				allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+				s.mu.RUnlock()
+				if allowDHT && d != nil && dhtPort != 0 {
+					if pip := net.ParseIP(ip); pip != nil {
+						d.AddNode(pip, dhtPort)
+					}
+				}
+			}
 		}
 
 		// Cancel and drop pieces another peer finished (endgame), then keep the
@@ -1743,6 +1785,9 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 	if s.paused || s.closed || !s.started {
 		return
 	}
+	if !s.allowsDecentralizedPeerDiscoveryLocked() {
+		return
+	}
 
 	pState, exists := s.Peers[peerAddr]
 	var shouldDial bool
@@ -1791,7 +1836,7 @@ func (s *Session) AttachDHT(d *dht.DHT) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
-	if s.closed || s.DHT != nil || d == nil {
+	if s.closed || s.DHT != nil || d == nil || !s.allowsDecentralizedPeerDiscoveryLocked() {
 		s.mu.Unlock()
 		return
 	}

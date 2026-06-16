@@ -27,6 +27,7 @@ type Torrent struct {
 	Name        string
 	Files       []File
 	InfoBytes   []byte // Raw bencoded info dictionary
+	Private     bool   // BEP 27 private torrents must use trackers only
 }
 
 // Parse decodes a bencoded torrent file, calculates the info hash, and returns a Torrent struct.
@@ -108,6 +109,11 @@ func Parse(data []byte) (*Torrent, error) {
 	pieceHashes := make([][20]byte, numPieces)
 	for i := 0; i < numPieces; i++ {
 		copy(pieceHashes[i][:], piecesBytes[i*20:(i+1)*20])
+	}
+
+	private := false
+	if privateFlag, ok := getInt64(info, "private"); ok {
+		private = privateFlag == 1
 	}
 
 	// 5. Files list (handling single-file vs multi-file)
@@ -207,6 +213,7 @@ func Parse(data []byte) (*Torrent, error) {
 		Name:        name,
 		Files:       files,
 		InfoBytes:   bencodedInfo,
+		Private:     private,
 	}, nil
 }
 
