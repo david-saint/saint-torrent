@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 )
 
 // ErrFileRepaired is returned when a write had to recreate or resize a target
@@ -653,10 +652,6 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 		return "", err
 	}
 	return resolver.ResolveAndValidate(relPath)
-}
-
-func openNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
-	return os.OpenFile(path, flag|syscall.O_NOFOLLOW, perm)
 }
 
 // isReservedStorageName reports whether a top-level path component would collide

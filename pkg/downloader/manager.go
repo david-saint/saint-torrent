@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"sainttorrent/pkg/bencode"
@@ -316,15 +315,6 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	}
 
 	return nil
-}
-
-func isDirectoryNotEmpty(err error) bool {
-	var pathErr *os.PathError
-	if !errors.As(err, &pathErr) {
-		return false
-	}
-	errno, ok := pathErr.Err.(syscall.Errno)
-	return ok && (errno == syscall.ENOTEMPTY || errno == 145)
 }
 
 // GetSession retrieves a session by its info hash hex string.
