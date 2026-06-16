@@ -2367,6 +2367,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// that already took our requests goes quiet but keeps the socket warm with
 	// keep-alives (which otherwise reset the read deadline and skipped pump).
 	pump := func() time.Duration {
+		// Block requests below are queued into the client's write buffer; flush the
+		// whole burst in one syscall on the way out, regardless of which branch
+		// returns. Flushing an empty buffer is a no-op, so this is cheap on the
+		// paused/choked/keep-alive paths that write nothing.
+		defer func() { _ = client.Flush() }()
+
 		s.mu.RLock()
 		paused := s.paused
 		choked := pState.Choked
@@ -2455,7 +2461,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				waitingForBandwidth = outstanding == 0
 				return retryAfter
 			}
-			if err := client.SendRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
+			if err := client.WriteRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
 				req.requested = false
 				return 0 // dead connection; cleanup releases the pieces
 			}
