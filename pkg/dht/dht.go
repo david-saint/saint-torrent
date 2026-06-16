@@ -660,7 +660,46 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	}
 }
 
+// AddNode ingests a DHT node advertised by a BitTorrent peer via the BEP 5 PORT
+// message. That message carries only the node's IP and UDP port — not its
+// Kademlia node ID — so we ping the endpoint to learn its ID and, on a valid
+// reply, insert it into the routing table. Live peers are one of the richest
+// sources of fresh DHT nodes, so this grows the table beyond bootstrap nodes and
+// lookups. The probe runs on a tracked goroutine so the caller (the peer message
+// loop) never blocks on the network.
+func (d *DHT) AddNode(ip net.IP, port uint16) {
+	if d == nil {
+		return
+	}
+	ip4 := ip.To4()
+	if ip4 == nil || port == 0 {
+		return
+	}
+	addr := &net.UDPAddr{IP: append(net.IP(nil), ip4...), Port: int(port)}
+	d.goTracked(func() {
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+		}
+		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		defer cancel()
+		id, err := d.queryNodeID(ctx, addr)
+		if err != nil {
+			return
+		}
+		d.addNode(id, addr)
+	})
+}
+
 func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
+	_, err := d.queryNodeID(ctx, addr)
+	return err
+}
+
+// queryNodeID pings addr and returns the responder's 20-byte Kademlia node ID.
+func (d *DHT) queryNodeID(ctx context.Context, addr *net.UDPAddr) ([20]byte, error) {
+	var id [20]byte
 	t := d.nextTransactionID()
 	query := map[string]interface{}{
 		"t": t,
@@ -673,7 +712,7 @@ func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
 
 	payload, err := bencode.Marshal(query)
 	if err != nil {
-		return err
+		return id, err
 	}
 
 	ch := make(chan interface{}, 1)
@@ -682,22 +721,23 @@ func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
 
 	_, err = d.conn.WriteToUDP(payload, addr)
 	if err != nil {
-		return err
+		return id, err
 	}
 
 	select {
 	case resp := <-ch:
 		rDict, ok := resp.(map[string]interface{})
 		if !ok {
-			return errors.New("invalid response")
+			return id, errors.New("invalid response")
 		}
 		idStr, _ := rDict["id"].(string)
 		if len(idStr) != 20 {
-			return errors.New("invalid responder id")
+			return id, errors.New("invalid responder id")
 		}
-		return nil
+		copy(id[:], idStr)
+		return id, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return id, ctx.Err()
 	}
 }
 

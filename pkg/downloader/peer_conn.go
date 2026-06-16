@@ -468,7 +468,8 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		InfoHash: s.Torrent.InfoHash,
 		PeerID:   s.PeerID,
 	}
-	respHs.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
+	respHs.Reserved[5] = 0x10  // Support extension protocol (BEP 10)
+	respHs.Reserved[7] |= 0x01 // Support DHT (BEP 5)
 	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}
@@ -579,6 +580,20 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.RUnlock()
 		// Local ut_metadata ID is 1
 		_ = client.SendExtHandshake(1, infoLen)
+	}
+
+	// Advertise our DHT UDP port to DHT-capable peers (BEP 5 PORT message). This
+	// lets live peers add us to their routing tables and is a counterpart to
+	// ingesting their PORT messages below.
+	if peerReserved[7]&0x01 != 0 {
+		s.mu.RLock()
+		d := s.DHT
+		s.mu.RUnlock()
+		if d != nil {
+			if dhtPort := d.Port(); dhtPort != 0 {
+				_ = client.SendPort(dhtPort)
+			}
+		}
 	}
 
 	// Read peer wire loop
@@ -1559,6 +1574,22 @@ peerLoop:
 							s.Uploaded.Add(length)
 							atomic.AddInt64(&pState.Uploaded, length)
 						}
+					}
+				}
+			}
+
+		case peer.MsgPort:
+			// BEP 5: the peer advertises its DHT UDP port. Combine it with the
+			// peer's source IP and feed it into the routing table so live peers
+			// grow our DHT beyond bootstrap nodes and lookups.
+			if len(msg.Payload) == 2 {
+				dhtPort := binary.BigEndian.Uint16(msg.Payload)
+				s.mu.RLock()
+				d := s.DHT
+				s.mu.RUnlock()
+				if d != nil && dhtPort != 0 {
+					if pip := net.ParseIP(ip); pip != nil {
+						d.AddNode(pip, dhtPort)
 					}
 				}
 			}
