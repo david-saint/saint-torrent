@@ -2,13 +2,14 @@
 package tracker
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"sainttorrent/pkg/bencode"
 )
 
 // Peer represents a torrent peer discovered from the tracker.
@@ -28,10 +29,6 @@ type TrackerResponse struct {
 }
 
 const defaultNumWant = 200
-
-// maxBencodeDepth bounds bencode container nesting when parsing tracker responses,
-// preventing a malicious tracker from exhausting the goroutine stack via deep recursion.
-const maxBencodeDepth = 100
 
 // BuildTrackerURL constructs the tracker announce URL with the proper parameters.
 // Specifically, it escapes infoHash and peerID exactly as required by the BitTorrent spec.
@@ -94,102 +91,16 @@ func escapeBinary(b []byte) string {
 	return sb.String()
 }
 
-type bencodeValue interface{}
-
-func parseBencode(data []byte, depth int) (bencodeValue, []byte, error) {
-	if len(data) == 0 {
-		return nil, nil, fmt.Errorf("empty data")
-	}
-	if depth > maxBencodeDepth {
-		return nil, nil, fmt.Errorf("bencode value nested too deeply")
-	}
-	switch data[0] {
-	case 'i':
-		// Integer
-		end := bytes.IndexByte(data, 'e')
-		if end == -1 {
-			return nil, nil, fmt.Errorf("malformed integer")
-		}
-		val, err := strconv.ParseInt(string(data[1:end]), 10, 64)
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid integer: %v", err)
-		}
-		return val, data[end+1:], nil
-	case 'l':
-		// List
-		var list []bencodeValue
-		rest := data[1:]
-		for len(rest) > 0 && rest[0] != 'e' {
-			var val bencodeValue
-			var err error
-			val, rest, err = parseBencode(rest, depth+1)
-			if err != nil {
-				return nil, nil, err
-			}
-			list = append(list, val)
-		}
-		if len(rest) == 0 {
-			return nil, nil, fmt.Errorf("unterminated list")
-		}
-		return list, rest[1:], nil
-	case 'd':
-		// Dictionary
-		dict := make(map[string]bencodeValue)
-		rest := data[1:]
-		for len(rest) > 0 && rest[0] != 'e' {
-			// Key must be a string
-			var keyVal bencodeValue
-			var err error
-			keyVal, rest, err = parseBencode(rest, depth+1)
-			if err != nil {
-				return nil, nil, err
-			}
-			key, ok := keyVal.(string)
-			if !ok {
-				return nil, nil, fmt.Errorf("dict key must be string")
-			}
-			var val bencodeValue
-			val, rest, err = parseBencode(rest, depth+1)
-			if err != nil {
-				return nil, nil, err
-			}
-			dict[key] = val
-		}
-		if len(rest) == 0 {
-			return nil, nil, fmt.Errorf("unterminated dict")
-		}
-		return dict, rest[1:], nil
-	default:
-		// String: <length>:<data>
-		colon := bytes.IndexByte(data, ':')
-		if colon == -1 {
-			return nil, nil, fmt.Errorf("malformed string")
-		}
-		length, err := strconv.Atoi(string(data[:colon]))
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid string length: %v", err)
-		}
-		if length < 0 {
-			return nil, nil, fmt.Errorf("negative string length: %d", length)
-		}
-		if length > len(data)-colon-1 {
-			return nil, nil, fmt.Errorf("string length exceeds data size")
-		}
-		strVal := data[colon+1 : colon+1+length]
-		return string(strVal), data[colon+1+length:], nil
-	}
-}
-
 // ParseTrackerResponse decodes a bencoded tracker response.
 func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
-	val, rest, err := parseBencode(data, 0)
+	val, rest, err := bencode.DecodePrefix(data)
 	if err != nil {
 		return nil, fmt.Errorf("bencode parsing error: %w", err)
 	}
 	if len(rest) != 0 {
 		return nil, fmt.Errorf("bencode parsing error: trailing data after tracker response")
 	}
-	dict, ok := val.(map[string]bencodeValue)
+	dict, ok := val.(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("tracker response is not a dictionary")
 	}
@@ -244,10 +155,10 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 					Port: port,
 				})
 			}
-		} else if peersList, ok := peersVal.([]bencodeValue); ok {
+		} else if peersList, ok := peersVal.([]interface{}); ok {
 			// Non-compact peer list (list of dictionaries)
 			for _, pVal := range peersList {
-				pDict, ok := pVal.(map[string]bencodeValue)
+				pDict, ok := pVal.(map[string]interface{})
 				if !ok {
 					continue
 				}

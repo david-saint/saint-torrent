@@ -17,6 +17,8 @@ func TestUnmarshal(t *testing.T) {
 		{"integer zero", "i0e", int64(0), false},
 		{"integer positive", "i42e", int64(42), false},
 		{"integer negative", "i-42e", int64(-42), false},
+		{"integer leading zero", "i03e", int64(3), false},
+		{"integer negative zero", "i-0e", int64(0), false},
 
 		// Strings
 		{"string normal", "4:spam", "spam", false},
@@ -38,8 +40,6 @@ func TestUnmarshal(t *testing.T) {
 		{"integer no e", "i42", nil, true},
 		{"integer no digits", "ie", nil, true},
 		{"integer invalid minus", "i-e", nil, true},
-		{"integer leading zero", "i03e", nil, true},  // spec does not allow leading zeros except for zero itself (let's check standard rule)
-		{"integer negative zero", "i-0e", nil, true}, // not allowed
 		{"string missing colon", "4spam", nil, true},
 		{"string length too long", "10:spam", nil, true},
 		{"string negative length", "-4:spam", nil, true},
