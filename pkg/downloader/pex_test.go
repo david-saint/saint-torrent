@@ -163,11 +163,12 @@ func TestPEXDiscoversAndConnectsThirdPeer(t *testing.T) {
 
 	sess.mu.RLock()
 	ps, ok := sess.Peers[thirdAddr]
+	dialable := ok && ps.Dialable
 	sess.mu.RUnlock()
 	if !ok {
 		t.Fatalf("third peer %s was not added to known peers", thirdAddr)
 	}
-	if !ps.Dialable {
+	if !dialable {
 		t.Fatalf("third peer %s was not marked dialable", thirdAddr)
 	}
 }
