@@ -13,6 +13,10 @@ import (
 	"sainttorrent/pkg/torrent"
 )
 
+func init() {
+	dht.DefaultBootstrapHosts = nil
+}
+
 // newDHTPortTestSession builds a minimal single-piece session backed by real
 // storage, for exercising the BEP 5 PORT exchange through runPeerMessageLoop.
 func newDHTPortTestSession(t *testing.T) *Session {
@@ -154,12 +158,12 @@ func TestPeerLoopIngestsInboundPort(t *testing.T) {
 
 	deadline := time.After(3 * time.Second)
 	for {
-		if sessionDHT.NodesCount() > 0 {
+		if sessionDHT.HasNodeAddress(net.ParseIP("127.0.0.1"), advertisedPort) {
 			break
 		}
 		select {
 		case <-deadline:
-			t.Fatal("routing table did not grow after inbound PORT")
+			t.Fatal("routing table did not receive the expected advertised node after inbound PORT")
 		case <-time.After(20 * time.Millisecond):
 		}
 	}

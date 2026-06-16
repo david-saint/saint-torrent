@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+func init() {
+	DefaultBootstrapHosts = nil
+}
+
 // TestAddNodeGrowsRoutingTable verifies that AddNode — the entry point used when
 // a BitTorrent peer advertises its DHT port via a BEP 5 PORT message — pings the
 // advertised endpoint, learns its node ID, and inserts it into the routing table.

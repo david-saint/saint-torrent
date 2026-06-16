@@ -250,6 +250,10 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 	return sess, nil
 }
 
+func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
+	return s.Torrent == nil || !s.Torrent.Private
+}
+
 // TotalPieces returns the number of pieces in the torrent.
 func (s *Session) TotalPieces() int {
 	return len(s.Torrent.PieceHashes)
@@ -968,6 +972,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.Torrent.Name = parsed.Name
 	s.Torrent.Files = parsed.Files
 	s.Torrent.InfoBytes = parsed.InfoBytes
+	s.Torrent.Private = parsed.Private
+	if parsed.Private {
+		s.DHT = nil
+	}
 
 	// Reinitialize priorities
 	s.FilePriorities = make([]FilePriority, len(s.Torrent.Files))

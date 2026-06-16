@@ -307,6 +307,9 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	// Handshake with deadline
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	s.mu.RLock()
+	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
 	handshake, err := client.Handshake()
 	if err != nil {
 		s.mu.Lock()
@@ -463,13 +466,19 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		return
 	}
 
+	s.mu.RLock()
+	allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
+
 	respHs := &peer.Handshake{
 		Pstr:     "BitTorrent protocol",
 		InfoHash: s.Torrent.InfoHash,
 		PeerID:   s.PeerID,
 	}
 	respHs.Reserved[5] = 0x10  // Support extension protocol (BEP 10)
-	respHs.Reserved[7] |= 0x01 // Support DHT (BEP 5)
+	if allowDHT {
+		respHs.Reserved[7] |= 0x01 // Support DHT (BEP 5)
+	}
 	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}
@@ -588,8 +597,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if peerReserved[7]&0x01 != 0 {
 		s.mu.RLock()
 		d := s.DHT
+		allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
 		s.mu.RUnlock()
-		if d != nil {
+		if allowDHT && d != nil {
 			if dhtPort := d.Port(); dhtPort != 0 {
 				_ = client.SendPort(dhtPort)
 			}
@@ -1586,8 +1596,9 @@ peerLoop:
 				dhtPort := binary.BigEndian.Uint16(msg.Payload)
 				s.mu.RLock()
 				d := s.DHT
+				allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
 				s.mu.RUnlock()
-				if d != nil && dhtPort != 0 {
+				if allowDHT && d != nil && dhtPort != 0 {
 					if pip := net.ParseIP(ip); pip != nil {
 						d.AddNode(pip, dhtPort)
 					}
