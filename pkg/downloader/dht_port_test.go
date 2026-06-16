@@ -157,10 +157,7 @@ func TestPeerLoopIngestsInboundPort(t *testing.T) {
 	}
 
 	deadline := time.After(3 * time.Second)
-	for {
-		if sessionDHT.HasNodeAddress(net.ParseIP("127.0.0.1"), advertisedPort) {
-			break
-		}
+	for !sessionDHT.HasNodeAddress(net.ParseIP("127.0.0.1"), advertisedPort) {
 		select {
 		case <-deadline:
 			t.Fatal("routing table did not receive the expected advertised node after inbound PORT")

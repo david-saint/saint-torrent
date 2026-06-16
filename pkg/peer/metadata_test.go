@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"sainttorrent/pkg/bencode"
 )
 
 func TestParseExtensionHandshake(t *testing.T) {
@@ -125,6 +127,36 @@ func TestSerializeExtensionHandshake_NoMetadataSize(t *testing.T) {
 	}
 	if hs.MetadataSize != 0 {
 		t.Errorf("MetadataSize = %d, want 0", hs.MetadataSize)
+	}
+}
+
+func TestSerializeExtensionHandshakeWithPEX(t *testing.T) {
+	data, err := SerializeExtensionHandshakeWithExtensions(map[string]int{
+		ExtNameMetadata: LocalMetadataExtID,
+		ExtNamePEX:      LocalPEXExtID,
+	}, 1234)
+	if err != nil {
+		t.Fatalf("SerializeExtensionHandshakeWithExtensions failed: %v", err)
+	}
+
+	hs, err := ParseExtensionHandshake(data)
+	if err != nil {
+		t.Fatalf("ParseExtensionHandshake failed: %v", err)
+	}
+	if hs.Extensions[ExtNameMetadata] != LocalMetadataExtID {
+		t.Errorf("ut_metadata = %d, want %d", hs.Extensions[ExtNameMetadata], LocalMetadataExtID)
+	}
+	if hs.Extensions[ExtNamePEX] != LocalPEXExtID {
+		t.Errorf("ut_pex = %d, want %d", hs.Extensions[ExtNamePEX], LocalPEXExtID)
+	}
+	if hs.MetadataSize != 1234 {
+		t.Errorf("MetadataSize = %d, want 1234", hs.MetadataSize)
+	}
+}
+
+func TestSerializeExtensionHandshakeRejectsInvalidExtensionID(t *testing.T) {
+	if _, err := SerializeExtensionHandshakeWithExtensions(map[string]int{ExtNamePEX: 256}, 0); err == nil {
+		t.Fatal("expected invalid extension ID to fail")
 	}
 }
 
@@ -292,6 +324,95 @@ func TestSerializeMetadataRequest_RoundTrip(t *testing.T) {
 			t.Errorf("piece %d: Piece = %d", piece, msg.Piece)
 		}
 	}
+}
+
+func TestPEXMessageRoundTrip(t *testing.T) {
+	input := &PEXMessage{
+		Added: []PEXPeer{
+			{IP: net.ParseIP("127.0.0.1"), Port: 6881, Flags: PEXFlagSeed},
+			{IP: net.ParseIP("2001:db8::1"), Port: 51413, Flags: PEXFlagUTP},
+		},
+		Dropped: []PEXPeer{
+			{IP: net.ParseIP("192.0.2.10"), Port: 6000},
+			{IP: net.ParseIP("2001:db8::2"), Port: 6001},
+		},
+	}
+
+	data, err := SerializePEXMessage(input)
+	if err != nil {
+		t.Fatalf("SerializePEXMessage failed: %v", err)
+	}
+	msg, err := ParsePEXMessage(data)
+	if err != nil {
+		t.Fatalf("ParsePEXMessage failed: %v", err)
+	}
+	if len(msg.Added) != len(input.Added) {
+		t.Fatalf("added count = %d, want %d", len(msg.Added), len(input.Added))
+	}
+	for i, got := range msg.Added {
+		want := input.Added[i]
+		if !got.IP.Equal(want.IP) || got.Port != want.Port || got.Flags != want.Flags {
+			t.Errorf("added[%d] = %s:%d flags=%d, want %s:%d flags=%d", i, got.IP, got.Port, got.Flags, want.IP, want.Port, want.Flags)
+		}
+	}
+	if len(msg.Dropped) != len(input.Dropped) {
+		t.Fatalf("dropped count = %d, want %d", len(msg.Dropped), len(input.Dropped))
+	}
+	for i, got := range msg.Dropped {
+		want := input.Dropped[i]
+		if !got.IP.Equal(want.IP) || got.Port != want.Port {
+			t.Errorf("dropped[%d] = %s:%d, want %s:%d", i, got.IP, got.Port, want.IP, want.Port)
+		}
+	}
+}
+
+func TestParsePEXMessageRejectsMalformedCompactPeers(t *testing.T) {
+	data, err := bencode.Marshal(map[string]interface{}{
+		"added": []byte{127, 0, 0, 1, 0x1a},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal PEX: %v", err)
+	}
+	if _, err := ParsePEXMessage(data); err == nil {
+		t.Fatal("expected malformed compact peer list to fail")
+	}
+}
+
+func TestParsePEXMessageRejectsMismatchedFlags(t *testing.T) {
+	data, err := bencode.Marshal(map[string]interface{}{
+		"added":   []byte{127, 0, 0, 1, 0x1a, 0xe1},
+		"added.f": []byte{0x00, 0x01},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal PEX: %v", err)
+	}
+	if _, err := ParsePEXMessage(data); err == nil {
+		t.Fatal("expected mismatched flags to fail")
+	}
+}
+
+func TestParsePEXMessageRejectsTooManyPeersAcrossFields(t *testing.T) {
+	data, err := bencode.Marshal(map[string]interface{}{
+		"added":   compactIPv4PEXTestPeers(MaxPEXPeers),
+		"dropped": compactIPv4PEXTestPeers(1),
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal PEX: %v", err)
+	}
+	if _, err := ParsePEXMessage(data); err == nil {
+		t.Fatal("expected split-field peer overflow to fail")
+	}
+}
+
+func compactIPv4PEXTestPeers(count int) []byte {
+	compact := make([]byte, 0, count*6)
+	for i := 0; i < count; i++ {
+		compact = append(compact, 10, 0, byte(i>>8), byte(i))
+		var port [2]byte
+		binary.BigEndian.PutUint16(port[:], uint16(1+i%65535))
+		compact = append(compact, port[:]...)
+	}
+	return compact
 }
 
 func TestExtensionHandshakeRoundTrip(t *testing.T) {

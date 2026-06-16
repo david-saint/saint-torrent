@@ -586,9 +586,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if peerReserved[5]&0x10 != 0 {
 		s.mu.RLock()
 		infoLen := len(s.Torrent.InfoBytes)
+		extensions := s.extensionHandshakeMapLocked()
 		s.mu.RUnlock()
-		// Local ut_metadata ID is 1
-		_ = client.SendExtHandshake(1, infoLen)
+		_ = client.SendExtHandshakeWithExtensions(extensions, infoLen)
 	}
 
 	// Advertise our DHT UDP port to DHT-capable peers (BEP 5 PORT message). This
@@ -733,6 +733,35 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 
 	var peerUtMetadataID int = -1
+	var peerUtPexID int = -1
+	pexAdvertised := make(map[string]struct{})
+	var pexTicker *time.Ticker
+	var pexTick <-chan time.Time
+	sendPEXDelta := func() {
+		if peerUtPexID == -1 || !s.pexEnabled() {
+			return
+		}
+		pexMsg, nextAdvertised, ok := s.buildPEXDelta(peerAddr, pexAdvertised)
+		pexAdvertised = nextAdvertised
+		if !ok {
+			return
+		}
+		if err := client.SendPEX(byte(peerUtPexID), pexMsg); err != nil {
+			_ = conn.Close()
+		}
+	}
+	startPEX := func() {
+		if pexTicker == nil && pexInterval > 0 {
+			pexTicker = time.NewTicker(pexInterval)
+			pexTick = pexTicker.C
+		}
+		sendPEXDelta()
+	}
+	defer func() {
+		if pexTicker != nil {
+			pexTicker.Stop()
+		}
+	}()
 
 	// Helper: check if peer has piece
 	hasPiece := func(index int64) bool {
@@ -1175,6 +1204,9 @@ peerLoop:
 				break peerLoop
 			}
 			msg = result.msg
+		case <-pexTick:
+			sendPEXDelta()
+			continue
 		case <-rateRetry:
 			rateRetry = nil
 			scheduleRateRetry(pump())
@@ -1234,7 +1266,11 @@ peerLoop:
 			if extMsgID == peer.ExtHandshake {
 				hs, err := peer.ParseExtensionHandshake(payloadBytes)
 				if err == nil {
-					if utID, ok := hs.Extensions["ut_metadata"]; ok {
+					if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
+						peerUtPexID = utPexID
+						startPEX()
+					}
+					if utID, ok := hs.Extensions[peer.ExtNameMetadata]; ok {
 						peerUtMetadataID = utID
 
 						// If we are in metadata mode, request the metadata blocks
@@ -1278,7 +1314,7 @@ peerLoop:
 						}
 					}
 				}
-			} else if extMsgID == 1 { // our local ID for ut_metadata is 1
+			} else if extMsgID == peer.LocalMetadataExtID {
 				metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
 				if err == nil {
 					switch metaMsg.MsgType {
@@ -1359,6 +1395,11 @@ peerLoop:
 					case peer.MetadataReject:
 						// Peer rejected metadata piece request, nothing to do.
 					}
+				}
+			} else if extMsgID == peer.LocalPEXExtID && s.pexEnabled() {
+				pexMsg, err := peer.ParsePEXMessage(payloadBytes)
+				if err == nil {
+					s.handlePEXMessage(peerAddr, pexMsg)
 				}
 			}
 
