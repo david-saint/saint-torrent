@@ -2,7 +2,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -993,13 +992,6 @@ func formatSpeed(speed float64) string {
 		return fmt.Sprintf("%.1f KB/s", speed/1024)
 	}
 	return fmt.Sprintf("%.1f MB/s", speed/(1024*1024))
-}
-
-func generatePeerID() [20]byte {
-	var id [20]byte
-	copy(id[:8], "-ST0001-")
-	_, _ = io.ReadFull(rand.Reader, id[8:])
-	return id
 }
 
 type appConfig struct {

@@ -243,7 +243,7 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 	case "stopped":
 		eventVal = 3
 	default:
-		eventVal = 0
+		eventVal = eventNone
 	}
 	binary.BigEndian.PutUint32(req[80:84], eventVal)
 	binary.BigEndian.PutUint32(req[84:88], 0) // IP address = 0 (default)
