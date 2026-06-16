@@ -19,6 +19,11 @@ const (
 	MsgRequest       MessageID = 6
 	MsgPiece         MessageID = 7
 	MsgCancel        MessageID = 8
+	// MsgPort carries a peer's DHT UDP port (BEP 5). Sent after the handshake to
+	// DHT-capable peers; on receipt the advertised port plus the peer's source IP
+	// is fed into the DHT routing table.
+	MsgPort MessageID = 9
+
 	MsgSuggestPiece  MessageID = 13
 	MsgHaveAll       MessageID = 14
 	MsgHaveNone      MessageID = 15

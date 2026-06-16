@@ -26,6 +26,7 @@ type Client struct {
 	writeMu  sync.Mutex    // protects concurrent writes to w (and reqBuf)
 	w        *bufio.Writer // buffers outbound messages; flushed explicitly
 	reqBuf   [17]byte      // reusable scratch for WriteRequest framing
+	DisableDHT bool        // Disable advertising DHT support in handshake
 }
 
 // NewClient initializes a new peer wire client.
@@ -48,6 +49,9 @@ func (c *Client) Handshake() (*Handshake, error) {
 		PeerID:   c.PeerID,
 	}
 	reqHandshake.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
+	if !c.DisableDHT {
+		reqHandshake.Reserved[7] |= 0x01 // Support DHT (BEP 5)
+	}
 	EnableFastExtension(&reqHandshake.Reserved)
 
 	c.writeMu.Lock()
@@ -158,6 +162,14 @@ func (c *Client) SendPiece(index, begin uint32, block []byte) error {
 	binary.BigEndian.PutUint32(payload[4:8], begin)
 	copy(payload[8:], block)
 	return c.SendMessage(&Message{ID: MsgPiece, Payload: payload})
+}
+
+// SendPort sends a PORT message (id 9, BEP 5) advertising our DHT UDP port so a
+// DHT-capable peer can add us to its routing table.
+func (c *Client) SendPort(port uint16) error {
+	payload := make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, port)
+	return c.SendMessage(&Message{ID: MsgPort, Payload: payload})
 }
 
 // SendCancel sends a cancel message to withdraw a request for a block.
