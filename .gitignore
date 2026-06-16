@@ -22,3 +22,4 @@ out/
 # Local TUI design explorations
 /design-proposals/
 /spikes/
+.claude/

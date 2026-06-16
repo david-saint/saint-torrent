@@ -75,23 +75,16 @@ func parse(data []byte, depth int) (interface{}, []byte, error) {
 			return nil, nil, errors.New("empty integer")
 		}
 
-		// Enforce spec constraints:
-		// - "i-0e" is invalid.
-		// - "i03e" (leading zeros) is invalid, unless it is "i0e".
+		// Enforce spec constraints but remain lenient for compatibility:
+		// - Allow leading zeros and negative zero for non-compliant tracker/peer implementations.
+		// - Ensure sign is followed by digits.
 		switch numBytes[0] {
 		case '-':
 			if len(numBytes) == 1 {
 				return nil, nil, errors.New("invalid integer: sign only")
 			}
-			if numBytes[1] == '0' {
-				return nil, nil, errors.New("negative zero is invalid")
-			}
 			if numBytes[1] == '-' {
 				return nil, nil, errors.New("multiple negative signs")
-			}
-		case '0':
-			if len(numBytes) > 1 {
-				return nil, nil, errors.New("leading zero in integer")
 			}
 		}
 

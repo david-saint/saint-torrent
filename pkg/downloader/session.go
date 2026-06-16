@@ -2370,8 +2370,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		// Block requests below are queued into the client's write buffer; flush the
 		// whole burst in one syscall on the way out, regardless of which branch
 		// returns. Flushing an empty buffer is a no-op, so this is cheap on the
-		// paused/choked/keep-alive paths that write nothing.
-		defer func() { _ = client.Flush() }()
+		// paused/choked/keep-alive paths that write nothing. If flushing fails, close
+		// the connection immediately to trigger teardown.
+		defer func() {
+			if err := client.Flush(); err != nil {
+				_ = conn.Close()
+			}
+		}()
 
 		s.mu.RLock()
 		paused := s.paused

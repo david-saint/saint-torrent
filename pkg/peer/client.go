@@ -8,10 +8,14 @@ import (
 	"sync"
 )
 
-// peerIOBufferSize is the size of the per-connection read and write buffers.
-// 64 KiB comfortably holds a burst of pipelined block requests in a single
-// write syscall and lets several inbound messages be drained from one read.
-const peerIOBufferSize = 64 * 1024
+// peerReadBufferSize is the size of the per-connection read buffer.
+// 64 KiB allows several inbound messages (e.g. piece blocks) to be drained in one syscall.
+const peerReadBufferSize = 64 * 1024
+
+// peerWriteBufferSize is the size of the per-connection write buffer.
+// 8 KiB is sized to comfortably hold a full burst of pipelined block requests
+// (up to 256 requests * 17 bytes = 4.25 KiB) in a single write syscall without overflowing.
+const peerWriteBufferSize = 8 * 1024
 
 // Client represents a connection to a BitTorrent peer.
 type Client struct {
@@ -30,8 +34,8 @@ func NewClient(conn net.Conn, infoHash, peerID [20]byte) *Client {
 		Conn:     conn,
 		InfoHash: infoHash,
 		PeerID:   peerID,
-		r:        bufio.NewReaderSize(conn, peerIOBufferSize),
-		w:        bufio.NewWriterSize(conn, peerIOBufferSize),
+		r:        bufio.NewReaderSize(conn, peerReadBufferSize),
+		w:        bufio.NewWriterSize(conn, peerWriteBufferSize),
 	}
 }
 
@@ -134,15 +138,6 @@ func (c *Client) SendHave(index uint32) error {
 // SendBitfield sends our bitfield representation of possessed pieces to the peer.
 func (c *Client) SendBitfield(bitfield []byte) error {
 	return c.SendMessage(&Message{ID: MsgBitfield, Payload: bitfield})
-}
-
-// SendRequest sends a request message for a block of a piece.
-func (c *Client) SendRequest(index, begin, length uint32) error {
-	payload := make([]byte, 12)
-	binary.BigEndian.PutUint32(payload[0:4], index)
-	binary.BigEndian.PutUint32(payload[4:8], begin)
-	binary.BigEndian.PutUint32(payload[8:12], length)
-	return c.SendMessage(&Message{ID: MsgRequest, Payload: payload})
 }
 
 // SendPiece sends a piece block message to the peer.
