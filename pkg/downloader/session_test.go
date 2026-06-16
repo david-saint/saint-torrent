@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -94,6 +95,73 @@ func TestSessionInitAndBlockCalculations(t *testing.T) {
 	p1Blocks := sess.blocksInPiece(1)
 	if p1Blocks != 3 {
 		t.Errorf("expected 3 blocks in piece 1, got %d", p1Blocks)
+	}
+}
+
+func TestSessionCloseClosesStorage(t *testing.T) {
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "close-storage.txt",
+		InfoHash:    sha1.Sum([]byte("close-storage")),
+		PieceLength: 64,
+		PieceHashes: [][20]byte{sha1.Sum(make([]byte, 64))},
+		Files:       []torrent.File{{Length: 64, Path: []string{"close-storage.txt"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "close-storage.txt", Length: 64}}, 64)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	if _, err := st.ReadBlock(0, 0, make([]byte, 64)); err != nil {
+		t.Fatalf("pre-close read failed: %v", err)
+	}
+	sess.Close()
+	sess.Close()
+
+	if _, err := st.ReadBlock(0, 0, make([]byte, 64)); !errors.Is(err, storage.ErrStorageClosed) {
+		t.Fatalf("expected storage to reject reads after session close, got %v", err)
+	}
+	if err := st.WriteBlock(0, 0, make([]byte, 64)); !errors.Is(err, storage.ErrStorageClosed) {
+		t.Fatalf("expected storage to reject writes after session close, got %v", err)
+	}
+}
+
+func TestSessionSaveStateErrorsAreSurfaced(t *testing.T) {
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "save-error.txt",
+		InfoHash:    sha1.Sum([]byte("save-error")),
+		PieceLength: 64,
+		PieceHashes: [][20]byte{sha1.Sum(make([]byte, 64))},
+		Files:       []torrent.File{{Length: 64, Path: []string{"save-error.txt"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "save-error.txt", Length: 64}}, 64)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("failed to close storage: %v", err)
+	}
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.saveStateLocked()
+	sess.mu.Unlock()
+
+	if err := sess.LastError(); err == nil {
+		t.Fatal("expected fast-resume save failure to be surfaced")
+	}
+	if status := sess.Status(); status != "Error" {
+		t.Fatalf("expected failed fast-resume save to set Error status, got %q", status)
 	}
 }
 
