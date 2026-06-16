@@ -9,8 +9,15 @@ import (
 
 // Extension message IDs for BEP 10 (Extension Protocol).
 const (
-	MsgExtended  MessageID = 20
-	ExtHandshake byte      = 0
+	MsgExtended MessageID = 20
+
+	ExtHandshake byte = 0
+
+	ExtNameMetadata = "ut_metadata"
+	ExtNamePEX      = "ut_pex"
+
+	LocalMetadataExtID = 1
+	LocalPEXExtID      = 2
 )
 
 // MetadataMsg types for BEP 9 (Metadata Exchange).
@@ -103,8 +110,26 @@ func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
 // We advertise ut_metadata support with the given message ID and, if known,
 // the total metadata size.
 func SerializeExtensionHandshake(utMetadataID int, metadataSize int) ([]byte, error) {
-	mDict := map[string]interface{}{
-		"ut_metadata": utMetadataID,
+	return SerializeExtensionHandshakeWithExtensions(map[string]int{
+		ExtNameMetadata: utMetadataID,
+	}, metadataSize)
+}
+
+// SerializeExtensionHandshakeWithExtensions creates the bencoded extension
+// handshake payload for an arbitrary BEP 10 extension map.
+func SerializeExtensionHandshakeWithExtensions(extensions map[string]int, metadataSize int) ([]byte, error) {
+	mDict := make(map[string]interface{}, len(extensions))
+	for name, id := range extensions {
+		if name == "" {
+			return nil, errors.New("extension name cannot be empty")
+		}
+		if id < 0 || id > 255 {
+			return nil, fmt.Errorf("extension ID for %q is out of range: %d", name, id)
+		}
+		if id == 0 {
+			continue
+		}
+		mDict[name] = id
 	}
 	payload := map[string]interface{}{
 		"m": mDict,
@@ -239,9 +264,24 @@ func (c *Client) SendExtHandshake(utMetadataID int, metadataSize int) error {
 		return err
 	}
 
+	return c.sendExtendedPayload(ExtHandshake, payload)
+}
+
+// SendExtHandshakeWithExtensions sends a BEP 10 extension handshake advertising
+// the provided local extension IDs.
+func (c *Client) SendExtHandshakeWithExtensions(extensions map[string]int, metadataSize int) error {
+	payload, err := SerializeExtensionHandshakeWithExtensions(extensions, metadataSize)
+	if err != nil {
+		return err
+	}
+
+	return c.sendExtendedPayload(ExtHandshake, payload)
+}
+
+func (c *Client) sendExtendedPayload(extMsgID byte, payload []byte) error {
 	// Extension message payload: [ext_msg_id (1 byte)][bencoded payload]
 	msgPayload := make([]byte, 1+len(payload))
-	msgPayload[0] = ExtHandshake
+	msgPayload[0] = extMsgID
 	copy(msgPayload[1:], payload)
 
 	return c.SendMessage(&Message{
