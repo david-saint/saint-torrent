@@ -469,6 +469,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		PeerID:   s.PeerID,
 	}
 	respHs.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
+	peer.EnableFastExtension(&respHs.Reserved)
 	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}
@@ -491,6 +492,8 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 }
 
 func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte, outbound bool) {
+	fastEnabled := peer.SupportsFastExtension(peerReserved)
+
 	s.mu.Lock()
 	if s.paused || s.closed {
 		s.mu.Unlock()
@@ -547,21 +550,40 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	s.mu.RUnlock()
 
 	var initializedPeersAndBitfield bool = false
+	allowedFastForPeer := make(map[int64]struct{})
+	peerAllowedFast := make(map[int64]struct{})
+	peerRejectedPieces := make(map[int64]struct{})
 
-	if !inMeta {
-		s.mu.RLock()
-		bf := make([]byte, (numPieces+7)/8)
-		hasAny := false
-		isComplete := s.isCompletedLocked()
-		for i, state := range s.PieceStates {
-			if state == PieceCompleted {
-				bf[i/8] |= 1 << (7 - (i % 8))
-				hasAny = true
-			}
+	sendAllowedFastPieces := func(states []PieceState) {
+		if !fastEnabled || len(states) == 0 {
+			return
 		}
+		for _, idx := range allowedFastSet(s.Torrent.InfoHash, ip, len(states), allowedFastSetSize) {
+			if idx < 0 || idx >= len(states) || states[idx] != PieceCompleted {
+				continue
+			}
+			pieceIndex := int64(idx)
+			if _, sent := allowedFastForPeer[pieceIndex]; sent {
+				continue
+			}
+			allowedFastForPeer[pieceIndex] = struct{}{}
+			_ = client.SendAllowedFast(uint32(idx))
+		}
+	}
+
+	sendInitialPeerState := func() {
+		s.mu.RLock()
+		states := append([]PieceState(nil), s.PieceStates...)
+		isComplete := s.isCompletedLocked()
 		s.mu.RUnlock()
 
-		if hasAny {
+		bf, hasAny, hasAll := completedPieceBitfield(states)
+		switch {
+		case fastEnabled && hasAll:
+			_ = client.SendHaveAll()
+		case fastEnabled && !hasAny:
+			_ = client.SendHaveNone()
+		case hasAny:
 			_ = client.SendBitfield(bf)
 		}
 		if isComplete {
@@ -569,6 +591,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		} else {
 			_ = client.SendInterested()
 		}
+		sendAllowedFastPieces(states)
+	}
+
+	if !inMeta {
+		sendInitialPeerState()
 		initializedPeersAndBitfield = true
 	}
 
@@ -706,6 +733,39 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		s.mu.Unlock()
 	}
+	abandonRejectedDownload := func(dl *activeDownload, rejectedBegin int64, now time.Time) {
+		if dl == nil {
+			return
+		}
+		peerRejectedPieces[dl.pieceIndex] = struct{}{}
+		for begin, req := range dl.pending {
+			if req.requested && !req.received {
+				if begin != rejectedBegin {
+					_ = client.SendCancel(uint32(dl.pieceIndex), uint32(begin), uint32(req.length))
+				}
+				finishRequest(req, requestFinishCancel, now)
+			}
+		}
+		if !dl.endgame {
+			s.mu.Lock()
+			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
+				s.PieceStates[dl.pieceIndex] == PieceDownloading {
+				s.PieceStates[dl.pieceIndex] = PieceEmpty
+				s.addNeededLocked(int(dl.pieceIndex))
+			}
+			s.mu.Unlock()
+		}
+		removeDownload(dl.pieceIndex)
+		publishPipelineSnapshot(now, true)
+	}
+	isFastMessage := func(id peer.MessageID) bool {
+		switch id {
+		case peer.MsgSuggestPiece, peer.MsgHaveAll, peer.MsgHaveNone, peer.MsgRejectRequest, peer.MsgAllowedFast:
+			return true
+		default:
+			return false
+		}
+	}
 
 	var peerUtMetadataID int = -1
 
@@ -724,21 +784,21 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// instead returns a redundant copy of an in-progress piece this peer has, leaving
 	// that piece's state owned by the original downloader. Returns nil when the peer
 	// has nothing left for us.
-	openNewPiece := func() *activeDownload {
+	openNewPiece := func(canRequestPiece func(int64) bool) *activeDownload {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.paused || s.closed {
 			return nil
 		}
 		endgame := false
-		bestIdx := s.selectNeededPieceLocked(hasPiece)
+		bestIdx := s.selectNeededPieceLocked(canRequestPiece)
 		if bestIdx == -1 {
 			if s.endgameActiveLocked() {
 				owned := make(map[int64]bool, len(activeDownloads))
 				for _, dl := range activeDownloads {
 					owned[dl.pieceIndex] = true
 				}
-				bestIdx = s.selectEndgamePieceLocked(hasPiece, owned)
+				bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
 				endgame = true
 			}
 			if bestIdx == -1 {
@@ -812,7 +872,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		return max(1, int((pieceLength+BlockSize-1)/BlockSize))
 	}
-	requestableWorkAvailable := func(pieceCap int) bool {
+	requestableWorkAvailable := func(pieceCap int, canRequestPiece func(int64) bool) bool {
 		for _, dl := range activeDownloads {
 			if requestable(dl) {
 				return true
@@ -825,13 +885,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		defer s.mu.RUnlock()
 		for idx := range s.neededPieces {
 			if idx >= 0 && idx < len(s.PieceStates) && s.PieceStates[idx] == PieceEmpty &&
-				hasPiece(int64(idx)) && s.isPieceWanted(int64(idx)) {
+				canRequestPiece(int64(idx)) && s.isPieceWanted(int64(idx)) {
 				return true
 			}
 		}
 		if s.endgameActiveLocked() {
 			for i, state := range s.PieceStates {
-				if state == PieceDownloading && hasPiece(int64(i)) && s.isPieceWanted(int64(i)) {
+				if state == PieceDownloading && canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
 					return true
 				}
 			}
@@ -878,6 +938,22 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		choked := pState.Choked
 		s.mu.RUnlock()
 		now := time.Now()
+		canRequestPiece := func(index int64) bool {
+			if !hasPiece(index) {
+				return false
+			}
+			if _, rejected := peerRejectedPieces[index]; rejected {
+				return false
+			}
+			if !choked {
+				return true
+			}
+			if !fastEnabled {
+				return false
+			}
+			_, ok := peerAllowedFast[index]
+			return ok
+		}
 		if paused {
 			waitingForBandwidth = false
 			publishPipelineSnapshot(now, false)
@@ -914,8 +990,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 		// A choked peer won't fulfill new requests, so don't open pieces or send;
 		// the timeout sweep above has already run, which is the part that matters
-		// for not leaking a stalled connection.
-		if choked {
+		// for not leaking a stalled connection. Fast peers may still serve pieces
+		// they explicitly listed with allowed_fast.
+		if choked && (!fastEnabled || len(peerAllowedFast) == 0) {
 			waitingForBandwidth = false
 			publishPipelineSnapshot(now, false)
 			return 0
@@ -947,7 +1024,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					pipeline.OnPieceCapLimited(now)
 					break
 				}
-				newDL := openNewPiece()
+				newDL := openNewPiece(canRequestPiece)
 				if newDL == nil {
 					break
 				}
@@ -1005,7 +1082,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			waitingForBandwidth = false
 			outstanding++
 		}
-		if outstanding >= window && requestableWorkAvailable(pieceCap) {
+		if outstanding >= window && requestableWorkAvailable(pieceCap, canRequestPiece) {
 			pipeline.OnWindowLimited(now)
 		}
 		waitingForBandwidth = false
@@ -1173,29 +1250,14 @@ peerLoop:
 
 		if !inMetaNow && !initializedPeersAndBitfield {
 			// Initialize now that metadata is downloaded!
-			s.mu.RLock()
-			bf := make([]byte, (numPiecesNow+7)/8)
-			hasAny := false
-			isComplete := s.isCompletedLocked()
-			for i, state := range s.PieceStates {
-				if state == PieceCompleted {
-					bf[i/8] |= 1 << (7 - (i % 8))
-					hasAny = true
-				}
-			}
-			s.mu.RUnlock()
-
-			if hasAny {
-				_ = client.SendBitfield(bf)
-			}
-			if isComplete {
-				_ = client.SendNotInterested()
-			} else {
-				_ = client.SendInterested()
-			}
+			sendInitialPeerState()
 
 			peerBitfield = make([]byte, (numPiecesNow+7)/8)
 			initializedPeersAndBitfield = true
+		}
+
+		if !fastEnabled && isFastMessage(msg.ID) {
+			break peerLoop
 		}
 
 		switch msg.ID {
@@ -1402,6 +1464,32 @@ peerLoop:
 				}
 			}
 
+		case peer.MsgHaveAll:
+			expectedLen := (numPiecesNow + 7) / 8
+			if len(msg.Payload) != 0 || expectedLen == 0 {
+				continue
+			}
+			if len(peerBitfield) != expectedLen {
+				peerBitfield = make([]byte, expectedLen)
+			}
+			oldBF := append([]byte(nil), peerBitfield...)
+			peerBitfield = fullPieceBitfield(numPiecesNow)
+			s.applyBitfieldAvailability(oldBF, peerBitfield)
+
+		case peer.MsgHaveNone:
+			expectedLen := (numPiecesNow + 7) / 8
+			if len(msg.Payload) != 0 || expectedLen == 0 {
+				continue
+			}
+			if len(peerBitfield) != expectedLen {
+				peerBitfield = make([]byte, expectedLen)
+			}
+			oldBF := append([]byte(nil), peerBitfield...)
+			for i := range peerBitfield {
+				peerBitfield[i] = 0
+			}
+			s.applyBitfieldAvailability(oldBF, peerBitfield)
+
 		case peer.MsgBitfield:
 			expectedLen := (numPiecesNow + 7) / 8
 			if expectedLen == 0 || len(msg.Payload) != expectedLen {
@@ -1413,6 +1501,38 @@ peerLoop:
 			oldBF := append([]byte(nil), peerBitfield...)
 			copy(peerBitfield, msg.Payload)
 			s.applyBitfieldAvailability(oldBF, peerBitfield)
+
+		case peer.MsgSuggestPiece:
+			// Advisory only. We still require Have/Bitfield/HaveAll before requesting.
+			if len(msg.Payload) != 4 {
+				continue
+			}
+
+		case peer.MsgAllowedFast:
+			if len(msg.Payload) != 4 {
+				continue
+			}
+			index := int64(binary.BigEndian.Uint32(msg.Payload))
+			if index >= 0 && index < int64(numPiecesNow) {
+				peerAllowedFast[index] = struct{}{}
+			}
+
+		case peer.MsgRejectRequest:
+			if len(msg.Payload) != 12 {
+				continue
+			}
+			index := int64(binary.BigEndian.Uint32(msg.Payload[0:4]))
+			begin := int64(binary.BigEndian.Uint32(msg.Payload[4:8]))
+			length := int64(binary.BigEndian.Uint32(msg.Payload[8:12]))
+			dl := findDownload(index)
+			if dl == nil {
+				continue
+			}
+			req, exists := dl.pending[begin]
+			if !exists || req.length != length || !req.requested || req.received {
+				continue
+			}
+			abandonRejectedDownload(dl, begin, time.Now())
 
 		case peer.MsgPiece:
 			if len(msg.Payload) < 8 {
@@ -1536,8 +1656,12 @@ peerLoop:
 					pieceLen = s.Storage.PieceLength(index)
 				}
 				s.mu.RUnlock()
+				_, requestAllowedFast := allowedFastForPeer[index]
 
-				if paused || amChoking {
+				if paused || (amChoking && !requestAllowedFast) {
+					if fastEnabled && length > 0 {
+						_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+					}
 					continue
 				}
 
@@ -1560,6 +1684,8 @@ peerLoop:
 							atomic.AddInt64(&pState.Uploaded, length)
 						}
 					}
+				} else if fastEnabled && length > 0 {
+					_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
 				}
 			}
 		}

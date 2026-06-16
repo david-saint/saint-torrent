@@ -48,6 +48,7 @@ func (c *Client) Handshake() (*Handshake, error) {
 		PeerID:   c.PeerID,
 	}
 	reqHandshake.Reserved[5] = 0x10 // Support extension protocol (BEP 10)
+	EnableFastExtension(&reqHandshake.Reserved)
 
 	c.writeMu.Lock()
 	_, err := c.w.Write(reqHandshake.Serialize())
@@ -140,6 +141,23 @@ func (c *Client) SendBitfield(bitfield []byte) error {
 	return c.SendMessage(&Message{ID: MsgBitfield, Payload: bitfield})
 }
 
+// SendSuggestPiece advises the peer that a piece may be useful to request.
+func (c *Client) SendSuggestPiece(index uint32) error {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, index)
+	return c.SendMessage(&Message{ID: MsgSuggestPiece, Payload: payload})
+}
+
+// SendHaveAll tells a fast-extension peer that we have every piece.
+func (c *Client) SendHaveAll() error {
+	return c.SendMessage(&Message{ID: MsgHaveAll})
+}
+
+// SendHaveNone tells a fast-extension peer that we have no pieces.
+func (c *Client) SendHaveNone() error {
+	return c.SendMessage(&Message{ID: MsgHaveNone})
+}
+
 // SendPiece sends a piece block message to the peer.
 func (c *Client) SendPiece(index, begin uint32, block []byte) error {
 	payload := make([]byte, 8+len(block))
@@ -156,6 +174,22 @@ func (c *Client) SendCancel(index, begin, length uint32) error {
 	binary.BigEndian.PutUint32(payload[4:8], begin)
 	binary.BigEndian.PutUint32(payload[8:12], length)
 	return c.SendMessage(&Message{ID: MsgCancel, Payload: payload})
+}
+
+// SendRejectRequest tells a fast-extension peer that a request will not be served.
+func (c *Client) SendRejectRequest(index, begin, length uint32) error {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[0:4], index)
+	binary.BigEndian.PutUint32(payload[4:8], begin)
+	binary.BigEndian.PutUint32(payload[8:12], length)
+	return c.SendMessage(&Message{ID: MsgRejectRequest, Payload: payload})
+}
+
+// SendAllowedFast grants the peer permission to request a piece while choked.
+func (c *Client) SendAllowedFast(index uint32) error {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, index)
+	return c.SendMessage(&Message{ID: MsgAllowedFast, Payload: payload})
 }
 
 // ReadMessage reads a message from the peer connection through the buffered
