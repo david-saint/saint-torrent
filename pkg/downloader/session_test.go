@@ -1073,6 +1073,102 @@ func TestFastExtensionRejectRequestImmediatelyRotatesPiece(t *testing.T) {
 	}
 }
 
+func TestFastExtensionUnchokeClearsRejectedPiece(t *testing.T) {
+	defer swapDuration(&blockRequestTimeout, time.Hour)()
+	data := []byte("retry me")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "reject-clear.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"reject-clear.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "reject-clear.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.pipelineBudget = newPipelineByteBudget(int64(len(data)))
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6105", "127.0.0.1", 6105, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgHaveNone {
+		t.Fatalf("expected have_none, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested, got msg=%#v err=%v", msg, err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgHaveAll}).Serialize()); err != nil {
+		t.Fatalf("failed to send have_all: %v", err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send unchoke: %v", err)
+	}
+
+	firstRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil || firstRequest == nil || firstRequest.ID != peer.MsgRequest || len(firstRequest.Payload) != 12 {
+		t.Fatalf("expected first request, got %#v err=%v", firstRequest, err)
+	}
+	if got := binary.BigEndian.Uint32(firstRequest.Payload[0:4]); got != 0 {
+		t.Fatalf("first request piece = %d, want 0", got)
+	}
+	// Reject the only piece. It must not be permanently barred from this peer.
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgRejectRequest, Payload: append([]byte(nil), firstRequest.Payload...)}).Serialize()); err != nil {
+		t.Fatalf("failed to send reject_request: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		sess.mu.RLock()
+		state := sess.PieceStates[0]
+		sess.mu.RUnlock()
+		if state == PieceEmpty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rejected piece state = %v, want PieceEmpty", state)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A fresh unchoke signals the peer is willing again, so the rejection clears and
+	// the piece becomes requestable from this peer once more.
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send second unchoke: %v", err)
+	}
+	secondRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil || secondRequest == nil || secondRequest.ID != peer.MsgRequest || len(secondRequest.Payload) != 12 {
+		t.Fatalf("expected re-request after unchoke, got %#v err=%v", secondRequest, err)
+	}
+	if got := binary.BigEndian.Uint32(secondRequest.Payload[0:4]); got != 0 {
+		t.Fatalf("re-request piece = %d, want 0 (rejection should have cleared on unchoke)", got)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
 func TestAnnounceMagnetUsesNonZeroLeft(t *testing.T) {
 	oldTimeout := trackerAnnounceTimeout
 	trackerAnnounceTimeout = 2 * time.Second

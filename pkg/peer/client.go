@@ -141,13 +141,6 @@ func (c *Client) SendBitfield(bitfield []byte) error {
 	return c.SendMessage(&Message{ID: MsgBitfield, Payload: bitfield})
 }
 
-// SendSuggestPiece advises the peer that a piece may be useful to request.
-func (c *Client) SendSuggestPiece(index uint32) error {
-	payload := make([]byte, 4)
-	binary.BigEndian.PutUint32(payload, index)
-	return c.SendMessage(&Message{ID: MsgSuggestPiece, Payload: payload})
-}
-
 // SendHaveAll tells a fast-extension peer that we have every piece.
 func (c *Client) SendHaveAll() error {
 	return c.SendMessage(&Message{ID: MsgHaveAll})

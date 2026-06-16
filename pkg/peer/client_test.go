@@ -201,10 +201,6 @@ func TestFastMessageSendHelpers(t *testing.T) {
 			errCh <- err
 			return
 		}
-		if err := client.SendSuggestPiece(7); err != nil {
-			errCh <- err
-			return
-		}
 		if err := client.SendRejectRequest(1, 2, 3); err != nil {
 			errCh <- err
 			return
@@ -223,7 +219,6 @@ func TestFastMessageSendHelpers(t *testing.T) {
 	}{
 		{id: MsgHaveAll},
 		{id: MsgHaveNone},
-		{id: MsgSuggestPiece, payload: []byte{0, 0, 0, 7}},
 		{id: MsgRejectRequest, payload: []byte{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3}},
 		{id: MsgAllowedFast, payload: []byte{0, 0, 0, 9}},
 	}

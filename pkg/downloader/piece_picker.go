@@ -104,6 +104,17 @@ func bitfieldHas(bf []byte, i int) bool {
 	return bf[byteIdx]&(1<<(7-uint(i%8))) != 0
 }
 
+// setBit sets bit i in a BitTorrent bitfield (MSB-first within each byte). It is
+// the write-side counterpart to bitfieldHas; both encode the single on-the-wire
+// bit ordering convention so callers never hand-roll the shift.
+func setBit(bf []byte, i int) {
+	byteIdx := i / 8
+	if byteIdx < 0 || byteIdx >= len(bf) {
+		return
+	}
+	bf[byteIdx] |= 1 << (7 - uint(i%8))
+}
+
 // addPieceAvailability records that a peer now advertises piece idx (a Have).
 func (s *Session) addPieceAvailability(idx int) {
 	s.mu.Lock()

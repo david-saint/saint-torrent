@@ -19,7 +19,7 @@ func completedPieceBitfield(states []PieceState) (bitfield []byte, hasAny bool, 
 			hasAll = false
 			continue
 		}
-		bitfield[i/8] |= 1 << (7 - (i % 8))
+		setBit(bitfield, i)
 		hasAny = true
 	}
 	return bitfield, hasAny, hasAll
@@ -31,7 +31,7 @@ func fullPieceBitfield(numPieces int) []byte {
 	}
 	bitfield := make([]byte, (numPieces+7)/8)
 	for i := 0; i < numPieces; i++ {
-		bitfield[i/8] |= 1 << (7 - (i % 8))
+		setBit(bitfield, i)
 	}
 	return bitfield
 }
