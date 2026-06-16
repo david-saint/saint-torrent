@@ -744,6 +744,7 @@ func (m *TorrentManager) saveStateInternal(allowClosed bool) error {
 				Trackers:  append([]string(nil), tor.Trackers...),
 				InfoHash:  tor.InfoHash,
 				InfoBytes: infoBytesCopy,
+				Private:   tor.Private,
 			}
 		}
 		sess.mu.RUnlock()

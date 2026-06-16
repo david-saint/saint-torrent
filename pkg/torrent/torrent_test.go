@@ -194,6 +194,44 @@ func TestParseTorrent(t *testing.T) {
 	})
 }
 
+func TestParsePrivateFlag(t *testing.T) {
+	tests := []struct {
+		name  string
+		value interface{}
+		want  bool
+	}{
+		{name: "missing", want: false},
+		{name: "zero", value: int64(0), want: false},
+		{name: "one", value: int64(1), want: true},
+		{name: "other integer", value: int64(2), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := map[string]interface{}{
+				"name":         "private.txt",
+				"piece length": int64(16),
+				"pieces":       string(make([]byte, 20)),
+				"length":       int64(16),
+			}
+			if tt.value != nil {
+				info["private"] = tt.value
+			}
+			data, err := bencode.Marshal(map[string]interface{}{"info": info})
+			if err != nil {
+				t.Fatalf("failed to marshal torrent: %v", err)
+			}
+			tor, err := Parse(data)
+			if err != nil {
+				t.Fatalf("Parse() failed: %v", err)
+			}
+			if tor.Private != tt.want {
+				t.Fatalf("Private = %v, want %v", tor.Private, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseRejectsInvalidLengthsAndPathCollisions(t *testing.T) {
 	t.Run("negative file length", func(t *testing.T) {
 		info := map[string]interface{}{

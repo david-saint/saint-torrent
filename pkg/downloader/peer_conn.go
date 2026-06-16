@@ -1685,13 +1685,14 @@ func (s *Session) dhtLoop() {
 	d := s.DHT
 	peerPort := s.Port
 	hasInbound := s.hasInboundListenerLocked()
+	allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
 	var infoHash [20]byte
 	if s.Torrent != nil {
 		infoHash = s.Torrent.InfoHash
 	}
 	s.mu.RUnlock()
 
-	if !paused && d != nil && s.Torrent != nil && hasInbound {
+	if !paused && allowDHT && d != nil && s.Torrent != nil && hasInbound {
 		d.Lookup(infoHash, peerPort)
 	}
 
@@ -1703,12 +1704,13 @@ func (s *Session) dhtLoop() {
 			d = s.DHT
 			peerPort = s.Port
 			hasInbound = s.hasInboundListenerLocked()
+			allowDHT = s.allowsDecentralizedPeerDiscoveryLocked()
 			if s.Torrent != nil {
 				infoHash = s.Torrent.InfoHash
 			}
 			s.mu.RUnlock()
 
-			if !paused && d != nil && s.Torrent != nil && hasInbound {
+			if !paused && allowDHT && d != nil && s.Torrent != nil && hasInbound {
 				d.Lookup(infoHash, peerPort)
 			}
 		case <-s.ctx.Done():
@@ -1741,6 +1743,9 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 	defer s.mu.Unlock()
 
 	if s.paused || s.closed || !s.started {
+		return
+	}
+	if !s.allowsDecentralizedPeerDiscoveryLocked() {
 		return
 	}
 
@@ -1791,7 +1796,7 @@ func (s *Session) AttachDHT(d *dht.DHT) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
-	if s.closed || s.DHT != nil || d == nil {
+	if s.closed || s.DHT != nil || d == nil || !s.allowsDecentralizedPeerDiscoveryLocked() {
 		s.mu.Unlock()
 		return
 	}

@@ -159,6 +159,42 @@ func TestManagerCloseClosesSessionsBeforeDHT(t *testing.T) {
 	}
 }
 
+func TestManagerDoesNotAttachDHTToPrivateSession(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	if err := mgr.StartDHT(tempDir, 0); err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+
+	tor := &torrent.Torrent{
+		Name:        "private-manager.txt",
+		InfoHash:    sha1.Sum([]byte("private-manager")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("x"))},
+		Files:       []torrent.File{{Length: 1, Path: []string{"private-manager.txt"}}},
+		Private:     true,
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "private-manager.txt", Length: 1}}, 1)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	mgr.AddSession("private-manager", sess)
+
+	sess.mu.RLock()
+	attached := sess.DHT != nil
+	sess.mu.RUnlock()
+	if attached {
+		t.Fatal("manager attached DHT to private session")
+	}
+}
+
 func TestTorrentManagerAddMethods(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "sainttorrent_manager_add_test")
 	if err != nil {
