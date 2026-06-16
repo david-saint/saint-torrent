@@ -26,10 +26,8 @@ func TestDynamicWindowStartupProbeAndRaisedCap(t *testing.T) {
 		t.Fatalf("initial window = %d, want 16", got)
 	}
 
-	for i := 0; i < 4; i++ {
-		now = now.Add(250 * time.Millisecond)
-		p.OnWindowLimited(now)
-	}
+	now = now.Add(250 * time.Millisecond)
+	p.OnWindowLimited(now)
 	if got := p.WindowBlocks(now); got != 256 {
 		t.Fatalf("startup probe window = %d, want 256", got)
 	}
@@ -70,13 +68,88 @@ func TestDynamicWindowSlowPeerShrinksTowardMinimum(t *testing.T) {
 	}
 }
 
+func TestDynamicWindowStartupDoesNotExitOnAcceptedBlockCount(t *testing.T) {
+	now := time.Unix(250, 0)
+	p := newPeerPipelineController(testPipelineConfig())
+
+	for i := 0; i < 16; i++ {
+		req := &blockRequest{length: BlockSize, requested: true, requestedAt: now.Add(-50 * time.Millisecond)}
+		p.OnRequestSent(req, req.requestedAt)
+		now = now.Add(2 * time.Millisecond)
+		p.OnBlockAccepted(req, BlockSize, now)
+	}
+
+	if !p.inStartupProbe {
+		t.Fatal("startup probe exited solely because 16 blocks were accepted")
+	}
+}
+
+func TestDynamicWindowHealthyWindowLimitedFloor(t *testing.T) {
+	now := time.Unix(260, 0)
+	p := newPeerPipelineController(testPipelineConfig())
+	p.inStartupProbe = false
+	p.windowBlocks = 32
+	p.targetWindowBlocks = 32
+	p.metrics.rateFast.update(float64(8*BlockSize), time.Second)
+	p.metrics.rateSlow.update(float64(8*BlockSize), time.Second)
+
+	p.OnWindowLimited(now)
+
+	if got := p.WindowBlocks(now); got < dynamicPipelineHealthyFloorBlocks {
+		t.Fatalf("healthy window-limited peer window = %d, want at least %d", got, dynamicPipelineHealthyFloorBlocks)
+	}
+
+	now = now.Add(200 * time.Millisecond)
+	if got := p.WindowBlocks(now); got < dynamicPipelineHealthyFloorBlocks {
+		t.Fatalf("healthy floor was not preserved during active demand: got %d", got)
+	}
+}
+
+func TestDynamicWindowTimeoutDisablesHealthyFloor(t *testing.T) {
+	now := time.Unix(270, 0)
+	p := newPeerPipelineController(testPipelineConfig())
+	p.inStartupProbe = false
+	p.windowBlocks = 128
+	p.targetWindowBlocks = 128
+
+	p.OnRequestTimeout(nil, now)
+	now = now.Add(500 * time.Millisecond)
+	p.OnWindowLimited(now)
+
+	if got := p.WindowBlocks(now); got >= dynamicPipelineHealthyFloorBlocks {
+		t.Fatalf("timeout-limited peer jumped to healthy floor: got %d, want below %d", got, dynamicPipelineHealthyFloorBlocks)
+	}
+
+	now = now.Add(time.Second)
+	p.OnWindowLimited(now)
+	if got := p.WindowBlocks(now); got < dynamicPipelineHealthyFloorBlocks {
+		t.Fatalf("peer did not recover healthy floor after timeout cooldown: got %d", got)
+	}
+}
+
+func TestDynamicWindowTimeoutBackoffHalvesOncePerCooldown(t *testing.T) {
+	now := time.Unix(280, 0)
+	p := newPeerPipelineController(testPipelineConfig())
+	p.inStartupProbe = false
+	p.windowBlocks = 256
+	p.targetWindowBlocks = 256
+
+	p.OnRequestTimeout(nil, now)
+	if got := p.WindowBlocks(now); got != 128 {
+		t.Fatalf("window after first timeout = %d, want 128", got)
+	}
+
+	p.OnRequestTimeout(nil, now.Add(100*time.Millisecond))
+	if got := p.WindowBlocks(now.Add(100 * time.Millisecond)); got != 128 {
+		t.Fatalf("window after second timeout in cooldown = %d, want 128", got)
+	}
+}
+
 func TestDynamicWindowTimeoutHalvesWindowAndReleasesOutstanding(t *testing.T) {
 	now := time.Unix(300, 0)
 	p := newPeerPipelineController(testPipelineConfig())
-	for i := 0; i < 4; i++ {
-		now = now.Add(250 * time.Millisecond)
-		p.OnWindowLimited(now)
-	}
+	now = now.Add(250 * time.Millisecond)
+	p.OnWindowLimited(now)
 	req := &blockRequest{length: BlockSize, requested: true, requestedAt: now}
 	p.OnRequestSent(req, now)
 
@@ -155,5 +228,12 @@ func TestDynamicWindowByteBudgetReserveReleaseAndHighWater(t *testing.T) {
 	_, used, _ = b.snapshot()
 	if used != 0 {
 		t.Fatalf("over-release used = %d, want 0", used)
+	}
+}
+
+func TestDynamicWindowSessionBudgetCoversLegacyOutboundDepth(t *testing.T) {
+	want := int64(maxOutboundPeers * dynamicPipelineHealthyFloorBlocks * BlockSize)
+	if dynamicPipelineSessionBudgetBytes < want {
+		t.Fatalf("session pipeline budget = %d, want at least %d", dynamicPipelineSessionBudgetBytes, want)
 	}
 }
