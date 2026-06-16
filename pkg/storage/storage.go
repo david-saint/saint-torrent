@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -21,8 +22,8 @@ import (
 // has succeeded, but callers should re-verify completed pieces.
 var ErrFileRepaired = errors.New("storage file repaired")
 
-// ErrStorageClosed is returned by block operations after Close has released the
-// storage's cached file handles.
+// ErrStorageClosed is returned by block operations after Close has marked the
+// storage unavailable and released cached file handles.
 var ErrStorageClosed = errors.New("storage is closed")
 
 // FileInfo represents a file in the torrent.
@@ -49,8 +50,7 @@ type fileLayout struct {
 	readHandle *os.File
 }
 
-// reader returns the cached O_RDONLY handle, opening it on first use. Callers must
-// hold the Storage read lock so the handle cannot be closed underneath them.
+// reader returns the cached O_RDONLY handle, opening it on first use.
 func (f *fileLayout) reader() (*os.File, error) {
 	f.rmu.Lock()
 	defer f.rmu.Unlock()
@@ -65,15 +65,26 @@ func (f *fileLayout) reader() (*os.File, error) {
 	return h, nil
 }
 
-// invalidateReader closes and drops the cached read handle. Called under the
-// Storage write lock (repair/close), so no concurrent reader is using it.
+// invalidateReader closes and drops the cached read handle.
 func (f *fileLayout) invalidateReader() {
 	f.rmu.Lock()
+	f.invalidateReaderLocked()
+	f.rmu.Unlock()
+}
+
+func (f *fileLayout) tryInvalidateReader() {
+	if !f.rmu.TryLock() {
+		return
+	}
+	f.invalidateReaderLocked()
+	f.rmu.Unlock()
+}
+
+func (f *fileLayout) invalidateReaderLocked() {
 	if f.readHandle != nil {
 		_ = f.readHandle.Close()
 		f.readHandle = nil
 	}
-	f.rmu.Unlock()
 }
 
 // Storage manages the files on disk for a torrent and provides thread-safe
@@ -82,9 +93,11 @@ func (f *fileLayout) invalidateReader() {
 // Concurrency model: mu is an RWMutex. Block reads (ReadBlock/VerifyPiece) take
 // the read lock and run concurrently — positional ReadAt on a cached handle is
 // safe for parallel use, so the seed path is no longer serialized through one
-// mutex. Writes, repair, fast-resume state, and Close take the write lock; they
-// are infrequent (per piece, not per block) and run on the background write pool,
-// so they never block peer goroutines.
+// mutex. Writes, repair, and fast-resume state take the write lock; they are
+// infrequent (per piece, not per block) and run on the background write pool, so
+// they never block peer goroutines. Close marks the storage closed atomically
+// before invalidating cached read handles so session teardown cannot wedge behind
+// a blocked VerifyPiece/read lock.
 type Storage struct {
 	mu          sync.RWMutex
 	resolver    *PathResolver
@@ -93,7 +106,7 @@ type Storage struct {
 	pieceLength int64
 	totalSize   int64
 	stateFileMt map[string]int64
-	closed      bool
+	closed      atomic.Bool
 }
 
 // NewStorage creates the target directories and pre-allocates files to their
@@ -268,7 +281,7 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 	// so many block reads (the hot seed path) run in parallel without serializing.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	if s.closed.Load() {
 		return 0, ErrStorageClosed
 	}
 
@@ -288,6 +301,10 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 			f, err := file.reader()
 			if err != nil {
 				return 0, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
+			}
+			if s.closed.Load() {
+				file.invalidateReader()
+				return 0, ErrStorageClosed
 			}
 
 			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
@@ -325,7 +342,7 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 	// briefly excluding concurrent reads — does not throttle the per-block seed path.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return ErrStorageClosed
 	}
 	repaired := false
@@ -401,7 +418,7 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.closed {
+	if s.closed.Load() {
 		return false, ErrStorageClosed
 	}
 
@@ -422,6 +439,10 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 			if err != nil {
 				return false, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
 			}
+			if s.closed.Load() {
+				file.invalidateReader()
+				return false, ErrStorageClosed
+			}
 
 			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
 			if err != nil && err != io.EOF {
@@ -437,17 +458,18 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 	return actualHash == expectedHash, nil
 }
 
-// Close releases the storage's cached file handles. It is idempotent. After Close,
-// block operations return ErrStorageClosed.
+// Close marks storage closed and releases cached file handles. It is idempotent.
+// Close is deliberately non-blocking with respect to active reads: a session may
+// be closing because background verification is wedged in disk I/O, and teardown
+// must still release ownership immediately. Operations that start after Close
+// return ErrStorageClosed; operations already in progress may finish or fail as
+// their underlying file handles are invalidated.
 func (s *Storage) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	for _, file := range s.files {
-		file.invalidateReader()
+		file.tryInvalidateReader()
 	}
 	return nil
 }
@@ -465,8 +487,15 @@ type FastResumeState struct {
 
 // SaveState writes the completed pieces and file metadata to a fast-resume state file.
 func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
+	if s.closed.Load() {
+		return ErrStorageClosed
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrStorageClosed
+	}
 
 	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {
@@ -506,8 +535,15 @@ func (s *Storage) stateMtimeLocked(path string, fallback int64) int64 {
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
 func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
+	if s.closed.Load() {
+		return nil, ErrStorageClosed
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return nil, ErrStorageClosed
+	}
 
 	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {

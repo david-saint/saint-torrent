@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -106,8 +107,20 @@ func TestTorrentManager(t *testing.T) {
 	if len(mgr.ListSessions()) != 0 {
 		t.Errorf("expected 0 sessions after removal, got %d", len(mgr.ListSessions()))
 	}
+	if _, err := st.ReadBlock(0, 0, make([]byte, tor.PieceLength)); !errors.Is(err, storage.ErrStorageClosed) {
+		t.Fatalf("expected removal to close session storage, got %v", err)
+	}
 
 	mgr.Close()
+}
+
+func TestManagerSaveStateReturnsWriteErrors(t *testing.T) {
+	mgr := NewTorrentManager()
+	mgr.stateDir = filepath.Join(t.TempDir(), "missing")
+
+	if err := mgr.saveState(); err == nil {
+		t.Fatal("expected saveState to return an error for a missing state directory")
+	}
 }
 
 func TestManagerCloseClosesSessionsBeforeDHT(t *testing.T) {
