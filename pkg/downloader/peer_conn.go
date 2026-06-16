@@ -1785,6 +1785,9 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 	if s.paused || s.closed || !s.started {
 		return
 	}
+	if !s.allowsDecentralizedPeerDiscoveryLocked() {
+		return
+	}
 
 	pState, exists := s.Peers[peerAddr]
 	var shouldDial bool
@@ -1833,7 +1836,7 @@ func (s *Session) AttachDHT(d *dht.DHT) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
-	if s.closed || s.DHT != nil || d == nil {
+	if s.closed || s.DHT != nil || d == nil || !s.allowsDecentralizedPeerDiscoveryLocked() {
 		s.mu.Unlock()
 		return
 	}

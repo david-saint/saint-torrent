@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/bencode"
+	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -129,6 +131,108 @@ func TestSessionCloseClosesStorage(t *testing.T) {
 		t.Fatalf("expected storage to reject writes after session close, got %v", err)
 	}
 }
+
+func TestPrivateTorrentSuppressesDHTAndDiscovery(t *testing.T) {
+	tempDir := t.TempDir()
+	d, err := dht.NewDHT(tempDir, 0)
+	if err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+	defer d.Close()
+
+	tor := &torrent.Torrent{
+		Name:        "private.txt",
+		InfoHash:    sha1.Sum([]byte("private-dht")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("x"))},
+		Files:       []torrent.File{{Length: 1, Path: []string{"private.txt"}}},
+		Private:     true,
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "private.txt", Length: 1}}, 1)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	sess.AttachDHT(d)
+	sess.mu.RLock()
+	attached := sess.DHT != nil
+	sess.mu.RUnlock()
+	if attached {
+		t.Fatal("private torrent attached DHT")
+	}
+
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	sess.AddPeerFromDiscovery("127.0.0.1:6881")
+
+	sess.mu.RLock()
+	peerCount := len(sess.Peers)
+	sess.mu.RUnlock()
+	if peerCount != 0 {
+		t.Fatalf("private torrent accepted decentralized discovery peers, got %d", peerCount)
+	}
+}
+
+func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
+	tempDir := t.TempDir()
+	info := map[string]interface{}{
+		"name":         "private-magnet.txt",
+		"piece length": int64(1),
+		"pieces":       string(make([]byte, 20)),
+		"length":       int64(1),
+		"private":      int64(1),
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatalf("failed to marshal metadata: %v", err)
+	}
+
+	tor := &torrent.Torrent{
+		Name:     "private-magnet",
+		InfoHash: sha1.Sum(infoBytes),
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	d, err := dht.NewDHT(tempDir, 0)
+	if err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+	defer d.Close()
+
+	sess.AttachDHT(d)
+	sess.mu.RLock()
+	attachedBeforeMetadata := sess.DHT != nil
+	sess.mu.RUnlock()
+	if !attachedBeforeMetadata {
+		t.Fatal("expected magnet session to attach DHT before private metadata is known")
+	}
+
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded failed: %v", err)
+	}
+
+	sess.mu.RLock()
+	private := sess.Torrent.Private
+	attachedAfterMetadata := sess.DHT != nil
+	sess.mu.RUnlock()
+	if !private {
+		t.Fatal("metadata private flag was not applied to the session torrent")
+	}
+	if attachedAfterMetadata {
+		t.Fatal("private metadata did not disable attached DHT")
+	}
+}
+
 
 func TestSessionSaveStateErrorsAreSurfaced(t *testing.T) {
 	tempDir := t.TempDir()
