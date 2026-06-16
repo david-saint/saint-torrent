@@ -854,14 +854,6 @@ func (s *Session) SetUploadLimit(bytesPerSec int64) {
 	s.UploadLimiter.SetLimit(bytesPerSec)
 }
 
-// reserveDownload non-blockingly reserves n bytes from the per-session and (if set)
-// manager-wide limiter. retryAfter estimates when a failed reservation should be
-// retried; a charged per-session reservation is refunded if the global limiter fails.
-func (s *Session) reserveDownload(n int) (reserved bool, retryAfter time.Duration) {
-	reserved, retryAfter, _ = s.reserveDownloadWithRefund(n)
-	return reserved, retryAfter
-}
-
 func (s *Session) reserveDownloadWithRefund(n int) (reserved bool, retryAfter time.Duration, refund func()) {
 	localOK, localCharged, localRetry := s.DownloadLimiter.tryReserve(n)
 	if !localOK {
