@@ -906,8 +906,12 @@ func TestForwardedDownloadDir(t *testing.T) {
 		t.Fatalf("expected session to be added")
 	}
 	gotDir := sess.DownloadDir()
-	if gotDir != "/custom/dir/immediate" {
-		t.Errorf("expected session download dir to be /custom/dir/immediate, got %s", gotDir)
+	expectedImmediateDir, err := filepath.Abs("/custom/dir/immediate")
+	if err != nil {
+		expectedImmediateDir = "/custom/dir/immediate"
+	}
+	if gotDir != expectedImmediateDir {
+		t.Errorf("expected session download dir to be %s, got %s", expectedImmediateDir, gotDir)
 	}
 }
 
