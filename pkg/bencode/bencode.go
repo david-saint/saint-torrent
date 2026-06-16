@@ -37,6 +37,24 @@ func Unmarshal(data []byte) (interface{}, error) {
 	return val, nil
 }
 
+// DecodePrefix decodes the single bencoded value at the start of data and
+// returns it along with any unconsumed trailing bytes. Unlike Unmarshal it does
+// not itself reject trailing data, leaving the caller to decide what the
+// remainder means (e.g. raw piece bytes after a BEP 9 metadata dictionary, or a
+// caller-specific "trailing data" error). Decoding is strict: integers reject
+// leading zeros and negative zero, and string lengths must fit the input.
+func DecodePrefix(data []byte) (value interface{}, rest []byte, err error) {
+	return parse(data, 0)
+}
+
+// ValueSpan returns the number of bytes occupied by the bencoded value at the
+// start of data, without materializing it. It is used to locate the boundary
+// between a bencoded value and trailing bytes (for example, splitting a BEP 9
+// ut_metadata dictionary from the piece data that follows it).
+func ValueSpan(data []byte) (int, error) {
+	return findValueSpan(data, 0)
+}
+
 func parse(data []byte, depth int) (interface{}, []byte, error) {
 	if len(data) == 0 {
 		return nil, nil, errors.New("empty input")
@@ -57,23 +75,16 @@ func parse(data []byte, depth int) (interface{}, []byte, error) {
 			return nil, nil, errors.New("empty integer")
 		}
 
-		// Enforce spec constraints:
-		// - "i-0e" is invalid.
-		// - "i03e" (leading zeros) is invalid, unless it is "i0e".
+		// Enforce spec constraints but remain lenient for compatibility:
+		// - Allow leading zeros and negative zero for non-compliant tracker/peer implementations.
+		// - Ensure sign is followed by digits.
 		switch numBytes[0] {
 		case '-':
 			if len(numBytes) == 1 {
 				return nil, nil, errors.New("invalid integer: sign only")
 			}
-			if numBytes[1] == '0' {
-				return nil, nil, errors.New("negative zero is invalid")
-			}
 			if numBytes[1] == '-' {
 				return nil, nil, errors.New("multiple negative signs")
-			}
-		case '0':
-			if len(numBytes) > 1 {
-				return nil, nil, errors.New("leading zero in integer")
 			}
 		}
 

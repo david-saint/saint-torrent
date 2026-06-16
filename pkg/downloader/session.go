@@ -853,7 +853,14 @@ func (s *Session) saveStateLocked() {
 			completed = append(completed, i)
 		}
 	}
-	_ = s.Storage.SaveState(infoHashHex, completed)
+	if err := s.Storage.SaveState(infoHashHex, completed); err != nil {
+		if err == storage.ErrStorageClosed && s.closed {
+			return
+		}
+		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
+		s.lastErr = stateErr
+		s.statusErr = stateErr
+	}
 }
 
 // TotalPieces returns the number of pieces in the torrent.
@@ -1250,15 +1257,17 @@ func (s *Session) Start() {
 	s.maybeStartVerification()
 }
 
-// Close shuts down the session and waits for its lifecycle goroutines (tracker, peer,
-// choke, listener, and DHT loops) to exit. Background piece verification is intentionally
-// NOT awaited — a VerifyPiece read can be wedged on slow I/O — but its global verification
-// slot is reclaimed here so capacity is never permanently lost, and it stops mutating the
-// session once s.closed is set.
+// Close shuts down the session, releases its storage ownership, and waits for its
+// lifecycle goroutines (tracker, peer, choke, listener, and DHT loops) to exit.
+// Background piece verification is intentionally NOT awaited — a VerifyPiece read
+// can be wedged on slow I/O — but its global verification slot is reclaimed here
+// so capacity is never permanently lost, and it stops mutating the session once
+// s.closed is set.
 func (s *Session) Close() {
 	s.lifecycleMu.Lock()
 	var gateRelease func()
 	var verifyDone chan struct{}
+	var storageToClose *storage.Storage
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		wasStarted := s.started
@@ -1278,6 +1287,7 @@ func (s *Session) Close() {
 		s.verifyDone = nil
 		gateRelease = s.verifyGateRelease
 		s.verifyGateRelease = nil
+		storageToClose = s.Storage
 		if s.listener != nil {
 			s.listener.Close()
 			s.listener = nil
@@ -1294,6 +1304,10 @@ func (s *Session) Close() {
 		s.mu.Unlock()
 	})
 	s.lifecycleMu.Unlock()
+
+	if storageToClose != nil {
+		_ = storageToClose.Close()
+	}
 
 	// Reclaim a verification slot held by a wedged VerifyPiece (outside any lock).
 	if gateRelease != nil {
@@ -2367,6 +2381,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// that already took our requests goes quiet but keeps the socket warm with
 	// keep-alives (which otherwise reset the read deadline and skipped pump).
 	pump := func() time.Duration {
+		// Block requests below are queued into the client's write buffer; flush the
+		// whole burst in one syscall on the way out, regardless of which branch
+		// returns. Flushing an empty buffer is a no-op, so this is cheap on the
+		// paused/choked/keep-alive paths that write nothing. If flushing fails, close
+		// the connection immediately to trigger teardown.
+		defer func() {
+			if err := client.Flush(); err != nil {
+				_ = conn.Close()
+			}
+		}()
+
 		s.mu.RLock()
 		paused := s.paused
 		choked := pState.Choked
@@ -2455,7 +2480,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				waitingForBandwidth = outstanding == 0
 				return retryAfter
 			}
-			if err := client.SendRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
+			if err := client.WriteRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
 				req.requested = false
 				return 0 // dead connection; cleanup releases the pieces
 			}
