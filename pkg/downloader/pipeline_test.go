@@ -178,6 +178,127 @@ func TestMultiPiecePipelineSpansPieces(t *testing.T) {
 	}
 }
 
+func TestDynamicWindowBudgetCapsOutstandingRequests(t *testing.T) {
+	const pieceLen = BlockSize
+	const numPieces = 16
+	total := pieceLen * numPieces
+
+	data := make([]byte, total)
+	for i := range data {
+		data[i] = byte(i*11 + 5)
+	}
+	hashes := make([][20]byte, numPieces)
+	for p := 0; p < numPieces; p++ {
+		hashes[p] = sha1.Sum(data[p*pieceLen : (p+1)*pieceLen])
+	}
+	tor := &torrent.Torrent{
+		Name:        "budget.bin",
+		PieceLength: int64(pieceLen),
+		PieceHashes: hashes,
+		Files:       []torrent.File{{Length: int64(total), Path: []string{"budget.bin"}}},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	const budgetBlocks = 4
+	requestsSeen := make(chan struct{}, budgetBlocks)
+	var requestCount atomic.Int64
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		hs, err := peer.ParseHandshake(conn)
+		if err != nil {
+			return
+		}
+		var pid [20]byte
+		copy(pid[:], "-MOCK01-budget-test")
+		_, _ = conn.Write((&peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: hs.InfoHash, PeerID: pid}).Serialize())
+		_, _ = conn.Write((&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0xFF, 0xFF}}).Serialize())
+
+		for {
+			msg, err := peer.ParseMessage(conn)
+			if err != nil {
+				return
+			}
+			if msg == nil {
+				continue
+			}
+			switch msg.ID {
+			case peer.MsgInterested:
+				_, _ = conn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+			case peer.MsgRequest:
+				if requestCount.Add(1) <= budgetBlocks {
+					select {
+					case requestsSeen <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}
+	}()
+
+	dir := t.TempDir()
+	st, err := storage.NewStorage(dir, []storage.FileInfo{{Path: "budget.bin", Length: int64(total)}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+
+	var pid [20]byte
+	copy(pid[:], "-ST0001-budget12345")
+	sess, err := NewSession(tor, st, pid, 0, dir)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	sess.pipelineBudget = newPipelineByteBudget(budgetBlocks * BlockSize)
+	sess.Start()
+	defer sess.Close()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	sess.AddPeerFromDiscovery("127.0.0.1:" + portStr)
+
+	deadline := time.After(3 * time.Second)
+	for len(requestsSeen) < budgetBlocks {
+		select {
+		case <-deadline:
+			t.Fatalf("saw %d requests, want %d", len(requestsSeen), budgetBlocks)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := requestCount.Load(); got != budgetBlocks {
+		t.Fatalf("budget allowed %d requests, want %d", got, budgetBlocks)
+	}
+	stats := sess.PipelineStats()
+	if stats.PipelineBudgetUsedBytes > stats.PipelineBudgetBytes {
+		t.Fatalf("budget used %d exceeds limit %d", stats.PipelineBudgetUsedBytes, stats.PipelineBudgetBytes)
+	}
+	if stats.PipelineBudgetHighWaterBytes > stats.PipelineBudgetBytes {
+		t.Fatalf("budget high-water %d exceeds limit %d", stats.PipelineBudgetHighWaterBytes, stats.PipelineBudgetBytes)
+	}
+	if stats.BudgetLimitedPeers == 0 {
+		t.Fatal("expected peer to report budget-limited state")
+	}
+
+	sess.Close()
+	<-peerDone
+	_, used, _ := sess.pipelineBudget.snapshot()
+	if used != 0 {
+		t.Fatalf("budget used after close = %d, want 0", used)
+	}
+}
+
 // TestSessionCountersConcurrentAtomic exercises the lock-free byte counters: many
 // goroutines bump the session and per-peer counters on the hot path (no s.mu)
 // while readers take snapshots. It checks the arithmetic is exact and, under

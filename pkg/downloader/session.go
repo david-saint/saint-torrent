@@ -33,22 +33,6 @@ const (
 // BlockSize is the standard block length for BitTorrent transfers (16 KB).
 const BlockSize = 16384
 
-// maxPendingBlockRequests is the per-peer request window: the number of 16 KB
-// block requests we keep in flight to a single peer. Throughput per peer is
-// roughly window÷RTT, so this must cover the bandwidth-delay product of a fast,
-// high-latency peer (256 × 16 KB = 4 MB, e.g. ~50 MB/s at 80 ms RTT). Crucially,
-// the window now spans MULTIPLE pieces (see maxConcurrentPiecesPerPeer): it is no
-// longer capped by a single piece's block count, which previously throttled
-// small-piece torrents to one piece's worth of in-flight data.
-const maxPendingBlockRequests = 256
-
-// maxConcurrentPiecesPerPeer bounds how many pieces a single peer downloads at
-// once. It exists so small-piece torrents can still fill maxPendingBlockRequests
-// (a 256 KB piece is only 16 blocks, so one piece could never fill a 256-block
-// window). Because we open just enough pieces to fill the window, the in-flight
-// buffer memory stays ≈ window×16 KB per peer regardless of piece size.
-const maxConcurrentPiecesPerPeer = 16
-
 // blockRequestTimeout is how long an outstanding block request may go unanswered
 // before pump re-arms it (and, after maxBlockRequestRetries, drops the peer). A var
 // (not const) so tests can shorten it; treat it as a constant in production.
@@ -80,6 +64,19 @@ type PeerState struct {
 	// Dialing prevents tracker, DHT, maintenance, and resume paths from launching
 	// duplicate concurrent attempts to the same endpoint.
 	Dialing bool
+
+	WindowBlocks         int
+	TargetWindowBlocks   int
+	OutstandingBlocks    int
+	OutstandingBytes     int64
+	PipelineQueueSeconds float64
+	PipelineRTT          time.Duration
+	PipelineRate         float64
+	TimeoutRate          float64
+	AppLimited           bool
+	BudgetLimited        bool
+	PieceCapLimited      bool
+	WriterLimited        bool
 }
 
 // FilePriority controls download ordering for files.
@@ -123,6 +120,7 @@ type Session struct {
 	pieceAvailability []int
 	Peers             map[string]*PeerState
 	activePeers       map[string]*peer.Client // for sending Have messages
+	pipelineBudget    *pipelineByteBudget
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
 	// background worker pool that verifies the SHA-1, writes to storage, and persists
@@ -228,6 +226,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		pieceAvailability:   make([]int, numPieces),
 		Peers:               make(map[string]*PeerState),
 		activePeers:         make(map[string]*peer.Client),
+		pipelineBudget:      newPipelineByteBudget(dynamicPipelineSessionBudgetBytes),
 		ctx:                 ctx,
 		cancel:              cancel,
 		resumeCh:            make(chan struct{}, 1),
@@ -855,24 +854,79 @@ func (s *Session) SetUploadLimit(bytesPerSec int64) {
 	s.UploadLimiter.SetLimit(bytesPerSec)
 }
 
-// reserveDownload non-blockingly reserves n bytes from the per-session and (if set)
-// manager-wide limiter. retryAfter estimates when a failed reservation should be
-// retried; a charged per-session reservation is refunded if the global limiter fails.
-func (s *Session) reserveDownload(n int) (reserved bool, retryAfter time.Duration) {
+func (s *Session) reserveDownloadWithRefund(n int) (reserved bool, retryAfter time.Duration, refund func()) {
 	localOK, localCharged, localRetry := s.DownloadLimiter.tryReserve(n)
 	if !localOK {
-		return false, localRetry
+		return false, localRetry, nil
 	}
+	globalCharged := false
 	if s.GlobalDownloadLimiter != nil {
-		globalOK, _, globalRetry := s.GlobalDownloadLimiter.tryReserve(n)
+		globalOK, charged, globalRetry := s.GlobalDownloadLimiter.tryReserve(n)
 		if !globalOK {
 			if localCharged {
 				s.DownloadLimiter.refund(n)
 			}
-			return false, globalRetry
+			return false, globalRetry, nil
+		}
+		globalCharged = charged
+	}
+	return true, 0, func() {
+		if localCharged {
+			s.DownloadLimiter.refund(n)
+		}
+		if globalCharged && s.GlobalDownloadLimiter != nil {
+			s.GlobalDownloadLimiter.refund(n)
 		}
 	}
-	return true, 0
+}
+
+// SessionPipelineStats summarizes the dynamic request windows across active peers.
+type SessionPipelineStats struct {
+	ActiveDownloadPeers          int
+	TotalOutstandingBlocks       int
+	TotalOutstandingBytes        int64
+	PipelineBudgetBytes          int64
+	PipelineBudgetUsedBytes      int64
+	PipelineBudgetHighWaterBytes int64
+	AppLimitedPeers              int
+	BudgetLimitedPeers           int
+	PieceCapLimitedPeers         int
+	WriterLimitedPeers           int
+}
+
+func (s *Session) PipelineStats() SessionPipelineStats {
+	if s.pipelineBudget == nil {
+		return SessionPipelineStats{}
+	}
+	limit, used, highWater := s.pipelineBudget.snapshot()
+	stats := SessionPipelineStats{
+		PipelineBudgetBytes:          limit,
+		PipelineBudgetUsedBytes:      used,
+		PipelineBudgetHighWaterBytes: highWater,
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.Peers {
+		if !p.Active {
+			continue
+		}
+		stats.ActiveDownloadPeers++
+		stats.TotalOutstandingBlocks += p.OutstandingBlocks
+		stats.TotalOutstandingBytes += p.OutstandingBytes
+		if p.AppLimited {
+			stats.AppLimitedPeers++
+		}
+		if p.BudgetLimited {
+			stats.BudgetLimitedPeers++
+		}
+		if p.PieceCapLimited {
+			stats.PieceCapLimitedPeers++
+		}
+		if p.WriterLimited {
+			stats.WriterLimitedPeers++
+		}
+	}
+	return stats
 }
 
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
