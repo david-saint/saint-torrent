@@ -13,9 +13,9 @@ import (
 const peerReadBufferSize = 64 * 1024
 
 // peerWriteBufferSize is the size of the per-connection write buffer.
-// 8 KiB is sized to comfortably hold a full burst of pipelined block requests
-// (up to 256 requests * 17 bytes = 4.25 KiB) in a single write syscall without overflowing.
-const peerWriteBufferSize = 8 * 1024
+// 32 KiB is sized to hold a raised dynamic-pipeline request burst
+// (1024 requests * 17 bytes = 17 KiB) in a single write syscall with headroom.
+const peerWriteBufferSize = 32 * 1024
 
 // Client represents a connection to a BitTorrent peer.
 type Client struct {

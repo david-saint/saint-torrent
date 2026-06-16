@@ -63,13 +63,16 @@ const maxKnownPeers = 2048
 
 // blockRequest tracks an outstanding block request sent to a peer.
 type blockRequest struct {
-	pieceIndex  int64
-	begin       int64
-	length      int64
-	requested   bool
-	received    bool
-	requestedAt time.Time
-	retries     int
+	pieceIndex          int64
+	begin               int64
+	length              int64
+	requested           bool
+	received            bool
+	requestedAt         time.Time
+	firstRequestedAt    time.Time
+	retries             int
+	controllerSeq       uint64
+	pipelineBudgetBytes int64
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
@@ -589,9 +592,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	defer func() { s.removePeerAvailability(peerBitfield) }()
 
 	// A peer downloads several pieces at once (activeDownloads, filled in slice
-	// order so earlier pieces complete first). The request window spans all of
-	// them, so in-flight depth is bounded by maxPendingBlockRequests rather than
-	// by a single piece's block count — the key throughput fix for small pieces.
+	// order so earlier pieces complete first). The dynamic pipeline window spans
+	// all of them instead of being capped by a single piece's block count.
 	type activeDownload struct {
 		pieceIndex     int64
 		hash           [20]byte
@@ -608,6 +610,15 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		endgame bool
 	}
 	var activeDownloads []*activeDownload
+	pipeline := newPeerPipelineController(defaultPeerPipelineConfig())
+
+	type requestFinishReason int
+	const (
+		requestFinishAccepted requestFinishReason = iota
+		requestFinishTimeout
+		requestFinishCancel
+		requestFinishAbandon
+	)
 
 	findDownload := func(index int64) *activeDownload {
 		for _, dl := range activeDownloads {
@@ -622,6 +633,57 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if dl.pieceIndex == index {
 				activeDownloads = append(activeDownloads[:i], activeDownloads[i+1:]...)
 				return
+			}
+		}
+	}
+	lastPipelineSnapshot := time.Time{}
+	publishPipelineSnapshot := func(now time.Time, force bool) {
+		if !force && !lastPipelineSnapshot.IsZero() && now.Sub(lastPipelineSnapshot) < 250*time.Millisecond {
+			return
+		}
+		snap := pipeline.Snapshot(now)
+		s.mu.Lock()
+		pState.WindowBlocks = snap.WindowBlocks
+		pState.TargetWindowBlocks = snap.TargetWindowBlocks
+		pState.OutstandingBlocks = snap.OutstandingBlocks
+		pState.OutstandingBytes = snap.OutstandingBytes
+		pState.PipelineQueueSeconds = snap.QueueSeconds
+		pState.PipelineRTT = snap.RTT
+		pState.PipelineRate = snap.Rate
+		pState.TimeoutRate = snap.TimeoutRate
+		pState.AppLimited = snap.AppLimited
+		pState.BudgetLimited = snap.BudgetLimited
+		pState.PieceCapLimited = snap.PieceCapLimited
+		pState.WriterLimited = snap.WriterLimited
+		s.mu.Unlock()
+		lastPipelineSnapshot = now
+	}
+	releasePipelineBudget := func(req *blockRequest) {
+		if req == nil || req.pipelineBudgetBytes <= 0 {
+			return
+		}
+		s.pipelineBudget.release(req.pipelineBudgetBytes)
+		req.pipelineBudgetBytes = 0
+	}
+	finishRequest := func(req *blockRequest, reason requestFinishReason, now time.Time) {
+		if req == nil || !req.requested || req.received {
+			return
+		}
+		releasePipelineBudget(req)
+		switch reason {
+		case requestFinishAccepted:
+			pipeline.OnBlockAccepted(req, req.length, now)
+		case requestFinishTimeout:
+			pipeline.OnRequestTimeout(req, now)
+		case requestFinishCancel, requestFinishAbandon:
+			pipeline.OnCancel(req, now)
+		}
+		req.requested = false
+	}
+	releasePipelineReservations := func(dls []*activeDownload, now time.Time) {
+		for _, dl := range dls {
+			for _, req := range dl.pending {
+				finishRequest(req, requestFinishAbandon, now)
 			}
 		}
 	}
@@ -700,15 +762,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 
 	// nextBlockInPiece returns the begin offset of the next block to request from
-	// dl (re-sending timed-out blocks first, then advancing the fresh cursor),
-	// creating/arming its blockRequest, or -1 when the piece is fully requested.
-	nextBlockInPiece := func(dl *activeDownload, now time.Time) int64 {
+	// dl (re-sending timed-out blocks first, then advancing the fresh cursor), or
+	// -1 when the piece is fully requested. It does not mark the request as sent;
+	// that happens only after limiter, pipeline budget, and socket queueing succeed.
+	nextBlockInPiece := func(dl *activeDownload) int64 {
 		for len(dl.retry) > 0 {
 			begin := dl.retry[len(dl.retry)-1]
 			dl.retry = dl.retry[:len(dl.retry)-1]
 			if req, ok := dl.pending[begin]; ok && !req.requested && !req.received {
-				req.requested = true
-				req.requestedAt = now
 				return begin
 			}
 		}
@@ -724,11 +785,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				blockLen = dl.length - begin
 			}
 			dl.pending[begin] = &blockRequest{
-				pieceIndex:  dl.pieceIndex,
-				begin:       begin,
-				length:      blockLen,
-				requested:   true,
-				requestedAt: now,
+				pieceIndex: dl.pieceIndex,
+				begin:      begin,
+				length:     blockLen,
 			}
 			return begin
 		}
@@ -736,6 +795,57 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 	requestable := func(dl *activeDownload) bool {
 		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
+	}
+	avgBlocksPerPiece := func() int {
+		if len(activeDownloads) > 0 {
+			var total int64
+			for _, dl := range activeDownloads {
+				total += dl.numBlocks
+			}
+			return max(1, int((total+int64(len(activeDownloads))-1)/int64(len(activeDownloads))))
+		}
+		s.mu.RLock()
+		pieceLength := s.Torrent.PieceLength
+		s.mu.RUnlock()
+		if pieceLength <= 0 {
+			return 1
+		}
+		return max(1, int((pieceLength+BlockSize-1)/BlockSize))
+	}
+	requestableWorkAvailable := func(pieceCap int) bool {
+		for _, dl := range activeDownloads {
+			if requestable(dl) {
+				return true
+			}
+		}
+		if len(activeDownloads) >= pieceCap {
+			return false
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for idx := range s.neededPieces {
+			if idx >= 0 && idx < len(s.PieceStates) && s.PieceStates[idx] == PieceEmpty &&
+				hasPiece(int64(idx)) && s.isPieceWanted(int64(idx)) {
+				return true
+			}
+		}
+		if s.endgameActiveLocked() {
+			for i, state := range s.PieceStates {
+				if state == PieceDownloading && hasPiece(int64(i)) && s.isPieceWanted(int64(i)) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	markRequestSent := func(req *blockRequest, budgetBytes int64, sentAt time.Time) {
+		req.requested = true
+		req.requestedAt = sentAt
+		if req.firstRequestedAt.IsZero() {
+			req.firstRequestedAt = sentAt
+		}
+		req.pipelineBudgetBytes = budgetBytes
+		pipeline.OnRequestSent(req, sentAt)
 	}
 
 	// These timestamps are owned by this peer goroutine. A request gives the peer a
@@ -767,12 +877,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		paused := s.paused
 		choked := pState.Choked
 		s.mu.RUnlock()
+		now := time.Now()
 		if paused {
 			waitingForBandwidth = false
+			publishPipelineSnapshot(now, false)
 			return 0
 		}
-
-		now := time.Now()
 
 		// Re-arm timed-out requests, or drop a peer that has stalled past its retry
 		// budget, and count what is still outstanding. This sweep runs even when the
@@ -793,7 +903,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						_ = conn.Close() // pieces are released by the disconnect cleanup
 						return 0
 					}
-					req.requested = false
+					finishRequest(req, requestFinishTimeout, now)
 					req.retries++
 					dl.retry = append(dl.retry, begin)
 					continue
@@ -807,24 +917,34 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		// for not leaking a stalled connection.
 		if choked {
 			waitingForBandwidth = false
+			publishPipelineSnapshot(now, false)
 			return 0
 		}
 
+		avgBlocks := avgBlocksPerPiece()
+		window := pipeline.WindowBlocks(now)
+		if effective := pipeline.EffectiveWindowBlocks(avgBlocks); effective < window {
+			window = effective
+			pipeline.OnPieceCapLimited(now)
+		}
+		pieceCap := pipeline.ConcurrentPieceCap(avgBlocks, 0)
+
 		// Fill the window, opening pieces on demand.
-		for outstanding < maxPendingBlockRequests {
+		for outstanding < window {
 			var chosen *activeDownload
 			var begin int64 = -1
 			for _, dl := range activeDownloads {
 				if !requestable(dl) {
 					continue
 				}
-				if b := nextBlockInPiece(dl, now); b != -1 {
+				if b := nextBlockInPiece(dl); b != -1 {
 					chosen, begin = dl, b
 					break
 				}
 			}
 			if chosen == nil {
-				if len(activeDownloads) >= maxConcurrentPiecesPerPeer {
+				if len(activeDownloads) >= pieceCap {
+					pipeline.OnPieceCapLimited(now)
 					break
 				}
 				newDL := openNewPiece()
@@ -836,32 +956,60 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 
 			req := chosen.pending[begin]
+			if !pipeline.CanReserve(req.length) {
+				pipeline.OnBudgetLimited(now)
+				chosen.retry = append(chosen.retry, begin)
+				waitingForBandwidth = false
+				publishPipelineSnapshot(now, true)
+				return 100 * time.Millisecond
+			}
 			// Never wait for bandwidth in the peer event loop: even with an empty
 			// request window, blocking here lets many rate-limited peers occupy every
 			// manager-wide connection slot while none of their sockets are drained.
 			// The event loop schedules another pump when the limiter says tokens should
 			// be available, while the dedicated reader below remains responsive.
-			if reserved, retryAfter := s.reserveDownload(int(req.length)); !reserved {
-				req.requested = false
+			reserved, retryAfter, refundBandwidth := s.reserveDownloadWithRefund(int(req.length))
+			if !reserved {
+				pipeline.OnAppLimited(now, retryAfter)
 				chosen.retry = append(chosen.retry, begin)
 				// With no request in flight, this idle period is intentional: the
 				// limiter is accumulating enough tokens for one full block. If other
 				// requests are outstanding, the peer still owes us data and remains
 				// subject to the normal stall and request timeouts.
 				waitingForBandwidth = outstanding == 0
+				publishPipelineSnapshot(now, true)
 				return retryAfter
 			}
+			budgetBytes := req.length
+			if !s.pipelineBudget.tryReserve(budgetBytes) {
+				if refundBandwidth != nil {
+					refundBandwidth()
+				}
+				pipeline.OnBudgetLimited(now)
+				chosen.retry = append(chosen.retry, begin)
+				waitingForBandwidth = false
+				publishPipelineSnapshot(now, true)
+				return 100 * time.Millisecond
+			}
 			if err := client.WriteRequest(uint32(chosen.pieceIndex), uint32(begin), uint32(req.length)); err != nil {
-				req.requested = false
+				s.pipelineBudget.release(budgetBytes)
+				if refundBandwidth != nil {
+					refundBandwidth()
+				}
+				_ = conn.Close()
 				return 0 // dead connection; cleanup releases the pieces
 			}
 			sentAt := time.Now()
-			req.requestedAt = sentAt
+			markRequestSent(req, budgetBytes, sentAt)
 			lastRequestAt = sentAt
 			waitingForBandwidth = false
 			outstanding++
 		}
+		if outstanding >= window && requestableWorkAvailable(pieceCap) {
+			pipeline.OnWindowLimited(now)
+		}
 		waitingForBandwidth = false
+		publishPipelineSnapshot(now, false)
 		return 0
 	}
 
@@ -869,11 +1017,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// in-progress piece that another peer has finished (so its state is no longer
 	// PieceDownloading) and sends a Cancel for each of our still-outstanding blocks so
 	// the peer stops feeding us data the swarm no longer needs. Bounded by
-	// maxConcurrentPiecesPerPeer, so it is cheap to run every message.
+	// the adaptive per-peer piece cap, so it is cheap to run every message.
 	dropCompletedElsewhere := func() {
 		if len(activeDownloads) == 0 {
 			return
 		}
+		now := time.Now()
 		var finished []int64
 		s.mu.RLock()
 		for _, dl := range activeDownloads {
@@ -891,10 +1040,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			for begin, req := range dl.pending {
 				if req.requested && !req.received {
 					_ = client.SendCancel(uint32(idx), uint32(begin), uint32(req.length))
+					finishRequest(req, requestFinishCancel, now)
 				}
 			}
 			removeDownload(idx)
 		}
+		publishPipelineSnapshot(now, true)
 	}
 
 	type peerReadResult struct {
@@ -1187,18 +1338,25 @@ peerLoop:
 			}
 
 		case peer.MsgChoke:
+			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = true
 			s.mu.Unlock()
 			// A choked peer won't fulfill our requests; return the in-progress
 			// pieces so other peers can grab them. We re-pick on unchoke.
+			pipeline.OnChoke(now)
+			releasePipelineReservations(activeDownloads, now)
 			releaseDownloads(activeDownloads)
 			activeDownloads = nil
+			publishPipelineSnapshot(now, true)
 
 		case peer.MsgUnchoke:
+			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = false
 			s.mu.Unlock()
+			pipeline.OnUnchoke(now)
+			publishPipelineSnapshot(now, true)
 
 		case peer.MsgInterested:
 			s.mu.Lock()
@@ -1263,38 +1421,49 @@ peerLoop:
 			index := int64(binary.BigEndian.Uint32(msg.Payload[0:4]))
 			begin := int64(binary.BigEndian.Uint32(msg.Payload[4:8]))
 			blockData := msg.Payload[8:]
+			now := time.Now()
 
 			// Validate against our outstanding requests for this piece.
 			dl := findDownload(index)
 			if dl == nil {
+				pipeline.OnUnsolicited(int64(len(blockData)), now)
 				continue // not a piece we're currently downloading; discard
 			}
 
 			// Validate begin is block-aligned
 			if begin%BlockSize != 0 {
+				pipeline.OnUnsolicited(int64(len(blockData)), now)
 				continue
 			}
 
 			// Validate this block was requested and not already received
 			req, exists := dl.pending[begin]
 			if !exists || !req.requested || req.received {
+				if exists && req.received {
+					pipeline.OnDuplicate(int64(len(blockData)), now)
+				} else {
+					pipeline.OnUnsolicited(int64(len(blockData)), now)
+				}
 				continue // Unsolicited or duplicate block
 			}
 
 			// Validate block length matches expected
 			if int64(len(blockData)) != req.length {
+				pipeline.OnUnsolicited(int64(len(blockData)), now)
 				continue
 			}
 
 			// Accept the block
 			blockIndex := begin / BlockSize
 			if blockIndex >= int64(len(dl.blocks)) {
+				pipeline.OnUnsolicited(int64(len(blockData)), now)
 				continue
 			}
+			finishRequest(req, requestFinishAccepted, now)
 			dl.blocks[blockIndex] = blockData
 			req.received = true
 			dl.blocksReceived++
-			lastProgressAt = time.Now() // forward progress; keeps the stall reaper off
+			lastProgressAt = now // forward progress; keeps the stall reaper off
 
 			// Counters are bumped lock-free on this hot path; s.mu would
 			// otherwise be taken per 16 KB block by every peer goroutine.
@@ -1339,8 +1508,13 @@ peerLoop:
 			}
 
 			s.ensurePieceWritePool()
+			writeQueueStarted := time.Now()
 			select {
 			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, conn: conn}:
+				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
+					pipeline.OnWriterLimited(time.Now())
+					publishPipelineSnapshot(time.Now(), true)
+				}
 			case <-s.ctx.Done():
 				return
 			}
@@ -1399,6 +1573,9 @@ peerLoop:
 
 	// If we disconnected while holding pieces, return them to empty so other
 	// peers can fetch them.
+	now := time.Now()
+	releasePipelineReservations(activeDownloads, now)
+	publishPipelineSnapshot(now, true)
 	releaseDownloads(activeDownloads)
 }
 
@@ -1427,6 +1604,21 @@ func (s *Session) GetActivePeers() []PeerState {
 				Active:        p.Active,
 				AmChoking:     p.AmChoking,
 				LastAttempt:   p.LastAttempt,
+				Dialable:      p.Dialable,
+				Dialing:       p.Dialing,
+
+				WindowBlocks:         p.WindowBlocks,
+				TargetWindowBlocks:   p.TargetWindowBlocks,
+				OutstandingBlocks:    p.OutstandingBlocks,
+				OutstandingBytes:     p.OutstandingBytes,
+				PipelineQueueSeconds: p.PipelineQueueSeconds,
+				PipelineRTT:          p.PipelineRTT,
+				PipelineRate:         p.PipelineRate,
+				TimeoutRate:          p.TimeoutRate,
+				AppLimited:           p.AppLimited,
+				BudgetLimited:        p.BudgetLimited,
+				PieceCapLimited:      p.PieceCapLimited,
+				WriterLimited:        p.WriterLimited,
 			})
 		}
 	}
