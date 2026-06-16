@@ -41,10 +41,7 @@ func TestAddNodeGrowsRoutingTable(t *testing.T) {
 	adder.AddNode(net.ParseIP("127.0.0.1"), receiverPort)
 
 	deadline := time.After(3 * time.Second)
-	for {
-		if adder.NodesCount() > 0 {
-			break
-		}
+	for adder.NodesCount() == 0 {
 		select {
 		case <-deadline:
 			t.Fatal("routing table did not grow after AddNode")
