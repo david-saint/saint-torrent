@@ -34,6 +34,9 @@ func TestMockPeerExchange(t *testing.T) {
 		if h.InfoHash != infoHash {
 			t.Errorf("Server got wrong info hash: %v", h.InfoHash)
 		}
+		if !SupportsFastExtension(h.Reserved) {
+			t.Error("client handshake did not advertise fast extension")
+		}
 
 		// 2. Send handshake back
 		respHandshake := &Handshake{
@@ -177,5 +180,58 @@ func TestMockPeerExchange(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Error during exchange: %v", err)
 		}
+	}
+}
+
+func TestFastMessageSendHelpers(t *testing.T) {
+	infoHash := [20]byte{1}
+	peerID := [20]byte{2}
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	client := NewClient(clientConn, infoHash, peerID)
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := client.SendHaveAll(); err != nil {
+			errCh <- err
+			return
+		}
+		if err := client.SendHaveNone(); err != nil {
+			errCh <- err
+			return
+		}
+		if err := client.SendRejectRequest(1, 2, 3); err != nil {
+			errCh <- err
+			return
+		}
+		if err := client.SendAllowedFast(9); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	expected := []struct {
+		id      MessageID
+		payload []byte
+	}{
+		{id: MsgHaveAll},
+		{id: MsgHaveNone},
+		{id: MsgRejectRequest, payload: []byte{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3}},
+		{id: MsgAllowedFast, payload: []byte{0, 0, 0, 9}},
+	}
+	for _, want := range expected {
+		msg, err := ParseMessage(serverConn)
+		if err != nil {
+			t.Fatalf("ParseMessage failed: %v", err)
+		}
+		if msg == nil || msg.ID != want.id || !bytes.Equal(msg.Payload, want.payload) {
+			t.Fatalf("got message %#v, want id=%d payload=%v", msg, want.id, want.payload)
+		}
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("send helper failed: %v", err)
 	}
 }

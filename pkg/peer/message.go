@@ -23,6 +23,17 @@ const (
 	// DHT-capable peers; on receipt the advertised port plus the peer's source IP
 	// is fed into the DHT routing table.
 	MsgPort MessageID = 9
+
+	MsgSuggestPiece  MessageID = 13
+	MsgHaveAll       MessageID = 14
+	MsgHaveNone      MessageID = 15
+	MsgRejectRequest MessageID = 16
+	MsgAllowedFast   MessageID = 17
+)
+
+const (
+	FastExtensionReservedByte = 7
+	FastExtensionReservedBit  = 0x04
 )
 
 // Message represents a BitTorrent peer wire message.
@@ -37,6 +48,19 @@ type Handshake struct {
 	InfoHash [20]byte
 	PeerID   [20]byte
 	Reserved [8]byte
+}
+
+// EnableFastExtension marks a handshake as supporting BEP 6 Fast Extension.
+func EnableFastExtension(reserved *[8]byte) {
+	if reserved == nil {
+		return
+	}
+	reserved[FastExtensionReservedByte] |= FastExtensionReservedBit
+}
+
+// SupportsFastExtension reports whether the BEP 6 Fast Extension bit is set.
+func SupportsFastExtension(reserved [8]byte) bool {
+	return reserved[FastExtensionReservedByte]&FastExtensionReservedBit != 0
 }
 
 // Serialize serializes a peer message into bytes.

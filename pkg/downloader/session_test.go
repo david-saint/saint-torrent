@@ -816,6 +816,463 @@ func TestSessionServesRequestedPieceAndCountsUpload(t *testing.T) {
 	}
 }
 
+func TestFastExtensionSendsHaveAllInsteadOfBitfield(t *testing.T) {
+	data := []byte("seed block")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "fast-seed.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"fast-seed.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "fast-seed.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	if err := st.WriteBlock(0, 0, data); err != nil {
+		t.Fatalf("failed to seed storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeNeededLocked()
+	sess.mu.Unlock()
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6100", "127.0.0.1", 6100, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	msg, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read have_all: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgHaveAll {
+		t.Fatalf("expected have_all, got %#v", msg)
+	}
+	msg, err = peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read not-interested: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgNotInterested {
+		t.Fatalf("expected not-interested, got %#v", msg)
+	}
+	msg, err = peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read allowed_fast: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgAllowedFast || !bytes.Equal(msg.Payload, []byte{0, 0, 0, 0}) {
+		t.Fatalf("expected allowed_fast for piece 0, got %#v", msg)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
+func TestFastExtensionSendsHaveNoneForEmptyPeer(t *testing.T) {
+	data := []byte("need me")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "fast-empty.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"fast-empty.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "fast-empty.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6101", "127.0.0.1", 6101, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	msg, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read have_none: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgHaveNone {
+		t.Fatalf("expected have_none, got %#v", msg)
+	}
+	msg, err = peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read interested: %v", err)
+	}
+	if msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested, got %#v", msg)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
+func TestFastExtensionAllowedFastRequestWhileChoked(t *testing.T) {
+	data := []byte("cold")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "allowed-fast-download.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"allowed-fast-download.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "allowed-fast-download.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.pipelineBudget = newPipelineByteBudget(int64(len(data)))
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6102", "127.0.0.1", 6102, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgHaveNone {
+		t.Fatalf("expected have_none, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested, got msg=%#v err=%v", msg, err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgHaveAll}).Serialize()); err != nil {
+		t.Fatalf("failed to send have_all: %v", err)
+	}
+	payload := []byte{0, 0, 0, 0}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgAllowedFast, Payload: payload}).Serialize()); err != nil {
+		t.Fatalf("failed to send allowed_fast: %v", err)
+	}
+
+	request, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read allowed-fast request: %v", err)
+	}
+	if request == nil || request.ID != peer.MsgRequest || !bytes.Equal(request.Payload, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(len(data))}) {
+		t.Fatalf("unexpected allowed-fast request: %#v", request)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
+func TestFastExtensionServesAllowedFastUploadWhileChoked(t *testing.T) {
+	data := []byte("seed")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "allowed-fast-upload.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"allowed-fast-upload.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "allowed-fast-upload.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	if err := st.WriteBlock(0, 0, data); err != nil {
+		t.Fatalf("failed to seed storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeNeededLocked()
+	sess.mu.Unlock()
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6103", "127.0.0.1", 6103, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgHaveAll {
+		t.Fatalf("expected have_all, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgNotInterested {
+		t.Fatalf("expected not-interested, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgAllowedFast {
+		t.Fatalf("expected allowed_fast, got msg=%#v err=%v", msg, err)
+	}
+
+	requestPayload := make([]byte, 12)
+	binary.BigEndian.PutUint32(requestPayload[8:12], uint32(len(data)))
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgRequest, Payload: requestPayload}).Serialize()); err != nil {
+		t.Fatalf("failed to request allowed-fast piece: %v", err)
+	}
+	pieceMsg, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read allowed-fast piece: %v", err)
+	}
+	if pieceMsg == nil || pieceMsg.ID != peer.MsgPiece || !bytes.Equal(pieceMsg.Payload[8:], data) {
+		t.Fatalf("unexpected piece response while choked: %#v", pieceMsg)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
+func TestFastExtensionRejectRequestImmediatelyRotatesPiece(t *testing.T) {
+	defer swapDuration(&blockRequestTimeout, time.Hour)()
+	pieces := [][]byte{[]byte("aaaa"), []byte("bbbb")}
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "reject-rotate.bin",
+		PieceLength: int64(len(pieces[0])),
+		PieceHashes: [][20]byte{sha1.Sum(pieces[0]), sha1.Sum(pieces[1])},
+		Files:       []torrent.File{{Length: int64(len(pieces[0]) + len(pieces[1])), Path: []string{"reject-rotate.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "reject-rotate.bin",
+		Length: int64(len(pieces[0]) + len(pieces[1])),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.pipelineBudget = newPipelineByteBudget(int64(len(pieces[0])))
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6104", "127.0.0.1", 6104, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgHaveNone {
+		t.Fatalf("expected have_none, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested, got msg=%#v err=%v", msg, err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgHaveAll}).Serialize()); err != nil {
+		t.Fatalf("failed to send have_all: %v", err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send unchoke: %v", err)
+	}
+
+	firstRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read first request: %v", err)
+	}
+	if firstRequest == nil || firstRequest.ID != peer.MsgRequest || len(firstRequest.Payload) != 12 {
+		t.Fatalf("expected first request, got %#v", firstRequest)
+	}
+	if got := binary.BigEndian.Uint32(firstRequest.Payload[0:4]); got != 0 {
+		t.Fatalf("first request piece = %d, want 0", got)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgRejectRequest, Payload: append([]byte(nil), firstRequest.Payload...)}).Serialize()); err != nil {
+		t.Fatalf("failed to send reject_request: %v", err)
+	}
+
+	secondRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil {
+		t.Fatalf("failed to read immediate replacement request: %v", err)
+	}
+	if secondRequest == nil || secondRequest.ID != peer.MsgRequest || len(secondRequest.Payload) != 12 {
+		t.Fatalf("expected replacement request, got %#v", secondRequest)
+	}
+	if got := binary.BigEndian.Uint32(secondRequest.Payload[0:4]); got != 1 {
+		t.Fatalf("replacement request piece = %d, want 1", got)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		sess.mu.RLock()
+		state := sess.PieceStates[0]
+		sess.mu.RUnlock()
+		if state == PieceEmpty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rejected piece state = %v, want PieceEmpty", state)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
+func TestFastExtensionUnchokeClearsRejectedPiece(t *testing.T) {
+	defer swapDuration(&blockRequestTimeout, time.Hour)()
+	data := []byte("retry me")
+	tempDir := t.TempDir()
+	tor := &torrent.Torrent{
+		Name:        "reject-clear.bin",
+		PieceLength: int64(len(data)),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"reject-clear.bin"}}},
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{
+		Path:   "reject-clear.bin",
+		Length: int64(len(data)),
+	}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+	sess.pipelineBudget = newPipelineByteBudget(int64(len(data)))
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6105", "127.0.0.1", 6105, reserved, true)
+		close(done)
+	}()
+
+	_ = remoteConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgHaveNone {
+		t.Fatalf("expected have_none, got msg=%#v err=%v", msg, err)
+	}
+	if msg, err := peer.ParseMessage(remoteConn); err != nil || msg == nil || msg.ID != peer.MsgInterested {
+		t.Fatalf("expected interested, got msg=%#v err=%v", msg, err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgHaveAll}).Serialize()); err != nil {
+		t.Fatalf("failed to send have_all: %v", err)
+	}
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send unchoke: %v", err)
+	}
+
+	firstRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil || firstRequest == nil || firstRequest.ID != peer.MsgRequest || len(firstRequest.Payload) != 12 {
+		t.Fatalf("expected first request, got %#v err=%v", firstRequest, err)
+	}
+	if got := binary.BigEndian.Uint32(firstRequest.Payload[0:4]); got != 0 {
+		t.Fatalf("first request piece = %d, want 0", got)
+	}
+	// Reject the only piece. It must not be permanently barred from this peer.
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgRejectRequest, Payload: append([]byte(nil), firstRequest.Payload...)}).Serialize()); err != nil {
+		t.Fatalf("failed to send reject_request: %v", err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		sess.mu.RLock()
+		state := sess.PieceStates[0]
+		sess.mu.RUnlock()
+		if state == PieceEmpty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("rejected piece state = %v, want PieceEmpty", state)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A fresh unchoke signals the peer is willing again, so the rejection clears and
+	// the piece becomes requestable from this peer once more.
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send second unchoke: %v", err)
+	}
+	secondRequest, err := peer.ParseMessage(remoteConn)
+	if err != nil || secondRequest == nil || secondRequest.ID != peer.MsgRequest || len(secondRequest.Payload) != 12 {
+		t.Fatalf("expected re-request after unchoke, got %#v err=%v", secondRequest, err)
+	}
+	if got := binary.BigEndian.Uint32(secondRequest.Payload[0:4]); got != 0 {
+		t.Fatalf("re-request piece = %d, want 0 (rejection should have cleared on unchoke)", got)
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
 func TestAnnounceMagnetUsesNonZeroLeft(t *testing.T) {
 	oldTimeout := trackerAnnounceTimeout
 	trackerAnnounceTimeout = 2 * time.Second

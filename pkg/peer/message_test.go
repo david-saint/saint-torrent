@@ -41,6 +41,31 @@ func TestSerializeMessage(t *testing.T) {
 			msg:      &Message{ID: MsgRequest, Payload: []byte{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3}},
 			expected: []byte{0, 0, 0, 13, 6, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3},
 		},
+		{
+			name:     "SuggestPiece",
+			msg:      &Message{ID: MsgSuggestPiece, Payload: []byte{0, 0, 0, 7}},
+			expected: []byte{0, 0, 0, 5, 13, 0, 0, 0, 7},
+		},
+		{
+			name:     "HaveAll",
+			msg:      &Message{ID: MsgHaveAll},
+			expected: []byte{0, 0, 0, 1, 14},
+		},
+		{
+			name:     "HaveNone",
+			msg:      &Message{ID: MsgHaveNone},
+			expected: []byte{0, 0, 0, 1, 15},
+		},
+		{
+			name:     "RejectRequest",
+			msg:      &Message{ID: MsgRejectRequest, Payload: []byte{0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3}},
+			expected: []byte{0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3},
+		},
+		{
+			name:     "AllowedFast",
+			msg:      &Message{ID: MsgAllowedFast, Payload: []byte{0, 0, 0, 9}},
+			expected: []byte{0, 0, 0, 5, 17, 0, 0, 0, 9},
+		},
 	}
 
 	for _, tt := range tests {
@@ -50,6 +75,20 @@ func TestSerializeMessage(t *testing.T) {
 				t.Errorf("Serialize() = %v, expected %v", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestFastExtensionReservedBit(t *testing.T) {
+	var reserved [8]byte
+	if SupportsFastExtension(reserved) {
+		t.Fatal("empty reserved bytes unexpectedly advertise fast extension")
+	}
+	EnableFastExtension(&reserved)
+	if !SupportsFastExtension(reserved) {
+		t.Fatal("reserved bytes do not advertise fast extension after EnableFastExtension")
+	}
+	if reserved[FastExtensionReservedByte] != FastExtensionReservedBit {
+		t.Fatalf("reserved fast byte = %#x, want %#x", reserved[FastExtensionReservedByte], FastExtensionReservedBit)
 	}
 }
 
