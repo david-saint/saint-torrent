@@ -391,6 +391,30 @@ func TestParsePEXMessageRejectsMismatchedFlags(t *testing.T) {
 	}
 }
 
+func TestParsePEXMessageRejectsTooManyPeersAcrossFields(t *testing.T) {
+	data, err := bencode.Marshal(map[string]interface{}{
+		"added":   compactIPv4PEXTestPeers(MaxPEXPeers),
+		"dropped": compactIPv4PEXTestPeers(1),
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal PEX: %v", err)
+	}
+	if _, err := ParsePEXMessage(data); err == nil {
+		t.Fatal("expected split-field peer overflow to fail")
+	}
+}
+
+func compactIPv4PEXTestPeers(count int) []byte {
+	compact := make([]byte, 0, count*6)
+	for i := 0; i < count; i++ {
+		compact = append(compact, 10, 0, byte(i>>8), byte(i))
+		var port [2]byte
+		binary.BigEndian.PutUint16(port[:], uint16(1+i%65535))
+		compact = append(compact, port[:]...)
+	}
+	return compact
+}
+
 func TestExtensionHandshakeRoundTrip(t *testing.T) {
 	for _, tc := range []struct {
 		id   int

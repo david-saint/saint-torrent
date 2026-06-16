@@ -43,34 +43,35 @@ func ParsePEXMessage(data []byte) (*PEXMessage, error) {
 	}
 
 	msg := &PEXMessage{}
-	if added, err := parsePEXPeers(dict, "added", "added.f", 6); err != nil {
+	remaining := MaxPEXPeers
+	if added, err := parsePEXPeers(dict, "added", "added.f", 6, remaining); err != nil {
 		return nil, err
 	} else {
 		msg.Added = append(msg.Added, added...)
+		remaining -= len(added)
 	}
-	if added6, err := parsePEXPeers(dict, "added6", "added6.f", 18); err != nil {
+	if added6, err := parsePEXPeers(dict, "added6", "added6.f", 18, remaining); err != nil {
 		return nil, err
 	} else {
 		msg.Added = append(msg.Added, added6...)
+		remaining -= len(added6)
 	}
-	if dropped, err := parsePEXPeers(dict, "dropped", "", 6); err != nil {
+	if dropped, err := parsePEXPeers(dict, "dropped", "", 6, remaining); err != nil {
 		return nil, err
 	} else {
 		msg.Dropped = append(msg.Dropped, dropped...)
+		remaining -= len(dropped)
 	}
-	if dropped6, err := parsePEXPeers(dict, "dropped6", "", 18); err != nil {
+	if dropped6, err := parsePEXPeers(dict, "dropped6", "", 18, remaining); err != nil {
 		return nil, err
 	} else {
 		msg.Dropped = append(msg.Dropped, dropped6...)
-	}
-	if len(msg.Added)+len(msg.Dropped) > MaxPEXPeers {
-		return nil, fmt.Errorf("PEX message has too many peers: %d", len(msg.Added)+len(msg.Dropped))
 	}
 
 	return msg, nil
 }
 
-func parsePEXPeers(dict map[string]interface{}, peerKey string, flagsKey string, peerSize int) ([]PEXPeer, error) {
+func parsePEXPeers(dict map[string]interface{}, peerKey string, flagsKey string, peerSize int, maxCount int) ([]PEXPeer, error) {
 	raw, ok := dict[peerKey]
 	if !ok {
 		return nil, nil
@@ -84,8 +85,8 @@ func parsePEXPeers(dict map[string]interface{}, peerKey string, flagsKey string,
 		return nil, fmt.Errorf("%q length must be a multiple of %d, got %d", peerKey, peerSize, len(compactBytes))
 	}
 	count := len(compactBytes) / peerSize
-	if count > MaxPEXPeers {
-		return nil, fmt.Errorf("%q has too many peers: %d", peerKey, count)
+	if count > maxCount {
+		return nil, fmt.Errorf("PEX message has too many peers: %q adds %d with only %d remaining", peerKey, count, maxCount)
 	}
 
 	flags := make([]byte, count)
