@@ -9,11 +9,12 @@ import (
 
 const (
 	dynamicPipelineMinWindowBlocks     = 4
-	dynamicPipelineInitialWindowBlocks = 16
+	dynamicPipelineInitialWindowBlocks = 64
 	dynamicPipelineMaxWindowBlocks     = 1024
 	dynamicPipelineStartupCeiling      = 256
+	dynamicPipelineHealthyFloorBlocks  = dynamicPipelineStartupCeiling
 	dynamicPipelinePeerMaxBytes        = int64(dynamicPipelineMaxWindowBlocks * BlockSize)
-	dynamicPipelineSessionBudgetBytes  = int64(128 * 1024 * 1024)
+	dynamicPipelineSessionBudgetBytes  = int64(maxOutboundPeers * dynamicPipelineHealthyFloorBlocks * BlockSize)
 	minConcurrentPiecesPerPeer         = 16
 	maxConcurrentPiecesPerPeer         = 2048
 )
@@ -217,13 +218,14 @@ type peerPipelineController struct {
 
 	metrics peerPipelineMetrics
 
-	lastAcceptedAt   time.Time
-	lastRateSampleAt time.Time
-	pendingRateBytes int64
-	lastWindowUpdate time.Time
-	lastProbeAt      time.Time
-	chokedAt         time.Time
-	seq              uint64
+	lastAcceptedAt     time.Time
+	lastRateSampleAt   time.Time
+	pendingRateBytes   int64
+	lastWindowUpdate   time.Time
+	lastProbeAt        time.Time
+	windowLimitedUntil time.Time
+	chokedAt           time.Time
+	seq                uint64
 
 	probeCooldownUntil   time.Time
 	appLimitedUntil      time.Time
@@ -350,6 +352,7 @@ func (p *peerPipelineController) OnWindowLimited(now time.Time) {
 	if p.limited(now) || now.Before(p.probeCooldownUntil) {
 		return
 	}
+	p.windowLimitedUntil = now.Add(p.windowLimitedHold())
 	minGap := p.probeGap()
 	if !p.lastProbeAt.IsZero() && now.Sub(p.lastProbeAt) < minGap {
 		return
@@ -364,6 +367,12 @@ func (p *peerPipelineController) OnWindowLimited(now time.Time) {
 		growBy = max(1, p.windowBlocks/16)
 	}
 	target := p.windowBlocks + growBy
+	if p.inStartupProbe && target < p.cfg.StartupProbeCeilingBlocks {
+		target = p.cfg.StartupProbeCeilingBlocks
+	}
+	if floor := p.healthyWindowFloor(now); floor > target {
+		target = floor
+	}
 	if target > ceiling {
 		target = ceiling
 	}
@@ -371,6 +380,7 @@ func (p *peerPipelineController) OnWindowLimited(now time.Time) {
 		p.windowBlocks = target
 		p.targetWindowBlocks = target
 	}
+	p.maybeFinishStartupProbe(now)
 }
 
 func (p *peerPipelineController) OnRequestSent(req *blockRequest, now time.Time) {
@@ -402,9 +412,6 @@ func (p *peerPipelineController) OnBlockAccepted(req *blockRequest, bytes int64,
 	if req.retries == 0 && !req.requestedAt.IsZero() {
 		p.recordLatency(now.Sub(req.requestedAt), now)
 	}
-	if p.metrics.blocksAccepted >= 16 {
-		p.inStartupProbe = false
-	}
 	p.updateWindow(now)
 }
 
@@ -414,9 +421,15 @@ func (p *peerPipelineController) OnRequestTimeout(req *blockRequest, now time.Ti
 	}
 	p.releaseOutstanding(req)
 	p.metrics.blocksTimedOut++
-	p.windowBlocks = max(p.cfg.MinWindowBlocks, p.windowBlocks/2)
-	p.targetWindowBlocks = p.windowBlocks
-	p.probeCooldownUntil = now.Add(maxDuration(time.Second, 2*p.smoothedRTT()))
+	cooldown := maxDuration(time.Second, 2*p.smoothedRTT())
+	if !now.Before(p.probeCooldownUntil) {
+		p.windowBlocks = max(p.cfg.MinWindowBlocks, p.windowBlocks/2)
+		p.targetWindowBlocks = p.windowBlocks
+	}
+	if until := now.Add(cooldown); until.After(p.probeCooldownUntil) {
+		p.probeCooldownUntil = until
+	}
+	p.windowLimitedUntil = time.Time{}
 }
 
 func (p *peerPipelineController) OnCancel(req *blockRequest, now time.Time) {
@@ -528,11 +541,20 @@ func (p *peerPipelineController) updateWindow(now time.Time) {
 			p.windowBlocks = p.cfg.MinWindowBlocks
 		}
 		p.targetWindowBlocks = p.windowBlocks
+		p.maybeFinishStartupProbe(now)
 		return
 	}
-	horizon := p.targetHorizon()
-	modelBlocks := divCeil(int(math.Ceil(rate*horizon.Seconds())), BlockSize)
-	target := clamp(modelBlocks, p.cfg.MinWindowBlocks, p.cfg.MaxWindowBlocks)
+	target := p.modelWindowBlocks(rate)
+	if p.inStartupProbe {
+		if target <= p.windowBlocks && !p.healthyDemandLimited(now) {
+			p.inStartupProbe = false
+		} else if target < p.windowBlocks {
+			target = p.windowBlocks
+		}
+	}
+	if floor := p.healthyWindowFloor(now); floor > target {
+		target = floor
+	}
 	p.targetWindowBlocks = target
 
 	if target > p.windowBlocks {
@@ -555,6 +577,7 @@ func (p *peerPipelineController) updateWindow(now time.Time) {
 		p.windowBlocks = clamp(next, p.cfg.MinWindowBlocks, p.cfg.MaxWindowBlocks)
 		p.lastWindowUpdate = now
 	}
+	p.maybeFinishStartupProbe(now)
 }
 
 func (p *peerPipelineController) limited(now time.Time) bool {
@@ -577,6 +600,12 @@ func (p *peerPipelineController) controlRate() float64 {
 	}
 }
 
+func (p *peerPipelineController) modelWindowBlocks(rate float64) int {
+	horizon := p.targetHorizon()
+	modelBlocks := divCeil(int(math.Ceil(rate*horizon.Seconds())), BlockSize)
+	return clamp(modelBlocks, p.cfg.MinWindowBlocks, p.cfg.MaxWindowBlocks)
+}
+
 func (p *peerPipelineController) recordRate(bytes int64, now time.Time) {
 	if bytes <= 0 {
 		return
@@ -594,6 +623,11 @@ func (p *peerPipelineController) recordRate(bytes int64, now time.Time) {
 	sample := float64(p.pendingRateBytes) / dt.Seconds()
 	p.metrics.rateFast.update(sample, dt)
 	p.metrics.rateSlow.update(sample, dt)
+	if p.healthyDemandLimited(now) && p.metrics.rateFast.initialized &&
+		(!p.metrics.rateSlow.initialized || p.metrics.rateSlow.value < p.metrics.rateFast.value) {
+		p.metrics.rateSlow.value = p.metrics.rateFast.value
+		p.metrics.rateSlow.initialized = true
+	}
 	p.pendingRateBytes = 0
 	p.lastRateSampleAt = now
 }
@@ -665,6 +699,36 @@ func (p *peerPipelineController) probeGap() time.Duration {
 		return clampDuration(rtt, 100*time.Millisecond, time.Second)
 	}
 	return 200 * time.Millisecond
+}
+
+func (p *peerPipelineController) windowLimitedHold() time.Duration {
+	return maxDuration(time.Second, 2*p.probeGap())
+}
+
+func (p *peerPipelineController) healthyDemandLimited(now time.Time) bool {
+	return now.Before(p.windowLimitedUntil) &&
+		!now.Before(p.probeCooldownUntil) &&
+		!p.limited(now)
+}
+
+func (p *peerPipelineController) healthyWindowFloor(now time.Time) int {
+	if !p.healthyDemandLimited(now) {
+		return 0
+	}
+	return clamp(dynamicPipelineHealthyFloorBlocks, p.cfg.MinWindowBlocks, p.cfg.MaxWindowBlocks)
+}
+
+func (p *peerPipelineController) maybeFinishStartupProbe(now time.Time) {
+	if !p.inStartupProbe {
+		return
+	}
+	if p.windowBlocks >= p.cfg.StartupProbeCeilingBlocks {
+		p.inStartupProbe = false
+		return
+	}
+	if rate := p.controlRate(); rate > 1 && p.modelWindowBlocks(rate) <= p.windowBlocks && !p.healthyDemandLimited(now) {
+		p.inStartupProbe = false
+	}
 }
 
 func (p *peerPipelineController) releaseOutstanding(req *blockRequest) {
