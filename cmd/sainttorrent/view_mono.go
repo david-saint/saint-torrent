@@ -281,13 +281,11 @@ func renderDetailsMono(m *model) string {
 		}
 	} else {
 		for _, p := range active {
-			choke := "They choke"
+			choke := "They allow"
 			pst := st.Muted
 			if p.Choked {
 				choke = "They choke"
 				pst = st.Faint
-			} else {
-				choke = "They allow"
 			}
 			uploadState := "not interested"
 			if p.Interested {

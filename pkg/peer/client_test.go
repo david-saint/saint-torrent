@@ -134,7 +134,10 @@ func TestMockPeerExchange(t *testing.T) {
 		}
 
 		// 4. Send Request
-		err = client.SendRequest(1, 0, 10)
+		err = client.WriteRequest(1, 0, 10)
+		if err == nil {
+			err = client.Flush()
+		}
 		if err != nil {
 			errChan <- err
 			return

@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"testing"
 
 	"sainttorrent/pkg/downloader"
@@ -92,12 +93,11 @@ func TestSaveLoadUIPrefsRoundTrip(t *testing.T) {
 	if err := saveUIPrefs(dir, "mono"); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	// 0600 perms on the written file.
 	info, err := os.Stat(uiPrefsPath(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Errorf("perms=%v want 0600", info.Mode().Perm())
 	}
 	p, err := loadUIPrefs(dir)

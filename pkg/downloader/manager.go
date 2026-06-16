@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"sainttorrent/pkg/bencode"
@@ -303,7 +302,9 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		}
 	}
 
-	m.saveState()
+	if err := m.saveState(); err != nil {
+		errs = append(errs, fmt.Errorf("failed to save manager state: %w", err))
+	}
 
 	if len(errs) > 0 {
 		var errStrs []string
@@ -314,15 +315,6 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	}
 
 	return nil
-}
-
-func isDirectoryNotEmpty(err error) bool {
-	var pathErr *os.PathError
-	if !errors.As(err, &pathErr) {
-		return false
-	}
-	errno, ok := pathErr.Err.(syscall.Errno)
-	return ok && (errno == syscall.ENOTEMPTY || errno == 145)
 }
 
 // GetSession retrieves a session by its info hash hex string.
@@ -714,18 +706,18 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 	return state
 }
 
-func (m *TorrentManager) saveState() {
-	m.saveStateInternal(false)
+func (m *TorrentManager) saveState() error {
+	return m.saveStateInternal(false)
 }
 
-func (m *TorrentManager) saveStateInternal(allowClosed bool) {
+func (m *TorrentManager) saveStateInternal(allowClosed bool) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
 	m.mu.Lock()
 	if m.stateDir == "" || m.restoring || (m.closed && !allowClosed) {
 		m.mu.Unlock()
-		return
+		return nil
 	}
 	state := m.getSnapshotLocked()
 	stateDir := m.stateDir
@@ -766,16 +758,24 @@ func (m *TorrentManager) saveStateInternal(allowClosed bool) {
 	}
 	m.mu.Unlock()
 
+	var errs []error
 	for _, item := range items {
 		if !item.metadata {
 			cachedPath := filepath.Join(stateDir, "torrents", item.infoHashHex+".torrent")
 			if _, err := os.Stat(cachedPath); os.IsNotExist(err) {
-				_ = reconstructAndWriteTorrent(stateDir, item.infoHashHex, item.torrent)
+				if err := reconstructAndWriteTorrent(stateDir, item.infoHashHex, item.torrent); err != nil {
+					errs = append(errs, fmt.Errorf("failed to write cached torrent %s: %w", item.infoHashHex, err))
+				}
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("failed to inspect cached torrent %s: %w", item.infoHashHex, err))
 			}
 		}
 	}
 
-	_ = atomicWriteState(stateDir, state)
+	if err := atomicWriteState(stateDir, state); err != nil {
+		errs = append(errs, fmt.Errorf("failed to write session state: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func reconstructAndWriteTorrent(stateDir string, infoHashHex string, tor *torrent.Torrent) error {

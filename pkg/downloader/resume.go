@@ -348,7 +348,14 @@ func (s *Session) saveStateLocked() {
 			completed = append(completed, i)
 		}
 	}
-	_ = s.Storage.SaveState(infoHashHex, completed)
+	if err := s.Storage.SaveState(infoHashHex, completed); err != nil {
+		if err == storage.ErrStorageClosed && s.closed {
+			return
+		}
+		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
+		s.lastErr = stateErr
+		s.statusErr = stateErr
+	}
 }
 
 type byteRange struct {

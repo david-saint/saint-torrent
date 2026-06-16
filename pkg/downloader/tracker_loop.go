@@ -24,7 +24,6 @@ var trackerAnnounceTimeout = 15 * time.Second
 // P1 FIX: Resume uses resumeCh signal instead of spawning untracked goroutines.
 func (s *Session) trackerLoop() {
 	defer s.wg.Done()
-	var nextInterval time.Duration = 0 // announce immediately on start
 
 	for {
 		s.mu.RLock()
@@ -46,6 +45,7 @@ func (s *Session) trackerLoop() {
 		hasMoreEvents := len(s.trackerEvents) > 0
 		s.mu.RUnlock()
 
+		var nextInterval time.Duration
 		if interval == 0 && hasMoreEvents {
 			// Announce failed, back off to prevent spamming trackers
 			nextInterval = 15 * time.Second

@@ -407,15 +407,17 @@ func (s *Session) Start() {
 	s.maybeStartVerification()
 }
 
-// Close shuts down the session and waits for its lifecycle goroutines (tracker, peer,
-// choke, listener, and DHT loops) to exit. Background piece verification is intentionally
-// NOT awaited — a VerifyPiece read can be wedged on slow I/O — but its global verification
-// slot is reclaimed here so capacity is never permanently lost, and it stops mutating the
-// session once s.closed is set.
+// Close shuts down the session, releases its storage ownership, and waits for its
+// lifecycle goroutines (tracker, peer, choke, listener, and DHT loops) to exit.
+// Background piece verification is intentionally NOT awaited — a VerifyPiece read
+// can be wedged on slow I/O — but its global verification slot is reclaimed here
+// so capacity is never permanently lost, and it stops mutating the session once
+// s.closed is set.
 func (s *Session) Close() {
 	s.lifecycleMu.Lock()
 	var gateRelease func()
 	var verifyDone chan struct{}
+	var storageToClose *storage.Storage
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		wasStarted := s.started
@@ -435,6 +437,7 @@ func (s *Session) Close() {
 		s.verifyDone = nil
 		gateRelease = s.verifyGateRelease
 		s.verifyGateRelease = nil
+		storageToClose = s.Storage
 		if s.listener != nil {
 			s.listener.Close()
 			s.listener = nil
@@ -451,6 +454,10 @@ func (s *Session) Close() {
 		s.mu.Unlock()
 	})
 	s.lifecycleMu.Unlock()
+
+	if storageToClose != nil {
+		_ = storageToClose.Close()
+	}
 
 	// Reclaim a verification slot held by a wedged VerifyPiece (outside any lock).
 	if gateRelease != nil {
