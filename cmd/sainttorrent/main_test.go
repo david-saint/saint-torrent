@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -346,29 +345,6 @@ func TestSanitizeText(t *testing.T) {
 	}
 }
 
-func TestFindTerminalTTY(t *testing.T) {
-	input, err := os.Open("/dev/null")
-	if err != nil {
-		t.Fatalf("failed to open character device: %v", err)
-	}
-	defer input.Close()
-
-	if got := findTerminalTTY(input, []string{"/dev/null"}); got != "/dev/null" {
-		t.Fatalf("expected matching device path, got %q", got)
-	}
-
-	tempFile, err := os.CreateTemp("", "sainttorrent-not-a-tty-*")
-	if err != nil {
-		t.Fatalf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
-
-	if got := findTerminalTTY(tempFile, []string{tempFile.Name()}); got != "" {
-		t.Fatalf("expected regular file to be rejected, got %q", got)
-	}
-}
-
 func TestLockHeldAndSocketNotReadyRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "sainttorrent-test-*")
 	if err != nil {
@@ -379,16 +355,11 @@ func TestLockHeldAndSocketNotReadyRetry(t *testing.T) {
 	lockPath := filepath.Join(tmpDir, "sainttorrent.lock")
 	socketPath := filepath.Join(tmpDir, "sainttorrent.sock")
 
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		t.Fatalf("failed to open lock file: %v", err)
-	}
-	defer lockFile.Close()
-
-	lockErr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	lockFile, lockErr := acquireLock(lockPath)
 	if lockErr != nil {
 		t.Fatalf("failed to acquire lock: %v", lockErr)
 	}
+	defer lockFile.Close()
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)

@@ -509,3 +509,30 @@ func TestStorageWriteBlockRepairsMissingFile(t *testing.T) {
 		t.Fatalf("repaired file data mismatch")
 	}
 }
+
+func TestOpenNoFollowSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetFile := filepath.Join(tmpDir, "target.bin")
+	if err := os.WriteFile(targetFile, []byte("target-content"), 0644); err != nil {
+		t.Fatalf("failed to write target file: %v", err)
+	}
+
+	linkFile := filepath.Join(tmpDir, "link.bin")
+	if err := os.Symlink(targetFile, linkFile); err != nil {
+		t.Skipf("symlink creation not supported in this environment: %v", err)
+	}
+
+	f, err := openNoFollow(linkFile, os.O_RDONLY, 0)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("expected openNoFollow to fail when opening a symlink")
+	}
+
+	content, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("failed to read target file: %v", err)
+	}
+	if string(content) != "target-content" {
+		t.Fatalf("expected target file content to be unmodified, got %q", string(content))
+	}
+}
