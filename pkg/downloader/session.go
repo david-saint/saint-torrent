@@ -14,6 +14,7 @@ import (
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
+	"sainttorrent/pkg/utp"
 )
 
 // PieceState represents the download state of a piece.
@@ -138,6 +139,7 @@ type Session struct {
 	wg                  sync.WaitGroup
 	closeOnce           sync.Once
 	listener            net.Listener
+	utpSocket           *utp.Socket
 	sharedInbound       bool
 	outboundSlots       chan struct{} // semaphore bounding concurrent outbound dials (lock-free)
 	inboundSlots        chan struct{} // semaphore bounding concurrent inbound connections (lock-free)

@@ -41,10 +41,19 @@ type bucket struct {
 	pingInProgress bool
 }
 
+// PacketConn is the UDP subset DHT needs. It is satisfied by *net.UDPConn and
+// by the uTP/DHT shared packet connection.
+type PacketConn interface {
+	ReadFromUDP([]byte) (int, *net.UDPAddr, error)
+	WriteToUDP([]byte, *net.UDPAddr) (int, error)
+	LocalAddr() net.Addr
+	Close() error
+}
+
 // DHT implements a BEP 5 Kademlia DHT client.
 type DHT struct {
 	nodeID       [20]byte
-	conn         *net.UDPConn
+	conn         PacketConn
 	mu           sync.RWMutex
 	buckets      [160]*bucket
 	peersMap     map[[20]byte]map[string]time.Time // infoHash -> peerAddr -> lastSeen
@@ -81,6 +90,16 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return nil, err
+	}
+
+	return NewDHTWithConn(downloadDir, conn)
+}
+
+// NewDHTWithConn creates and starts a DHT client using an already-bound UDP
+// packet connection. The DHT takes ownership of conn and closes it from Close.
+func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
+	if conn == nil {
+		return nil, errors.New("nil DHT packet connection")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

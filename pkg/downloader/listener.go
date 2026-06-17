@@ -109,6 +109,33 @@ func (m *TorrentManager) peerAcceptLoop(listener net.Listener) {
 	}
 }
 
+func (m *TorrentManager) utpAcceptLoop(listener net.Listener) {
+	defer m.wg.Done()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			m.mu.RLock()
+			closed := m.closed || m.utpListener != listener
+			m.mu.RUnlock()
+			if closed {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		m.mu.Lock()
+		if m.closed || m.utpListener != listener {
+			m.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		m.wg.Add(1)
+		m.mu.Unlock()
+		go m.handleRoutedIncomingConnection(conn)
+	}
+}
+
 func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	defer m.wg.Done()
 	defer conn.Close()

@@ -1,12 +1,14 @@
 package downloader
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/tracker"
+	"sainttorrent/pkg/utp"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -269,14 +271,8 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	}
 	acquiredSlots = true
 
-	var dialErr error
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.DialContext(s.ctx, "tcp", peerAddr)
+	conn, err := s.dialPeer(peerAddr)
 	if err != nil {
-		dialErr = err
-	}
-
-	if dialErr != nil {
 		s.mu.Lock()
 		if ps, ok := s.Peers[peerAddr]; ok {
 			ps.Active = false
@@ -341,6 +337,31 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	s.mu.Unlock()
 
 	s.runPeerMessageLoop(client, conn, peerAddr, p.IP.String(), p.Port, handshake.Reserved, true)
+}
+
+func (s *Session) dialPeer(peerAddr string) (net.Conn, error) {
+	// Transport policy: prefer TCP for existing swarm compatibility, then fall
+	// back to uTP on the same endpoint when TCP cannot connect.
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, tcpErr := dialer.DialContext(s.ctx, "tcp", peerAddr)
+	if tcpErr == nil {
+		return conn, nil
+	}
+
+	s.mu.RLock()
+	udpSocket := s.utpSocket
+	s.mu.RUnlock()
+	if udpSocket == nil {
+		return nil, tcpErr
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
+	conn, utpErr := udpSocket.DialContext(ctx, peerAddr)
+	if utpErr == nil {
+		return conn, nil
+	}
+	return nil, fmt.Errorf("tcp dial failed: %v; utp dial failed: %w", tcpErr, utpErr)
 }
 
 // inboundListenerLoop accepts incoming peer connections on the already-bound listener.
@@ -2132,4 +2153,15 @@ func (s *Session) AttachDHT(d *dht.DHT) {
 		s.wg.Add(1)
 		go s.dhtLoop()
 	}
+}
+
+func (s *Session) attachUTPSocket(socket *utp.Socket) {
+	if socket == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.closed {
+		s.utpSocket = socket
+	}
+	s.mu.Unlock()
 }
