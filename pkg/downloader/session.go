@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -98,6 +99,10 @@ type Session struct {
 	Port      uint16
 	StartTime time.Time
 	AddedAt   time.Time
+	// EncryptionPolicy controls whether peer connections use MSE/PE. Sessions
+	// created directly default to plaintext compatibility; the CLI-managed
+	// TorrentManager sets its configured policy when adding sessions.
+	EncryptionPolicy mse.Policy
 
 	mu sync.RWMutex
 	// Downloaded and Uploaded are cumulative session byte counters. They are
@@ -225,6 +230,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		Port:                port,
 		StartTime:           time.Now(),
 		AddedAt:             time.Now(),
+		EncryptionPolicy:    mse.PolicyDisable,
 		PieceStates:         states,
 		pieceAvailability:   make([]int, numPieces),
 		Peers:               make(map[string]*PeerState),

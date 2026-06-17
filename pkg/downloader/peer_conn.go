@@ -288,10 +288,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		s.mu.Unlock()
 		return
 	}
-	defer conn.Close()
 	tunePeerConn(conn)
 
-	// Spawn context monitor to interrupt immediately on shutdown
+	// Spawn context monitor before encryption negotiation so shutdown interrupts
+	// both MSE handshakes and the later peer-wire message loop.
+	connMonitor := &monitoredPeerConn{}
+	connMonitor.set(conn)
 	doneCh := make(chan struct{})
 	monitorDone := make(chan struct{})
 	defer func() {
@@ -302,13 +304,26 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		defer close(monitorDone)
 		select {
 		case <-s.ctx.Done():
-			_ = conn.Close()
+			connMonitor.close()
 		case <-doneCh:
 		}
 	}()
 
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
+	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn)
+	if err != nil {
+		s.mu.Lock()
+		if ps, ok := s.Peers[peerAddr]; ok {
+			ps.Active = false
+			ps.LastAttempt = time.Now()
+		}
+		s.mu.Unlock()
+		return
+	}
+	connMonitor.set(conn)
+	defer conn.Close()
+
 	// Handshake with deadline
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
 	s.mu.RLock()
 	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
@@ -512,9 +527,9 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	}()
 
 	if handshake == nil {
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
 		var err error
-		handshake, err = peer.ParseHandshake(conn)
+		conn, handshake, err = s.parseIncomingHandshake(conn)
 		if err != nil {
 			return
 		}

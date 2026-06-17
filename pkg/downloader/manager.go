@@ -20,6 +20,7 @@ import (
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 	"sainttorrent/pkg/utp"
@@ -43,6 +44,7 @@ type TorrentManager struct {
 	natStatus             NATStatus
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
+	encryptionPolicy      mse.Policy
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	wg                    sync.WaitGroup
@@ -52,6 +54,26 @@ type TorrentManager struct {
 	restoring      bool
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+}
+
+// SetEncryptionPolicy configures MSE/PE behavior for all existing and future
+// sessions managed by m.
+func (m *TorrentManager) SetEncryptionPolicy(policy mse.Policy) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.encryptionPolicy = policy
+	for _, sess := range m.sessions {
+		sess.mu.Lock()
+		sess.EncryptionPolicy = policy
+		sess.mu.Unlock()
+	}
+}
+
+// EncryptionPolicy returns the manager-wide MSE/PE policy.
+func (m *TorrentManager) EncryptionPolicy() mse.Policy {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.encryptionPolicy
 }
 
 // maxGlobalOutboundPeers caps total concurrent outbound dials across ALL sessions, so a
@@ -169,6 +191,7 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
+	sess.EncryptionPolicy = m.encryptionPolicy
 	if m.peerListener != nil {
 		sess.sharedInbound = true
 		sess.Port = m.advertisedPeerPort
