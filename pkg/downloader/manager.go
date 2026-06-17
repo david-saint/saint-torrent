@@ -22,6 +22,7 @@ import (
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
+	"sainttorrent/pkg/utp"
 )
 
 // TorrentManager manages multiple Torrent Session instances, allowing
@@ -34,12 +35,14 @@ type TorrentManager struct {
 	globalOutboundSlots   chan struct{}
 	globalInboundSlots    chan struct{}
 	peerListener          net.Listener
+	utpListener           net.Listener
 	peerListenPort        uint16
 	advertisedPeerPort    uint16
 	natGateway            portMapper
 	natStarted            bool
 	natStatus             NATStatus
 	dht                   *dht.DHT
+	utpSocket             *utp.Socket
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	wg                    sync.WaitGroup
@@ -82,12 +85,24 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 	if m.dht != nil {
 		return nil
 	}
+	if m.closed {
+		return fmt.Errorf("torrent manager is closed")
+	}
 
-	d, err := dht.NewDHT(downloadDir, listenPort)
+	udpSocket, err := utp.NewSocket(listenPort)
 	if err != nil {
 		return err
 	}
+	d, err := dht.NewDHTWithConn(downloadDir, udpSocket.DHTConn())
+	if err != nil {
+		_ = udpSocket.Close()
+		return err
+	}
+	utpListener := udpSocket.Listen()
+
 	m.dht = d
+	m.utpSocket = udpSocket
+	m.utpListener = utpListener
 
 	// Route discovered peers to sessions
 	m.wg.Add(1)
@@ -111,9 +126,12 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 			}
 		}
 	}()
+	m.wg.Add(1)
+	go m.utpAcceptLoop(utpListener)
 
 	for _, sess := range m.sessions {
 		sess.AttachDHT(d)
+		sess.attachUTPSocket(udpSocket)
 	}
 
 	return nil
@@ -154,6 +172,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	if m.peerListener != nil {
 		sess.sharedInbound = true
 		sess.Port = m.advertisedPeerPort
+	}
+	if m.utpSocket != nil {
+		sess.utpSocket = m.utpSocket
 	}
 	sess.mu.Unlock()
 
@@ -437,9 +458,14 @@ func (m *TorrentManager) Close() {
 	m.cancel()
 	peerListener := m.peerListener
 	m.peerListener = nil
+	utpListener := m.utpListener
+	m.utpListener = nil
 	m.mu.Unlock()
 	if peerListener != nil {
 		_ = peerListener.Close()
+	}
+	if utpListener != nil {
+		_ = utpListener.Close()
 	}
 
 	m.saveStateInternal(true)
@@ -452,6 +478,8 @@ func (m *TorrentManager) Close() {
 	m.sessions = make(map[string]*Session)
 	d := m.dht
 	m.dht = nil
+	udpSocket := m.utpSocket
+	m.utpSocket = nil
 	m.mu.Unlock()
 
 	// H1: best-effort, parallel, bounded "stopped" announces. Pre-marks every session as
@@ -471,6 +499,9 @@ func (m *TorrentManager) Close() {
 
 	if d != nil {
 		d.Close()
+	}
+	if udpSocket != nil {
+		_ = udpSocket.Close()
 	}
 	m.wg.Wait()
 }
