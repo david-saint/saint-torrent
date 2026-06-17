@@ -179,6 +179,51 @@ func TestPrivateTorrentSuppressesDHTAndDiscovery(t *testing.T) {
 	}
 }
 
+func TestPrivateTorrentReconnectsKnownPeer(t *testing.T) {
+	tempDir := t.TempDir()
+
+	tor := &torrent.Torrent{
+		Name:        "private-reconnect.txt",
+		InfoHash:    sha1.Sum([]byte("private-reconnect")),
+		PieceLength: 1,
+		PieceHashes: [][20]byte{sha1.Sum([]byte("x"))},
+		Files:       []torrent.File{{Length: 1, Path: []string{"private-reconnect.txt"}}},
+		Private:     true,
+	}
+	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{Path: "private-reconnect.txt", Length: 1}}, 1)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+
+	// Decentralized discovery stays suppressed for private torrents.
+	sess.AddPeerFromDiscovery("127.0.0.1:6881")
+	sess.mu.RLock()
+	discoveryCount := len(sess.Peers)
+	sess.mu.RUnlock()
+	if discoveryCount != 0 {
+		t.Fatalf("private torrent accepted decentralized discovery peers, got %d", discoveryCount)
+	}
+
+	// Reconnecting an already-known peer (the resume path) must still work: a
+	// private torrent's peers come from its trackers, which BEP 27 allows.
+	sess.addPeer("127.0.0.1:6881", false)
+	sess.mu.RLock()
+	_, reconnected := sess.Peers["127.0.0.1:6881"]
+	sess.mu.RUnlock()
+	if !reconnected {
+		t.Fatal("private torrent failed to reconnect a known (tracker-sourced) peer")
+	}
+}
+
 func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
 	tempDir := t.TempDir()
 	info := map[string]interface{}{

@@ -550,7 +550,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Unlock()
 
 		if reconnectAfterResume {
-			s.AddPeerFromDiscovery(peerAddr)
+			// Re-dial an already-known peer rather than perform decentralized
+			// discovery, so private torrents (which use trackers only) can still
+			// re-establish dropped connections after a resume.
+			s.addPeer(peerAddr, false)
 		}
 	}()
 
@@ -2030,9 +2033,19 @@ func (s *Session) dhtLoop() {
 	}
 }
 
-// AddPeerFromDiscovery adds a new peer found via DHT or other discovery mechanism
-// and attempts to initiate a connection.
+// AddPeerFromDiscovery adds a peer learned via a decentralized discovery mechanism
+// (DHT, PEX) and attempts to initiate a connection. Discovery peers are suppressed
+// for private torrents (BEP 27), which must use trackers only.
 func (s *Session) AddPeerFromDiscovery(peerAddr string) {
+	s.addPeer(peerAddr, true)
+}
+
+// addPeer records peerAddr and, when eligible, dials it. fromDiscovery marks peers
+// learned via decentralized discovery (DHT/PEX); those are rejected for private
+// torrents. Reconnecting an already-known peer (e.g. after a resume) passes
+// fromDiscovery=false, so a private torrent can still re-establish its
+// tracker-sourced connections.
+func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	host, portStr, err := net.SplitHostPort(peerAddr)
 	if err != nil {
 		return
@@ -2056,7 +2069,7 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 	if s.paused || s.closed || !s.started {
 		return
 	}
-	if !s.allowsDecentralizedPeerDiscoveryLocked() {
+	if fromDiscovery && !s.allowsDecentralizedPeerDiscoveryLocked() {
 		return
 	}
 
