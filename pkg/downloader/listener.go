@@ -84,38 +84,25 @@ func (m *TorrentManager) AdvertisedPeerPort() uint16 {
 
 func (m *TorrentManager) peerAcceptLoop(listener net.Listener) {
 	defer m.wg.Done()
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			m.mu.RLock()
-			closed := m.closed || m.peerListener != listener
-			m.mu.RUnlock()
-			if closed {
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		m.mu.Lock()
-		if m.closed || m.peerListener != listener {
-			m.mu.Unlock()
-			_ = conn.Close()
-			return
-		}
-		m.wg.Add(1)
-		m.mu.Unlock()
-		go m.handleRoutedIncomingConnection(conn)
-	}
+	m.acceptLoop(listener, func() bool {
+		return m.peerListener == listener
+	})
 }
 
 func (m *TorrentManager) utpAcceptLoop(listener net.Listener) {
 	defer m.wg.Done()
+	m.acceptLoop(listener, func() bool {
+		return m.utpListener == listener
+	})
+}
+
+// acceptLoop serves manager-wide listeners. current is called while m.mu is held.
+func (m *TorrentManager) acceptLoop(listener net.Listener, current func() bool) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			m.mu.RLock()
-			closed := m.closed || m.utpListener != listener
+			closed := m.closed || !current()
 			m.mu.RUnlock()
 			if closed {
 				return
@@ -125,7 +112,7 @@ func (m *TorrentManager) utpAcceptLoop(listener net.Listener) {
 		}
 
 		m.mu.Lock()
-		if m.closed || m.utpListener != listener {
+		if m.closed || !current() {
 			m.mu.Unlock()
 			_ = conn.Close()
 			return
@@ -147,7 +134,6 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		return
 	}
 
-	tunePeerConn(conn)
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	handshake, err := peer.ParseHandshake(conn)
 	if err != nil {

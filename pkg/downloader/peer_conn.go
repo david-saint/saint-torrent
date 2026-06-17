@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sainttorrent/pkg/dht"
@@ -75,6 +76,12 @@ type blockRequest struct {
 	retries             int
 	controllerSeq       uint64
 	pipelineBudgetBytes int64
+}
+
+type transportDialResult struct {
+	transport string
+	conn      net.Conn
+	err       error
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
@@ -341,27 +348,58 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 
 func (s *Session) dialPeer(peerAddr string) (net.Conn, error) {
 	// Transport policy: prefer TCP for existing swarm compatibility, then fall
-	// back to uTP on the same endpoint when TCP cannot connect.
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	conn, tcpErr := dialer.DialContext(s.ctx, "tcp", peerAddr)
-	if tcpErr == nil {
-		return conn, nil
-	}
+	// back to uTP on the same endpoint. Race both when uTP is available so a
+	// firewalled TCP path does not hold the bounded outbound slot for two full
+	// dial timeouts before uTP gets a chance.
+	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+	defer cancel()
 
 	s.mu.RLock()
 	udpSocket := s.utpSocket
 	s.mu.RUnlock()
+
+	dialCount := 1
+	if udpSocket != nil {
+		dialCount = 2
+	}
+	results := make(chan transportDialResult, dialCount)
+
+	go func() {
+		dialer := net.Dialer{}
+		conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
+		results <- transportDialResult{transport: "tcp", conn: conn, err: err}
+	}()
+
 	if udpSocket == nil {
-		return nil, tcpErr
+		res := <-results
+		return res.conn, res.err
 	}
 
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
-	defer cancel()
-	conn, utpErr := udpSocket.DialContext(ctx, peerAddr)
-	if utpErr == nil {
-		return conn, nil
+	go func() {
+		conn, err := udpSocket.DialContext(ctx, peerAddr)
+		results <- transportDialResult{transport: "utp", conn: conn, err: err}
+	}()
+
+	var errs []error
+	for i := 0; i < dialCount; i++ {
+		res := <-results
+		if res.err == nil {
+			cancel()
+			go closeLateDialSuccesses(results, dialCount-i-1)
+			return res.conn, nil
+		}
+		errs = append(errs, fmt.Errorf("%s dial failed: %w", res.transport, res.err))
 	}
-	return nil, fmt.Errorf("tcp dial failed: %v; utp dial failed: %w", tcpErr, utpErr)
+	return nil, errors.Join(errs...)
+}
+
+func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {
+	for i := 0; i < remaining; i++ {
+		res := <-results
+		if res.err == nil && res.conn != nil {
+			_ = res.conn.Close()
+		}
+	}
 }
 
 // inboundListenerLoop accepts incoming peer connections on the already-bound listener.
@@ -473,9 +511,8 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		}
 	}()
 
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
 	if handshake == nil {
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 		var err error
 		handshake, err = peer.ParseHandshake(conn)
 		if err != nil {

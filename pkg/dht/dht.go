@@ -96,7 +96,8 @@ func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
 }
 
 // NewDHTWithConn creates and starts a DHT client using an already-bound UDP
-// packet connection. The DHT takes ownership of conn and closes it from Close.
+// packet connection. DHT.Close calls conn.Close; ownership of any parent shared
+// socket still belongs to the caller that created that socket.
 func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 	if conn == nil {
 		return nil, errors.New("nil DHT packet connection")
@@ -213,6 +214,10 @@ func (d *DHT) readLoop() {
 			case <-d.ctx.Done():
 				return
 			default:
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 		}

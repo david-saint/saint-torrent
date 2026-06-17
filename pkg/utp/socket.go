@@ -30,8 +30,7 @@ type connKey struct {
 // packets. uTP packets are routed to Conn values; every non-uTP packet is exposed
 // through DHTConn so the DHT and uTP can share one UDP port.
 type Socket struct {
-	conn    *net.UDPConn
-	started time.Time
+	conn *net.UDPConn
 
 	mu       sync.Mutex
 	conns    map[connKey]*Conn
@@ -60,11 +59,12 @@ func NewSocket(listenPort int) (*Socket, error) {
 // NewSocketFromUDP wraps an existing UDP socket. The Socket takes ownership of
 // conn and closes it from Close.
 func NewSocketFromUDP(conn *net.UDPConn) *Socket {
+	_ = conn.SetReadBuffer(4 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 	s := &Socket{
-		conn:    conn,
-		started: time.Now(),
-		conns:   make(map[connKey]*Conn),
-		done:    make(chan struct{}),
+		conn:  conn,
+		conns: make(map[connKey]*Conn),
+		done:  make(chan struct{}),
 	}
 	s.dhtConn = newPacketConn(s)
 	go s.readLoop()
@@ -135,7 +135,7 @@ func (s *Socket) localAddr() net.Addr {
 }
 
 func (s *Socket) nowMicros() uint32 {
-	return uint32(time.Since(s.started) / time.Microsecond)
+	return uint32(time.Now().UnixMicro())
 }
 
 func (s *Socket) register(c *Conn) error {
@@ -200,8 +200,12 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	listener := s.listener
 	closed := s.closed
 	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
-		c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-		s.conns[key] = c
+		recvKey := connKey{addr: addr.String(), id: p.connID + 1}
+		c = s.conns[recvKey]
+		if c == nil {
+			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
+			s.conns[recvKey] = c
+		}
 	}
 	s.mu.Unlock()
 
@@ -390,6 +394,5 @@ func (c *PacketConn) deliver(pkt udpPacket) {
 	case <-c.closed:
 	case <-c.socket.done:
 	case c.incoming <- pkt:
-	default:
 	}
 }
