@@ -340,3 +340,30 @@ func TestScrape_DispatchUDP(t *testing.T) {
 		t.Errorf("unexpected stats: %+v", got)
 	}
 }
+
+func TestParseUDPScrapeResponse_FewerTriplesThanHashes(t *testing.T) {
+	// Two hashes requested, but the tracker returns only one triple. The first
+	// hash must be mapped and the second simply absent (tolerated, not an error).
+	h1 := [20]byte{1}
+	h2 := [20]byte{2}
+	data := make([]byte, udpScrapeResponseHeaderSize+udpScrapeStatSize)
+	binary.BigEndian.PutUint32(data[0:4], actionScrape)
+	off := udpScrapeResponseHeaderSize
+	binary.BigEndian.PutUint32(data[off:off+4], 11)    // seeders
+	binary.BigEndian.PutUint32(data[off+4:off+8], 22)  // completed
+	binary.BigEndian.PutUint32(data[off+8:off+12], 33) // leechers
+
+	result, err := parseUDPScrapeResponse(data, [][20]byte{h1, h2})
+	if err != nil {
+		t.Fatalf("expected fewer triples to be tolerated, got error: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 mapped result, got %d", len(result))
+	}
+	if got := result[h1]; got.Complete != 11 || got.Downloaded != 22 || got.Incomplete != 33 {
+		t.Errorf("unexpected stats for first hash: %+v", got)
+	}
+	if _, ok := result[h2]; ok {
+		t.Errorf("did not expect stats for the omitted second hash")
+	}
+}

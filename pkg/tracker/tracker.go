@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -236,12 +237,42 @@ type ScrapeStats struct {
 // MITM'd tracker from streaming unbounded data into memory.
 const maxScrapeResponse = 1 * 1024 * 1024
 
+// defaultScrapeTimeout bounds an HTTP scrape when the caller passes a context
+// without its own deadline, so an exported call can never hang indefinitely.
+const defaultScrapeTimeout = 30 * time.Second
+
+// scrapeHTTPClient issues scrape requests. Request lifetime is bounded by the
+// per-request context (see HTTPScrape); using a dedicated client avoids
+// coupling to the process-wide http.DefaultClient.
+var scrapeHTTPClient = &http.Client{}
+
+// ReadCappedBody reads up to max bytes from r, returning an error if the source
+// exceeds the cap rather than silently truncating. Reading one byte past the
+// cap is what lets us detect (rather than hide) an over-limit response. It
+// bounds tracker announce and scrape bodies against a malicious or MITM'd
+// tracker streaming unbounded data into memory.
+func ReadCappedBody(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
+
 // ScrapeURL derives the scrape URL from an announce URL using the BEP 48
 // convention: the final path segment must begin with "announce", and that
 // "announce" prefix is replaced with "scrape" (e.g. "/announce" -> "/scrape",
 // "/x/announce.php" -> "/x/scrape.php"). An error is returned when the URL has
 // no path or the final segment does not begin with "announce", signalling that
 // the tracker does not advertise scrape support.
+//
+// The result is canonicalized via url.String(). A percent-encoded path
+// separator in the announce URL (e.g. "/x%2Fannounce") cannot be preserved
+// because url.Parse decodes it before this function sees it; such URLs are
+// effectively non-existent for real trackers.
 func ScrapeURL(announceURL string) (string, error) {
 	u, err := url.Parse(announceURL)
 	if err != nil {
@@ -256,6 +287,11 @@ func ScrapeURL(announceURL string) (string, error) {
 		return "", fmt.Errorf("announce URL segment %q does not support scrape", last)
 	}
 	u.Path = u.Path[:idx+1] + "scrape" + last[len("announce"):]
+	// Clear any escaped-path cached from the announce URL so String() re-encodes
+	// canonically from the new Path rather than emitting a stale RawPath. (A
+	// percent-encoded path separator in the announce URL is already decoded by
+	// url.Parse, so it cannot be faithfully preserved here regardless.)
+	u.RawPath = ""
 	return u.String(), nil
 }
 
@@ -346,12 +382,20 @@ func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte)
 		return nil, err
 	}
 
+	// Guarantee a deadline even if the caller supplied an unbounded context, so
+	// a stalled tracker can never hang the request indefinitely.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultScrapeTimeout)
+		defer cancel()
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scrapeHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -361,14 +405,9 @@ func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte)
 		return nil, fmt.Errorf("scrape returned HTTP %d", resp.StatusCode)
 	}
 
-	// Reading one byte past the cap lets us detect and reject an over-limit
-	// response rather than silently truncating it.
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeResponse+1))
+	data, err := ReadCappedBody(resp.Body, maxScrapeResponse)
 	if err != nil {
 		return nil, err
-	}
-	if len(data) > maxScrapeResponse {
-		return nil, fmt.Errorf("scrape response exceeds %d bytes", maxScrapeResponse)
 	}
 
 	return ParseScrapeResponse(data)
@@ -378,16 +417,14 @@ func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte)
 // implementation based on the announce URL scheme. It returns swarm-health
 // counts keyed by raw info hash.
 func Scrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
-	u, err := url.Parse(announceURL)
-	if err != nil {
-		return nil, fmt.Errorf("parsing announce URL: %w", err)
-	}
-	switch u.Scheme {
-	case "udp":
+	// Dispatch on the scheme prefix (mirroring announceTracker) instead of a
+	// full url.Parse here; the chosen implementation parses the URL itself.
+	switch {
+	case strings.HasPrefix(announceURL, "udp"):
 		return UDPScrape(ctx, announceURL, infoHashes...)
-	case "http", "https":
+	case strings.HasPrefix(announceURL, "http"):
 		return HTTPScrape(ctx, announceURL, infoHashes...)
 	default:
-		return nil, fmt.Errorf("unsupported tracker scheme %q for scrape", u.Scheme)
+		return nil, fmt.Errorf("unsupported tracker scheme for scrape: %q", announceURL)
 	}
 }

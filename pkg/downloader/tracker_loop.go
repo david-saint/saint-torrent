@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"sainttorrent/pkg/tracker"
 	"time"
@@ -20,10 +19,21 @@ const maxTrackerResponse = 2 * 1024 * 1024
 
 var trackerAnnounceTimeout = 15 * time.Second
 
+// scrapeMinInterval throttles how often the best-effort scrape runs. Announce
+// already supplies seeders/leechers every cycle; scrape's only net-new datum is
+// the (slowly-changing, cosmetic) completed count, so a full extra tracker
+// round-trip on every announce cycle isn't worth the traffic and added loop
+// latency. Scraping on this slower cadence keeps the count fresh enough.
+var scrapeMinInterval = 15 * time.Minute
+
 // trackerLoop handles periodic tracker announces.
 // P1 FIX: Resume uses resumeCh signal instead of spawning untracked goroutines.
 func (s *Session) trackerLoop() {
 	defer s.wg.Done()
+
+	// lastScrape is loop-local state (only this goroutine touches it), so it
+	// needs no locking. The zero value forces a scrape on the first cycle.
+	var lastScrape time.Time
 
 	for {
 		s.mu.RLock()
@@ -36,9 +46,11 @@ func (s *Session) trackerLoop() {
 			interval = s.announceAndConnect()
 			// Best-effort scrape to surface swarm health (seeders / leechers /
 			// completed) for the TUI. The completed count is unavailable from
-			// announce, so it can only come from scrape.
-			if !paused {
+			// announce, so it can only come from scrape. Throttled to
+			// scrapeMinInterval so it doesn't double tracker traffic every cycle.
+			if !paused && time.Since(lastScrape) >= scrapeMinInterval {
 				s.scrapeTrackers()
+				lastScrape = time.Now()
 			}
 		}
 		select {
@@ -128,21 +140,16 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 			return trackerAnnounceResult{err: err}
 		}
 
-		buf := new(bytes.Buffer)
 		// Bound how much we buffer: a tracker announce reply is a few KB even at
 		// numwant=200. The cap stops a malicious or MITM'd tracker from streaming
-		// unbounded data into memory. Reading one byte past the cap lets us detect
-		// and reject an over-limit response rather than silently truncating it.
-		_, err = io.Copy(buf, io.LimitReader(resp.Body, maxTrackerResponse+1))
+		// unbounded data into memory (shared with the scrape path).
+		data, err := tracker.ReadCappedBody(resp.Body, maxTrackerResponse)
 		resp.Body.Close()
 		if err != nil {
 			return trackerAnnounceResult{err: err}
 		}
-		if buf.Len() > maxTrackerResponse {
-			return trackerAnnounceResult{err: fmt.Errorf("tracker response exceeds %d bytes", maxTrackerResponse)}
-		}
 
-		trackerResp, err := tracker.ParseTrackerResponse(buf.Bytes())
+		trackerResp, err := tracker.ParseTrackerResponse(data)
 		if err != nil {
 			return trackerAnnounceResult{err: err}
 		}
@@ -381,30 +388,30 @@ func (s *Session) scrapeTrackers() {
 		return
 	}
 
-	results := make(chan tracker.ScrapeStats, len(trackers))
+	type scrapeResult struct {
+		stats tracker.ScrapeStats
+		ok    bool
+	}
+	results := make(chan scrapeResult, len(trackers))
 	for _, tr := range trackers {
 		trackerURL := tr
 		go func() {
 			st, err := scrapeTracker(s.ctx, trackerURL, infoHash, trackerAnnounceTimeout)
-			if err != nil {
-				results <- tracker.ScrapeStats{Complete: -1}
-				return
-			}
-			results <- st
+			results <- scrapeResult{stats: st, ok: err == nil}
 		}()
 	}
 
 	var seeders, leechers, completed int
 	any := false
 	for range trackers {
-		st := <-results
-		if st.Complete < 0 {
-			continue // sentinel for a failed scrape
+		r := <-results
+		if !r.ok {
+			continue
 		}
 		any = true
-		seeders = max(seeders, st.Complete)
-		leechers = max(leechers, st.Incomplete)
-		completed = max(completed, st.Downloaded)
+		seeders = max(seeders, r.stats.Complete)
+		leechers = max(leechers, r.stats.Incomplete)
+		completed = max(completed, r.stats.Downloaded)
 	}
 	if !any {
 		return
@@ -413,7 +420,10 @@ func (s *Session) scrapeTrackers() {
 	s.mu.Lock()
 	s.trackerSeeders = max(s.trackerSeeders, seeders)
 	s.trackerLeechers = max(s.trackerLeechers, leechers)
-	s.trackerCompleted = completed
+	// completed is a cumulative tracker counter (times the torrent finished
+	// downloading), so it should only ever climb; max() prevents a later cycle
+	// where the highest-count tracker dropped out from regressing the display.
+	s.trackerCompleted = max(s.trackerCompleted, completed)
 	s.mu.Unlock()
 }
 

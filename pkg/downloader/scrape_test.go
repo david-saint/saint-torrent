@@ -104,3 +104,39 @@ func TestScrapeTrackersNoTrackers(t *testing.T) {
 		t.Errorf("expected zero stats, got %d/%d/%d", seeders, leechers, completed)
 	}
 }
+
+// TestScrapeTrackersCompletedMonotonic verifies that a later scrape reporting a
+// lower "completed" (downloaded) count never regresses the stored value, since
+// completed is a cumulative tracker counter that only climbs.
+func TestScrapeTrackersCompletedMonotonic(t *testing.T) {
+	infoHash := sha1.Sum([]byte("monotonic"))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte("d5:filesd20:")
+		body = append(body, infoHash[:]...)
+		// downloaded=5 is lower than the pre-seeded stored value of 1000.
+		body = append(body, []byte("d8:completei9e10:downloadedi5e10:incompletei2eeee")...)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	tor := &torrent.Torrent{
+		Name:     "monotonic",
+		InfoHash: infoHash,
+		Trackers: []string{srv.URL + "/announce"},
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+
+	sess.mu.Lock()
+	sess.trackerCompleted = 1000 // higher count from an earlier cycle
+	sess.mu.Unlock()
+
+	sess.scrapeTrackers()
+
+	if _, _, completed := sess.TrackerSwarmStats(); completed != 1000 {
+		t.Errorf("expected completed to stay at 1000 (monotonic), got %d", completed)
+	}
+}
