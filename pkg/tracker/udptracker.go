@@ -21,6 +21,9 @@ const (
 	// actionAnnounce is the action value for an announce request/response.
 	actionAnnounce uint32 = 1
 
+	// actionScrape is the action value for a scrape request/response.
+	actionScrape uint32 = 2
+
 	// actionError is the action value for an error response.
 	actionError uint32 = 3
 
@@ -40,9 +43,137 @@ const (
 	// (header only, no peers).
 	udpAnnounceResponseMinSize = 20
 
+	// udpScrapeRequestHeaderSize is the byte size of a scrape request header,
+	// before the appended 20-byte info hashes.
+	udpScrapeRequestHeaderSize = 16
+
+	// udpScrapeResponseHeaderSize is the byte size of a scrape response header
+	// (action + transaction_id), before the per-torrent stat triples.
+	udpScrapeResponseHeaderSize = 8
+
+	// udpScrapeStatSize is the byte size of one per-torrent stat triple in a
+	// scrape response: seeders, completed, leechers (3 * 4 bytes).
+	udpScrapeStatSize = 12
+
+	// udpMaxScrapeHashes is the maximum number of info hashes a single UDP
+	// scrape request may carry (BEP 15).
+	udpMaxScrapeHashes = 74
+
 	// eventNone is the "none" event value for an announce request.
 	eventNone uint32 = 0
 )
+
+// udpDial parses a "udp://host:port/..." announce URL, dials the tracker, and
+// starts a watchdog that closes the connection when ctx is cancelled. The
+// returned cleanup func stops the watchdog and closes the connection; callers
+// must defer it. It is shared by UDPAnnounce and UDPScrape.
+func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) {
+	u, err := url.Parse(announceURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing announce URL: %w", err)
+	}
+	if u.Scheme != "udp" {
+		return nil, nil, fmt.Errorf("unsupported scheme %q, expected \"udp\"", u.Scheme)
+	}
+	host := u.Host
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		return nil, nil, fmt.Errorf("invalid host %q: %w", host, err)
+	}
+
+	dialer := net.Dialer{Timeout: 15 * time.Second}
+	conn, err := dialer.DialContext(ctx, "udp", host)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dialing UDP %s: %w", host, err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	cleanup := func() {
+		close(done)
+		_ = conn.Close()
+	}
+	return conn, cleanup, nil
+}
+
+// udpRoundTrip writes req on conn and waits for a single response, retrying
+// with BEP 15 exponential backoff up to udpMaxRetries times. It validates the
+// response transaction ID, surfaces tracker error packets (action=3), and
+// requires the response action to equal expectedAction. opName labels the
+// operation in error messages. It is shared by udpConnect, udpAnnounceRequest,
+// and udpScrapeRequest.
+func udpRoundTrip(ctx context.Context, conn net.Conn, req []byte, txnID, expectedAction uint32, minRespSize int, opName string) ([]byte, error) {
+	for n := 0; n <= udpMaxRetries; n++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		timeout := udpTimeout(n)
+		deadline := time.Now().Add(timeout)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting write deadline: %w", err)
+		}
+		if _, err := conn.Write(req); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, fmt.Errorf("writing %s request: %w", opName, err)
+		}
+
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return nil, fmt.Errorf("setting read deadline: %w", err)
+		}
+
+		var buf [4096]byte
+		nRead, err := conn.Read(buf[:])
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, fmt.Errorf("reading %s response: %w", opName, err)
+		}
+
+		if nRead < minRespSize {
+			return nil, fmt.Errorf("%s response too short: %d bytes", opName, nRead)
+		}
+
+		respAction := binary.BigEndian.Uint32(buf[0:4])
+		respTxnID := binary.BigEndian.Uint32(buf[4:8])
+
+		if respTxnID != txnID {
+			return nil, fmt.Errorf("%s response transaction ID mismatch: expected %d, got %d", opName, txnID, respTxnID)
+		}
+		if respAction == actionError {
+			return nil, fmt.Errorf("tracker error: %s", string(buf[8:nRead]))
+		}
+		if respAction != expectedAction {
+			return nil, fmt.Errorf("unexpected %s response action: %d", opName, respAction)
+		}
+
+		// Copy out of the stack buffer so the returned slice stays valid.
+		out := make([]byte, nRead)
+		copy(out, buf[:nRead])
+		return out, nil
+	}
+
+	return nil, fmt.Errorf("%s timed out after %d retries", opName, udpMaxRetries+1)
+}
 
 // udpTimeout returns the timeout duration for retry attempt n, per BEP 15:
 // 15 * 2^n seconds.
@@ -73,34 +204,11 @@ func newTransactionID() (uint32, error) {
 // retries on timeouts. Callers should pass a bounded context for app-level
 // tracker fallback; cancellation closes the UDP connection promptly.
 func UDPAnnounce(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, numWant ...int) (*TrackerResponse, error) {
-	u, err := url.Parse(announceURL)
+	conn, cleanup, err := udpDial(ctx, announceURL)
 	if err != nil {
-		return nil, fmt.Errorf("parsing announce URL: %w", err)
+		return nil, err
 	}
-	if u.Scheme != "udp" {
-		return nil, fmt.Errorf("unsupported scheme %q, expected \"udp\"", u.Scheme)
-	}
-	host := u.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		return nil, fmt.Errorf("invalid host %q: %w", host, err)
-	}
-
-	dialer := net.Dialer{Timeout: 15 * time.Second}
-	conn, err := dialer.DialContext(ctx, "udp", host)
-	if err != nil {
-		return nil, fmt.Errorf("dialing UDP %s: %w", host, err)
-	}
-	defer conn.Close()
-
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
+	defer cleanup()
 
 	// Step 1: Connect handshake.
 	connectionID, err := udpConnect(ctx, conn)
@@ -132,74 +240,11 @@ func udpConnect(ctx context.Context, conn net.Conn) (uint64, error) {
 	binary.BigEndian.PutUint32(req[8:12], actionConnect)
 	binary.BigEndian.PutUint32(req[12:16], txnID)
 
-	for n := 0; n <= udpMaxRetries; n++ {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-
-		timeout := udpTimeout(n)
-		deadline := time.Now().Add(timeout)
-
-		// If context has a deadline that's earlier, use that.
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
-		}
-
-		if err := conn.SetWriteDeadline(deadline); err != nil {
-			return 0, fmt.Errorf("setting write deadline: %w", err)
-		}
-		if _, err := conn.Write(req[:]); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return 0, ctxErr
-			}
-			// On timeout, retry.
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return 0, fmt.Errorf("writing connect request: %w", err)
-		}
-
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			return 0, fmt.Errorf("setting read deadline: %w", err)
-		}
-
-		var buf [2048]byte
-		nRead, err := conn.Read(buf[:])
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return 0, ctxErr
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return 0, fmt.Errorf("reading connect response: %w", err)
-		}
-
-		if nRead < udpConnectResponseSize {
-			return 0, fmt.Errorf("connect response too short: %d bytes", nRead)
-		}
-
-		respAction := binary.BigEndian.Uint32(buf[0:4])
-		respTxnID := binary.BigEndian.Uint32(buf[4:8])
-
-		if respTxnID != txnID {
-			return 0, fmt.Errorf("connect response transaction ID mismatch: expected %d, got %d", txnID, respTxnID)
-		}
-
-		if respAction == actionError {
-			msg := string(buf[8:nRead])
-			return 0, fmt.Errorf("tracker error: %s", msg)
-		}
-
-		if respAction != actionConnect {
-			return 0, fmt.Errorf("unexpected connect response action: %d", respAction)
-		}
-
-		connectionID := binary.BigEndian.Uint64(buf[8:16])
-		return connectionID, nil
+	resp, err := udpRoundTrip(ctx, conn, req[:], txnID, actionConnect, udpConnectResponseSize, "connect")
+	if err != nil {
+		return 0, err
 	}
-
-	return 0, fmt.Errorf("connect timed out after %d retries", udpMaxRetries+1)
+	return binary.BigEndian.Uint64(resp[8:16]), nil
 }
 
 // udpAnnounceRequest performs the BEP 15 announce on an already-connected UDP
@@ -257,71 +302,11 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 	binary.BigEndian.PutUint32(req[92:96], uint32(int32(want)))
 	binary.BigEndian.PutUint16(req[96:98], port)
 
-	for n := 0; n <= udpMaxRetries; n++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		timeout := udpTimeout(n)
-		deadline := time.Now().Add(timeout)
-
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
-		}
-
-		if err := conn.SetWriteDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting write deadline: %w", err)
-		}
-		if _, err := conn.Write(req[:]); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return nil, fmt.Errorf("writing announce request: %w", err)
-		}
-
-		if err := conn.SetReadDeadline(deadline); err != nil {
-			return nil, fmt.Errorf("setting read deadline: %w", err)
-		}
-
-		var buf [4096]byte
-		nRead, err := conn.Read(buf[:])
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return nil, fmt.Errorf("reading announce response: %w", err)
-		}
-
-		if nRead < udpAnnounceResponseMinSize {
-			return nil, fmt.Errorf("announce response too short: %d bytes", nRead)
-		}
-
-		respAction := binary.BigEndian.Uint32(buf[0:4])
-		respTxnID := binary.BigEndian.Uint32(buf[4:8])
-
-		if respTxnID != txnID {
-			return nil, fmt.Errorf("announce response transaction ID mismatch: expected %d, got %d", txnID, respTxnID)
-		}
-
-		if respAction == actionError {
-			msg := string(buf[8:nRead])
-			return nil, fmt.Errorf("tracker error: %s", msg)
-		}
-
-		if respAction != actionAnnounce {
-			return nil, fmt.Errorf("unexpected announce response action: %d", respAction)
-		}
-
-		return parseUDPAnnounceResponse(buf[:nRead])
+	resp, err := udpRoundTrip(ctx, conn, req[:], txnID, actionAnnounce, udpAnnounceResponseMinSize, "announce")
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, fmt.Errorf("announce timed out after %d retries", udpMaxRetries+1)
+	return parseUDPAnnounceResponse(resp)
 }
 
 // parseUDPAnnounceResponse parses a raw UDP announce response into a
@@ -363,4 +348,105 @@ func parseUDPAnnounceResponse(data []byte) (*TrackerResponse, error) {
 		Complete:   seeders,
 		Incomplete: leechers,
 	}, nil
+}
+
+// UDPScrape performs a BEP 15 UDP tracker scrape (action=2) for one or more
+// info hashes. It resolves the host from announceURL, reuses the connect
+// handshake to obtain a connection_id, then sends the scrape request and parses
+// the per-torrent swarm-health counts. The result is keyed by raw info hash, in
+// the same order the tracker returns them (matching the request order).
+//
+// The announceURL should be of the form "udp://host:port/announce". The
+// function respects context cancellation and applies the same exponential
+// backoff retries on timeouts as UDPAnnounce.
+func UDPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
+	if len(infoHashes) == 0 {
+		return nil, fmt.Errorf("UDP scrape requires at least one info hash")
+	}
+	if len(infoHashes) > udpMaxScrapeHashes {
+		return nil, fmt.Errorf("UDP scrape supports at most %d info hashes, got %d", udpMaxScrapeHashes, len(infoHashes))
+	}
+
+	conn, cleanup, err := udpDial(ctx, announceURL)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	connectionID, err := udpConnect(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("UDP connect: %w", err)
+	}
+
+	resp, err := udpScrapeRequest(ctx, conn, connectionID, infoHashes)
+	if err != nil {
+		return nil, fmt.Errorf("UDP scrape: %w", err)
+	}
+	return resp, nil
+}
+
+// udpScrapeRequest performs the BEP 15 scrape on an already-connected UDP
+// connection using the given connection_id. It retries with exponential backoff
+// up to udpMaxRetries times.
+func udpScrapeRequest(ctx context.Context, conn net.Conn, connectionID uint64, infoHashes [][20]byte) (map[[20]byte]ScrapeStats, error) {
+	txnID, err := newTransactionID()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build scrape request:
+	// [0..8]   connection_id
+	// [8..12]  action = 2
+	// [12..16] transaction_id
+	// [16..]   info_hash (20 bytes each)
+	req := make([]byte, udpScrapeRequestHeaderSize+20*len(infoHashes))
+	binary.BigEndian.PutUint64(req[0:8], connectionID)
+	binary.BigEndian.PutUint32(req[8:12], actionScrape)
+	binary.BigEndian.PutUint32(req[12:16], txnID)
+	for i, h := range infoHashes {
+		copy(req[udpScrapeRequestHeaderSize+i*20:], h[:])
+	}
+
+	resp, err := udpRoundTrip(ctx, conn, req, txnID, actionScrape, udpScrapeResponseHeaderSize, "scrape")
+	if err != nil {
+		return nil, err
+	}
+	return parseUDPScrapeResponse(resp, infoHashes)
+}
+
+// parseUDPScrapeResponse parses a raw UDP scrape response into a map keyed by
+// info hash. The response layout is:
+//
+//	[0..4]  action = 2
+//	[4..8]  transaction_id
+//	[8..]   per-torrent triples: seeders (4), completed (4), leechers (4)
+//
+// The triples correspond, in order, to the info hashes that were requested. A
+// payload that is not a whole number of triples is rejected as malformed, but a
+// response carrying fewer triples than requested is tolerated (a tracker may
+// omit hashes it doesn't know): only the triples actually returned are mapped.
+func parseUDPScrapeResponse(data []byte, infoHashes [][20]byte) (map[[20]byte]ScrapeStats, error) {
+	if len(data) < udpScrapeResponseHeaderSize {
+		return nil, fmt.Errorf("scrape response too short: %d bytes", len(data))
+	}
+
+	payload := data[udpScrapeResponseHeaderSize:]
+	if len(payload)%udpScrapeStatSize != 0 {
+		return nil, fmt.Errorf("scrape response has %d stat bytes, not a whole number of %d-byte triples",
+			len(payload), udpScrapeStatSize)
+	}
+
+	// Map only the triples the tracker actually returned, capped at the number
+	// of hashes we asked for (any extra triples are ignored).
+	n := min(len(payload)/udpScrapeStatSize, len(infoHashes))
+	result := make(map[[20]byte]ScrapeStats, n)
+	for i := 0; i < n; i++ {
+		offset := i * udpScrapeStatSize
+		result[infoHashes[i]] = ScrapeStats{
+			Complete:   int(binary.BigEndian.Uint32(payload[offset : offset+4])),
+			Downloaded: int(binary.BigEndian.Uint32(payload[offset+4 : offset+8])),
+			Incomplete: int(binary.BigEndian.Uint32(payload[offset+8 : offset+12])),
+		}
+	}
+	return result, nil
 }

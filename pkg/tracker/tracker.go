@@ -2,12 +2,16 @@
 package tracker
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -214,4 +218,213 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 		Complete:    complete,
 		Incomplete:  incomplete,
 	}, nil
+}
+
+// ScrapeStats holds the swarm-health counts reported by a tracker scrape for a
+// single info hash (BEP 48 "files" entry / BEP 15 scrape response triple).
+type ScrapeStats struct {
+	// Complete is the number of seeders (peers with the complete file).
+	Complete int
+	// Downloaded is the number of times the torrent has been downloaded to
+	// completion, as reported by the tracker.
+	Downloaded int
+	// Incomplete is the number of leechers (peers still downloading).
+	Incomplete int
+}
+
+// maxScrapeResponse caps how many bytes of an HTTP scrape response we buffer. A
+// scrape reply is a small bencoded dictionary; this ceiling stops a malicious or
+// MITM'd tracker from streaming unbounded data into memory.
+const maxScrapeResponse = 1 * 1024 * 1024
+
+// defaultScrapeTimeout bounds an HTTP scrape when the caller passes a context
+// without its own deadline, so an exported call can never hang indefinitely.
+const defaultScrapeTimeout = 30 * time.Second
+
+// scrapeHTTPClient issues scrape requests. Request lifetime is bounded by the
+// per-request context (see HTTPScrape); using a dedicated client avoids
+// coupling to the process-wide http.DefaultClient.
+var scrapeHTTPClient = &http.Client{}
+
+// ReadCappedBody reads up to max bytes from r, returning an error if the source
+// exceeds the cap rather than silently truncating. Reading one byte past the
+// cap is what lets us detect (rather than hide) an over-limit response. It
+// bounds tracker announce and scrape bodies against a malicious or MITM'd
+// tracker streaming unbounded data into memory.
+func ReadCappedBody(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
+
+// ScrapeURL derives the scrape URL from an announce URL using the BEP 48
+// convention: the final path segment must begin with "announce", and that
+// "announce" prefix is replaced with "scrape" (e.g. "/announce" -> "/scrape",
+// "/x/announce.php" -> "/x/scrape.php"). An error is returned when the URL has
+// no path or the final segment does not begin with "announce", signalling that
+// the tracker does not advertise scrape support.
+//
+// The result is canonicalized via url.String(). A percent-encoded path
+// separator in the announce URL (e.g. "/x%2Fannounce") cannot be preserved
+// because url.Parse decodes it before this function sees it; such URLs are
+// effectively non-existent for real trackers.
+func ScrapeURL(announceURL string) (string, error) {
+	u, err := url.Parse(announceURL)
+	if err != nil {
+		return "", err
+	}
+	idx := strings.LastIndex(u.Path, "/")
+	if idx == -1 {
+		return "", fmt.Errorf("announce URL %q has no path segment to derive scrape URL", announceURL)
+	}
+	last := u.Path[idx+1:]
+	if !strings.HasPrefix(last, "announce") {
+		return "", fmt.Errorf("announce URL segment %q does not support scrape", last)
+	}
+	u.Path = u.Path[:idx+1] + "scrape" + last[len("announce"):]
+	// Clear any escaped-path cached from the announce URL so String() re-encodes
+	// canonically from the new Path rather than emitting a stale RawPath. (A
+	// percent-encoded path separator in the announce URL is already decoded by
+	// url.Parse, so it cannot be faithfully preserved here regardless.)
+	u.RawPath = ""
+	return u.String(), nil
+}
+
+// BuildScrapeURL constructs an HTTP scrape request URL, appending one
+// info_hash query parameter per requested hash. The hashes are escaped exactly
+// as required by the BitTorrent spec, mirroring BuildTrackerURL.
+func BuildScrapeURL(scrapeURL string, infoHashes ...[20]byte) (string, error) {
+	base, err := url.Parse(scrapeURL)
+	if err != nil {
+		return "", err
+	}
+	params := base.Query()
+	params.Del("info_hash")
+
+	var sb strings.Builder
+	sb.WriteString(params.Encode())
+	for _, h := range infoHashes {
+		if sb.Len() > 0 {
+			sb.WriteByte('&')
+		}
+		sb.WriteString("info_hash=")
+		sb.WriteString(escapeBinary(h[:]))
+	}
+	base.RawQuery = sb.String()
+	return base.String(), nil
+}
+
+// ParseScrapeResponse decodes a bencoded HTTP scrape response (BEP 48). The
+// returned map is keyed by the raw 20-byte info hash found in the "files"
+// dictionary. Entries whose key is not exactly 20 bytes are skipped.
+func ParseScrapeResponse(data []byte) (map[[20]byte]ScrapeStats, error) {
+	val, rest, err := bencode.DecodePrefix(data)
+	if err != nil {
+		return nil, fmt.Errorf("bencode parsing error: %w", err)
+	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("bencode parsing error: trailing data after scrape response")
+	}
+	dict, ok := val.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("scrape response is not a dictionary")
+	}
+	if failReason, ok := dict["failure reason"].(string); ok {
+		return nil, fmt.Errorf("tracker error: %s", failReason)
+	}
+	filesVal, ok := dict["files"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("scrape response missing files dictionary")
+	}
+
+	result := make(map[[20]byte]ScrapeStats, len(filesVal))
+	for key, v := range filesVal {
+		if len(key) != 20 {
+			continue
+		}
+		fileDict, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		var stats ScrapeStats
+		if c, ok := fileDict["complete"].(int64); ok {
+			stats.Complete = int(c)
+		}
+		if d, ok := fileDict["downloaded"].(int64); ok {
+			stats.Downloaded = int(d)
+		}
+		if i, ok := fileDict["incomplete"].(int64); ok {
+			stats.Incomplete = int(i)
+		}
+		var hash [20]byte
+		copy(hash[:], key)
+		result[hash] = stats
+	}
+	return result, nil
+}
+
+// HTTPScrape performs a full HTTP(S) scrape against the tracker identified by
+// announceURL (BEP 48). It derives the scrape endpoint from the announce URL,
+// issues the request, and parses the swarm-health counts per info hash. The
+// context bounds the request lifetime.
+func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
+	scrapeURL, err := ScrapeURL(announceURL)
+	if err != nil {
+		return nil, err
+	}
+	reqURL, err := BuildScrapeURL(scrapeURL, infoHashes...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Guarantee a deadline even if the caller supplied an unbounded context, so
+	// a stalled tracker can never hang the request indefinitely.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultScrapeTimeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := scrapeHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("scrape returned HTTP %d", resp.StatusCode)
+	}
+
+	data, err := ReadCappedBody(resp.Body, maxScrapeResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return ParseScrapeResponse(data)
+}
+
+// Scrape queries a tracker's scrape endpoint, dispatching to the HTTP or UDP
+// implementation based on the announce URL scheme. It returns swarm-health
+// counts keyed by raw info hash.
+func Scrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
+	// Dispatch on the scheme prefix (mirroring announceTracker) instead of a
+	// full url.Parse here; the chosen implementation parses the URL itself.
+	switch {
+	case strings.HasPrefix(announceURL, "udp"):
+		return UDPScrape(ctx, announceURL, infoHashes...)
+	case strings.HasPrefix(announceURL, "http"):
+		return HTTPScrape(ctx, announceURL, infoHashes...)
+	default:
+		return nil, fmt.Errorf("unsupported tracker scheme for scrape: %q", announceURL)
+	}
 }
