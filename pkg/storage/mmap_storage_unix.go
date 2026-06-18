@@ -13,9 +13,15 @@ import (
 )
 
 type mappedFile struct {
-	layout *fileLayout
-	file   *os.File
-	data   []byte
+	layout   *fileLayout
+	file     *os.File
+	data     []byte
+	identity fileIdentity
+}
+
+type fileIdentity struct {
+	dev uint64
+	ino uint64
 }
 
 // MMapStorage serves torrent content from shared file-backed memory mappings.
@@ -176,6 +182,9 @@ func (s *MMapStorage) Close() error {
 		return nil
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var firstErr error
 	for _, mapped := range s.maps {
 		if len(mapped.data) > 0 {
@@ -185,11 +194,13 @@ func (s *MMapStorage) Close() error {
 			if err := unix.Munmap(mapped.data); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			mapped.data = nil
 		}
 		if mapped.file != nil {
 			if err := mapped.file.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+			mapped.file = nil
 		}
 	}
 	for _, file := range s.files {
@@ -203,7 +214,12 @@ func openMappedFile(layout *fileLayout) (*mappedFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %s for mmap: %w", layout.path, err)
 	}
-	mapped := &mappedFile{layout: layout, file: f}
+	identity, err := fileIdentityForHandle(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("failed to identify file %s for mmap: %w", layout.path, err)
+	}
+	mapped := &mappedFile{layout: layout, file: f, identity: identity}
 	if layout.length == 0 {
 		return mapped, nil
 	}
@@ -226,8 +242,8 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile) (bool, error) {
 		return false, nil
 	}
 
-	fi, err := os.Stat(layout.absPath)
-	if err == nil && fi.Size() == layout.length {
+	identity, size, err := fileIdentityForPath(layout.absPath)
+	if err == nil && size == layout.length && identity == mapped.identity {
 		return false, nil
 	}
 	if err != nil && !os.IsNotExist(err) {
@@ -254,6 +270,11 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile) (bool, error) {
 		_ = f.Close()
 		return false, fmt.Errorf("failed to repair size for file %s: %w", layout.path, err)
 	}
+	identity, err = fileIdentityForHandle(f)
+	if err != nil {
+		_ = f.Close()
+		return false, fmt.Errorf("failed to identify repaired file %s for mmap: %w", layout.path, err)
+	}
 	mapped.file = f
 	data, err := unix.Mmap(int(f.Fd()), 0, int(layout.length), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
@@ -262,7 +283,24 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile) (bool, error) {
 		return false, fmt.Errorf("failed to remap file %s after repair: %w", layout.path, err)
 	}
 	mapped.data = data
+	mapped.identity = identity
 	return true, nil
+}
+
+func fileIdentityForHandle(f *os.File) (fileIdentity, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return fileIdentity{}, err
+	}
+	return fileIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, nil
+}
+
+func fileIdentityForPath(path string) (fileIdentity, int64, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		return fileIdentity{}, 0, err
+	}
+	return fileIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, int64(st.Size), nil
 }
 
 func flushMappedRange(data []byte) error {

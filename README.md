@@ -102,6 +102,15 @@ compatibility:
 ./sainttorrent --encryption disable
 ```
 
+Storage defaults to regular file-backed downloads. For testing or platform
+experiments, select another backend:
+
+```bash
+./sainttorrent --storage file   # default persistent files
+./sainttorrent --storage mmap   # memory-mapped files, unavailable on Windows
+./sainttorrent --storage mem    # in-memory content, not persistent
+```
+
 ### macOS Magnet Handler
 
 On macOS you can register saintTorrent as the default handler for `magnet:`
