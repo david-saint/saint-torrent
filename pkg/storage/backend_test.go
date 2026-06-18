@@ -6,7 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
+	"slices"
 	"testing"
 )
 
@@ -17,9 +17,6 @@ func TestStorageBackendsCommonSuite(t *testing.T) {
 	}{
 		{name: "file", new: func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
 			return NewFileStorage(baseDir, files, pieceLength)
-		}},
-		{name: "mmap", new: func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewMMapStorage(baseDir, files, pieceLength)
 		}},
 		{name: "mem", new: func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
 			return NewMemStorage(baseDir, files, pieceLength)
@@ -32,9 +29,6 @@ func TestStorageBackendsCommonSuite(t *testing.T) {
 			}
 			st, err := tc.new(t.TempDir(), files, 25)
 			if err != nil {
-				if tc.name == "mmap" && runtime.GOOS == "windows" {
-					t.Skipf("mmap unavailable on windows: %v", err)
-				}
 				t.Fatalf("new storage: %v", err)
 			}
 			defer st.Close()
@@ -89,7 +83,7 @@ func TestStorageBackendsCommonSuite(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadState: %v", err)
 			}
-			if !equalInts(pieces, []int{1, 2}) {
+			if !slices.Equal(pieces, []int{1, 2}) {
 				t.Fatalf("LoadState pieces = %v, want [1 2]", pieces)
 			}
 
@@ -106,72 +100,6 @@ func TestStorageBackendsCommonSuite(t *testing.T) {
 	}
 }
 
-func TestMMapStorageWriteBlockRepairsMissingFile(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("mmap storage is not supported on windows")
-	}
-
-	tmpDir := t.TempDir()
-	st, err := NewMMapStorage(tmpDir, []FileInfo{{Path: "missing.bin", Length: 32}}, 32)
-	if err != nil {
-		t.Fatalf("NewMMapStorage: %v", err)
-	}
-	defer st.Close()
-
-	filePath := filepath.Join(tmpDir, "missing.bin")
-	if err := os.Remove(filePath); err != nil {
-		t.Fatalf("remove mapped file: %v", err)
-	}
-
-	data := bytes.Repeat([]byte{'x'}, 32)
-	err = st.WriteBlock(0, 0, data)
-	if !errors.Is(err, ErrFileRepaired) {
-		t.Fatalf("WriteBlock = %v, want ErrFileRepaired", err)
-	}
-	got, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("read repaired file: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("repaired file mismatch: got %q want %q", got, data)
-	}
-}
-
-func TestMMapStorageWriteBlockRepairsSameSizeReplacement(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("mmap storage is not supported on windows")
-	}
-
-	tmpDir := t.TempDir()
-	st, err := NewMMapStorage(tmpDir, []FileInfo{{Path: "replace.bin", Length: 32}}, 32)
-	if err != nil {
-		t.Fatalf("NewMMapStorage: %v", err)
-	}
-	defer st.Close()
-
-	filePath := filepath.Join(tmpDir, "replace.bin")
-	replacementPath := filepath.Join(tmpDir, "replacement.bin")
-	if err := os.WriteFile(replacementPath, bytes.Repeat([]byte{'y'}, 32), 0644); err != nil {
-		t.Fatalf("write replacement file: %v", err)
-	}
-	if err := os.Rename(replacementPath, filePath); err != nil {
-		t.Fatalf("replace mapped file: %v", err)
-	}
-
-	data := bytes.Repeat([]byte{'x'}, 32)
-	err = st.WriteBlock(0, 0, data)
-	if !errors.Is(err, ErrFileRepaired) {
-		t.Fatalf("WriteBlock = %v, want ErrFileRepaired", err)
-	}
-	got, err := os.ReadFile(filePath)
-	if err != nil {
-		t.Fatalf("read repaired file: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("repaired file mismatch: got %q want %q", got, data)
-	}
-}
-
 func TestStorageBackendSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -179,15 +107,11 @@ func TestStorageBackendSelection(t *testing.T) {
 		want    any
 	}{
 		{name: "file", backend: BackendFile, want: (*FileStorage)(nil)},
-		{name: "mmap", backend: BackendMMap, want: (*MMapStorage)(nil)},
 		{name: "mem", backend: BackendMemory, want: (*MemStorage)(nil)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st, err := NewStorageWithBackend(tc.backend, t.TempDir(), []FileInfo{{Path: "data.bin", Length: 1}}, 1)
 			if err != nil {
-				if tc.backend == BackendMMap && runtime.GOOS == "windows" {
-					t.Skipf("mmap unavailable on windows: %v", err)
-				}
 				t.Fatalf("NewStorageWithBackend: %v", err)
 			}
 			defer st.Close()
@@ -195,10 +119,6 @@ func TestStorageBackendSelection(t *testing.T) {
 			case *FileStorage:
 				if _, ok := st.(*FileStorage); !ok {
 					t.Fatalf("backend type = %T, want *FileStorage", st)
-				}
-			case *MMapStorage:
-				if _, ok := st.(*MMapStorage); !ok {
-					t.Fatalf("backend type = %T, want *MMapStorage", st)
 				}
 			case *MemStorage:
 				if _, ok := st.(*MemStorage); !ok {
@@ -216,14 +136,16 @@ func TestStorageBackendSelection(t *testing.T) {
 	}
 }
 
-func equalInts(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
+func TestMemStorageRejectsSymlinkPathComponents(t *testing.T) {
+	tmpDir := t.TempDir()
+	outside := t.TempDir()
+	linkPath := filepath.Join(tmpDir, "linkdir")
+	if err := os.Symlink(outside, linkPath); err != nil {
+		t.Skipf("symlink creation not available: %v", err)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+
+	_, err := NewMemStorage(tmpDir, []FileInfo{{Path: "linkdir/file.bin", Length: 1}}, 1)
+	if err == nil {
+		t.Fatal("expected symlink path component to be rejected")
 	}
-	return true
 }

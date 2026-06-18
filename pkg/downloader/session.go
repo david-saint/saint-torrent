@@ -248,7 +248,6 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		metadataMode:        metadataMode,
 		metadataCompletedCh: make(chan struct{}),
 		downloadDir:         resolvedDir,
-		storageFactory:      storage.NewStorage,
 		trackerEvents:       []string{"started"},
 		outboundSlots:       make(chan struct{}, maxOutboundPeers),
 		inboundSlots:        make(chan struct{}, maxInboundPeers),

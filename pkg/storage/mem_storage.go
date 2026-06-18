@@ -42,6 +42,15 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		}
 		resolvedBase = filepath.Clean(abs)
 	}
+	var resolver *PathResolver
+	if resolvedBase != "" {
+		var err error
+		resolver, err = NewPathResolver(resolvedBase)
+		if err != nil {
+			return nil, err
+		}
+		resolvedBase = resolver.BaseDir()
+	}
 
 	var layouts []*fileLayout
 	var currentOffset int64
@@ -58,7 +67,14 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		}
 
 		cleanPath := filepath.Clean(file.Path)
-		if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+		var absPath string
+		if resolver != nil {
+			var err error
+			absPath, err = resolver.ResolveAndValidate(file.Path)
+			if err != nil {
+				return nil, err
+			}
+		} else if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", file.Path)
 		}
 
@@ -81,6 +97,7 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 
 		layout := &fileLayout{
 			path:        file.Path,
+			absPath:     absPath,
 			length:      file.Length,
 			startOffset: currentOffset,
 			endOffset:   currentOffset + file.Length,

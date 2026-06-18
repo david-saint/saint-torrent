@@ -79,9 +79,7 @@ func FactoryForBackend(backend Backend) (Factory, error) {
 			return NewFileStorage(baseDir, files, pieceLength)
 		}, nil
 	case BackendMMap:
-		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewMMapStorage(baseDir, files, pieceLength)
-		}, nil
+		return mmapFactory()
 	case BackendMemory:
 		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
 			return NewMemStorage(baseDir, files, pieceLength)
@@ -570,6 +568,10 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return ErrStorageClosed
 	}
 
+	return s.saveStateLocked(infoHashHex, completedPieces)
+}
+
+func (s *FileStorage) saveStateLocked(infoHashHex string, completedPieces []int) error {
 	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {
 		return err

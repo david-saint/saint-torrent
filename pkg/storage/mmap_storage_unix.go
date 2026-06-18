@@ -13,21 +13,15 @@ import (
 )
 
 type mappedFile struct {
-	layout   *fileLayout
-	file     *os.File
-	data     []byte
-	identity fileIdentity
-}
-
-type fileIdentity struct {
-	dev uint64
-	ino uint64
+	layout *fileLayout
+	data   []byte
 }
 
 // MMapStorage serves torrent content from shared file-backed memory mappings.
 type MMapStorage struct {
 	*FileStorage
-	maps []*mappedFile
+	maps  []*mappedFile
+	dirty map[*fileLayout]struct{}
 }
 
 var _ Storage = (*MMapStorage)(nil)
@@ -39,14 +33,12 @@ func NewMMapStorage(baseDir string, files []FileInfo, pieceLength int64) (*MMapS
 		return nil, err
 	}
 
-	st := &MMapStorage{FileStorage: fs}
+	st := &MMapStorage{
+		FileStorage: fs,
+		dirty:       make(map[*fileLayout]struct{}),
+	}
 	for _, layout := range fs.files {
-		mapped, err := openMappedFile(layout)
-		if err != nil {
-			_ = st.Close()
-			return nil, err
-		}
-		st.maps = append(st.maps, mapped)
+		st.maps = append(st.maps, &mappedFile{layout: layout})
 	}
 	return st, nil
 }
@@ -68,14 +60,18 @@ func (s *MMapStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 		return 0, fmt.Errorf("block exceeds piece boundaries: pieceLen=%d, offset=%d, readLen=%d", pieceLen, offset, len(buf))
 	}
 
+	globalStart := pieceIndex*s.pieceLength + offset
+	globalEnd := globalStart + int64(len(buf))
+	if err := s.ensureMappedRange(globalStart, globalEnd); err != nil {
+		return 0, err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed.Load() {
 		return 0, ErrStorageClosed
 	}
 
-	globalStart := pieceIndex*s.pieceLength + offset
-	globalEnd := globalStart + int64(len(buf))
 	for _, mapped := range s.maps {
 		file := mapped.layout
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
@@ -119,7 +115,7 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	for _, mapped := range s.maps {
 		file := mapped.layout
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
-			wasRepaired, err := s.ensureMappedFileLocked(mapped)
+			wasRepaired, err := s.ensureMappedFileLocked(mapped, true)
 			if err != nil {
 				return err
 			}
@@ -131,10 +127,7 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 			copy(mapped.data[fileOffset:fileOffset+nBytes], data[bufOffset:bufOffset+nBytes])
-			if err := flushMappedRange(mapped.data); err != nil {
-				return fmt.Errorf("failed to flush mapped file %s: %w", file.path, err)
-			}
-			s.touchMappedFileLocked(file)
+			s.dirty[file] = struct{}{}
 		}
 	}
 	if repaired {
@@ -150,6 +143,12 @@ func (s *MMapStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 		return false, fmt.Errorf("invalid piece index: %d", pieceIndex)
 	}
 
+	globalStart := pieceIndex * s.pieceLength
+	globalEnd := globalStart + pieceLen
+	if err := s.ensureMappedRange(globalStart, globalEnd); err != nil {
+		return false, err
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed.Load() {
@@ -157,8 +156,6 @@ func (s *MMapStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	}
 
 	h := sha1.New()
-	globalStart := pieceIndex * s.pieceLength
-	globalEnd := globalStart + pieceLen
 	for _, mapped := range s.maps {
 		file := mapped.layout
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
@@ -196,12 +193,6 @@ func (s *MMapStorage) Close() error {
 			}
 			mapped.data = nil
 		}
-		if mapped.file != nil {
-			if err := mapped.file.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-			mapped.file = nil
-		}
 	}
 	for _, file := range s.files {
 		file.tryInvalidateReader()
@@ -209,116 +200,133 @@ func (s *MMapStorage) Close() error {
 	return firstErr
 }
 
-func openMappedFile(layout *fileLayout) (*mappedFile, error) {
-	f, err := openNoFollow(layout.absPath, os.O_RDWR, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file %s for mmap: %w", layout.path, err)
+func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrStorageClosed
 	}
-	identity, err := fileIdentityForHandle(f)
+	for _, mapped := range s.maps {
+		file := mapped.layout
+		if globalStart < file.endOffset && globalEnd > file.startOffset {
+			if _, err := s.ensureMappedFileLocked(mapped, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (bool, error) {
+	layout := mapped.layout
+	if layout.length == 0 || len(mapped.data) > 0 {
+		return false, nil
+	}
+
+	data, repaired, err := mapOrRepairFile(layout, repair)
+	if err != nil {
+		return false, err
+	}
+	mapped.data = data
+	return repaired, nil
+}
+
+func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {
+	f, err := openNoFollow(layout.absPath, os.O_RDWR, 0644)
+	repaired := false
+	if os.IsNotExist(err) {
+		if !repair {
+			return nil, false, fmt.Errorf("failed to open file %s for mmap: %w", layout.path, err)
+		}
+		if err := os.MkdirAll(filepath.Dir(layout.absPath), 0755); err != nil {
+			return nil, false, fmt.Errorf("failed to recreate directories for file %s: %w", layout.path, err)
+		}
+		f, err = openNoFollow(layout.absPath, os.O_CREATE|os.O_RDWR, 0644)
+		repaired = true
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to open file %s for mmap: %w", layout.path, err)
+	}
+	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("failed to identify file %s for mmap: %w", layout.path, err)
+		return nil, false, fmt.Errorf("failed to stat file %s for mmap: %w", layout.path, err)
 	}
-	mapped := &mappedFile{layout: layout, file: f, identity: identity}
+	if fi.Size() != layout.length {
+		if !repair {
+			_ = f.Close()
+			return nil, false, fmt.Errorf("file %s size mismatch for mmap: got %d, want %d", layout.path, fi.Size(), layout.length)
+		}
+		if err := f.Truncate(layout.length); err != nil {
+			_ = f.Close()
+			return nil, false, fmt.Errorf("failed to repair size for file %s: %w", layout.path, err)
+		}
+		repaired = true
+	}
 	if layout.length == 0 {
-		return mapped, nil
+		if err := f.Close(); err != nil {
+			return nil, false, fmt.Errorf("failed to close file %s after mmap repair: %w", layout.path, err)
+		}
+		return nil, repaired, nil
 	}
 	if layout.length > int64(int(^uint(0)>>1)) {
 		_ = f.Close()
-		return nil, fmt.Errorf("file %s is too large to mmap on this platform", layout.path)
+		return nil, false, fmt.Errorf("file %s is too large to mmap on this platform", layout.path)
 	}
 	data, err := unix.Mmap(int(f.Fd()), 0, int(layout.length), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("failed to mmap file %s: %w", layout.path, err)
+		return nil, false, fmt.Errorf("failed to mmap file %s: %w", layout.path, err)
 	}
-	mapped.data = data
-	return mapped, nil
+	if err := f.Close(); err != nil {
+		_ = unix.Munmap(data)
+		return nil, false, fmt.Errorf("failed to close file %s after mmap: %w", layout.path, err)
+	}
+	return data, repaired, nil
 }
 
-func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile) (bool, error) {
-	layout := mapped.layout
-	if layout.length == 0 {
-		return false, nil
+// SaveState refreshes mmap-backed file mtimes once per resume persist rather
+// than on every block write, then reuses FileStorage's state serialization.
+func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error {
+	if s.closed.Load() {
+		return ErrStorageClosed
 	}
 
-	identity, size, err := fileIdentityForPath(layout.absPath)
-	if err == nil && size == layout.length && identity == mapped.identity {
-		return false, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrStorageClosed
 	}
-	if err != nil && !os.IsNotExist(err) {
-		return false, fmt.Errorf("failed to stat file %s for mmap write: %w", layout.path, err)
+	if err := s.refreshDirtyStateLocked(); err != nil {
+		return err
 	}
-
-	if len(mapped.data) > 0 {
-		_ = unix.Munmap(mapped.data)
-		mapped.data = nil
-	}
-	if mapped.file != nil {
-		_ = mapped.file.Close()
-		mapped.file = nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(layout.absPath), 0755); err != nil {
-		return false, fmt.Errorf("failed to recreate directories for file %s: %w", layout.path, err)
-	}
-	f, err := openNoFollow(layout.absPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return false, fmt.Errorf("failed to open/create file %s for mmap repair: %w", layout.path, err)
-	}
-	if err := f.Truncate(layout.length); err != nil {
-		_ = f.Close()
-		return false, fmt.Errorf("failed to repair size for file %s: %w", layout.path, err)
-	}
-	identity, err = fileIdentityForHandle(f)
-	if err != nil {
-		_ = f.Close()
-		return false, fmt.Errorf("failed to identify repaired file %s for mmap: %w", layout.path, err)
-	}
-	mapped.file = f
-	data, err := unix.Mmap(int(f.Fd()), 0, int(layout.length), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		_ = f.Close()
-		mapped.file = nil
-		return false, fmt.Errorf("failed to remap file %s after repair: %w", layout.path, err)
-	}
-	mapped.data = data
-	mapped.identity = identity
-	return true, nil
+	return s.saveStateLocked(infoHashHex, completedPieces)
 }
 
-func fileIdentityForHandle(f *os.File) (fileIdentity, error) {
-	var st unix.Stat_t
-	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
-		return fileIdentity{}, err
+func (s *MMapStorage) refreshDirtyStateLocked() error {
+	for file := range s.dirty {
+		if err := s.touchMappedFileLocked(file); err != nil {
+			return err
+		}
+		delete(s.dirty, file)
 	}
-	return fileIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, nil
+	return nil
 }
 
-func fileIdentityForPath(path string) (fileIdentity, int64, error) {
-	var st unix.Stat_t
-	if err := unix.Stat(path, &st); err != nil {
-		return fileIdentity{}, 0, err
-	}
-	return fileIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, int64(st.Size), nil
-}
-
-func flushMappedRange(data []byte) error {
-	if len(data) == 0 {
-		return nil
-	}
-	return unix.Msync(data, unix.MS_SYNC)
-}
-
-func (s *MMapStorage) touchMappedFileLocked(file *fileLayout) {
+func (s *MMapStorage) touchMappedFileLocked(file *fileLayout) error {
 	now := time.Now()
 	if err := os.Chtimes(file.absPath, now, now); err != nil {
-		s.stateFileMt[file.path] = now.UnixNano()
-		return
+		fi, statErr := os.Stat(file.absPath)
+		if statErr != nil {
+			return fmt.Errorf("failed to refresh mtime for file %s: chtimes: %v; stat: %w", file.path, err, statErr)
+		}
+		s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+		return nil
 	}
 	if fi, err := os.Stat(file.absPath); err == nil {
 		s.stateFileMt[file.path] = fi.ModTime().UnixNano()
-		return
+		return nil
+	} else {
+		return fmt.Errorf("failed to stat file %s after mtime refresh: %w", file.path, err)
 	}
-	s.stateFileMt[file.path] = now.UnixNano()
 }

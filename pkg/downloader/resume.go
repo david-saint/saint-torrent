@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -90,15 +91,15 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	}
 
 	err := s.Storage.WriteBlock(job.index, 0, job.data)
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		s.markPieceCompleted(job.index)
-	case storage.ErrFileRepaired:
+	case errors.Is(err, storage.ErrFileRepaired):
 		s.mu.Lock()
 		s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
 		s.mu.Unlock()
 		s.resetProgressAfterStorageRepair(job.index)
-	case storage.ErrStorageClosed:
+	case errors.Is(err, storage.ErrStorageClosed):
 		// Session is tearing down; nothing to record.
 		return
 	default:
