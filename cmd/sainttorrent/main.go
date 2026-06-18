@@ -19,6 +19,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
 	"sainttorrent/pkg/mse"
+	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 )
 
@@ -157,6 +158,7 @@ type cliOptions struct {
 	listenPort  int
 	natEnabled  bool
 	encryption  mse.Policy
+	storage     storage.Backend
 	err         error
 	items       []string
 }
@@ -1063,6 +1065,7 @@ func parseCLIArgs(args []string) cliOptions {
 		listenPort:  defaultPeerPort,
 		natEnabled:  true,
 		encryption:  mse.PolicyPrefer,
+		storage:     storage.BackendFile,
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1113,6 +1116,18 @@ func parseCLIArgs(args []string) cliOptions {
 				continue
 			}
 			opts.encryption = policy
+		case "--storage":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires file, mmap, or mem", args[i])
+				continue
+			}
+			backend, err := storage.ParseBackend(args[i+1])
+			i++
+			if err != nil {
+				opts.err = err
+				continue
+			}
+			opts.storage = backend
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1513,6 +1528,11 @@ func main() {
 
 	mgr := downloader.NewTorrentManager()
 	mgr.SetEncryptionPolicy(opts.encryption)
+	if err := mgr.SetStorageBackend(opts.storage); err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring storage backend: %v\n", err)
+		mgr.Close()
+		os.Exit(1)
+	}
 	perfMarkf("manager")
 	if err := mgr.StartPeerListener(uint16(opts.listenPort)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting peer listener on port %d: %v\n", opts.listenPort, err)

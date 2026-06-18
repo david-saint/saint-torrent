@@ -31,6 +31,80 @@ type FileInfo struct {
 	Length int64  // Size of the file in bytes
 }
 
+// Storage is the pluggable torrent storage contract used by the downloader.
+type Storage interface {
+	BaseDir() string
+	TotalSize() int64
+	PieceLengthValue() int64
+	PieceLength(pieceIndex int64) int64
+	ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error)
+	WriteBlock(pieceIndex int64, offset int64, data []byte) error
+	VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error)
+	SaveState(infoHashHex string, completedPieces []int) error
+	LoadState(infoHashHex string) ([]int, error)
+	Close() error
+}
+
+// Factory creates a Storage backend for a torrent.
+type Factory func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error)
+
+// Backend identifies the built-in storage implementations.
+type Backend string
+
+const (
+	BackendFile   Backend = "file"
+	BackendMMap   Backend = "mmap"
+	BackendMemory Backend = "mem"
+)
+
+// ParseBackend parses a storage backend name.
+func ParseBackend(name string) (Backend, error) {
+	switch Backend(strings.ToLower(strings.TrimSpace(name))) {
+	case "", BackendFile:
+		return BackendFile, nil
+	case BackendMMap:
+		return BackendMMap, nil
+	case BackendMemory, "memory":
+		return BackendMemory, nil
+	default:
+		return "", fmt.Errorf("unknown storage backend %q", name)
+	}
+}
+
+// FactoryForBackend returns a constructor for a built-in storage backend.
+func FactoryForBackend(backend Backend) (Factory, error) {
+	switch backend {
+	case BackendFile:
+		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
+			return NewFileStorage(baseDir, files, pieceLength)
+		}, nil
+	case BackendMMap:
+		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
+			return NewMMapStorage(baseDir, files, pieceLength)
+		}, nil
+	case BackendMemory:
+		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
+			return NewMemStorage(baseDir, files, pieceLength)
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown storage backend %q", backend)
+	}
+}
+
+// NewStorageWithBackend creates storage using one of the built-in backends.
+func NewStorageWithBackend(backend Backend, baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
+	factory, err := FactoryForBackend(backend)
+	if err != nil {
+		return nil, err
+	}
+	return factory(baseDir, files, pieceLength)
+}
+
+// NewStorage creates the default file-backed storage.
+func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
+	return NewFileStorage(baseDir, files, pieceLength)
+}
+
 // fileLayout holds a file's byte range within the torrent plus a lazily-opened,
 // cached read handle. The absolute path is validated once at construction (see
 // NewStorage) so the hot read path never re-walks/EvalSymlinks the path.
@@ -86,7 +160,7 @@ func (f *fileLayout) invalidateReaderLocked() {
 	}
 }
 
-// Storage manages the files on disk for a torrent and provides thread-safe
+// FileStorage manages the files on disk for a torrent and provides thread-safe
 // block read/write and piece verification.
 //
 // Concurrency model: mu is an RWMutex. Block reads (ReadBlock/VerifyPiece) take
@@ -97,7 +171,7 @@ func (f *fileLayout) invalidateReaderLocked() {
 // they never block peer goroutines. Close marks the storage closed atomically
 // before invalidating cached read handles so session teardown cannot wedge behind
 // a blocked VerifyPiece/read lock.
-type Storage struct {
+type FileStorage struct {
 	mu          sync.RWMutex
 	resolver    *PathResolver
 	baseDir     string
@@ -108,9 +182,9 @@ type Storage struct {
 	closed      atomic.Bool
 }
 
-// NewStorage creates the target directories and pre-allocates files to their
+// NewFileStorage creates the target directories and pre-allocates files to their
 // respective sizes.
-func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, error) {
+func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileStorage, error) {
 	if pieceLength <= 0 {
 		return nil, fmt.Errorf("piece length must be positive, got %d", pieceLength)
 	}
@@ -216,7 +290,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 		}
 	}
 
-	return &Storage{
+	return &FileStorage{
 		resolver:    resolver,
 		baseDir:     resolver.BaseDir(),
 		files:       layouts,
@@ -227,23 +301,23 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (*Storage, 
 }
 
 // BaseDir returns the base directory of the storage.
-func (s *Storage) BaseDir() string {
+func (s *FileStorage) BaseDir() string {
 	return s.baseDir
 }
 
 // TotalSize returns the total size of all files in the torrent.
-func (s *Storage) TotalSize() int64 {
+func (s *FileStorage) TotalSize() int64 {
 	return s.totalSize
 }
 
 // PieceLengthValue returns the standard piece length (not the actual length of a specific piece).
-func (s *Storage) PieceLengthValue() int64 {
+func (s *FileStorage) PieceLengthValue() int64 {
 	return s.pieceLength
 }
 
 // PieceLength returns the length of a piece at pieceIndex.
 // All pieces except the last are equal to the standard pieceLength.
-func (s *Storage) PieceLength(pieceIndex int64) int64 {
+func (s *FileStorage) PieceLength(pieceIndex int64) int64 {
 	if pieceIndex < 0 {
 		return 0
 	}
@@ -260,7 +334,7 @@ func (s *Storage) PieceLength(pieceIndex int64) int64 {
 
 // ReadBlock reads a block of data from the storage.
 // It returns the number of bytes read, or an error.
-func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
+func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
 	if pieceIndex < 0 {
 		return 0, fmt.Errorf("negative piece index: %d", pieceIndex)
 	}
@@ -320,7 +394,7 @@ func (s *Storage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, er
 }
 
 // WriteBlock writes a block of data to the storage, spanning across files if necessary.
-func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error {
+func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) error {
 	if pieceIndex < 0 {
 		return fmt.Errorf("negative piece index: %d", pieceIndex)
 	}
@@ -409,7 +483,7 @@ func (s *Storage) WriteBlock(pieceIndex int64, offset int64, data []byte) error 
 }
 
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
-func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
+func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
 	pieceLen := s.PieceLength(pieceIndex)
 	if pieceLen == 0 {
 		return false, fmt.Errorf("invalid piece index: %d", pieceIndex)
@@ -463,7 +537,7 @@ func (s *Storage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, er
 // must still release ownership immediately. Operations that start after Close
 // return ErrStorageClosed; operations already in progress may finish or fail as
 // their underlying file handles are invalidated.
-func (s *Storage) Close() error {
+func (s *FileStorage) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -485,7 +559,7 @@ type FastResumeState struct {
 }
 
 // SaveState writes the completed pieces and file metadata to a fast-resume state file.
-func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
+func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error {
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
@@ -525,7 +599,7 @@ func (s *Storage) SaveState(infoHashHex string, completedPieces []int) error {
 	return os.WriteFile(statePath, data, 0644)
 }
 
-func (s *Storage) stateMtimeLocked(path string, fallback int64) int64 {
+func (s *FileStorage) stateMtimeLocked(path string, fallback int64) int64 {
 	if mt, ok := s.stateFileMt[path]; ok {
 		return mt
 	}
@@ -533,7 +607,7 @@ func (s *Storage) stateMtimeLocked(path string, fallback int64) int64 {
 }
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
-func (s *Storage) LoadState(infoHashHex string) ([]int, error) {
+func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 	if s.closed.Load() {
 		return nil, ErrStorageClosed
 	}

@@ -96,7 +96,7 @@ const (
 // Session orchestrates the download/upload of a single torrent.
 type Session struct {
 	Torrent   *torrent.Torrent
-	Storage   *storage.Storage
+	Storage   storage.Storage
 	PeerID    [20]byte
 	Port      uint16
 	StartTime time.Time
@@ -203,10 +203,11 @@ type Session struct {
 	metadataCompletedCh chan struct{}
 	DHT                 *dht.DHT
 	downloadDir         string
+	storageFactory      storage.Factory
 }
 
 // NewSession creates a new download session for a torrent.
-func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port uint16, downloadDir string) (*Session, error) {
+func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port uint16, downloadDir string) (*Session, error) {
 	numPieces := len(tor.PieceHashes)
 	states := make([]PieceState, numPieces)
 
@@ -247,6 +248,7 @@ func NewSession(tor *torrent.Torrent, st *storage.Storage, peerID [20]byte, port
 		metadataMode:        metadataMode,
 		metadataCompletedCh: make(chan struct{}),
 		downloadDir:         resolvedDir,
+		storageFactory:      storage.NewStorage,
 		trackerEvents:       []string{"started"},
 		outboundSlots:       make(chan struct{}, maxOutboundPeers),
 		inboundSlots:        make(chan struct{}, maxInboundPeers),
@@ -437,7 +439,7 @@ func (s *Session) Close() {
 	s.lifecycleMu.Lock()
 	var gateRelease func()
 	var verifyDone chan struct{}
-	var storageToClose *storage.Storage
+	var storageToClose storage.Storage
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		wasStarted := s.started
@@ -1025,7 +1027,11 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			Length: f.Length,
 		})
 	}
-	st, err := storage.NewStorage(s.downloadDir, fileInfos, s.Torrent.PieceLength)
+	factory := s.storageFactory
+	if factory == nil {
+		factory = storage.NewStorage
+	}
+	st, err := factory(s.downloadDir, fileInfos, s.Torrent.PieceLength)
 	if err != nil {
 		statusErr := fmt.Errorf("failed to initialize storage: %w", err)
 		s.lastErr = statusErr
