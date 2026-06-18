@@ -10,9 +10,9 @@ import (
 // the bytes it was read from.
 func FuzzParseMessage(f *testing.F) {
 	seeds := [][]byte{
-		{0, 0, 0, 0},                            // keep-alive
-		{0, 0, 0, 1, 0},                         // choke
-		{0, 0, 0, 5, 4, 0, 0, 0, 1},             // have
+		{0, 0, 0, 0},                // keep-alive
+		{0, 0, 0, 1, 0},             // choke
+		{0, 0, 0, 5, 4, 0, 0, 0, 1}, // have
 		{0, 0, 0, 13, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // request
 	}
 	for _, s := range seeds {

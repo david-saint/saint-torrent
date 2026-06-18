@@ -278,7 +278,6 @@ func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
 	}
 }
 
-
 func TestSessionSaveStateErrorsAreSurfaced(t *testing.T) {
 	tempDir := t.TempDir()
 	tor := &torrent.Torrent{

@@ -44,22 +44,24 @@ const maxBlockRequestRetries = 2
 
 // PeerState holds per-peer state visible to the TUI.
 type PeerState struct {
+	// Downloaded and Uploaded are cumulative byte counters bumped on the peer's
+	// hot path WITHOUT holding s.mu. They must be accessed only via sync/atomic
+	// (AddInt64/LoadInt64); never read or copy them with a plain struct copy.
+	// Keep these counters first so they stay 64-bit aligned on 32-bit platforms
+	// while remaining plain int64 fields for the snapshots GetActivePeers hands
+	// to the TUI.
+	Downloaded int64
+	Uploaded   int64
+
 	IP            string
 	Port          uint16
 	Choked        bool
 	Interested    bool
 	DownloadSpeed float64 // Bytes per second
 	UploadSpeed   float64 // Bytes per second
-	// Downloaded and Uploaded are cumulative byte counters bumped on the peer's
-	// hot path WITHOUT holding s.mu. They must be accessed only via sync/atomic
-	// (AddInt64/LoadInt64); never read or copy them with a plain struct copy.
-	// (Kept as plain int64 rather than atomic.Int64 so PeerState stays copyable
-	// for the snapshots GetActivePeers hands to the TUI.)
-	Downloaded  int64
-	Uploaded    int64
-	Active      bool
-	AmChoking   bool
-	LastAttempt time.Time
+	Active        bool
+	AmChoking     bool
+	LastAttempt   time.Time
 	// Dialable means IP:Port came from tracker/DHT discovery or an outbound dial,
 	// rather than only from an inbound connection's usually-ephemeral source port.
 	Dialable bool

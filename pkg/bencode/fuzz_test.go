@@ -12,8 +12,8 @@ func FuzzUnmarshal(f *testing.F) {
 	seeds := []string{
 		"i42e",
 		"i-1e",
-		"i-0e",   // invalid: negative zero
-		"i03e",   // invalid: leading zero
+		"i-0e", // invalid: negative zero
+		"i03e", // invalid: leading zero
 		"4:spam",
 		"0:",
 		"le",
