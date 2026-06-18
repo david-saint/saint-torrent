@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/torrent"
 )
 
@@ -155,6 +156,7 @@ type cliOptions struct {
 	theme       string
 	listenPort  int
 	natEnabled  bool
+	encryption  mse.Policy
 	err         error
 	items       []string
 }
@@ -1060,6 +1062,7 @@ func parseCLIArgs(args []string) cliOptions {
 		confirm:     true,
 		listenPort:  defaultPeerPort,
 		natEnabled:  true,
+		encryption:  mse.PolicyPrefer,
 	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1098,6 +1101,18 @@ func parseCLIArgs(args []string) cliOptions {
 			opts.listenPort = port
 		case "--no-nat":
 			opts.natEnabled = false
+		case "--encryption":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires prefer, require, or disable", args[i])
+				continue
+			}
+			policy, err := mse.ParsePolicy(args[i+1])
+			i++
+			if err != nil {
+				opts.err = err
+				continue
+			}
+			opts.encryption = policy
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1497,6 +1512,7 @@ func main() {
 	}
 
 	mgr := downloader.NewTorrentManager()
+	mgr.SetEncryptionPolicy(opts.encryption)
 	perfMarkf("manager")
 	if err := mgr.StartPeerListener(uint16(opts.listenPort)); err != nil {
 		fmt.Fprintf(os.Stderr, "Error starting peer listener on port %d: %v\n", opts.listenPort, err)

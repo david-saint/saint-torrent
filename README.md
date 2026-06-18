@@ -91,6 +91,17 @@ also attempts automatic UPnP IGD or NAT-PMP mapping:
 ./sainttorrent --port 0          # explicitly request an ephemeral port
 ```
 
+Peer protocol encryption defaults to `prefer`: saintTorrent tries BitTorrent
+MSE/PE first and falls back to plaintext when a peer does not support it. Use
+`require` to reject plaintext peer connections, or `disable` for plaintext-only
+compatibility:
+
+```bash
+./sainttorrent --encryption prefer
+./sainttorrent --encryption require
+./sainttorrent --encryption disable
+```
+
 ### macOS Magnet Handler
 
 On macOS you can register saintTorrent as the default handler for `magnet:`

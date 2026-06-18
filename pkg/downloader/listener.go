@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"strconv"
@@ -134,9 +135,21 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		return
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
+	m.mu.RLock()
+	policy := m.encryptionPolicy
+	secrets := m.secretKeys
+	m.mu.RUnlock()
+
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(secrets...))
+	if err != nil {
+		return
+	}
 	handshake, err := peer.ParseHandshake(conn)
 	if err != nil {
+		return
+	}
+	if encrypted && !bytes.Equal(mseResult.SecretKey, handshake.InfoHash[:]) {
 		return
 	}
 

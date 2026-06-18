@@ -20,6 +20,7 @@ import (
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 	"sainttorrent/pkg/utp"
@@ -43,6 +44,8 @@ type TorrentManager struct {
 	natStatus             NATStatus
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
+	encryptionPolicy      mse.Policy
+	secretKeys            [][20]byte
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	wg                    sync.WaitGroup
@@ -52,6 +55,19 @@ type TorrentManager struct {
 	restoring      bool
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+}
+
+// SetEncryptionPolicy configures MSE/PE behavior for all existing and future
+// sessions managed by m.
+func (m *TorrentManager) SetEncryptionPolicy(policy mse.Policy) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.encryptionPolicy = policy
+	for _, sess := range m.sessions {
+		sess.mu.Lock()
+		sess.EncryptionPolicy = policy
+		sess.mu.Unlock()
+	}
 }
 
 // maxGlobalOutboundPeers caps total concurrent outbound dials across ALL sessions, so a
@@ -160,7 +176,11 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if old := m.sessions[infoHashHex]; old != nil {
+		m.removeSessionSecretLocked(old)
+	}
 	m.sessions[infoHashHex] = sess
+	m.addSessionSecretLocked(sess)
 	sess.mu.Lock()
 	if sess.AddedAt.IsZero() {
 		sess.AddedAt = time.Now()
@@ -169,6 +189,7 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
+	sess.EncryptionPolicy = m.encryptionPolicy
 	if m.peerListener != nil {
 		sess.sharedInbound = true
 		sess.Port = m.advertisedPeerPort
@@ -183,6 +204,32 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	}
 }
 
+func (m *TorrentManager) addSessionSecretLocked(sess *Session) {
+	if sess == nil || sess.Torrent == nil {
+		return
+	}
+	next := make([][20]byte, 0, len(m.secretKeys)+1)
+	next = append(next, m.secretKeys...)
+	next = append(next, sess.Torrent.InfoHash)
+	m.secretKeys = next
+}
+
+func (m *TorrentManager) removeSessionSecretLocked(sess *Session) {
+	if sess == nil || sess.Torrent == nil {
+		return
+	}
+	target := sess.Torrent.InfoHash
+	for i, secret := range m.secretKeys {
+		if secret == target {
+			next := make([][20]byte, 0, len(m.secretKeys)-1)
+			next = append(next, m.secretKeys[:i]...)
+			next = append(next, m.secretKeys[i+1:]...)
+			m.secretKeys = next
+			return
+		}
+	}
+}
+
 // RemoveSession stops the session associated with the given info hash, removes it from the manager,
 // and deletes state files. If deleteFiles is true, it also deletes the downloaded files.
 // It returns any aggregated errors encountered during the removal process.
@@ -191,6 +238,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	sess, ok := m.sessions[infoHashHex]
 	if ok {
 		delete(m.sessions, infoHashHex)
+		m.removeSessionSecretLocked(sess)
 	}
 	var newFailed []PersistedTorrent
 	failedRemoved := false
@@ -476,6 +524,7 @@ func (m *TorrentManager) Close() {
 		sessions = append(sessions, sess)
 	}
 	m.sessions = make(map[string]*Session)
+	m.secretKeys = nil
 	d := m.dht
 	m.dht = nil
 	udpSocket := m.utpSocket

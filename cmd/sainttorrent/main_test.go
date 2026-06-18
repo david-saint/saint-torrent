@@ -16,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/mse"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -41,18 +42,23 @@ func TestGetSpaceActionHelp(t *testing.T) {
 
 func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	defaults := parseCLIArgs(nil)
-	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.err != nil {
+	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.err != nil {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat"})
-	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.err != nil {
+	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat", "--encryption", "require"})
+	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 
 	invalid := parseCLIArgs([]string{"--port", "70000"})
 	if invalid.err == nil {
 		t.Fatal("expected invalid port error")
+	}
+
+	invalidEncryption := parseCLIArgs([]string{"--encryption", "bogus"})
+	if invalidEncryption.err == nil {
+		t.Fatal("expected invalid encryption policy error")
 	}
 }
 
