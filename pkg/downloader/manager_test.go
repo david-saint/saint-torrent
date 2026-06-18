@@ -196,6 +196,57 @@ func TestTorrentManagerAddMethods(t *testing.T) {
 	}
 }
 
+func TestTorrentManagerStorageBackendSelection(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if err := mgr.SetStorageBackend(storage.BackendMemory); err != nil {
+		t.Fatalf("SetStorageBackend: %v", err)
+	}
+
+	torrentData := []byte("d8:announce27:http://tracker.org/announce4:infod6:lengthi100e4:name9:dummy.txt12:piece lengthi32768e6:pieces20:12345678901234567890ee")
+	torrentPath := filepath.Join(tempDir, "dummy.torrent")
+	if err := os.WriteFile(torrentPath, torrentData, 0644); err != nil {
+		t.Fatalf("write torrent: %v", err)
+	}
+
+	sess, err := mgr.AddTorrentFile(torrentPath, tempDir)
+	if err != nil {
+		t.Fatalf("AddTorrentFile: %v", err)
+	}
+	if _, ok := sess.Storage.(*storage.MemStorage); !ok {
+		t.Fatalf("session storage = %T, want *storage.MemStorage", sess.Storage)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "dummy.txt")); !os.IsNotExist(err) {
+		t.Fatalf("memory backend should not create content file, stat err: %v", err)
+	}
+}
+
+func TestTorrentManagerStorageBackendSelectionForMagnetMetadata(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if err := mgr.SetStorageBackend(storage.BackendMemory); err != nil {
+		t.Fatalf("SetStorageBackend: %v", err)
+	}
+
+	infoBytes := []byte("d6:lengthi100e4:name9:dummy.txt12:piece lengthi32768e6:pieces20:12345678901234567890e")
+	infoHash := sha1.Sum(infoBytes)
+	magnetURI := "magnet:?xt=urn:btih:" + fmt.Sprintf("%x", infoHash) + "&dn=Dummy"
+	sess, err := mgr.AddMagnet(magnetURI, tempDir)
+	if err != nil {
+		t.Fatalf("AddMagnet: %v", err)
+	}
+
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded: %v", err)
+	}
+	sess.WaitVerified()
+	if _, ok := sess.Storage.(*storage.MemStorage); !ok {
+		t.Fatalf("session storage = %T, want *storage.MemStorage", sess.Storage)
+	}
+}
+
 func TestPersistenceRestorePaused(t *testing.T) {
 	tempDir := t.TempDir()
 

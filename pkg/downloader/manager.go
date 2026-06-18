@@ -45,6 +45,7 @@ type TorrentManager struct {
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
 	encryptionPolicy      mse.Policy
+	storageFactory        storage.Factory
 	secretKeys            [][20]byte
 	ctx                   context.Context
 	cancel                context.CancelFunc
@@ -88,8 +89,36 @@ func NewTorrentManager() *TorrentManager {
 		globalUploadLimiter:   NewRateLimiter(0), // unlimited by default
 		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
 		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
+		storageFactory:        storage.NewStorage,
 		ctx:                   ctx,
 		cancel:                cancel,
+	}
+}
+
+// SetStorageBackend configures the storage backend for future manager-created sessions.
+func (m *TorrentManager) SetStorageBackend(backend storage.Backend) error {
+	factory, err := storage.FactoryForBackend(backend)
+	if err != nil {
+		return err
+	}
+	m.SetStorageFactory(factory)
+	return nil
+}
+
+// SetStorageFactory configures the storage factory for future manager-created sessions.
+func (m *TorrentManager) SetStorageFactory(factory storage.Factory) {
+	if factory == nil {
+		factory = storage.NewStorage
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.storageFactory = factory
+	for _, sess := range m.sessions {
+		sess.mu.Lock()
+		if sess.Storage == nil {
+			sess.storageFactory = factory
+		}
+		sess.mu.Unlock()
 	}
 }
 
@@ -190,6 +219,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
 	sess.EncryptionPolicy = m.encryptionPolicy
+	if sess.storageFactory == nil {
+		sess.storageFactory = m.storageFactory
+	}
 	if m.peerListener != nil {
 		sess.sharedInbound = true
 		sess.Port = m.advertisedPeerPort
@@ -620,6 +652,10 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 		m.mu.Unlock()
 		return s, nil
 	}
+	storageFactory := m.storageFactory
+	if storageFactory == nil {
+		storageFactory = storage.NewStorage
+	}
 	m.mu.Unlock()
 
 	tor := &torrent.Torrent{
@@ -639,6 +675,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 	if err != nil {
 		return nil, err
 	}
+	sess.storageFactory = storageFactory
 
 	sess.MagnetURI = uri
 	sess.OnStateChange = func() {
@@ -674,6 +711,10 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		m.mu.Unlock()
 		return s, nil
 	}
+	storageFactory := m.storageFactory
+	if storageFactory == nil {
+		storageFactory = storage.NewStorage
+	}
 	m.mu.Unlock()
 
 	// Prepare storage files
@@ -685,7 +726,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		}
 	}
 
-	st, err := storage.NewStorage(downloadDir, files, tor.PieceLength)
+	st, err := storageFactory(downloadDir, files, tor.PieceLength)
 	if err != nil {
 		return nil, err
 	}
@@ -699,6 +740,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		st.Close()
 		return nil, err
 	}
+	sess.storageFactory = storageFactory
 
 	sess.OnStateChange = func() {
 		m.saveState()

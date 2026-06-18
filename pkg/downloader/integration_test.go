@@ -166,7 +166,7 @@ func TestEndToEndDownload(t *testing.T) {
 	files := []storage.FileInfo{
 		{Path: filepath.Join(tor.Files[0].Path...), Length: tor.Files[0].Length},
 	}
-	st, err := storage.NewStorage(tempDir, files, tor.PieceLength)
+	st, err := storage.NewMemStorage(tempDir, files, tor.PieceLength)
 	if err != nil {
 		t.Fatalf("failed to create storage: %v", err)
 	}
@@ -196,11 +196,15 @@ func TestEndToEndDownload(t *testing.T) {
 		t.Fatalf("download did not complete in time, percentage: %f", sess.PercentComplete())
 	}
 
-	// 7. Verify File Content on Disk
-	resultPath := filepath.Join(tempDir, "integration_test.txt")
-	resBytes, err := os.ReadFile(resultPath)
+	// 7. Verify downloaded content from the in-memory backend.
+	resBytes := make([]byte, len(mockData))
+	_, err = st.ReadBlock(0, 0, resBytes[:32])
 	if err != nil {
-		t.Fatalf("failed to read downloaded file: %v", err)
+		t.Fatalf("failed to read downloaded piece 0: %v", err)
+	}
+	_, err = st.ReadBlock(1, 0, resBytes[32:])
+	if err != nil {
+		t.Fatalf("failed to read downloaded piece 1: %v", err)
 	}
 
 	if string(resBytes) != string(mockData) {

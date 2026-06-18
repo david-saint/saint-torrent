@@ -17,6 +17,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
 	"sainttorrent/pkg/mse"
+	"sainttorrent/pkg/storage"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -42,12 +43,12 @@ func TestGetSpaceActionHelp(t *testing.T) {
 
 func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	defaults := parseCLIArgs(nil)
-	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.err != nil {
+	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat", "--encryption", "require"})
-	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.err != nil {
+	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat", "--encryption", "require", "--storage", "mmap"})
+	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 
@@ -59,6 +60,11 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	invalidEncryption := parseCLIArgs([]string{"--encryption", "bogus"})
 	if invalidEncryption.err == nil {
 		t.Fatal("expected invalid encryption policy error")
+	}
+
+	invalidStorage := parseCLIArgs([]string{"--storage", "bogus"})
+	if invalidStorage.err == nil {
+		t.Fatal("expected invalid storage backend error")
 	}
 }
 
