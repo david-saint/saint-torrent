@@ -87,6 +87,8 @@ type Result struct {
 var (
 	dhPrime       = mustPrime()
 	dhGenerator   = big.NewInt(2)
+	dhMinPeerKey  = big.NewInt(2)
+	dhMaxPeerKey  = new(big.Int).Sub(dhPrime, big.NewInt(1))
 	maxPadLenBig  = big.NewInt(maxPadLen + 1)
 	req1          = []byte("req1")
 	req2          = []byte("req2")
@@ -456,12 +458,16 @@ func (h *handshaker) establishSecret() error {
 		return fmt.Errorf("mse: read public key: %w", err)
 	}
 	peerY := new(big.Int).SetBytes(peerYBytes[:])
-	if peerY.Sign() <= 0 || peerY.Cmp(dhPrime) >= 0 {
+	if !validPeerPublicKey(peerY) {
 		return errors.New("mse: invalid peer public key")
 	}
 	secret := new(big.Int).Exp(peerY, x, dhPrime)
 	copy(h.s[keyLen-len(secret.Bytes()):], secret.Bytes())
 	return nil
+}
+
+func validPeerPublicKey(peerY *big.Int) bool {
+	return peerY.Cmp(dhMinPeerKey) >= 0 && peerY.Cmp(dhMaxPeerKey) < 0
 }
 
 func (h *handshaker) postRandomPad() error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
@@ -188,6 +189,42 @@ func TestSelectRC4RejectsPlaintextOnlyOffer(t *testing.T) {
 	}
 	if !sawNoMethod {
 		t.Fatal("receiver did not reject a plaintext-only MSE offer")
+	}
+}
+
+func TestPeerPublicKeyRangeRejectsDegenerateKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		key  *big.Int
+	}{
+		{"zero", big.NewInt(0)},
+		{"one", big.NewInt(1)},
+		{"prime-minus-one", new(big.Int).Sub(dhPrime, big.NewInt(1))},
+		{"prime", new(big.Int).Set(dhPrime)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if validPeerPublicKey(tt.key) {
+				t.Fatalf("degenerate key %s accepted", tt.key)
+			}
+		})
+	}
+}
+
+func TestPeerPublicKeyRangeAcceptsValidBoundaries(t *testing.T) {
+	tests := []struct {
+		name string
+		key  *big.Int
+	}{
+		{"two", big.NewInt(2)},
+		{"prime-minus-two", new(big.Int).Sub(dhPrime, big.NewInt(2))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !validPeerPublicKey(tt.key) {
+				t.Fatalf("valid key %s rejected", tt.key)
+			}
+		})
 	}
 }
 
