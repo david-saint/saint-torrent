@@ -1017,8 +1017,21 @@ const (
 	dhtLookupParallelism = 8
 )
 
-// Lookup queries the DHT swarm for a given torrent's info-hash.
+// LookupOptions controls how a DHT lookup behaves.
+type LookupOptions struct {
+	// Announce publishes our peer port with announce_peer responses. Callers that
+	// have not confirmed a torrent is public should leave this false.
+	Announce bool
+}
+
+// Lookup queries the DHT swarm for a given torrent's info-hash and announces
+// peerPort to nodes that return valid tokens.
 func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
+	d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: true})
+}
+
+// LookupWithOptions queries the DHT swarm for a given torrent's info-hash.
+func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	d.goTracked(func() {
 		startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
 		if len(startNodes) == 0 {
@@ -1108,7 +1121,7 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 					}
 				}
 
-				if result.res.Token != "" && peerPort != 0 {
+				if opts.Announce && result.res.Token != "" && peerPort != 0 {
 					n := result.node
 					token := result.res.Token
 					d.goTracked(func() {

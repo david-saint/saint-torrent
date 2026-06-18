@@ -2086,14 +2086,16 @@ func (s *Session) dhtLoop() {
 	d := s.DHT
 	peerPort := s.Port
 	hasInbound := s.hasInboundListenerLocked()
+	hasTorrent := s.Torrent != nil
+	allowAnnounce := s.allowsDHTAnnounceLocked()
 	var infoHash [20]byte
-	if s.Torrent != nil {
+	if hasTorrent {
 		infoHash = s.Torrent.InfoHash
 	}
 	s.mu.RUnlock()
 
-	if !paused && d != nil && s.Torrent != nil && hasInbound {
-		d.Lookup(infoHash, peerPort)
+	if !paused && d != nil && hasTorrent && hasInbound {
+		d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
 	}
 
 	for {
@@ -2104,13 +2106,15 @@ func (s *Session) dhtLoop() {
 			d = s.DHT
 			peerPort = s.Port
 			hasInbound = s.hasInboundListenerLocked()
-			if s.Torrent != nil {
+			hasTorrent = s.Torrent != nil
+			allowAnnounce = s.allowsDHTAnnounceLocked()
+			if hasTorrent {
 				infoHash = s.Torrent.InfoHash
 			}
 			s.mu.RUnlock()
 
-			if !paused && d != nil && s.Torrent != nil && hasInbound {
-				d.Lookup(infoHash, peerPort)
+			if !paused && d != nil && hasTorrent && hasInbound {
+				d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
 			}
 		case <-s.ctx.Done():
 			return

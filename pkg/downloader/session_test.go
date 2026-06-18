@@ -262,6 +262,13 @@ func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
 		t.Fatal("expected magnet session to attach DHT before private metadata is known")
 	}
 
+	sess.mu.RLock()
+	announceBeforeMetadata := sess.allowsDHTAnnounceLocked()
+	sess.mu.RUnlock()
+	if announceBeforeMetadata {
+		t.Fatal("expected magnet session to suppress DHT announce before private metadata is known")
+	}
+
 	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
 		t.Fatalf("onMetadataDownloaded failed: %v", err)
 	}
@@ -269,12 +276,62 @@ func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
 	sess.mu.RLock()
 	private := sess.Torrent.Private
 	attachedAfterMetadata := sess.DHT != nil
+	announceAfterMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 	if !private {
 		t.Fatal("metadata private flag was not applied to the session torrent")
 	}
 	if attachedAfterMetadata {
 		t.Fatal("private metadata did not disable attached DHT")
+	}
+	if announceAfterMetadata {
+		t.Fatal("private metadata did not keep DHT announce disabled")
+	}
+}
+
+func TestMetadataModeSuppressesDHTAnnounceUntilPublicMetadata(t *testing.T) {
+	tempDir := t.TempDir()
+	info := map[string]interface{}{
+		"name":         "public-magnet.txt",
+		"piece length": int64(1),
+		"pieces":       string(make([]byte, 20)),
+		"length":       int64(1),
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatalf("failed to marshal metadata: %v", err)
+	}
+
+	tor := &torrent.Torrent{
+		Name:     "public-magnet",
+		InfoHash: sha1.Sum(infoBytes),
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	sess.mu.RLock()
+	announceBeforeMetadata := sess.allowsDHTAnnounceLocked()
+	sess.mu.RUnlock()
+	if announceBeforeMetadata {
+		t.Fatal("expected magnet session to suppress DHT announce before metadata is known")
+	}
+
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded failed: %v", err)
+	}
+
+	sess.mu.RLock()
+	metadataMode := sess.metadataMode
+	announceAfterMetadata := sess.allowsDHTAnnounceLocked()
+	sess.mu.RUnlock()
+	if metadataMode {
+		t.Fatal("expected metadata mode to end after public metadata download")
+	}
+	if !announceAfterMetadata {
+		t.Fatal("expected public metadata to allow DHT announce")
 	}
 }
 

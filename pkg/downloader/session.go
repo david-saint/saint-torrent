@@ -265,6 +265,12 @@ func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
 	return s.Torrent == nil || !s.Torrent.Private
 }
 
+func (s *Session) allowsDHTAnnounceLocked() bool {
+	// A magnet session does not know the BEP 27 private flag until metadata
+	// arrives, so it may use get_peers for bootstrap but must not publish itself.
+	return s.Torrent != nil && !s.Torrent.Private && !s.metadataMode
+}
+
 // TotalPieces returns the number of pieces in the torrent.
 func (s *Session) TotalPieces() int {
 	return len(s.Torrent.PieceHashes)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"os"
 	"testing"
@@ -271,6 +272,150 @@ func TestDHTGetPeersParsesValuesAndNodesTogether(t *testing.T) {
 	}
 	if len(res.Nodes) != 1 {
 		t.Fatalf("expected 1 node, got %d", len(res.Nodes))
+	}
+}
+
+func TestDHTLookupWithOptionsSuppressesAnnouncePeer(t *testing.T) {
+	queries := runLookupAgainstTokenNode(t, func(d *DHT, infoHash [20]byte, peerPort uint16) {
+		d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: false})
+	})
+
+	assertSawQuery(t, queries, "get_peers")
+	assertDidNotSeeQuery(t, queries, "announce_peer")
+}
+
+func TestDHTLookupAnnouncesByDefault(t *testing.T) {
+	queries := runLookupAgainstTokenNode(t, func(d *DHT, infoHash [20]byte, peerPort uint16) {
+		d.Lookup(infoHash, peerPort)
+	})
+
+	assertSawQuery(t, queries, "get_peers")
+	assertSawQuery(t, queries, "announce_peer")
+}
+
+func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) []string {
+	t.Helper()
+
+	oldBootstrapHosts := DefaultBootstrapHosts
+	DefaultBootstrapHosts = nil
+	t.Cleanup(func() {
+		DefaultBootstrapHosts = oldBootstrapHosts
+	})
+
+	d, err := NewDHT(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+	defer d.Close()
+
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("failed to listen UDP: %v", err)
+	}
+	defer server.Close()
+
+	nodeID := sha1.Sum([]byte("lookup-token-node"))
+	d.addNode(nodeID, server.LocalAddr().(*net.UDPAddr))
+
+	queriesCh := make(chan string, 8)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(queriesCh)
+
+		buf := make([]byte, 2048)
+		deadline := time.Now().Add(700 * time.Millisecond)
+		for {
+			_ = server.SetReadDeadline(deadline)
+			n, addr, err := server.ReadFromUDP(buf)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					return
+				}
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
+			parsed, err := bencode.Unmarshal(buf[:n])
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			request, ok := parsed.(map[string]interface{})
+			if !ok {
+				select {
+				case errCh <- fmt.Errorf("unexpected DHT request: %#v", parsed):
+				default:
+				}
+				return
+			}
+			query, _ := request["q"].(string)
+			txn, _ := request["t"].(string)
+			if query != "" {
+				queriesCh <- query
+			}
+
+			response := map[string]interface{}{
+				"t": txn,
+				"y": "r",
+				"r": map[string]interface{}{
+					"id": string(nodeID[:]),
+				},
+			}
+			if query == "get_peers" {
+				response["r"].(map[string]interface{})["token"] = "tok"
+			}
+			payload, err := bencode.Marshal(response)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			_, _ = server.WriteToUDP(payload, addr)
+		}
+	}()
+
+	run(d, sha1.Sum([]byte("lookup-infohash")), 51413)
+
+	var queries []string
+	for {
+		select {
+		case query, ok := <-queriesCh:
+			if !ok {
+				return queries
+			}
+			queries = append(queries, query)
+		case err := <-errCh:
+			t.Fatalf("test DHT node failed: %v", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for DHT lookup queries")
+		}
+	}
+}
+
+func assertSawQuery(t *testing.T, queries []string, want string) {
+	t.Helper()
+	for _, query := range queries {
+		if query == want {
+			return
+		}
+	}
+	t.Fatalf("expected DHT query %q, got %v", want, queries)
+}
+
+func assertDidNotSeeQuery(t *testing.T, queries []string, want string) {
+	t.Helper()
+	for _, query := range queries {
+		if query == want {
+			t.Fatalf("did not expect DHT query %q, got %v", want, queries)
+		}
 	}
 }
 

@@ -318,10 +318,14 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	// Verify pending file priorities are stored
 	sess.mu.RLock()
 	pending := sess.PendingFilePriorities
+	announceBeforeMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 
 	if len(pending) != 2 || pending[0] != PriorityHigh || pending[1] != PrioritySkip {
 		t.Errorf("unexpected pending priorities: %v", pending)
+	}
+	if announceBeforeMetadata {
+		t.Fatal("restored magnet should suppress DHT announce until metadata is known")
 	}
 
 	// Simulate metadata download completion
@@ -336,6 +340,7 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	sess.mu.RLock()
 	priorities := sess.FilePriorities
 	clearedPending := sess.PendingFilePriorities
+	announceAfterMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 
 	if len(priorities) != 2 || priorities[0] != PriorityHigh || priorities[1] != PrioritySkip {
@@ -344,6 +349,9 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 
 	if clearedPending != nil {
 		t.Error("expected PendingFilePriorities to be cleared after application")
+	}
+	if !announceAfterMetadata {
+		t.Error("expected restored public magnet to allow DHT announce after metadata is known")
 	}
 
 	mgr.Close()
