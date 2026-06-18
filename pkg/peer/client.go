@@ -19,14 +19,14 @@ const peerWriteBufferSize = 32 * 1024
 
 // Client represents a connection to a BitTorrent peer.
 type Client struct {
-	Conn     net.Conn
-	InfoHash [20]byte
-	PeerID   [20]byte
-	r        *bufio.Reader // buffers inbound framing so reads coalesce syscalls
-	writeMu  sync.Mutex    // protects concurrent writes to w (and reqBuf)
-	w        *bufio.Writer // buffers outbound messages; flushed explicitly
-	reqBuf   [17]byte      // reusable scratch for WriteRequest framing
-	DisableDHT bool        // Disable advertising DHT support in handshake
+	Conn       net.Conn
+	InfoHash   [20]byte
+	PeerID     [20]byte
+	r          *bufio.Reader // buffers inbound framing so reads coalesce syscalls
+	writeMu    sync.Mutex    // protects concurrent writes to w (and reqBuf)
+	w          *bufio.Writer // buffers outbound messages; flushed explicitly
+	reqBuf     [17]byte      // reusable scratch for WriteRequest framing
+	DisableDHT bool          // Disable advertising DHT support in handshake
 }
 
 // NewClient initializes a new peer wire client.

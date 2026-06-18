@@ -2,45 +2,63 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
-    name: Build & Test
+    name: Go ${{ matrix.go-version }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.24']
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: ${{ matrix.go-version }}
           cache: true
 
-      - name: Verify Go Mod
+      - name: Verify modules
         run: go mod verify
 
-      - name: Build Codebase
-        run: go build -v ./...
+      - name: Check formatting
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            echo "Go files must be formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
 
-      - name: Run Go Vet
+      - name: Run go vet
         run: go vet ./...
 
-      - name: Run Tests (with Race Detector)
+      - name: Build packages
+        run: go build -v ./...
+
+      - name: Run tests with race detector
         run: go test -v -race ./...
 
+      - name: Run benchmark smoke tests
+        run: go test -run '^$' -bench 'BenchmarkColdStartup|BenchmarkShutdown' -benchtime=1x -benchmem ./pkg/downloader
+
   lint:
-    name: Lint Check
+    name: golangci-lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Go
@@ -53,3 +71,25 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.4.0
+
+  test-386:
+    name: linux / 386
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: 386
+      CGO_ENABLED: 0
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build packages
+        run: go build -v ./...
+
+      - name: Run tests
+        run: go test -v ./...
