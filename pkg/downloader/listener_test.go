@@ -163,3 +163,48 @@ func TestManagerSharedUTPListenerRoutesByInfoHash(t *testing.T) {
 		t.Fatal("shared uTP listener routed connection to the wrong session")
 	}
 }
+
+func TestManagerSecretKeysSnapshotTracksSessionLifecycle(t *testing.T) {
+	mgr := NewTorrentManager()
+
+	first := newEncryptionTestSession(t, "secret-cache-first")
+	second := newEncryptionTestSession(t, "secret-cache-second")
+	firstHex := fmt.Sprintf("%x", first.Torrent.InfoHash)
+	secondHex := fmt.Sprintf("%x", second.Torrent.InfoHash)
+
+	mgr.AddSession(firstHex, first)
+	mgr.AddSession(secondHex, second)
+
+	mgr.mu.RLock()
+	secrets := append([][20]byte(nil), mgr.secretKeys...)
+	mgr.mu.RUnlock()
+	if len(secrets) != 2 || !hasSecret(secrets, first.Torrent.InfoHash) || !hasSecret(secrets, second.Torrent.InfoHash) {
+		t.Fatalf("unexpected cached secrets after add: %x", secrets)
+	}
+
+	if err := mgr.RemoveSession(firstHex, false); err != nil {
+		t.Fatalf("remove first session: %v", err)
+	}
+	mgr.mu.RLock()
+	secrets = append([][20]byte(nil), mgr.secretKeys...)
+	mgr.mu.RUnlock()
+	if len(secrets) != 1 || hasSecret(secrets, first.Torrent.InfoHash) || !hasSecret(secrets, second.Torrent.InfoHash) {
+		t.Fatalf("unexpected cached secrets after remove: %x", secrets)
+	}
+
+	mgr.Close()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	if len(mgr.secretKeys) != 0 {
+		t.Fatalf("expected cached secrets to clear on close, got %x", mgr.secretKeys)
+	}
+}
+
+func hasSecret(secrets [][20]byte, want [20]byte) bool {
+	for _, secret := range secrets {
+		if secret == want {
+			return true
+		}
+	}
+	return false
+}

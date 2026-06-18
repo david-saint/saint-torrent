@@ -112,13 +112,40 @@ func (s *Session) prunePeersLocked() {
 }
 
 func tunePeerConn(conn net.Conn) {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
+	tcpConn := underlyingTCPConn(conn)
+	if tcpConn == nil {
 		return
 	}
 	_ = tcpConn.SetNoDelay(true)
 	_ = tcpConn.SetReadBuffer(peerSocketBufferSize)
 	_ = tcpConn.SetWriteBuffer(peerSocketBufferSize)
+}
+
+type underlyingConn interface {
+	UnderlyingConn() net.Conn
+}
+
+func underlyingTCPConn(conn net.Conn) *net.TCPConn {
+	for conn != nil {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			return tcpConn
+		}
+		wrapped, ok := conn.(underlyingConn)
+		if !ok {
+			return nil
+		}
+		conn = wrapped.UnderlyingConn()
+	}
+	return nil
+}
+
+func (s *Session) markPeerAttemptFailed(peerAddr string) {
+	s.mu.Lock()
+	if ps, ok := s.Peers[peerAddr]; ok {
+		ps.Active = false
+		ps.LastAttempt = time.Now()
+	}
+	s.mu.Unlock()
 }
 
 func (s *Session) broadcastHave(index uint32) {
@@ -280,12 +307,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 
 	conn, err := s.dialPeer(peerAddr)
 	if err != nil {
-		s.mu.Lock()
-		if ps, ok := s.Peers[peerAddr]; ok {
-			ps.Active = false
-			ps.LastAttempt = time.Now()
-		}
-		s.mu.Unlock()
+		s.markPeerAttemptFailed(peerAddr)
 		return
 	}
 	tunePeerConn(conn)
@@ -310,43 +332,29 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	}()
 
 	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn)
+	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn, connMonitor)
 	if err != nil {
-		s.mu.Lock()
-		if ps, ok := s.Peers[peerAddr]; ok {
-			ps.Active = false
-			ps.LastAttempt = time.Now()
-		}
-		s.mu.Unlock()
+		s.markPeerAttemptFailed(peerAddr)
 		return
 	}
 	connMonitor.set(conn)
 	defer conn.Close()
 
 	// Handshake with deadline
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
 	s.mu.RLock()
 	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
 	s.mu.RUnlock()
 	handshake, err := client.Handshake()
 	if err != nil {
-		s.mu.Lock()
-		if ps, ok := s.Peers[peerAddr]; ok {
-			ps.Active = false
-			ps.LastAttempt = time.Now()
-		}
-		s.mu.Unlock()
+		s.markPeerAttemptFailed(peerAddr)
 		return
 	}
 	_ = conn.SetDeadline(time.Time{}) // clear deadline
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
-		s.mu.Lock()
-		if ps, ok := s.Peers[peerAddr]; ok {
-			ps.Active = false
-			ps.LastAttempt = time.Now()
-		}
-		s.mu.Unlock()
+		s.markPeerAttemptFailed(peerAddr)
 		return
 	}
 
@@ -511,6 +519,8 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	}
 
 	// Spawn context monitor to interrupt immediately on shutdown
+	connMonitor := &monitoredPeerConn{}
+	connMonitor.set(conn)
 	doneCh := make(chan struct{})
 	monitorDone := make(chan struct{})
 	defer func() {
@@ -521,7 +531,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		defer close(monitorDone)
 		select {
 		case <-s.ctx.Done():
-			_ = conn.Close()
+			connMonitor.close()
 		case <-doneCh:
 		}
 	}()
@@ -533,6 +543,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		if err != nil {
 			return
 		}
+		connMonitor.set(conn)
 	}
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
@@ -553,6 +564,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 		respHs.Reserved[7] |= 0x01 // Support DHT (BEP 5)
 	}
 	peer.EnableFastExtension(&respHs.Reserved)
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
 	if _, err := conn.Write(respHs.Serialize()); err != nil {
 		return
 	}

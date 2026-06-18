@@ -127,6 +127,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return c.w.Write(p)
 }
 
+func (c *Conn) UnderlyingConn() net.Conn {
+	return c.Conn
+}
+
 type cipherReader struct {
 	c *rc4.Cipher
 	r io.Reader
@@ -327,7 +331,7 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	}
 	var encrypted bytes.Buffer
 	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildInitiatorPayload(methods, initialPayload)); err != nil {
+	if _, err := writeFull(ew, buildCryptoFrame(methods, initialPayload, true)); err != nil {
 		return nil, Result{}, err
 	}
 	if err := h.out.post(encrypted.Bytes()); err != nil {
@@ -353,7 +357,7 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	if err != nil {
 		return nil, Result{}, err
 	}
-	if _, err := io.CopyN(io.Discard, cr, int64(padLen)); err != nil {
+	if err := discardHandshakePad(cr, padLen); err != nil {
 		return nil, Result{}, err
 	}
 	selected := CryptoMethod(method) & methods
@@ -403,7 +407,7 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	if err != nil {
 		return nil, Result{}, err
 	}
-	if _, err := io.CopyN(io.Discard, cr, int64(padLen)); err != nil {
+	if err := discardHandshakePad(cr, padLen); err != nil {
 		return nil, Result{}, err
 	}
 	iaLen, err := readUint16(cr)
@@ -428,7 +432,7 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	}
 	var encrypted bytes.Buffer
 	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildReceiverPayload(selected)); err != nil {
+	if _, err := writeFull(ew, buildCryptoFrame(selected, nil, false)); err != nil {
 		return nil, Result{}, err
 	}
 	if err := h.out.post(encrypted.Bytes()); err != nil {
@@ -524,22 +528,7 @@ func (h *handshaker) wrapConn(method CryptoMethod, initialPayload []byte, readCi
 	}
 }
 
-func buildInitiatorPayload(methods CryptoMethod, initialPayload []byte) []byte {
-	padLen, err := randomPadLen()
-	if err != nil {
-		panic(err)
-	}
-	var buf bytes.Buffer
-	buf.Write(vc[:])
-	writeUint32(&buf, uint32(methods))
-	writeUint16(&buf, uint16(padLen))
-	buf.Write(zeroPad[:padLen])
-	writeUint16(&buf, uint16(len(initialPayload)))
-	buf.Write(initialPayload)
-	return buf.Bytes()
-}
-
-func buildReceiverPayload(method CryptoMethod) []byte {
+func buildCryptoFrame(method CryptoMethod, initialPayload []byte, includeInitialPayload bool) []byte {
 	padLen, err := randomPadLen()
 	if err != nil {
 		panic(err)
@@ -549,7 +538,19 @@ func buildReceiverPayload(method CryptoMethod) []byte {
 	writeUint32(&buf, uint32(method))
 	writeUint16(&buf, uint16(padLen))
 	buf.Write(zeroPad[:padLen])
+	if includeInitialPayload {
+		writeUint16(&buf, uint16(len(initialPayload)))
+		buf.Write(initialPayload)
+	}
 	return buf.Bytes()
+}
+
+func discardHandshakePad(r io.Reader, padLen uint16) error {
+	if padLen > maxPadLen {
+		return fmt.Errorf("mse: pad length %d exceeds maximum %d", padLen, maxPadLen)
+	}
+	_, err := io.CopyN(io.Discard, r, int64(padLen))
+	return err
 }
 
 func randomPrivate() (*big.Int, error) {

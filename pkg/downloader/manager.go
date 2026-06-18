@@ -45,6 +45,7 @@ type TorrentManager struct {
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
 	encryptionPolicy      mse.Policy
+	secretKeys            [][20]byte
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	wg                    sync.WaitGroup
@@ -67,13 +68,6 @@ func (m *TorrentManager) SetEncryptionPolicy(policy mse.Policy) {
 		sess.EncryptionPolicy = policy
 		sess.mu.Unlock()
 	}
-}
-
-// EncryptionPolicy returns the manager-wide MSE/PE policy.
-func (m *TorrentManager) EncryptionPolicy() mse.Policy {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.encryptionPolicy
 }
 
 // maxGlobalOutboundPeers caps total concurrent outbound dials across ALL sessions, so a
@@ -182,7 +176,11 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if old := m.sessions[infoHashHex]; old != nil {
+		m.removeSessionSecretLocked(old)
+	}
 	m.sessions[infoHashHex] = sess
+	m.addSessionSecretLocked(sess)
 	sess.mu.Lock()
 	if sess.AddedAt.IsZero() {
 		sess.AddedAt = time.Now()
@@ -206,6 +204,32 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	}
 }
 
+func (m *TorrentManager) addSessionSecretLocked(sess *Session) {
+	if sess == nil || sess.Torrent == nil {
+		return
+	}
+	next := make([][20]byte, 0, len(m.secretKeys)+1)
+	next = append(next, m.secretKeys...)
+	next = append(next, sess.Torrent.InfoHash)
+	m.secretKeys = next
+}
+
+func (m *TorrentManager) removeSessionSecretLocked(sess *Session) {
+	if sess == nil || sess.Torrent == nil {
+		return
+	}
+	target := sess.Torrent.InfoHash
+	for i, secret := range m.secretKeys {
+		if secret == target {
+			next := make([][20]byte, 0, len(m.secretKeys)-1)
+			next = append(next, m.secretKeys[:i]...)
+			next = append(next, m.secretKeys[i+1:]...)
+			m.secretKeys = next
+			return
+		}
+	}
+}
+
 // RemoveSession stops the session associated with the given info hash, removes it from the manager,
 // and deletes state files. If deleteFiles is true, it also deletes the downloaded files.
 // It returns any aggregated errors encountered during the removal process.
@@ -214,6 +238,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	sess, ok := m.sessions[infoHashHex]
 	if ok {
 		delete(m.sessions, infoHashHex)
+		m.removeSessionSecretLocked(sess)
 	}
 	var newFailed []PersistedTorrent
 	failedRemoved := false
@@ -499,6 +524,7 @@ func (m *TorrentManager) Close() {
 		sessions = append(sessions, sess)
 	}
 	m.sessions = make(map[string]*Session)
+	m.secretKeys = nil
 	d := m.dht
 	m.dht = nil
 	udpSocket := m.utpSocket

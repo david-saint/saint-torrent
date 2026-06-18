@@ -138,15 +138,10 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
 	m.mu.RLock()
 	policy := m.encryptionPolicy
-	secrets := make([][20]byte, 0, len(m.sessions))
-	for _, sess := range m.sessions {
-		if sess.Torrent != nil {
-			secrets = append(secrets, sess.Torrent.InfoHash)
-		}
-	}
+	secrets := m.secretKeys
 	m.mu.RUnlock()
 
-	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretListIter(secrets))
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(secrets...))
 	if err != nil {
 		return
 	}

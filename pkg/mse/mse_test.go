@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -187,6 +188,31 @@ func TestSelectRC4RejectsPlaintextOnlyOffer(t *testing.T) {
 	}
 	if !sawNoMethod {
 		t.Fatal("receiver did not reject a plaintext-only MSE offer")
+	}
+}
+
+func TestDiscardHandshakePadRejectsOversizedPad(t *testing.T) {
+	pad := bytes.Repeat([]byte{0}, maxPadLen+1)
+	r := bytes.NewReader(pad)
+	err := discardHandshakePad(r, maxPadLen+1)
+	if err == nil {
+		t.Fatal("expected oversized pad to be rejected")
+	}
+	if !strings.Contains(err.Error(), "pad length") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.Len() != len(pad) {
+		t.Fatalf("oversized pad consumed %d bytes before rejection", len(pad)-r.Len())
+	}
+}
+
+func TestDiscardHandshakePadConsumesBoundedPad(t *testing.T) {
+	r := bytes.NewReader([]byte{1, 2, 3, 4})
+	if err := discardHandshakePad(r, 3); err != nil {
+		t.Fatalf("bounded pad rejected: %v", err)
+	}
+	if r.Len() != 1 {
+		t.Fatalf("bounded pad consumed wrong length, remaining = %d", r.Len())
 	}
 }
 

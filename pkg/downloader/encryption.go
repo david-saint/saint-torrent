@@ -21,19 +21,30 @@ type bufferedConn struct {
 }
 
 type monitoredPeerConn struct {
-	mu   sync.Mutex
-	conn net.Conn
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
 }
 
 func (m *monitoredPeerConn) set(conn net.Conn) {
+	var closeConn net.Conn
 	m.mu.Lock()
-	m.conn = conn
+	if m.closed {
+		closeConn = conn
+	} else {
+		m.conn = conn
+	}
 	m.mu.Unlock()
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
 }
 
 func (m *monitoredPeerConn) close() {
 	m.mu.Lock()
 	conn := m.conn
+	m.conn = nil
+	m.closed = true
 	m.mu.Unlock()
 	if conn != nil {
 		_ = conn.Close()
@@ -58,13 +69,11 @@ func (c *bufferedConn) Peek(n int) ([]byte, error) {
 	return c.r.Peek(n)
 }
 
-func singleSecret(infoHash [20]byte) mse.SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		callback(infoHash[:])
-	}
+func (c *bufferedConn) UnderlyingConn() net.Conn {
+	return c.Conn
 }
 
-func secretListIter(secrets [][20]byte) mse.SecretKeyIter {
+func secretKeyIter(secrets ...[20]byte) mse.SecretKeyIter {
 	return func(callback func([]byte) bool) {
 		for i := range secrets {
 			if !callback(secrets[i][:]) {
@@ -96,7 +105,7 @@ func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.Sec
 	return wrapped, res, true, nil
 }
 
-func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn) (net.Conn, error) {
+func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, monitor *monitoredPeerConn) (net.Conn, error) {
 	s.mu.RLock()
 	policy := s.EncryptionPolicy
 	infoHash := s.Torrent.InfoHash
@@ -107,9 +116,15 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn) (net
 
 	wrapped, _, err := mse.Initiate(conn, infoHash[:], nil, mse.CryptoMethodRC4)
 	if err == nil {
+		if monitor != nil {
+			monitor.set(wrapped)
+		}
 		return wrapped, nil
 	}
 	_ = conn.Close()
+	if monitor != nil {
+		monitor.set(nil)
+	}
 	if policy == mse.PolicyRequire {
 		return nil, fmt.Errorf("mse handshake failed: %w", err)
 	}
@@ -122,7 +137,13 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn) (net
 		)
 	}
 	tunePeerConn(fallback)
-	_ = fallback.SetDeadline(time.Now().Add(peerHandshakeTimeout))
+	if monitor != nil {
+		monitor.set(fallback)
+	}
+	if ctxErr := s.ctx.Err(); ctxErr != nil {
+		_ = fallback.Close()
+		return nil, ctxErr
+	}
 	return fallback, nil
 }
 
@@ -132,7 +153,7 @@ func (s *Session) parseIncomingHandshake(conn net.Conn) (net.Conn, *peer.Handsha
 	infoHash := s.Torrent.InfoHash
 	s.mu.RUnlock()
 
-	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, singleSecret(infoHash))
+	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(infoHash))
 	if err != nil {
 		return nil, nil, err
 	}

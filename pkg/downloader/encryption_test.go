@@ -75,7 +75,7 @@ func TestConnectToPeerWithRequiredEncryption(t *testing.T) {
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-		wrapped, _, err := mse.Receive(conn, singleSecret(sess.Torrent.InfoHash), mse.SelectRC4)
+		wrapped, _, err := mse.Receive(conn, secretKeyIter(sess.Torrent.InfoHash), mse.SelectRC4)
 		if err != nil {
 			serverDone <- fmt.Errorf("receive MSE: %w", err)
 			return
@@ -213,6 +213,46 @@ func TestConnectToPeerPreferFallsBackToPlaintext(t *testing.T) {
 	case <-clientDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("connectToPeer did not exit after fallback peer closed")
+	}
+}
+
+func TestUnderlyingTCPConnUnwrapsBufferedConnection(t *testing.T) {
+	ln, port := listenEncryptionTestPeer(t)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	var serverConn net.Conn
+	select {
+	case serverConn = <-accepted:
+		defer serverConn.Close()
+	case err := <-acceptErr:
+		t.Fatalf("accept: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for accept")
+	}
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("dial returned %T, want *net.TCPConn", conn)
+	}
+	if got := underlyingTCPConn(newBufferedConn(conn)); got != tcpConn {
+		t.Fatalf("underlyingTCPConn(newBufferedConn(conn)) = %p, want %p", got, tcpConn)
 	}
 }
 
