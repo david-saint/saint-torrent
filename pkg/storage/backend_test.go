@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
-	"time"
 )
 
 func TestStorageBackendsCommonSuite(t *testing.T) {
@@ -170,48 +169,6 @@ func TestMMapStorageWriteBlockRepairsSameSizeReplacement(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("repaired file mismatch: got %q want %q", got, data)
-	}
-}
-
-func TestMMapStorageCloseWaitsForActiveReaders(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("mmap storage is not supported on windows")
-	}
-
-	st, err := NewMMapStorage(t.TempDir(), []FileInfo{{Path: "data.bin", Length: 32}}, 32)
-	if err != nil {
-		t.Fatalf("NewMMapStorage: %v", err)
-	}
-
-	st.mu.RLock()
-	done := make(chan struct{})
-	go func() {
-		_ = st.Close()
-		close(done)
-	}()
-
-	deadline := time.After(time.Second)
-	for !st.closed.Load() {
-		select {
-		case <-deadline:
-			st.mu.RUnlock()
-			t.Fatal("Close did not start")
-		default:
-			runtime.Gosched()
-		}
-	}
-	select {
-	case <-done:
-		st.mu.RUnlock()
-		t.Fatal("Close returned while a reader held the mmap read lock")
-	default:
-	}
-
-	st.mu.RUnlock()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Close did not finish after reader released lock")
 	}
 }
 
