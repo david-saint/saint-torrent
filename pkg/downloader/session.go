@@ -68,6 +68,9 @@ type PeerState struct {
 	// Dialing prevents tracker, DHT, maintenance, and resume paths from launching
 	// duplicate concurrent attempts to the same endpoint.
 	Dialing bool
+	// WebSeed marks a synthetic HTTP source entry. It is kept out of peer-wire
+	// choking and upload stats because no BitTorrent peer exists behind it.
+	WebSeed bool
 
 	WindowBlocks         int
 	TargetWindowBlocks   int
@@ -935,7 +938,7 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, p := range s.Peers {
-		if !p.Active {
+		if !p.Active || p.WebSeed {
 			continue
 		}
 		stats.ActiveDownloadPeers++

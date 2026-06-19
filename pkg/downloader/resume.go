@@ -24,8 +24,9 @@ type pieceWriteJob struct {
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
 	// disconnect-on-corruption.
-	conn   net.Conn
-	result chan<- pieceWriteResult
+	conn                    net.Conn
+	result                  chan<- pieceWriteResult
+	recoverableStorageError bool
 }
 
 type pieceWriteStatus int
@@ -136,7 +137,9 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	default:
 		s.mu.Lock()
 		s.lastErr = err
-		s.statusErr = err
+		if !job.recoverableStorageError {
+			s.statusErr = err
+		}
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.PieceStates[job.index] = PieceEmpty
 			s.addNeededLocked(int(job.index))

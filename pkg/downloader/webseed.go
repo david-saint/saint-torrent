@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -16,10 +17,13 @@ import (
 )
 
 var (
-	webseedHTTPClient     = http.DefaultClient
-	webseedRequestTimeout = 30 * time.Second
-	webseedIdleDelay      = 500 * time.Millisecond
-	errWebseedPaused      = errors.New("webseed paused")
+	webseedHTTPClient        = http.DefaultClient
+	webseedRequestTimeout    = 30 * time.Second
+	webseedIdleDelay         = 500 * time.Millisecond
+	webseedRetryBaseDelay    = time.Second
+	webseedRetryMaxDelay     = 30 * time.Second
+	webseedPausePollInterval = 50 * time.Millisecond
+	errWebseedPaused         = errors.New("webseed paused")
 )
 
 type webseedSpec struct {
@@ -41,6 +45,7 @@ type webseedPiece struct {
 	hash          [20]byte
 	length        int64
 	absoluteStart int64
+	endgame       bool
 }
 
 func (s *Session) webseedSpecsForStart() []webseedSpec {
@@ -104,14 +109,16 @@ func buildWebseedSpec(raw string, files []webseedTorrentFile, multiFile bool) (w
 		host:    base.Hostname(),
 		port:    defaultURLPort(base),
 	}
+	appendSingleFileName := !multiFile && strings.HasSuffix(base.EscapedPath(), "/")
 	var offset int64
 	for _, f := range files {
-		fileURL := base.String()
-		if multiFile {
-			fileURL, err = url.JoinPath(base.String(), f.path...)
-			if err != nil {
-				return webseedSpec{}, false
-			}
+		var segments []string
+		if multiFile || appendSingleFileName {
+			segments = f.path
+		}
+		fileURL, ok := webseedURLForPath(base, segments)
+		if !ok {
+			return webseedSpec{}, false
 		}
 		spec.files = append(spec.files, webseedFile{
 			start: offset,
@@ -121,6 +128,38 @@ func buildWebseedSpec(raw string, files []webseedTorrentFile, multiFile bool) (w
 		offset += f.length
 	}
 	return spec, true
+}
+
+func webseedURLForPath(base *url.URL, segments []string) (string, bool) {
+	u := *base
+	if len(segments) == 0 {
+		return u.String(), true
+	}
+
+	parts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment == "" {
+			continue
+		}
+		parts = append(parts, url.PathEscape(segment))
+	}
+	if len(parts) == 0 {
+		return u.String(), true
+	}
+
+	escapedPath := strings.TrimRight(u.EscapedPath(), "/")
+	if escapedPath == "" {
+		escapedPath = "/" + strings.Join(parts, "/")
+	} else {
+		escapedPath += "/" + strings.Join(parts, "/")
+	}
+	decodedPath, err := url.PathUnescape(escapedPath)
+	if err != nil {
+		return "", false
+	}
+	u.Path = decodedPath
+	u.RawPath = escapedPath
+	return u.String(), true
 }
 
 func defaultURLPort(u *url.URL) uint16 {
@@ -152,12 +191,14 @@ func (s *Session) webseedLoop(spec webseedSpec) {
 		client = http.DefaultClient
 	}
 
+	backoff := webseedRetryBaseDelay
 	for {
 		piece, ok, done := s.claimWebseedPiece()
 		if done {
 			return
 		}
 		if !ok {
+			backoff = webseedRetryBaseDelay
 			if !s.waitWebseedIdle() {
 				return
 			}
@@ -166,39 +207,73 @@ func (s *Session) webseedLoop(spec webseedSpec) {
 
 		data, err := s.fetchWebseedPiece(s.ctx, client, spec, piece, pState)
 		if errors.Is(err, errWebseedPaused) {
-			s.releaseWebseedPiece(piece.index, nil)
+			s.releaseWebseedPiece(piece, nil)
 			if !s.waitWebseedIdle() {
 				return
 			}
 			continue
 		}
 		if err != nil {
-			s.releaseWebseedPiece(piece.index, fmt.Errorf("webseed %s: %w", spec.display, err))
-			return
+			wrapped := fmt.Errorf("webseed %s: %w", spec.display, err)
+			s.releaseWebseedPiece(piece, wrapped)
+			s.recordWebseedError(peerAddr, wrapped)
+			if !s.waitWebseedBackoff(backoff) {
+				return
+			}
+			backoff = nextWebseedBackoff(backoff)
+			continue
 		}
 
 		result := make(chan pieceWriteResult, 1)
 		s.ensurePieceWritePool()
 		select {
-		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, result: result}:
+		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, result: result, recoverableStorageError: true}:
 		case <-s.ctx.Done():
-			s.releaseWebseedPiece(piece.index, nil)
+			s.releaseWebseedPiece(piece, nil)
 			return
 		}
 
 		select {
 		case res := <-result:
 			switch res.status {
+			case pieceWriteCompleted:
+				backoff = webseedRetryBaseDelay
+			case pieceWriteSkipped:
+				s.releaseWebseedPiece(piece, nil)
+				if res.err != nil {
+					return
+				}
+				backoff = webseedRetryBaseDelay
 			case pieceWriteHashFailed:
-				s.markWebseedFailed(peerAddr, fmt.Errorf("webseed %s served corrupt bytes: %w", spec.display, res.err))
-				return
+				wrapped := fmt.Errorf("webseed %s served corrupt bytes: %w", spec.display, res.err)
+				s.recordWebseedError(peerAddr, wrapped)
+				if !s.waitWebseedBackoff(backoff) {
+					return
+				}
+				backoff = nextWebseedBackoff(backoff)
 			case pieceWriteStorageFailed:
-				return
+				wrapped := fmt.Errorf("webseed %s storage write failed: %w", spec.display, res.err)
+				s.recordWebseedError(peerAddr, wrapped)
+				if !s.waitWebseedBackoff(backoff) {
+					return
+				}
+				backoff = nextWebseedBackoff(backoff)
 			}
 		case <-s.ctx.Done():
 			return
 		}
 	}
+}
+
+func nextWebseedBackoff(cur time.Duration) time.Duration {
+	if cur <= 0 {
+		return webseedRetryBaseDelay
+	}
+	next := cur * 2
+	if next > webseedRetryMaxDelay {
+		return webseedRetryMaxDelay
+	}
+	return next
 }
 
 func (s *Session) registerWebseedPeer(spec webseedSpec) (string, *PeerState) {
@@ -215,14 +290,13 @@ func (s *Session) registerWebseedPeer(spec webseedSpec) (string, *PeerState) {
 	pState.IP = spec.host
 	pState.Port = spec.port
 	pState.Choked = false
-	pState.Interested = true
+	pState.Interested = false
 	pState.Active = true
-	pState.AmChoking = true
+	pState.AmChoking = false
 	pState.LastAttempt = now
 	pState.Dialable = false
 	pState.Dialing = false
-	pState.WindowBlocks = 1
-	pState.TargetWindowBlocks = 1
+	pState.WebSeed = true
 	return addr, pState
 }
 
@@ -237,18 +311,20 @@ func (s *Session) unregisterWebseedPeer(addr string) {
 		pState.DownloadSpeed = 0
 		pState.OutstandingBlocks = 0
 		pState.OutstandingBytes = 0
+		pState.AppLimited = false
+		pState.BudgetLimited = false
+		pState.PieceCapLimited = false
+		pState.WriterLimited = false
 	}
 }
 
-func (s *Session) markWebseedFailed(addr string, err error) {
+func (s *Session) recordWebseedError(addr string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastErr = err
 	if pState := s.Peers[addr]; pState != nil {
-		pState.Active = false
-		pState.Choked = true
-		pState.Interested = false
 		pState.LastAttempt = time.Now()
+		pState.DownloadSpeed = 0
 	}
 }
 
@@ -258,32 +334,47 @@ func (s *Session) claimWebseedPiece() (webseedPiece, bool, bool) {
 	if s.closed || s.paused || s.Storage == nil || s.metadataMode {
 		return webseedPiece{}, false, false
 	}
+	if s.verifying && s.verifyFullScan {
+		return webseedPiece{}, false, false
+	}
 	if s.isCompletedLocked() {
 		return webseedPiece{}, false, true
 	}
+
+	endgame := false
 	bestIdx := s.selectNeededPieceLocked(func(int64) bool { return true })
+	if bestIdx == -1 && s.endgameActiveLocked() {
+		bestIdx = s.selectEndgamePieceLocked(func(int64) bool { return true }, nil)
+		endgame = bestIdx != -1
+	}
 	if bestIdx == -1 {
 		return webseedPiece{}, false, false
 	}
-	s.PieceStates[bestIdx] = PieceDownloading
-	s.removeNeededLocked(bestIdx)
+	if !endgame {
+		s.PieceStates[bestIdx] = PieceDownloading
+		s.removeNeededLocked(bestIdx)
+	}
 	return webseedPiece{
 		index:         int64(bestIdx),
 		hash:          s.Torrent.PieceHashes[bestIdx],
 		length:        s.Storage.PieceLength(int64(bestIdx)),
 		absoluteStart: int64(bestIdx) * s.Storage.PieceLengthValue(),
+		endgame:       endgame,
 	}, true, false
 }
 
-func (s *Session) releaseWebseedPiece(index int64, err error) {
+func (s *Session) releaseWebseedPiece(piece webseedPiece, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
 		s.lastErr = err
 	}
-	if index >= 0 && index < int64(len(s.PieceStates)) && s.PieceStates[index] == PieceDownloading {
-		s.PieceStates[index] = PieceEmpty
-		s.addNeededLocked(int(index))
+	if piece.endgame {
+		return
+	}
+	if piece.index >= 0 && piece.index < int64(len(s.PieceStates)) && s.PieceStates[piece.index] == PieceDownloading {
+		s.PieceStates[piece.index] = PieceEmpty
+		s.addNeededLocked(int(piece.index))
 	}
 }
 
@@ -291,26 +382,36 @@ func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, sp
 	if piece.length < 0 || piece.length > int64(^uint(0)>>1) {
 		return nil, fmt.Errorf("piece %d length is not addressable: %d", piece.index, piece.length)
 	}
+	pieceEnd := piece.absoluteStart + piece.length
+	if pieceEnd < piece.absoluteStart {
+		return nil, fmt.Errorf("piece %d range overflows int64", piece.index)
+	}
+
 	data := make([]byte, int(piece.length))
-	var offset int64
-	for offset < piece.length {
+	var written int64
+	absolute := piece.absoluteStart
+	for absolute < pieceEnd {
 		if s.webseedPaused() {
 			return nil, errWebseedPaused
 		}
-		blockLen := int64(BlockSize)
-		if remaining := piece.length - offset; remaining < blockLen {
-			blockLen = remaining
+		f, ok := spec.fileForOffset(absolute)
+		if !ok {
+			return nil, fmt.Errorf("offset %d is outside webseed file layout", absolute)
 		}
-		block, err := s.fetchWebseedLinearRange(ctx, client, spec, piece.absoluteStart+offset, blockLen)
-		if err != nil {
+		partLen := min(pieceEnd, f.end) - absolute
+		if partLen <= 0 || written+partLen > int64(len(data)) {
+			return nil, fmt.Errorf("invalid webseed range for piece %d", piece.index)
+		}
+
+		dst := data[int(written):int(written+partLen)]
+		if err := s.fetchWebseedHTTPRange(ctx, client, f.url, absolute-f.start, dst); err != nil {
 			return nil, err
 		}
-		copy(data[int(offset):], block)
-		offset += blockLen
 
-		n := int64(len(block))
-		s.Downloaded.Add(n)
-		atomic.AddInt64(&pState.Downloaded, n)
+		absolute += partLen
+		written += partLen
+		s.Downloaded.Add(partLen)
+		atomic.AddInt64(&pState.Downloaded, partLen)
 	}
 	return data, nil
 }
@@ -321,91 +422,129 @@ func (s *Session) webseedPaused() bool {
 	return s.paused || s.closed
 }
 
-func (s *Session) fetchWebseedLinearRange(ctx context.Context, client *http.Client, spec webseedSpec, start, length int64) ([]byte, error) {
-	if length <= 0 {
-		return nil, fmt.Errorf("invalid webseed range length %d", length)
-	}
-	out := make([]byte, 0, int(length))
-	end := start + length
-	for start < end {
-		f, ok := spec.fileForOffset(start)
-		if !ok {
-			return nil, fmt.Errorf("offset %d is outside webseed file layout", start)
-		}
-		partLen := minInt64(end, f.end) - start
-		part, err := s.fetchWebseedHTTPRange(ctx, client, f.url, start-f.start, partLen)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, part...)
-		start += partLen
-	}
-	if int64(len(out)) != length {
-		return nil, fmt.Errorf("assembled webseed range length %d, want %d", len(out), length)
-	}
-	return out, nil
-}
-
 func (spec webseedSpec) fileForOffset(offset int64) (webseedFile, bool) {
-	for _, f := range spec.files {
-		if offset >= f.start && offset < f.end {
-			return f, true
-		}
+	i := sort.Search(len(spec.files), func(i int) bool {
+		return spec.files[i].end > offset
+	})
+	if i < len(spec.files) && offset >= spec.files[i].start && offset < spec.files[i].end {
+		return spec.files[i], true
 	}
 	return webseedFile{}, false
 }
 
-func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client, rawURL string, start, length int64) ([]byte, error) {
-	if length <= 0 || length > int64(^uint(0)>>1) {
-		return nil, fmt.Errorf("invalid HTTP range length %d", length)
+func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client, rawURL string, start int64, dst []byte) error {
+	length := int64(len(dst))
+	if length <= 0 {
+		return fmt.Errorf("invalid HTTP range length %d", length)
 	}
-	refund, err := s.reserveWebseedDownload(ctx, int(length))
+	refund, err := s.reserveWebseedDownload(ctx, len(dst))
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, webseedRequestTimeout)
+	reqCtx, cancel := s.webseedRequestContext(ctx)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		refund()
-		return nil, err
+		return err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, start+length-1))
 
 	resp, err := client.Do(req)
 	if err != nil {
 		refund()
-		return nil, err
+		if s.webseedPaused() {
+			return errWebseedPaused
+		}
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent {
 		refund()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("range GET %s returned %s", rawURL, resp.Status)
+		return fmt.Errorf("range GET %s returned %s", rawURL, resp.Status)
 	}
 	if !contentRangeMatches(resp.Header.Get("Content-Range"), start, length) {
 		refund()
-		return nil, fmt.Errorf("range GET %s returned mismatched Content-Range %q", rawURL, resp.Header.Get("Content-Range"))
+		return fmt.Errorf("range GET %s returned mismatched Content-Range %q", rawURL, resp.Header.Get("Content-Range"))
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, length+1))
+
+	n, err := io.ReadFull(resp.Body, dst)
 	if err != nil {
 		refund()
-		return nil, err
+		if s.webseedPaused() {
+			return errWebseedPaused
+		}
+		return fmt.Errorf("range GET %s returned %d bytes, want %d: %w", rawURL, n, length, err)
 	}
-	if int64(len(body)) != length {
+	var extra [1]byte
+	extraN, extraErr := resp.Body.Read(extra[:])
+	if extraN > 0 {
 		refund()
-		return nil, fmt.Errorf("range GET %s returned %d bytes, want %d", rawURL, len(body), length)
+		return fmt.Errorf("range GET %s returned more than %d bytes", rawURL, length)
 	}
-	return body, nil
+	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
+		refund()
+		if s.webseedPaused() {
+			return errWebseedPaused
+		}
+		return extraErr
+	}
+	return nil
+}
+
+func (s *Session) webseedRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeoutCtx, timeoutCancel := context.WithTimeout(parent, webseedRequestTimeout)
+	ctx, cancel := context.WithCancel(timeoutCtx)
+	pollInterval := webseedPausePollInterval
+	go func() {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.webseedPaused() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		timeoutCancel()
+	}
 }
 
 func (s *Session) reserveWebseedDownload(ctx context.Context, n int) (func(), error) {
-	for {
-		reserved, retryAfter, refund := s.reserveDownloadWithRefund(n)
+	if n <= 0 {
+		return func() {}, nil
+	}
+	var refunds []func()
+	refundAll := func() {
+		for i := len(refunds) - 1; i >= 0; i-- {
+			refunds[i]()
+		}
+	}
+
+	remaining := n
+	for remaining > 0 {
+		if s.webseedPaused() {
+			refundAll()
+			return nil, errWebseedPaused
+		}
+		chunk := min(remaining, BlockSize)
+		reserved, retryAfter, refund := s.reserveDownloadWithRefund(chunk)
 		if reserved {
-			return refund, nil
+			if refund != nil {
+				refunds = append(refunds, refund)
+			}
+			remaining -= chunk
+			continue
 		}
 		if retryAfter <= 0 {
 			retryAfter = 100 * time.Millisecond
@@ -420,9 +559,11 @@ func (s *Session) reserveWebseedDownload(ctx context.Context, n int) (func(), er
 				default:
 				}
 			}
+			refundAll()
 			return nil, ctx.Err()
 		}
 	}
+	return refundAll, nil
 }
 
 func contentRangeMatches(header string, start, length int64) bool {
@@ -454,6 +595,20 @@ func contentRangeMatches(header string, start, length int64) bool {
 
 func (s *Session) waitWebseedIdle() bool {
 	timer := time.NewTimer(webseedIdleDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
+func (s *Session) waitWebseedBackoff(delay time.Duration) bool {
+	if delay <= 0 {
+		delay = webseedRetryBaseDelay
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
