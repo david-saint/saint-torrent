@@ -288,3 +288,61 @@ func TestParsePrivateFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestParseURLListWebSeeds(t *testing.T) {
+	t.Run("single string", func(t *testing.T) {
+		info := map[string]interface{}{
+			"name":         "seeded.iso",
+			"piece length": int64(16),
+			"pieces":       string(make([]byte, 20)),
+			"length":       int64(16),
+		}
+		data, err := bencode.Marshal(map[string]interface{}{
+			"info":     info,
+			"url-list": "  http://seed.example/seeded.iso  ",
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		tor, err := Parse(data)
+		if err != nil {
+			t.Fatalf("Parse() failed: %v", err)
+		}
+		want := []string{"http://seed.example/seeded.iso"}
+		if !reflect.DeepEqual(tor.WebSeeds, want) {
+			t.Fatalf("WebSeeds = %v, want %v", tor.WebSeeds, want)
+		}
+	})
+
+	t.Run("list", func(t *testing.T) {
+		info := map[string]interface{}{
+			"name":         "root",
+			"piece length": int64(16),
+			"pieces":       string(make([]byte, 20)),
+			"files": []interface{}{
+				map[string]interface{}{"length": int64(8), "path": []interface{}{"a.bin"}},
+				map[string]interface{}{"length": int64(8), "path": []interface{}{"b.bin"}},
+			},
+		}
+		data, err := bencode.Marshal(map[string]interface{}{
+			"info": info,
+			"url-list": []interface{}{
+				"http://seed-a.example/base/",
+				"",
+				" https://seed-b.example/base ",
+				int64(12),
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		tor, err := Parse(data)
+		if err != nil {
+			t.Fatalf("Parse() failed: %v", err)
+		}
+		want := []string{"http://seed-a.example/base/", "https://seed-b.example/base"}
+		if !reflect.DeepEqual(tor.WebSeeds, want) {
+			t.Fatalf("WebSeeds = %v, want %v", tor.WebSeeds, want)
+		}
+	})
+}

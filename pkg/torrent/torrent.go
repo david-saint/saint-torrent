@@ -21,6 +21,7 @@ type File struct {
 type Torrent struct {
 	Announce    string
 	Trackers    []string
+	WebSeeds    []string
 	InfoHash    [20]byte
 	PieceLength int64
 	PieceHashes [][20]byte
@@ -62,6 +63,8 @@ func Parse(data []byte) (*Torrent, error) {
 	if len(trackers) == 0 && announce != "" {
 		trackers = []string{announce}
 	}
+
+	webSeeds := getStringList(dict, "url-list")
 
 	// 2. Info Dictionary
 	infoVal, ok := dict["info"]
@@ -207,6 +210,7 @@ func Parse(data []byte) (*Torrent, error) {
 	return &Torrent{
 		Announce:    announce,
 		Trackers:    trackers,
+		WebSeeds:    webSeeds,
 		InfoHash:    infoHash,
 		PieceLength: pieceLength,
 		PieceHashes: pieceHashes,
@@ -240,6 +244,34 @@ func getString(m map[string]interface{}, key string) (string, bool) {
 	}
 	s, ok := v.(string)
 	return s, ok
+}
+
+func getStringList(m map[string]interface{}, key string) []string {
+	v, ok := m[key]
+	if !ok {
+		return nil
+	}
+	add := func(dst []string, s string) []string {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return dst
+		}
+		return append(dst, s)
+	}
+	switch val := v.(type) {
+	case string:
+		return add(nil, val)
+	case []interface{}:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				out = add(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func getInt64(m map[string]interface{}, key string) (int64, bool) {

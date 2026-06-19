@@ -24,7 +24,32 @@ type pieceWriteJob struct {
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
 	// disconnect-on-corruption.
-	conn net.Conn
+	conn   net.Conn
+	result chan<- pieceWriteResult
+}
+
+type pieceWriteStatus int
+
+const (
+	pieceWriteSkipped pieceWriteStatus = iota
+	pieceWriteCompleted
+	pieceWriteHashFailed
+	pieceWriteStorageFailed
+)
+
+type pieceWriteResult struct {
+	status pieceWriteStatus
+	err    error
+}
+
+func (job pieceWriteJob) sendResult(status pieceWriteStatus, err error) {
+	if job.result == nil {
+		return
+	}
+	select {
+	case job.result <- pieceWriteResult{status: status, err: err}:
+	default:
+	}
 }
 
 // pieceWriteQueueDepth bounds how many completed-piece buffers can be queued for the
@@ -73,12 +98,14 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		s.PieceStates[job.index] == PieceCompleted
 	s.mu.RUnlock()
 	if closed || alreadyDone {
+		job.sendResult(pieceWriteSkipped, nil)
 		return
 	}
 
 	if sha1.Sum(job.data) != job.hash {
+		verifyErr := fmt.Errorf("piece %d failed hash verification", job.index)
 		s.mu.Lock()
-		s.lastErr = fmt.Errorf("piece %d failed hash verification", job.index)
+		s.lastErr = verifyErr
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.PieceStates[job.index] = PieceEmpty
 			s.addNeededLocked(int(job.index))
@@ -87,6 +114,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if job.conn != nil {
 			_ = job.conn.Close()
 		}
+		job.sendResult(pieceWriteHashFailed, verifyErr)
 		return
 	}
 
@@ -94,13 +122,16 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	switch {
 	case err == nil:
 		s.markPieceCompleted(job.index)
+		job.sendResult(pieceWriteCompleted, nil)
 	case errors.Is(err, storage.ErrFileRepaired):
 		s.mu.Lock()
 		s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
 		s.mu.Unlock()
 		s.resetProgressAfterStorageRepair(job.index)
+		job.sendResult(pieceWriteCompleted, nil)
 	case errors.Is(err, storage.ErrStorageClosed):
 		// Session is tearing down; nothing to record.
+		job.sendResult(pieceWriteSkipped, err)
 		return
 	default:
 		s.mu.Lock()
@@ -111,6 +142,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			s.addNeededLocked(int(job.index))
 		}
 		s.mu.Unlock()
+		job.sendResult(pieceWriteStorageFailed, err)
 	}
 }
 

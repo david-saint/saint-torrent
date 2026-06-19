@@ -407,6 +407,8 @@ func (s *Session) Start() {
 	s.mu.RLock()
 	hasDHT := s.DHT != nil
 	s.mu.RUnlock()
+	webseeds := s.webseedSpecsForStart()
+	goroutineCount += len(webseeds)
 	if hasDHT {
 		goroutineCount++
 	}
@@ -422,6 +424,10 @@ func (s *Session) Start() {
 	}
 	if hasDHT {
 		go s.dhtLoop()
+	}
+	for _, seed := range webseeds {
+		seed := seed
+		go s.webseedLoop(seed)
 	}
 
 	// Kick off background fast-resume verification (no-op if nothing to verify).
