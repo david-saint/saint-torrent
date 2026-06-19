@@ -341,29 +341,97 @@ func TestScrape_DispatchUDP(t *testing.T) {
 	}
 }
 
+// buildScrapeResponse builds a raw UDP scrape response carrying the given
+// triples (issue #35 tests). Each triple is (seeders, completed, leechers).
+func buildScrapeResponse(triples ...[3]uint32) []byte {
+	data := make([]byte, udpScrapeResponseHeaderSize+len(triples)*udpScrapeStatSize)
+	binary.BigEndian.PutUint32(data[0:4], actionScrape)
+	for i, tr := range triples {
+		off := udpScrapeResponseHeaderSize + i*udpScrapeStatSize
+		binary.BigEndian.PutUint32(data[off:off+4], tr[0])
+		binary.BigEndian.PutUint32(data[off+4:off+8], tr[1])
+		binary.BigEndian.PutUint32(data[off+8:off+12], tr[2])
+	}
+	return data
+}
+
+// TestParseUDPScrapeResponse_FewerTriplesThanHashes verifies the issue #35
+// hardening: a tracker that returns fewer triples than hashes requested breaks
+// the positional correspondence, so the whole response is rejected rather than
+// silently mapping counts to the wrong torrent.
 func TestParseUDPScrapeResponse_FewerTriplesThanHashes(t *testing.T) {
-	// Two hashes requested, but the tracker returns only one triple. The first
-	// hash must be mapped and the second simply absent (tolerated, not an error).
 	h1 := [20]byte{1}
 	h2 := [20]byte{2}
-	data := make([]byte, udpScrapeResponseHeaderSize+udpScrapeStatSize)
-	binary.BigEndian.PutUint32(data[0:4], actionScrape)
-	off := udpScrapeResponseHeaderSize
-	binary.BigEndian.PutUint32(data[off:off+4], 11)    // seeders
-	binary.BigEndian.PutUint32(data[off+4:off+8], 22)  // completed
-	binary.BigEndian.PutUint32(data[off+8:off+12], 33) // leechers
+	data := buildScrapeResponse([3]uint32{11, 22, 33}) // one triple, two hashes
 
-	result, err := parseUDPScrapeResponse(data, [][20]byte{h1, h2})
+	if _, err := parseUDPScrapeResponse(data, [][20]byte{h1, h2}); err == nil {
+		t.Fatal("expected error when triple count is fewer than requested hashes, got nil")
+	}
+}
+
+// TestParseUDPScrapeResponse_MoreTriplesThanHashes verifies that a tracker
+// returning more triples than hashes requested is also rejected: an extra triple
+// shifts every subsequent hash's mapping, so the response cannot be trusted.
+func TestParseUDPScrapeResponse_MoreTriplesThanHashes(t *testing.T) {
+	h1 := [20]byte{1}
+	data := buildScrapeResponse([3]uint32{1, 2, 3}, [3]uint32{4, 5, 6}) // two triples, one hash
+
+	if _, err := parseUDPScrapeResponse(data, [][20]byte{h1}); err == nil {
+		t.Fatal("expected error when triple count exceeds requested hashes, got nil")
+	}
+}
+
+// TestParseUDPScrapeResponse_ExactCountMapsByPosition documents the positional
+// trust assumption: when the tracker returns exactly one triple per requested
+// hash, triples are mapped to hashes strictly in request order. A response that
+// silently reorders triples while preserving the count is indistinguishable on
+// the wire from a correct one, so this ordering is what we (must) trust.
+func TestParseUDPScrapeResponse_ExactCountMapsByPosition(t *testing.T) {
+	h1 := [20]byte{1}
+	h2 := [20]byte{2}
+	h3 := [20]byte{3}
+	data := buildScrapeResponse(
+		[3]uint32{10, 11, 12},
+		[3]uint32{20, 21, 22},
+		[3]uint32{30, 31, 32},
+	)
+
+	result, err := parseUDPScrapeResponse(data, [][20]byte{h1, h2, h3})
 	if err != nil {
-		t.Fatalf("expected fewer triples to be tolerated, got error: %v", err)
+		t.Fatalf("expected exact triple count to parse, got error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 mapped result, got %d", len(result))
+	if len(result) != 3 {
+		t.Fatalf("expected 3 mapped results, got %d", len(result))
 	}
-	if got := result[h1]; got.Complete != 11 || got.Downloaded != 22 || got.Incomplete != 33 {
-		t.Errorf("unexpected stats for first hash: %+v", got)
+	want := map[[20]byte]ScrapeStats{
+		h1: {Complete: 10, Downloaded: 11, Incomplete: 12},
+		h2: {Complete: 20, Downloaded: 21, Incomplete: 22},
+		h3: {Complete: 30, Downloaded: 31, Incomplete: 32},
 	}
-	if _, ok := result[h2]; ok {
-		t.Errorf("did not expect stats for the omitted second hash")
+	for h, w := range want {
+		if got := result[h]; got != w {
+			t.Errorf("hash %v: got %+v, want %+v", h[0], got, w)
+		}
+	}
+}
+
+// TestUDPScrape_WrongTripleCount exercises the full UDP flow against a tracker
+// whose response carries the wrong number of triples (one triple for two
+// requested hashes). UDPScrape must surface this as an error rather than
+// returning a partial, positionally-ambiguous mapping.
+func TestUDPScrape_WrongTripleCount(t *testing.T) {
+	// mockUDPScrapeServer replies with exactly the stats it is given, regardless
+	// of how many hashes the request carried, so a single stat for a two-hash
+	// request produces a count mismatch.
+	addr, cleanup := mockUDPScrapeServer(t, []ScrapeStats{{Complete: 1, Downloaded: 2, Incomplete: 3}})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	hash1 := [20]byte{1, 2, 3, 4}
+	hash2 := [20]byte{5, 6, 7, 8}
+	if _, err := UDPScrape(ctx, "udp://"+addr+"/announce", hash1, hash2); err == nil {
+		t.Fatal("expected error for mismatched triple count, got nil")
 	}
 }

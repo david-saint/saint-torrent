@@ -353,8 +353,13 @@ func parseUDPAnnounceResponse(data []byte) (*TrackerResponse, error) {
 // UDPScrape performs a BEP 15 UDP tracker scrape (action=2) for one or more
 // info hashes. It resolves the host from announceURL, reuses the connect
 // handshake to obtain a connection_id, then sends the scrape request and parses
-// the per-torrent swarm-health counts. The result is keyed by raw info hash, in
-// the same order the tracker returns them (matching the request order).
+// the per-torrent swarm-health counts. The result is keyed by raw info hash.
+//
+// Because a BEP 15 scrape response carries no info-hash identifiers, hashes are
+// matched to triples by position. To keep that mapping safe when batching
+// multiple hashes, the tracker must return exactly one triple per requested hash
+// or the whole response is rejected; see parseUDPScrapeResponse for the full
+// policy.
 //
 // The announceURL should be of the form "udp://host:port/announce". The
 // function respects context cancellation and applies the same exponential
@@ -421,10 +426,24 @@ func udpScrapeRequest(ctx context.Context, conn net.Conn, connectionID uint64, i
 //	[4..8]  transaction_id
 //	[8..]   per-torrent triples: seeders (4), completed (4), leechers (4)
 //
-// The triples correspond, in order, to the info hashes that were requested. A
-// payload that is not a whole number of triples is rejected as malformed, but a
-// response carrying fewer triples than requested is tolerated (a tracker may
-// omit hashes it doesn't know): only the triples actually returned are mapped.
+// Mapping policy (issue #35): a BEP 15 scrape response is a flat sequence of
+// triples that carries no info-hash identifiers, so the only correspondence to
+// the requested hashes is positional — the spec mandates exactly one triple per
+// requested hash, in request order. We therefore map purely by position, but
+// only when the tracker returns a triple count that exactly matches the number
+// of hashes requested. Any other count means the positional correspondence has
+// been broken (a triple was dropped, added, or otherwise shifted), so we reject
+// the whole response rather than risk assigning swarm counts to the wrong
+// torrent. Reordering that preserves the count is undetectable from the wire and
+// is the documented trust assumption of positional mapping.
+//
+// This strictness matters most for multi-hash (batched) scrapes, where a count
+// mismatch would otherwise mis-map counts across torrents. On the single-hash
+// live path the only compliant reply is one triple, which still maps normally;
+// a non-compliant reply with the wrong count is now rejected rather than
+// partially mapped. That is a behavior change only for an over-count reply
+// (formerly the first triple was used), but it is harmless: that tracker's
+// scrape is best-effort and simply ignored by the caller.
 func parseUDPScrapeResponse(data []byte, infoHashes [][20]byte) (map[[20]byte]ScrapeStats, error) {
 	if len(data) < udpScrapeResponseHeaderSize {
 		return nil, fmt.Errorf("scrape response too short: %d bytes", len(data))
@@ -436,11 +455,16 @@ func parseUDPScrapeResponse(data []byte, infoHashes [][20]byte) (map[[20]byte]Sc
 			len(payload), udpScrapeStatSize)
 	}
 
-	// Map only the triples the tracker actually returned, capped at the number
-	// of hashes we asked for (any extra triples are ignored).
-	n := min(len(payload)/udpScrapeStatSize, len(infoHashes))
-	result := make(map[[20]byte]ScrapeStats, n)
-	for i := 0; i < n; i++ {
+	// Positional mapping is only safe when each requested hash has exactly one
+	// triple. Reject any count mismatch instead of mapping by position.
+	triples := len(payload) / udpScrapeStatSize
+	if triples != len(infoHashes) {
+		return nil, fmt.Errorf("scrape response returned %d triples for %d requested info hash(es); "+
+			"positional hash mapping requires an exact match", triples, len(infoHashes))
+	}
+
+	result := make(map[[20]byte]ScrapeStats, triples)
+	for i := 0; i < triples; i++ {
 		offset := i * udpScrapeStatSize
 		result[infoHashes[i]] = ScrapeStats{
 			Complete:   int(binary.BigEndian.Uint32(payload[offset : offset+4])),
