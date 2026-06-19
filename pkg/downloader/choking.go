@@ -154,7 +154,7 @@ func (s *Session) recalculateOptimistic(optimisticPeer *string) {
 	// They must be active, interested in us, and currently choked by us
 	var candidates []string
 	for addr, pState := range s.Peers {
-		if pState.Active && pState.Interested && pState.AmChoking {
+		if pState.Active && pState.Interested && pState.AmChoking && !pState.WebSeed {
 			candidates = append(candidates, addr)
 		}
 	}

@@ -1987,7 +1987,7 @@ func (s *Session) GetActivePeers() []PeerState {
 
 	var list []PeerState
 	for _, p := range s.Peers {
-		if p.Active {
+		if p.Active && !p.WebSeed {
 			// Build the snapshot field-by-field rather than copying *p: the
 			// Downloaded/Uploaded counters are written lock-free on the peer hot
 			// path, so a whole-struct copy would race them (the copy reads those
@@ -2039,7 +2039,7 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 
 	var stats UploadPeerStats
 	for _, p := range s.Peers {
-		if !p.Active {
+		if !p.Active || p.WebSeed {
 			continue
 		}
 		stats.Connected++
