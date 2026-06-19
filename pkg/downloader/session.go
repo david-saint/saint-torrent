@@ -117,13 +117,13 @@ type Session struct {
 	Uploaded    atomic.Int64
 	PieceStates []PieceState
 	// neededPieces is the incrementally-maintained set of pieces that are still
-	// PieceEmpty and wanted (file priority != skip). The picker scans only this set
-	// instead of all pieces on every pick, so selection cost is O(remaining-needed)
-	// — which shrinks toward zero as the download completes — rather than O(total).
-	// It is a hint: the picker re-verifies state==PieceEmpty before claiming, so a
-	// stale entry (e.g. a test mutating PieceStates directly) is harmless. Guarded
-	// by s.mu like PieceStates.
-	neededPieces map[int]struct{}
+	// PieceEmpty and wanted (file priority != skip). neededBuckets indexes the same
+	// set by priority and swarm availability so selection does not scan every needed
+	// piece while holding s.mu. The set is still kept for cheap endgame checks and
+	// tests; stale entries are re-verified before claiming. Guarded by s.mu like
+	// PieceStates.
+	neededPieces  map[int]struct{}
+	neededBuckets neededPieceBuckets
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length

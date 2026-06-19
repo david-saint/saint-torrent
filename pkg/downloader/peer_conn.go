@@ -1090,13 +1090,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if len(activeDownloads) >= pieceCap {
 			return false
 		}
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		for idx := range s.neededPieces {
-			if idx >= 0 && idx < len(s.PieceStates) && s.PieceStates[idx] == PieceEmpty &&
-				canRequestPiece(int64(idx)) && s.isPieceWanted(int64(idx)) {
-				return true
-			}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.hasSelectableNeededPieceLocked(canRequestPiece) {
+			return true
 		}
 		if s.endgameActiveLocked() {
 			for i, state := range s.PieceStates {

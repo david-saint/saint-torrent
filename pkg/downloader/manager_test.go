@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 )
@@ -406,6 +407,92 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	}
 
 	mgr.Close()
+}
+
+func TestPersistenceRestoreTorrentPrioritiesRebuildNeededBuckets(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	if err := os.MkdirAll(filepath.Join(configDir, "torrents"), 0755); err != nil {
+		t.Fatalf("failed to create torrent cache dir: %v", err)
+	}
+
+	pieceData := [][]byte{
+		[]byte("low-priority----"),
+		[]byte("high-priority---"),
+	}
+	var pieces []byte
+	for _, data := range pieceData {
+		hash := sha1.Sum(data)
+		pieces = append(pieces, hash[:]...)
+	}
+	info := map[string]interface{}{
+		"name":         "priority-restore",
+		"piece length": int64(16),
+		"pieces":       pieces,
+		"files": []interface{}{
+			map[string]interface{}{
+				"length": int64(16),
+				"path":   []interface{}{"low.bin"},
+			},
+			map[string]interface{}{
+				"length": int64(16),
+				"path":   []interface{}{"high.bin"},
+			},
+		},
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatalf("failed to encode info dict: %v", err)
+	}
+	infoHash := sha1.Sum(infoBytes)
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	torrentBytes, err := bencode.Marshal(map[string]interface{}{
+		"announce": "http://tracker.org/announce",
+		"info":     info,
+	})
+	if err != nil {
+		t.Fatalf("failed to encode torrent: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "torrents", infoHashHex+".torrent"), torrentBytes, 0644); err != nil {
+		t.Fatalf("failed to write cached torrent: %v", err)
+	}
+
+	state := PersistedState{
+		Version: 1,
+		Torrents: []PersistedTorrent{
+			{
+				InfoHashHex:    infoHashHex,
+				DownloadDir:    tempDir,
+				FilePriorities: []FilePriority{PriorityNormal, PriorityHigh},
+			},
+		},
+	}
+	stateBytes, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("failed to encode persisted state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "session.json"), stateBytes, 0644); err != nil {
+		t.Fatalf("failed to write session.json: %v", err)
+	}
+
+	mgr := NewTorrentManager()
+	_, err = mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatalf("EnablePersistence failed: %v", err)
+	}
+	defer mgr.Close()
+
+	sess := mgr.GetSession(infoHashHex)
+	if sess == nil {
+		t.Fatal("session not restored")
+	}
+	sess.mu.Lock()
+	got := sess.selectNeededPieceLocked(func(int64) bool { return true })
+	sess.mu.Unlock()
+
+	if got != 1 {
+		t.Fatalf("expected restored PriorityHigh file piece 1 to be selected first, got %d", got)
+	}
 }
 
 func TestPersistenceAtomicWriteCorruption(t *testing.T) {

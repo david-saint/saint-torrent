@@ -31,7 +31,9 @@ func TestRarestFirstSelection(t *testing.T) {
 
 	setAvail := func(avail ...int) {
 		sess.mu.Lock()
-		copy(sess.pieceAvailability, avail)
+		for i, a := range avail {
+			sess.setPieceAvailabilityLocked(i, a)
+		}
 		sess.mu.Unlock()
 	}
 	pick := func() int {
@@ -117,6 +119,47 @@ func TestPieceAvailabilityTracking(t *testing.T) {
 	wantAvail(0, 0, 0, 0)
 }
 
+func TestAvailabilityUpdatesMoveNeededBuckets(t *testing.T) {
+	sess := newPieceTestSession(t, 16, threePieces())
+	pick := func() int {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return sess.selectNeededPieceLocked(func(int64) bool { return true })
+	}
+
+	// Initially all pieces are equally available, so lowest index wins.
+	if got := pick(); got != 0 {
+		t.Fatalf("expected initial lowest-index piece 0, got %d", got)
+	}
+
+	// A bitfield for pieces 0 and 2 makes piece 1 rarest, and the bucket index must
+	// reflect that without a full rebuild.
+	sess.applyBitfieldAvailability(nil, []byte{0xA0})
+	if got := pick(); got != 1 {
+		t.Fatalf("expected bitfield update to make piece 1 rarest, got %d", got)
+	}
+
+	// A Have for piece 1 ties availability again, restoring the lowest-index tie
+	// break through another incremental bucket move.
+	sess.addPieceAvailability(1)
+	if got := pick(); got != 0 {
+		t.Fatalf("expected Have update to restore lowest-index piece 0, got %d", got)
+	}
+
+	// Bias piece 0 upward so the disconnect path must move piece 2 into the rarest
+	// bucket; otherwise piece 0 could win by tie-break even if disconnect did nothing.
+	sess.addPieceAvailability(0)
+	if got := pick(); got != 1 {
+		t.Fatalf("expected second Have update to make piece 1 the rarest tie winner, got %d", got)
+	}
+
+	// Removing the bitfield contribution leaves piece 2 uniquely rarest.
+	sess.removePeerAvailability([]byte{0xA0})
+	if got := pick(); got != 2 {
+		t.Fatalf("expected disconnect update to move piece 2 into the rarest bucket, got %d", got)
+	}
+}
+
 // TestApplyBitfieldAvailabilityDelta proves a peer that re-sends or shrinks its
 // advertised bitfield is folded as a delta rather than double-counted.
 func TestApplyBitfieldAvailabilityDelta(t *testing.T) {
@@ -161,7 +204,9 @@ func TestEndgameActiveAndSelection(t *testing.T) {
 		sess.PieceStates[i] = PieceDownloading
 	}
 	sess.recomputeNeededLocked()
-	copy(sess.pieceAvailability, []int{3, 1, 2})
+	for i, availability := range []int{3, 1, 2} {
+		sess.setPieceAvailabilityLocked(i, availability)
+	}
 	if !sess.endgameActiveLocked() {
 		t.Fatal("endgame should be active once all pieces are claimed")
 	}

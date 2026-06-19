@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"crypto/sha1"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ import (
 
 // newPieceTestSession builds a single-file session with numPieces pieces of the
 // given length, backed by real storage in a temp dir.
-func newPieceTestSession(t *testing.T, pieceLen int64, pieces [][]byte) *Session {
+func newPieceTestSession(t testing.TB, pieceLen int64, pieces [][]byte) *Session {
 	t.Helper()
 	dir := t.TempDir()
 	hashes := make([][20]byte, len(pieces))
@@ -282,4 +283,103 @@ func TestSelectNeededPieceSelfHealsStaleEntries(t *testing.T) {
 	if stillThere {
 		t.Fatal("expected the stale needed entry to be pruned during selection")
 	}
+}
+
+func TestSelectNeededPieceUsesAvailabilityBuckets(t *testing.T) {
+	const numPieces = 256
+	pieces := make([][]byte, numPieces)
+	for i := range pieces {
+		pieces[i] = []byte(fmt.Sprintf("piece-%03d-payload", i))
+	}
+	sess := newPieceTestSession(t, int64(len(pieces[0])), pieces)
+
+	sess.mu.Lock()
+	for i := range sess.PieceStates {
+		sess.setPieceAvailabilityLocked(i, 100)
+	}
+	sess.setPieceAvailabilityLocked(numPieces-1, 1)
+	calls := 0
+	got := sess.selectNeededPieceLocked(func(int64) bool {
+		calls++
+		return true
+	})
+	sess.mu.Unlock()
+
+	if got != numPieces-1 {
+		t.Fatalf("expected rarest bucket piece %d, got %d", numPieces-1, got)
+	}
+	if calls != 1 {
+		t.Fatalf("selection checked %d pieces; expected one predicate call from the rarest bucket", calls)
+	}
+
+	sess.mu.Lock()
+	calls = 0
+	got = sess.selectNeededPieceLocked(func(idx int64) bool {
+		calls++
+		return idx != numPieces-1
+	})
+	sess.mu.Unlock()
+
+	if got != 0 {
+		t.Fatalf("expected fall-through to piece 0 when peer lacks rarest piece, got %d", got)
+	}
+	if calls != 2 {
+		t.Fatalf("fall-through checked %d pieces; expected rarest skip plus next-bucket pick", calls)
+	}
+}
+
+func TestHasSelectableNeededPieceRepairsBucketDrift(t *testing.T) {
+	data := []byte("a single-piece torrent payload exactly!!")
+	sess := newPieceTestSession(t, int64(len(data)), [][]byte{data})
+
+	sess.mu.Lock()
+	sess.neededBuckets.total = 0 // simulate derived-index drift
+	got := sess.hasSelectableNeededPieceLocked(func(int64) bool { return true })
+	fresh := sess.neededBucketsFreshLocked()
+	sess.mu.Unlock()
+
+	if !got {
+		t.Fatal("expected selectable work after repairing bucket drift")
+	}
+	if !fresh {
+		t.Fatal("expected bucket index to be fresh after repair")
+	}
+}
+
+func BenchmarkSelectNeededPiecePeerCount(b *testing.B) {
+	for _, peerCount := range []int{50, 1000} {
+		b.Run(fmt.Sprintf("peers_%d", peerCount), func(b *testing.B) {
+			sess := newBenchmarkPickerSession(b, 4096, peerCount)
+			hasAll := func(int64) bool { return true }
+			want := len(sess.PieceStates) - 1
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				sess.mu.Lock()
+				got := sess.selectNeededPieceLocked(hasAll)
+				sess.mu.Unlock()
+				if got != want {
+					b.Fatalf("pick=%d, want %d", got, want)
+				}
+			}
+		})
+	}
+}
+
+func newBenchmarkPickerSession(b *testing.B, numPieces, peerCount int) *Session {
+	b.Helper()
+	const pieceLen = int64(16)
+	pieces := make([][]byte, numPieces)
+	for i := range pieces {
+		pieces[i] = []byte(fmt.Sprintf("%016d", i))
+	}
+	sess := newPieceTestSession(b, pieceLen, pieces)
+
+	sess.mu.Lock()
+	for i := range sess.PieceStates {
+		sess.setPieceAvailabilityLocked(i, peerCount+1+(i%64))
+	}
+	sess.setPieceAvailabilityLocked(len(sess.PieceStates)-1, peerCount)
+	sess.mu.Unlock()
+	return sess
 }
