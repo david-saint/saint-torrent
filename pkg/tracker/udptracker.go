@@ -437,9 +437,13 @@ func udpScrapeRequest(ctx context.Context, conn net.Conn, connectionID uint64, i
 // torrent. Reordering that preserves the count is undetectable from the wire and
 // is the documented trust assumption of positional mapping.
 //
-// This strictness only matters for multi-hash (batched) scrapes. The live path
-// scrapes a single info hash, where a missing triple already surfaces as a
-// scrape failure for that tracker (best-effort, ignored by the caller).
+// This strictness matters most for multi-hash (batched) scrapes, where a count
+// mismatch would otherwise mis-map counts across torrents. On the single-hash
+// live path the only compliant reply is one triple, which still maps normally;
+// a non-compliant reply with the wrong count is now rejected rather than
+// partially mapped. That is a behavior change only for an over-count reply
+// (formerly the first triple was used), but it is harmless: that tracker's
+// scrape is best-effort and simply ignored by the caller.
 func parseUDPScrapeResponse(data []byte, infoHashes [][20]byte) (map[[20]byte]ScrapeStats, error) {
 	if len(data) < udpScrapeResponseHeaderSize {
 		return nil, fmt.Errorf("scrape response too short: %d bytes", len(data))
