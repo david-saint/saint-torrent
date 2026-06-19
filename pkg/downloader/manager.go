@@ -1096,11 +1096,16 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 					}
 					sess.PendingFilePriorities = pending
 				} else {
+					changed := false
 					for i := 0; i < len(sess.FilePriorities) && i < len(entry.FilePriorities); i++ {
 						prio := entry.FilePriorities[i]
-						if prio >= PrioritySkip && prio <= PriorityHigh {
+						if prio >= PrioritySkip && prio <= PriorityHigh && sess.FilePriorities[i] != prio {
 							sess.FilePriorities[i] = prio
+							changed = true
 						}
+					}
+					if changed {
+						sess.recomputeNeededLocked()
 					}
 				}
 				sess.mu.Unlock()
