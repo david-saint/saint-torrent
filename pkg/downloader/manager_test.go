@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -674,7 +675,7 @@ func TestPersistenceFailedRestorePreservation(t *testing.T) {
 	data, _ := json.Marshal(state)
 	_ = os.WriteFile(filepath.Join(configDir, "session.json"), data, 0644)
 
-	_, err := mgr.EnablePersistence(configDir)
+	warning, err := mgr.EnablePersistence(configDir)
 	if err != nil {
 		t.Fatalf("EnablePersistence failed: %v", err)
 	}
@@ -682,6 +683,14 @@ func TestPersistenceFailedRestorePreservation(t *testing.T) {
 	// Verify it was NOT loaded in sessions list
 	if sess := mgr.GetSession(infoHashHex); sess != nil {
 		t.Fatal("expected session to fail loading")
+	}
+
+	// The failure must be surfaced to the user, not swallowed silently.
+	if !strings.Contains(warning, "failed to restore") {
+		t.Errorf("expected restore failure to be surfaced in warning, got %q", warning)
+	}
+	if !strings.Contains(warning, infoHashHex[:12]) {
+		t.Errorf("expected warning to identify the failed torrent %q, got %q", infoHashHex[:12], warning)
 	}
 
 	// Trigger manual save

@@ -982,6 +982,37 @@ func atomicWriteFile(destPath string, data []byte) error {
 	return nil
 }
 
+const (
+	// restoreMaxAttempts bounds how many times a cached .torrent restore is
+	// retried before falling back to the magnet URI / failing. Transient
+	// filesystem errors (Spotlight, cloud-sync, a momentary open failure) are
+	// the motivating case.
+	restoreMaxAttempts = 3
+	// restoreRetryBackoff is the base delay between restore attempts; the Nth
+	// retry waits N*restoreRetryBackoff.
+	restoreRetryBackoff = 100 * time.Millisecond
+)
+
+// restoreDisplayName derives a human-readable name for a persisted torrent that
+// failed to restore, used only for surfacing the failure to the user. It is
+// best-effort: cached .torrent name, then the magnet dn=, then a short hash.
+func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
+	if data, err := os.ReadFile(cachedPath); err == nil {
+		if tor, err := torrent.Parse(data); err == nil && tor.Name != "" {
+			return tor.Name
+		}
+	}
+	if entry.MagnetURI != "" {
+		if mag, err := torrent.ParseMagnet(entry.MagnetURI); err == nil && mag.Name != "" {
+			return mag.Name
+		}
+	}
+	if len(entry.InfoHashHex) >= 12 {
+		return entry.InfoHashHex[:12]
+	}
+	return entry.InfoHashHex
+}
+
 // EnablePersistence initializes the manager state directory and restores previous torrents.
 // It returns a non-fatal warning message (if any recovery was needed) and a fatal error.
 func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
@@ -1029,6 +1060,17 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	m.SetGlobalDownloadLimit(savedState.GlobalDownloadLimit)
 	m.SetGlobalUploadLimit(savedState.GlobalUploadLimit)
 
+	// Collect entries that fail to restore so the failure is surfaced to the
+	// user instead of silently vanishing. The entry is still preserved in
+	// session.json via failedTorrents and retried on the next launch.
+	type restoreFailure struct {
+		entry PersistedTorrent
+		name  string
+		err   error
+	}
+	var restoreFailMu sync.Mutex
+	var restoreFailures []restoreFailure
+
 	restoreOne := func(entry PersistedTorrent) {
 		absoluteDownloadDir, err := filepath.Abs(entry.DownloadDir)
 		if err != nil {
@@ -1039,13 +1081,26 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		var loadErr error
 		cachedPath := filepath.Join(stateDir, "torrents", entry.InfoHashHex+".torrent")
 		if _, statErr := os.Stat(cachedPath); statErr == nil {
-			sess, loadErr = m.AddTorrentFile(cachedPath, absoluteDownloadDir)
+			// Retry transient failures (e.g. a momentary file-open error from
+			// the OS, Spotlight, or a cloud-sync touch) before giving up. Don't
+			// retry deterministic errors: a permission denial (macOS TCC on
+			// ~/Downloads etc.) or a corrupt torrent will never succeed on retry,
+			// so retrying only wastes startup time.
+			for attempt := 1; ; attempt++ {
+				sess, loadErr = m.AddTorrentFile(cachedPath, absoluteDownloadDir)
+				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) {
+					break
+				}
+				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
+			}
 			if loadErr != nil && entry.MagnetURI != "" {
 				// Fallback to MagnetURI if cached torrent failed to parse
-				sess, _ = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
+				sess, loadErr = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
 			}
 		} else if entry.MagnetURI != "" {
-			sess, _ = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
+			sess, loadErr = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
+		} else {
+			loadErr = fmt.Errorf("no cached torrent file or magnet URI available")
 		}
 
 		if sess != nil {
@@ -1115,6 +1170,14 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			m.mu.Lock()
 			m.failedTorrents = append(m.failedTorrents, entry)
 			m.mu.Unlock()
+
+			restoreFailMu.Lock()
+			restoreFailures = append(restoreFailures, restoreFailure{
+				entry: entry,
+				name:  restoreDisplayName(entry, cachedPath),
+				err:   loadErr,
+			})
+			restoreFailMu.Unlock()
 		}
 	}
 
@@ -1161,6 +1224,52 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	}
 	close(entryCh)
 	restoreWG.Wait()
+
+	if len(restoreFailures) > 0 {
+		sort.Slice(restoreFailures, func(i, j int) bool {
+			return restoreFailures[i].name < restoreFailures[j].name
+		})
+
+		details := make([]string, len(restoreFailures))
+		anyPermission := false
+		for i, f := range restoreFailures {
+			if f.err != nil {
+				details[i] = fmt.Sprintf("%s (%v)", f.name, f.err)
+				if errors.Is(f.err, os.ErrPermission) {
+					anyPermission = true
+				}
+			} else {
+				details[i] = f.name
+			}
+		}
+		failMsg := fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
+			len(restoreFailures), strings.Join(details, "; "))
+		if anyPermission {
+			// macOS TCC: the launching app lacks access to the download folder.
+			failMsg += ". Permission denied — grant your terminal app Full Disk Access " +
+				"(System Settings > Privacy & Security), or use a download folder outside " +
+				"~/Downloads, ~/Desktop and ~/Documents."
+		}
+		if warning != "" {
+			warning = warning + "; " + failMsg
+		} else {
+			warning = failMsg
+		}
+
+		// Append the full errors to a durable log so an intermittent failure can
+		// be diagnosed after the fact (the warning banner is transient). Each line
+		// records the exact syscall error, which is what reveals the root cause.
+		if logPath := filepath.Join(stateDir, "restore-failures.log"); logPath != "" {
+			if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+				ts := time.Now().Format(time.RFC3339)
+				for _, f := range restoreFailures {
+					fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
+						ts, f.entry.InfoHashHex, f.entry.DownloadDir, f.name, f.err)
+				}
+				lf.Close()
+			}
+		}
+	}
 
 	// 5. Turn off restoring and save initial state
 	m.mu.Lock()
