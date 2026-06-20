@@ -144,6 +144,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			s.PieceStates[job.index] = PieceEmpty
 			s.addNeededLocked(int(job.index))
 		}
+		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		job.sendResult(pieceWriteStorageFailed, err)
 	}
@@ -297,6 +298,9 @@ func (s *Session) runVerification(ctx context.Context) bool {
 				s.PieceStates[idx] = PieceEmpty
 				s.addNeededLocked(idx)
 			}
+		}
+		if nowCompleted {
+			s.broadcastPieceWaitersLocked()
 		}
 		s.mu.Unlock()
 
@@ -495,6 +499,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	s.removeNeededLocked(int(index))
 	s.lastErr = nil
 	s.statusErr = nil
+	s.broadcastPieceWaitersLocked()
 	// Skip the resume persist if the session is closing so a late piece write (the
 	// async pool is not awaited by Close) cannot recreate a .state file a remove is
 	// deleting — mirroring finishVerify.
@@ -533,6 +538,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	s.recomputeNeededLocked()
 	s.lastErr = nil
 	s.statusErr = nil
+	s.broadcastPieceWaitersLocked()
 	if !s.closed {
 		s.saveStateLocked()
 	}
