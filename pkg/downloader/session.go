@@ -179,7 +179,7 @@ type Session struct {
 	verifyFullScan    bool
 	verifyDone        chan struct{}
 	verifyGateRelease func() // releases this session's global verification slot (once)
-	pieceCond         *sync.Cond
+	pieceWaiters      map[int64]*pieceWaiter
 
 	// Sequential mode biases piece selection toward a read cursor plus a readahead
 	// window. It is opt-in so the default picker remains priority + rarest-first.
@@ -268,7 +268,6 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		outboundSlots:       make(chan struct{}, maxOutboundPeers),
 		inboundSlots:        make(chan struct{}, maxInboundPeers),
 	}
-	sess.pieceCond = sync.NewCond(&sess.mu)
 
 	if !metadataMode {
 		// Cheaply load fast-resume hints (no hashing). Actual hash verification runs in
