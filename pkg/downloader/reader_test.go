@@ -3,6 +3,7 @@ package downloader
 import (
 	"bytes"
 	"crypto/sha1"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -122,5 +123,95 @@ func TestTorrentReaderReadsFileWhileDownloadProgresses(t *testing.T) {
 	}
 	if n != len(at) || !bytes.Equal(at, pieces[2]) {
 		t.Fatalf("ReadAt mismatch: n=%d data=%q", n, at)
+	}
+}
+
+// TestReaderReturnsCompletedPieceDespiteStatusErr proves a verified, on-disk piece
+// is still readable even when a non-fatal session error (such as a fast-resume
+// persistence failure) has been recorded in statusErr.
+func TestReaderReturnsCompletedPieceDespiteStatusErr(t *testing.T) {
+	pieces := threePieces()
+	sess := newPieceTestSession(t, int64(len(pieces[0])), pieces)
+
+	sess.processCompletedPiece(pieceWriteJob{index: 0, hash: sha1.Sum(pieces[0]), data: pieces[0]})
+
+	sess.mu.Lock()
+	sess.statusErr = errors.New("failed to save fast-resume state")
+	sess.mu.Unlock()
+
+	reader, err := sess.NewReader(ReaderOptions{Length: int64(len(pieces[0]))})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer reader.Close()
+
+	buf := make([]byte, len(pieces[0]))
+	n, err := reader.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt returned error for a verified piece despite statusErr: %v", err)
+	}
+	if n != len(buf) || !bytes.Equal(buf, pieces[0]) {
+		t.Fatalf("ReadAt mismatch: n=%d data=%q", n, buf)
+	}
+}
+
+// TestReaderFailsFastOnDeprioritizedFile proves a reader over a skipped file returns
+// an error promptly instead of blocking forever on a piece that will never download.
+func TestReaderFailsFastOnDeprioritizedFile(t *testing.T) {
+	pieces := threePieces()
+	sess := newPieceTestSession(t, int64(len(pieces[0])), pieces)
+
+	sess.mu.Lock()
+	sess.FilePriorities = []FilePriority{PrioritySkip}
+	sess.mu.Unlock()
+
+	reader, err := sess.NewFileReader(0, ReaderOptions{})
+	if err != nil {
+		t.Fatalf("NewFileReader: %v", err)
+	}
+	defer reader.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, readErr := reader.Read(make([]byte, len(pieces[0])))
+		done <- readErr
+	}()
+
+	select {
+	case readErr := <-done:
+		if readErr == nil {
+			t.Fatal("expected an error reading a deprioritized file, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader hung on a deprioritized file instead of failing fast")
+	}
+}
+
+// TestSequentialModeClearedAfterLastReaderCloses proves the sequential picker bias a
+// reader turns on is turned back off once the last reader closes, so a transient
+// stream does not permanently skew piece selection.
+func TestSequentialModeClearedAfterLastReaderCloses(t *testing.T) {
+	pieces := threePieces()
+	sess := newPieceTestSession(t, int64(len(pieces[0])), pieces)
+	for i, p := range pieces {
+		sess.processCompletedPiece(pieceWriteJob{index: int64(i), hash: sha1.Sum(p), data: p})
+	}
+
+	reader, err := sess.NewFileReader(0, ReaderOptions{ReadaheadPieces: 2})
+	if err != nil {
+		t.Fatalf("NewFileReader: %v", err)
+	}
+	if _, err := io.ReadAll(reader); err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if enabled, _, _ := sess.SequentialMode(); !enabled {
+		t.Fatal("expected sequential mode enabled after a streaming read")
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if enabled, _, _ := sess.SequentialMode(); enabled {
+		t.Fatal("expected sequential mode disabled after the last reader closed")
 	}
 }

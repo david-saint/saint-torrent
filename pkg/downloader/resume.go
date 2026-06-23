@@ -395,6 +395,9 @@ func (s *Session) saveStateLocked() {
 		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
 		s.lastErr = stateErr
 		s.statusErr = stateErr
+		// Wake any blocked readers so they observe the new statusErr rather than
+		// sleeping until the next unrelated state change.
+		s.broadcastPieceWaitersLocked()
 	}
 }
 

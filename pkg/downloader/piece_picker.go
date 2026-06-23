@@ -661,6 +661,16 @@ func (s *Session) blocksInPiece(pieceIndex int64) int64 {
 	return (length + BlockSize - 1) / BlockSize
 }
 
+// fileStartOffsetLocked returns the byte offset of file fileIndex within the
+// concatenated torrent. Caller holds s.mu (read or write).
+func (s *Session) fileStartOffsetLocked(fileIndex int) int64 {
+	var start int64
+	for i := 0; i < fileIndex && i < len(s.Torrent.Files); i++ {
+		start += s.Torrent.Files[i].Length
+	}
+	return start
+}
+
 // isPieceWanted checks if a piece should be downloaded based on file selection.
 func (s *Session) isPieceWanted(pieceIndex int64) bool {
 	// If no file priorities set, all pieces are wanted

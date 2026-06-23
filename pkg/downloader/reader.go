@@ -45,8 +45,8 @@ var (
 
 // NewReader returns a verified reader over the configured torrent byte range.
 func (s *Session) NewReader(opts ReaderOptions) (*TorrentReader, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.Storage == nil {
 		return nil, fmt.Errorf("torrent storage is not available")
 	}
@@ -61,6 +61,9 @@ func (s *Session) NewReader(opts ReaderOptions) (*TorrentReader, error) {
 	if length <= 0 || length > total-opts.Offset {
 		length = total - opts.Offset
 	}
+	// Track live readers so sequential mode can be turned back off once the last
+	// reader closes, instead of leaving the picker biased forever (see Close).
+	s.sequentialReaders++
 	return &TorrentReader{
 		sess:            s,
 		base:            opts.Offset,
@@ -85,10 +88,7 @@ func (s *Session) NewFileReader(fileIndex int, opts ReaderOptions) (*TorrentRead
 		s.mu.RUnlock()
 		return nil, fmt.Errorf("file index %d out of range", fileIndex)
 	}
-	var fileStart int64
-	for i := 0; i < fileIndex; i++ {
-		fileStart += s.Torrent.Files[i].Length
-	}
+	fileStart := s.fileStartOffsetLocked(fileIndex)
 	fileLen := s.Torrent.Files[fileIndex].Length
 	s.mu.RUnlock()
 
@@ -221,6 +221,15 @@ func (r *TorrentReader) Seek(offset int64, whence int) (int64, error) {
 func (r *TorrentReader) Close() error {
 	if r.closed.CompareAndSwap(false, true) {
 		r.sess.mu.Lock()
+		// Once the last reader goes away, drop the sequential bias so the picker
+		// returns to its default priority + rarest-first strategy rather than
+		// streaming forever from a stale cursor.
+		if r.sess.sequentialReaders > 0 {
+			r.sess.sequentialReaders--
+		}
+		if r.sess.sequentialReaders == 0 {
+			r.sess.sequentialMode = false
+		}
 		r.sess.broadcastPieceWaitersLocked()
 		r.sess.mu.Unlock()
 	}
@@ -268,17 +277,25 @@ func (r *TorrentReader) waitForPiece(pieceIndex int64) error {
 		if r.closed.Load() {
 			return ErrReaderClosed
 		}
+		if pieceIndex < 0 || pieceIndex >= int64(len(r.sess.PieceStates)) {
+			return io.EOF
+		}
+		// A verified piece is on disk and readable regardless of any session-level
+		// error (e.g. a non-fatal fast-resume persistence failure), so return its
+		// data before surfacing statusErr.
+		if r.sess.PieceStates[pieceIndex] == PieceCompleted {
+			return nil
+		}
 		if r.sess.closed {
 			return storage.ErrStorageClosed
 		}
 		if r.sess.statusErr != nil {
 			return r.sess.statusErr
 		}
-		if pieceIndex < 0 || pieceIndex >= int64(len(r.sess.PieceStates)) {
-			return io.EOF
-		}
-		if r.sess.PieceStates[pieceIndex] == PieceCompleted {
-			return nil
+		// A piece that belongs only to deprioritized (skipped) files will never be
+		// downloaded, so blocking would hang forever; fail fast instead.
+		if !r.sess.isPieceWanted(pieceIndex) {
+			return fmt.Errorf("piece %d will not be downloaded: file is deprioritized", pieceIndex)
 		}
 		cond.Wait()
 	}
