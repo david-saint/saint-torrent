@@ -181,17 +181,15 @@ type Session struct {
 	verifyGateRelease func() // releases this session's global verification slot (once)
 	pieceCond         *sync.Cond
 
-	// Sequential mode biases piece selection toward a read cursor plus a readahead
-	// window. It is opt-in so the default picker remains priority + rarest-first.
-	// sequentialReaders counts live TorrentReaders so the bias is dropped once the
-	// last one closes. The cursor is a single session-wide window, so it is tuned
-	// for one active stream at a time; concurrent readers over disjoint ranges
-	// still read correctly (the picker falls back to rarest-first) but contend for
-	// the readahead window.
+	// Sequential mode biases piece selection toward one or more read cursors plus
+	// readahead windows. SetSequentialMode owns the session-wide window; live
+	// TorrentReaders register their own current windows so concurrent streams do
+	// not overwrite each other's readahead.
 	sequentialMode            bool
 	sequentialStartPiece      int64
 	sequentialReadaheadPieces int
-	sequentialReaders         int
+	sequentialReaderWindows   map[int64]sequentialReadWindow
+	nextSequentialReaderID    int64
 
 	OnStateChange         func()
 	MagnetURI             string
