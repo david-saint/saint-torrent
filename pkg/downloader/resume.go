@@ -300,7 +300,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 			}
 		}
 		if nowCompleted {
-			s.broadcastPieceWaitersLocked()
+			s.signalPieceWaitersLocked(int64(idx))
 		}
 		s.mu.Unlock()
 
@@ -502,7 +502,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	s.removeNeededLocked(int(index))
 	s.lastErr = nil
 	s.statusErr = nil
-	s.broadcastPieceWaitersLocked()
+	s.signalPieceWaitersLocked(index)
 	// Skip the resume persist if the session is closing so a late piece write (the
 	// async pool is not awaited by Close) cannot recreate a .state file a remove is
 	// deleting — mirroring finishVerify.
@@ -541,7 +541,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	s.recomputeNeededLocked()
 	s.lastErr = nil
 	s.statusErr = nil
-	s.broadcastPieceWaitersLocked()
+	s.signalPieceWaitersLocked(index)
 	if !s.closed {
 		s.saveStateLocked()
 	}

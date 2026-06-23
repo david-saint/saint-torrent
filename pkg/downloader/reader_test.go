@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -364,6 +365,185 @@ func TestTorrentReaderReadsFileWhileDownloadProgresses(t *testing.T) {
 	}
 }
 
+func TestPieceCompletionWakesOnlyWaitersForCompletedPiece(t *testing.T) {
+	pieces := threePieces()
+	pieceLen := int64(len(pieces[0]))
+	sess := newPieceTestSession(t, pieceLen, pieces)
+
+	reader0, err := sess.NewReader(ReaderOptions{Offset: 0, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader piece 0: %v", err)
+	}
+	defer reader0.Close()
+
+	reader1, err := sess.NewReader(ReaderOptions{Offset: pieceLen, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader piece 1: %v", err)
+	}
+	defer reader1.Close()
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	done0 := make(chan readResult, 1)
+	done1 := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, len(pieces[0]))
+		_, err := io.ReadFull(reader0, buf)
+		done0 <- readResult{data: buf, err: err}
+	}()
+	go func() {
+		buf := make([]byte, len(pieces[1]))
+		_, err := io.ReadFull(reader1, buf)
+		done1 <- readResult{data: buf, err: err}
+	}()
+
+	ch0 := waitForPieceWaiter(t, sess, 0)
+	ch1 := waitForPieceWaiter(t, sess, 1)
+
+	sess.processCompletedPiece(pieceWriteJob{
+		index: 0,
+		hash:  sha1.Sum(pieces[0]),
+		data:  pieces[0],
+	})
+
+	select {
+	case <-ch0:
+	case <-time.After(time.Second):
+		t.Fatal("piece 0 waiter was not signaled")
+	}
+	select {
+	case <-ch1:
+		t.Fatal("piece 1 waiter was signaled by piece 0 completion")
+	default:
+	}
+
+	select {
+	case res := <-done0:
+		if res.err != nil {
+			t.Fatalf("piece 0 read failed: %v", res.err)
+		}
+		if !bytes.Equal(res.data, pieces[0]) {
+			t.Fatalf("piece 0 data mismatch: got %q want %q", res.data, pieces[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader for completed piece 0 did not finish")
+	}
+	select {
+	case res := <-done1:
+		t.Fatalf("reader for incomplete piece 1 finished early: data=%q err=%v", res.data, res.err)
+	default:
+	}
+
+	sess.processCompletedPiece(pieceWriteJob{
+		index: 1,
+		hash:  sha1.Sum(pieces[1]),
+		data:  pieces[1],
+	})
+	select {
+	case res := <-done1:
+		if res.err != nil {
+			t.Fatalf("piece 1 read failed: %v", res.err)
+		}
+		if !bytes.Equal(res.data, pieces[1]) {
+			t.Fatalf("piece 1 data mismatch: got %q want %q", res.data, pieces[1])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader for completed piece 1 did not finish")
+	}
+}
+
+func TestPieceCompletionWakesAllWaitersForSamePiece(t *testing.T) {
+	pieces := threePieces()
+	pieceLen := int64(len(pieces[0]))
+	sess := newPieceTestSession(t, pieceLen, pieces)
+
+	readerA, err := sess.NewReader(ReaderOptions{Offset: 0, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader A: %v", err)
+	}
+	defer readerA.Close()
+
+	readerB, err := sess.NewReader(ReaderOptions{Offset: 0, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader B: %v", err)
+	}
+	defer readerB.Close()
+
+	doneA := make(chan error, 1)
+	doneB := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(readerA)
+		doneA <- err
+	}()
+	go func() {
+		_, err := io.ReadAll(readerB)
+		doneB <- err
+	}()
+
+	_ = waitForPieceWaiters(t, sess, 0, 2)
+	sess.processCompletedPiece(pieceWriteJob{
+		index: 0,
+		hash:  sha1.Sum(pieces[0]),
+		data:  pieces[0],
+	})
+
+	for name, done := range map[string]<-chan error{"reader A": doneA, "reader B": doneB} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s read failed: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not finish after piece completion", name)
+		}
+	}
+}
+
+// TestDeprioritizingFileWakesBlockedReader proves that setting a file to PrioritySkip
+// wakes a reader already blocked on one of its pieces, so it returns the deprioritized
+// error promptly instead of sleeping forever. Per-piece completion signals never fire
+// for a piece that will no longer be downloaded, so the priority change must wake the
+// reader itself (a regression guard for the per-piece wakeup scheme).
+func TestDeprioritizingFileWakesBlockedReader(t *testing.T) {
+	pieces := threePieces()
+	pieceLen := int64(len(pieces[0]))
+	sess := newPieceTestSession(t, pieceLen, pieces)
+
+	reader, err := sess.NewReader(ReaderOptions{Offset: 0, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer reader.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(pieces[0]))
+		_, err := io.ReadFull(reader, buf)
+		done <- err
+	}()
+
+	// Block on piece 0's waiter channel before changing priority, so we exercise the
+	// wakeup path rather than the subscribe-time fast-fail in waitForPiece.
+	_ = waitForPieceWaiter(t, sess, 0)
+
+	// The single test file spans every piece, so skipping it makes piece 0 unwanted.
+	sess.SetFilePriority(0, PrioritySkip)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after the file was deprioritized, got nil")
+		}
+		if !strings.Contains(err.Error(), "deprioritized") {
+			t.Fatalf("expected a deprioritized error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader blocked on a deprioritized piece was not woken after SetFilePriority")
+	}
+}
+
 // TestReaderReturnsCompletedPieceDespiteStatusErr proves a verified, on-disk piece
 // is still readable even when a non-fatal session error (such as a fast-resume
 // persistence failure) has been recorded in statusErr.
@@ -456,5 +636,35 @@ func TestReaderWindowClearedAfterLastReaderCloses(t *testing.T) {
 	sess.mu.Unlock()
 	if readerWindows != 0 {
 		t.Fatalf("expected reader windows cleared after close, got %d", readerWindows)
+	}
+}
+
+func waitForPieceWaiter(t *testing.T, sess *Session, pieceIndex int64) <-chan struct{} {
+	t.Helper()
+	return waitForPieceWaiters(t, sess, pieceIndex, 1)
+}
+
+func waitForPieceWaiters(t *testing.T, sess *Session, pieceIndex int64, want int) <-chan struct{} {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		sess.mu.Lock()
+		waiter := sess.pieceWaiters[pieceIndex]
+		if waiter != nil && waiter.waiters >= want {
+			ch := waiter.ch
+			sess.mu.Unlock()
+			return ch
+		}
+		sess.mu.Unlock()
+
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for %d waiter(s) on piece %d", want, pieceIndex)
+		case <-ticker.C:
+		}
 	}
 }

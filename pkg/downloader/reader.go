@@ -30,11 +30,17 @@ type TorrentReader struct {
 	base            int64
 	length          int64
 	readaheadPieces int
+	closeCh         chan struct{}
 	sequentialID    int64
 
 	mu     sync.Mutex
 	offset int64
 	closed atomic.Bool
+}
+
+type pieceWaiter struct {
+	ch      chan struct{}
+	waiters int
 }
 
 var (
@@ -69,6 +75,7 @@ func (s *Session) NewReader(opts ReaderOptions) (*TorrentReader, error) {
 		base:            opts.Offset,
 		length:          length,
 		readaheadPieces: normalizeSequentialReadaheadPieces(opts.ReadaheadPieces),
+		closeCh:         make(chan struct{}),
 		sequentialID:    sequentialID,
 	}, nil
 }
@@ -221,13 +228,13 @@ func (r *TorrentReader) Seek(offset int64, whence int) (int64, error) {
 
 func (r *TorrentReader) Close() error {
 	if r.closed.CompareAndSwap(false, true) {
+		close(r.closeCh)
 		r.sess.mu.Lock()
 		// Drop only this reader's sequential window so remaining readers keep their
 		// own readahead and stale ranges do not keep biasing the picker after close.
 		if r.sess.sequentialReaderWindows != nil {
 			delete(r.sess.sequentialReaderWindows, r.sequentialID)
 		}
-		r.sess.broadcastPieceWaitersLocked()
 		r.sess.mu.Unlock()
 	}
 	return nil
@@ -282,7 +289,6 @@ func (r *TorrentReader) chunkFor(globalOffset int64, maxLen int) (storage.Storag
 func (r *TorrentReader) waitForPiece(pieceIndex int64) error {
 	r.sess.mu.Lock()
 	defer r.sess.mu.Unlock()
-	cond := r.sess.ensurePieceCondLocked()
 	for {
 		if r.closed.Load() {
 			return ErrReaderClosed
@@ -307,19 +313,55 @@ func (r *TorrentReader) waitForPiece(pieceIndex int64) error {
 		if !r.sess.isPieceWanted(pieceIndex) {
 			return fmt.Errorf("piece %d will not be downloaded: file is deprioritized", pieceIndex)
 		}
-		cond.Wait()
+
+		waiter := r.sess.addPieceWaiterLocked(pieceIndex)
+		wakeCh := waiter.ch
+		r.sess.mu.Unlock()
+
+		select {
+		case <-wakeCh:
+		case <-r.closeCh:
+		}
+
+		r.sess.mu.Lock()
+		r.sess.removePieceWaiterLocked(pieceIndex, waiter)
 	}
 }
 
-func (s *Session) ensurePieceCondLocked() *sync.Cond {
-	if s.pieceCond == nil {
-		s.pieceCond = sync.NewCond(&s.mu)
+func (s *Session) addPieceWaiterLocked(pieceIndex int64) *pieceWaiter {
+	if s.pieceWaiters == nil {
+		s.pieceWaiters = make(map[int64]*pieceWaiter)
 	}
-	return s.pieceCond
+	waiter := s.pieceWaiters[pieceIndex]
+	if waiter == nil {
+		waiter = &pieceWaiter{ch: make(chan struct{})}
+		s.pieceWaiters[pieceIndex] = waiter
+	}
+	waiter.waiters++
+	return waiter
+}
+
+func (s *Session) removePieceWaiterLocked(pieceIndex int64, waiter *pieceWaiter) {
+	if waiter.waiters > 0 {
+		waiter.waiters--
+	}
+	if waiter.waiters == 0 && s.pieceWaiters[pieceIndex] == waiter {
+		delete(s.pieceWaiters, pieceIndex)
+	}
+}
+
+func (s *Session) signalPieceWaitersLocked(pieceIndex int64) {
+	waiter := s.pieceWaiters[pieceIndex]
+	if waiter == nil {
+		return
+	}
+	close(waiter.ch)
+	waiter.ch = make(chan struct{})
 }
 
 func (s *Session) broadcastPieceWaitersLocked() {
-	if s.pieceCond != nil {
-		s.pieceCond.Broadcast()
+	for _, waiter := range s.pieceWaiters {
+		close(waiter.ch)
+		waiter.ch = make(chan struct{})
 	}
 }
