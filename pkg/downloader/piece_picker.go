@@ -7,6 +7,10 @@ import (
 
 const neededBucketPriorities = int(PriorityHigh) + 1
 
+// DefaultSequentialReadaheadPieces is the number of pieces prioritized ahead of a
+// sequential read cursor when callers opt in without specifying a larger window.
+const DefaultSequentialReadaheadPieces = 8
+
 type intMinHeap []int
 
 func (h intMinHeap) Len() int { return len(h) }
@@ -358,6 +362,9 @@ func (s *Session) neededCandidateLocked(idx int) bool {
 // in-line and never selected. Caller holds s.mu.
 func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) int {
 	s.ensureNeededBucketsLocked()
+	if bestIdx := s.selectSequentialNeededPieceLocked(hasPiece); bestIdx != -1 {
+		return bestIdx
+	}
 	bestIdx, dropped := s.neededBuckets.firstMatch(func(i int) neededBucketMatch {
 		if !s.neededCandidateLocked(i) {
 			return neededBucketDrop
@@ -371,6 +378,110 @@ func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) 
 		delete(s.neededPieces, idx)
 	}
 	return bestIdx
+}
+
+func normalizeSequentialReadaheadPieces(n int) int {
+	if n <= 0 {
+		return DefaultSequentialReadaheadPieces
+	}
+	return n
+}
+
+// SetSequentialMode enables or disables sequential piece selection. When enabled,
+// the picker first tries PieceEmpty wanted pieces in [startPiece,
+// startPiece+readaheadPieces), ordered by piece index. If no candidate in that
+// window is available from a peer, selection falls back to the normal priority +
+// rarest-first strategy so bandwidth is not left idle.
+func (s *Session) SetSequentialMode(enabled bool, startPiece int64, readaheadPieces int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sequentialMode = enabled
+	if startPiece < 0 {
+		startPiece = 0
+	}
+	s.sequentialStartPiece = startPiece
+	s.sequentialReadaheadPieces = normalizeSequentialReadaheadPieces(readaheadPieces)
+}
+
+// SequentialMode returns the current sequential picker configuration.
+func (s *Session) SequentialMode() (enabled bool, startPiece int64, readaheadPieces int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sequentialMode, s.sequentialStartPiece, s.sequentialReadaheadPieces
+}
+
+// prioritizeSequentialReadLocked points sequential mode at a byte range that a
+// stream reader is about to need. Caller holds s.mu.
+func (s *Session) prioritizeSequentialReadLocked(offset, length int64, readaheadPieces int) {
+	if s.Storage == nil || len(s.PieceStates) == 0 || offset < 0 {
+		return
+	}
+	pieceLength := s.Storage.PieceLengthValue()
+	if pieceLength <= 0 {
+		return
+	}
+	startPiece := offset / pieceLength
+	if startPiece >= int64(len(s.PieceStates)) {
+		startPiece = int64(len(s.PieceStates) - 1)
+	}
+	window := normalizeSequentialReadaheadPieces(readaheadPieces)
+	if length > 0 {
+		lastByte := offset + length - 1
+		if lastByte < offset {
+			lastByte = offset
+		}
+		endPiece := lastByte / pieceLength
+		span := int(endPiece - startPiece + 1)
+		if span > window {
+			window = span
+		}
+	}
+	s.sequentialMode = true
+	s.sequentialStartPiece = startPiece
+	s.sequentialReadaheadPieces = window
+}
+
+func (s *Session) selectSequentialNeededPieceLocked(hasPiece func(pieceIndex int64) bool) int {
+	if !s.sequentialMode || s.Storage == nil || len(s.PieceStates) == 0 {
+		return -1
+	}
+	start := int(s.sequentialStartPiece)
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(s.PieceStates) {
+		return -1
+	}
+
+	for start < len(s.PieceStates) {
+		state := s.PieceStates[start]
+		if state != PieceCompleted && s.isPieceWanted(int64(start)) {
+			break
+		}
+		start++
+	}
+	s.sequentialStartPiece = int64(start)
+	if start >= len(s.PieceStates) {
+		return -1
+	}
+
+	end := start + normalizeSequentialReadaheadPieces(s.sequentialReadaheadPieces)
+	if end > len(s.PieceStates) {
+		end = len(s.PieceStates)
+	}
+	for i := start; i < end; i++ {
+		if _, needed := s.neededPieces[i]; !needed {
+			continue
+		}
+		if !s.neededCandidateLocked(i) {
+			s.removeNeededLocked(i)
+			continue
+		}
+		if hasPiece(int64(i)) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *Session) hasSelectableNeededPieceLocked(hasPiece func(pieceIndex int64) bool) bool {
@@ -548,6 +659,16 @@ func (s *Session) blocksInPiece(pieceIndex int64) int64 {
 	}
 	length := s.Storage.PieceLength(pieceIndex)
 	return (length + BlockSize - 1) / BlockSize
+}
+
+// fileStartOffsetLocked returns the byte offset of file fileIndex within the
+// concatenated torrent. Caller holds s.mu (read or write).
+func (s *Session) fileStartOffsetLocked(fileIndex int) int64 {
+	var start int64
+	for i := 0; i < fileIndex && i < len(s.Torrent.Files); i++ {
+		start += s.Torrent.Files[i].Length
+	}
+	return start
 }
 
 // isPieceWanted checks if a piece should be downloaded based on file selection.

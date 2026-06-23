@@ -179,6 +179,19 @@ type Session struct {
 	verifyFullScan    bool
 	verifyDone        chan struct{}
 	verifyGateRelease func() // releases this session's global verification slot (once)
+	pieceCond         *sync.Cond
+
+	// Sequential mode biases piece selection toward a read cursor plus a readahead
+	// window. It is opt-in so the default picker remains priority + rarest-first.
+	// sequentialReaders counts live TorrentReaders so the bias is dropped once the
+	// last one closes. The cursor is a single session-wide window, so it is tuned
+	// for one active stream at a time; concurrent readers over disjoint ranges
+	// still read correctly (the picker falls back to rarest-first) but contend for
+	// the readahead window.
+	sequentialMode            bool
+	sequentialStartPiece      int64
+	sequentialReadaheadPieces int
+	sequentialReaders         int
 
 	OnStateChange         func()
 	MagnetURI             string
@@ -255,6 +268,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		outboundSlots:       make(chan struct{}, maxOutboundPeers),
 		inboundSlots:        make(chan struct{}, maxInboundPeers),
 	}
+	sess.pieceCond = sync.NewCond(&sess.mu)
 
 	if !metadataMode {
 		// Cheaply load fast-resume hints (no hashing). Actual hash verification runs in
@@ -475,6 +489,7 @@ func (s *Session) Close() {
 		for _, client := range s.activePeers {
 			_ = client.Conn.Close()
 		}
+		s.broadcastPieceWaitersLocked()
 		if s.chokeTimer != nil {
 			s.chokeTimer.Stop()
 		}
@@ -1044,6 +1059,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		statusErr := fmt.Errorf("failed to initialize storage: %w", err)
 		s.lastErr = statusErr
 		s.statusErr = statusErr
+		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return statusErr
 	}
