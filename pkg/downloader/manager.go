@@ -1160,7 +1160,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 						}
 					}
 					if changed {
-						sess.recomputeNeededLocked()
+						sess.onFilePriorityChangedLocked()
 					}
 				}
 				sess.mu.Unlock()

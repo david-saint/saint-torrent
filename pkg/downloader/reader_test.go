@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -259,6 +260,49 @@ func TestPieceCompletionWakesAllWaitersForSamePiece(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("%s did not finish after piece completion", name)
 		}
+	}
+}
+
+// TestDeprioritizingFileWakesBlockedReader proves that setting a file to PrioritySkip
+// wakes a reader already blocked on one of its pieces, so it returns the deprioritized
+// error promptly instead of sleeping forever. Per-piece completion signals never fire
+// for a piece that will no longer be downloaded, so the priority change must wake the
+// reader itself (a regression guard for the per-piece wakeup scheme).
+func TestDeprioritizingFileWakesBlockedReader(t *testing.T) {
+	pieces := threePieces()
+	pieceLen := int64(len(pieces[0]))
+	sess := newPieceTestSession(t, pieceLen, pieces)
+
+	reader, err := sess.NewReader(ReaderOptions{Offset: 0, Length: pieceLen})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	defer reader.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, len(pieces[0]))
+		_, err := io.ReadFull(reader, buf)
+		done <- err
+	}()
+
+	// Block on piece 0's waiter channel before changing priority, so we exercise the
+	// wakeup path rather than the subscribe-time fast-fail in waitForPiece.
+	_ = waitForPieceWaiter(t, sess, 0)
+
+	// The single test file spans every piece, so skipping it makes piece 0 unwanted.
+	sess.SetFilePriority(0, PrioritySkip)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after the file was deprioritized, got nil")
+		}
+		if !strings.Contains(err.Error(), "deprioritized") {
+			t.Fatalf("expected a deprioritized error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader blocked on a deprioritized piece was not woken after SetFilePriority")
 	}
 }
 

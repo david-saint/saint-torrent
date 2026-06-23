@@ -869,8 +869,9 @@ func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 			s.FilePriorities[fileIndex] = priority
 			changed = true
 			// Wanted-ness of the pieces overlapping this file may have flipped, so
-			// rebuild the needed set (rare, user-initiated — O(pieces) is fine here).
-			s.recomputeNeededLocked()
+			// rebuild the needed set and wake any blocked readers (rare, user-initiated
+			// — O(pieces) is fine here).
+			s.onFilePriorityChangedLocked()
 		}
 	}
 	s.mu.Unlock()
@@ -878,6 +879,18 @@ func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 	if changed && s.OnStateChange != nil {
 		s.OnStateChange()
 	}
+}
+
+// onFilePriorityChangedLocked rebuilds the needed-piece set after a file-priority change
+// and wakes readers blocked in waitForPiece. A reader parked on a piece that just became
+// unwanted (its only overlapping files were set to PrioritySkip) would otherwise sleep
+// until the session or reader is closed: per-piece completion signals never fire for a
+// piece that will no longer be downloaded. Broadcasting lets such a reader re-evaluate
+// isPieceWanted and return the "will not be downloaded" error; readers still waiting on
+// wanted pieces harmlessly re-check and resume waiting. Caller holds s.mu.
+func (s *Session) onFilePriorityChangedLocked() {
+	s.recomputeNeededLocked()
+	s.broadcastPieceWaitersLocked()
 }
 
 // GetFilePriorities returns a copy of the current file priorities.
