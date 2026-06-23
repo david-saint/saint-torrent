@@ -11,6 +11,20 @@ const neededBucketPriorities = int(PriorityHigh) + 1
 // sequential read cursor when callers opt in without specifying a larger window.
 const DefaultSequentialReadaheadPieces = 8
 
+type sequentialReadWindow struct {
+	startPiece int64
+	// endPiece bounds reader-owned windows. Manual sequential mode leaves it zero
+	// so the historical sliding window behavior is preserved.
+	endPiece        int64
+	readaheadPieces int
+}
+
+type sequentialReadWindowRef struct {
+	readerID int64
+	manual   bool
+	window   sequentialReadWindow
+}
+
 type intMinHeap []int
 
 func (h intMinHeap) Len() int { return len(h) }
@@ -387,11 +401,13 @@ func normalizeSequentialReadaheadPieces(n int) int {
 	return n
 }
 
-// SetSequentialMode enables or disables sequential piece selection. When enabled,
-// the picker first tries PieceEmpty wanted pieces in [startPiece,
-// startPiece+readaheadPieces), ordered by piece index. If no candidate in that
-// window is available from a peer, selection falls back to the normal priority +
-// rarest-first strategy so bandwidth is not left idle.
+// SetSequentialMode enables or disables the session-wide manual sequential picker
+// window. Reader-private windows are tracked separately and are not cleared by
+// disabling this manual mode. When enabled, the picker first tries PieceEmpty
+// wanted pieces in [startPiece, startPiece+readaheadPieces), ordered by piece
+// index. If no candidate in that window is available from a peer, selection falls
+// back to the normal priority + rarest-first strategy so bandwidth is not left
+// idle.
 func (s *Session) SetSequentialMode(enabled bool, startPiece int64, readaheadPieces int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -403,22 +419,21 @@ func (s *Session) SetSequentialMode(enabled bool, startPiece int64, readaheadPie
 	s.sequentialReadaheadPieces = normalizeSequentialReadaheadPieces(readaheadPieces)
 }
 
-// SequentialMode returns the current sequential picker configuration.
+// SequentialMode returns the manual sequential picker configuration. It does not
+// report reader-private windows registered by TorrentReader.
 func (s *Session) SequentialMode() (enabled bool, startPiece int64, readaheadPieces int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.sequentialMode, s.sequentialStartPiece, s.sequentialReadaheadPieces
 }
 
-// prioritizeSequentialReadLocked points sequential mode at a byte range that a
-// stream reader is about to need. Caller holds s.mu.
-func (s *Session) prioritizeSequentialReadLocked(offset, length int64, readaheadPieces int) {
+func (s *Session) sequentialWindowForRangeLocked(offset, length, limitOffset int64, readaheadPieces int) (sequentialReadWindow, bool) {
 	if s.Storage == nil || len(s.PieceStates) == 0 || offset < 0 {
-		return
+		return sequentialReadWindow{}, false
 	}
 	pieceLength := s.Storage.PieceLengthValue()
 	if pieceLength <= 0 {
-		return
+		return sequentialReadWindow{}, false
 	}
 	startPiece := offset / pieceLength
 	if startPiece >= int64(len(s.PieceStates)) {
@@ -436,38 +451,160 @@ func (s *Session) prioritizeSequentialReadLocked(offset, length int64, readahead
 			window = span
 		}
 	}
-	s.sequentialMode = true
-	s.sequentialStartPiece = startPiece
-	s.sequentialReadaheadPieces = window
+	endPiece := startPiece + int64(window)
+	if limitOffset > offset {
+		limitEndPiece := (limitOffset-1)/pieceLength + 1
+		if limitEndPiece < endPiece {
+			endPiece = limitEndPiece
+		}
+	}
+	if maxPiece := int64(len(s.PieceStates)); endPiece > maxPiece {
+		endPiece = maxPiece
+	}
+	if endPiece <= startPiece {
+		return sequentialReadWindow{}, false
+	}
+	return sequentialReadWindow{startPiece: startPiece, endPiece: endPiece, readaheadPieces: window}, true
+}
+
+// prioritizeSequentialReadLocked records the byte range that a stream reader is
+// about to need without overwriting other active readers' windows. Caller holds
+// s.mu.
+func (s *Session) prioritizeSequentialReadLocked(readerID int64, offset, length, limitOffset int64, readaheadPieces int) {
+	window, ok := s.sequentialWindowForRangeLocked(offset, length, limitOffset, readaheadPieces)
+	if !ok {
+		return
+	}
+	if s.sequentialReaderWindows == nil {
+		s.sequentialReaderWindows = make(map[int64]sequentialReadWindow)
+	}
+	s.sequentialReaderWindows[readerID] = window
 }
 
 func (s *Session) selectSequentialNeededPieceLocked(hasPiece func(pieceIndex int64) bool) int {
-	if !s.sequentialMode || s.Storage == nil || len(s.PieceStates) == 0 {
+	if (!s.sequentialMode && len(s.sequentialReaderWindows) == 0) ||
+		s.Storage == nil ||
+		len(s.PieceStates) == 0 {
 		return -1
 	}
-	start := int(s.sequentialStartPiece)
+
+	readerWindows := len(s.sequentialReaderWindows)
+	if readerWindows == 0 {
+		return s.selectSequentialWindowRefLocked(sequentialReadWindowRef{
+			readerID: -1,
+			manual:   true,
+			window: sequentialReadWindow{
+				startPiece:      s.sequentialStartPiece,
+				readaheadPieces: s.sequentialReadaheadPieces,
+			},
+		}, hasPiece)
+	}
+	if readerWindows == 1 {
+		for readerID, window := range s.sequentialReaderWindows {
+			readerRef := sequentialReadWindowRef{readerID: readerID, window: window}
+			if !s.sequentialMode {
+				return s.selectSequentialWindowRefLocked(readerRef, hasPiece)
+			}
+			manualRef := sequentialReadWindowRef{
+				readerID: -1,
+				manual:   true,
+				window: sequentialReadWindow{
+					startPiece:      s.sequentialStartPiece,
+					readaheadPieces: s.sequentialReadaheadPieces,
+				},
+			}
+			firstRef, secondRef := manualRef, readerRef
+			if sequentialWindowRefLess(readerRef, manualRef) {
+				firstRef, secondRef = readerRef, manualRef
+			}
+			if piece := s.selectSequentialWindowRefLocked(firstRef, hasPiece); piece != -1 {
+				return piece
+			}
+			return s.selectSequentialWindowRefLocked(secondRef, hasPiece)
+		}
+	}
+
+	windows := make([]sequentialReadWindowRef, 0, 1+len(s.sequentialReaderWindows))
+	if s.sequentialMode {
+		windows = append(windows, sequentialReadWindowRef{
+			readerID: -1,
+			manual:   true,
+			window: sequentialReadWindow{
+				startPiece:      s.sequentialStartPiece,
+				readaheadPieces: s.sequentialReadaheadPieces,
+			},
+		})
+	}
+	for readerID, window := range s.sequentialReaderWindows {
+		windows = append(windows, sequentialReadWindowRef{
+			readerID: readerID,
+			window:   window,
+		})
+	}
+	sort.Slice(windows, func(i, j int) bool { return sequentialWindowRefLess(windows[i], windows[j]) })
+
+	for _, ref := range windows {
+		if piece := s.selectSequentialWindowRefLocked(ref, hasPiece); piece != -1 {
+			return piece
+		}
+	}
+	return -1
+}
+
+func sequentialWindowRefLess(a, b sequentialReadWindowRef) bool {
+	if a.window.startPiece != b.window.startPiece {
+		return a.window.startPiece < b.window.startPiece
+	}
+	return a.readerID < b.readerID
+}
+
+func (s *Session) selectSequentialWindowRefLocked(ref sequentialReadWindowRef, hasPiece func(pieceIndex int64) bool) int {
+	piece, adjusted := s.selectFromSequentialWindowLocked(ref.window, hasPiece)
+	if ref.manual {
+		s.sequentialStartPiece = adjusted.startPiece
+		s.sequentialReadaheadPieces = adjusted.readaheadPieces
+	} else if s.sequentialReaderWindows != nil {
+		s.sequentialReaderWindows[ref.readerID] = adjusted
+	}
+	return piece
+}
+
+func (s *Session) selectFromSequentialWindowLocked(window sequentialReadWindow, hasPiece func(pieceIndex int64) bool) (int, sequentialReadWindow) {
+	start := int(window.startPiece)
 	if start < 0 {
 		start = 0
 	}
 	if start >= len(s.PieceStates) {
-		return -1
+		window.startPiece = int64(start)
+		return -1, window
 	}
 
-	for start < len(s.PieceStates) {
+	end := len(s.PieceStates)
+	if window.endPiece > 0 && window.endPiece < int64(end) {
+		end = int(window.endPiece)
+	}
+	if start >= end {
+		window.startPiece = int64(start)
+		return -1, window
+	}
+
+	for start < end {
 		state := s.PieceStates[start]
 		if state != PieceCompleted && s.isPieceWanted(int64(start)) {
 			break
 		}
 		start++
 	}
-	s.sequentialStartPiece = int64(start)
-	if start >= len(s.PieceStates) {
-		return -1
+	window.startPiece = int64(start)
+	if start >= end {
+		return -1, window
 	}
 
-	end := start + normalizeSequentialReadaheadPieces(s.sequentialReadaheadPieces)
-	if end > len(s.PieceStates) {
-		end = len(s.PieceStates)
+	if window.endPiece <= 0 {
+		end = start + normalizeSequentialReadaheadPieces(window.readaheadPieces)
+		if end > len(s.PieceStates) {
+			end = len(s.PieceStates)
+		}
 	}
 	for i := start; i < end; i++ {
 		if _, needed := s.neededPieces[i]; !needed {
@@ -478,10 +615,10 @@ func (s *Session) selectSequentialNeededPieceLocked(hasPiece func(pieceIndex int
 			continue
 		}
 		if hasPiece(int64(i)) {
-			return i
+			return i, window
 		}
 	}
-	return -1
+	return -1, window
 }
 
 func (s *Session) hasSelectableNeededPieceLocked(hasPiece func(pieceIndex int64) bool) bool {

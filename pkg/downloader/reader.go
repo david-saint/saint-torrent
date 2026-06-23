@@ -31,6 +31,7 @@ type TorrentReader struct {
 	length          int64
 	readaheadPieces int
 	closeCh         chan struct{}
+	sequentialID    int64
 
 	mu     sync.Mutex
 	offset int64
@@ -67,15 +68,15 @@ func (s *Session) NewReader(opts ReaderOptions) (*TorrentReader, error) {
 	if length <= 0 || length > total-opts.Offset {
 		length = total - opts.Offset
 	}
-	// Track live readers so sequential mode can be turned back off once the last
-	// reader closes, instead of leaving the picker biased forever (see Close).
-	s.sequentialReaders++
+	sequentialID := s.nextSequentialReaderID
+	s.nextSequentialReaderID++
 	return &TorrentReader{
 		sess:            s,
 		base:            opts.Offset,
 		length:          length,
 		readaheadPieces: normalizeSequentialReadaheadPieces(opts.ReadaheadPieces),
 		closeCh:         make(chan struct{}),
+		sequentialID:    sequentialID,
 	}, nil
 }
 
@@ -229,14 +230,10 @@ func (r *TorrentReader) Close() error {
 	if r.closed.CompareAndSwap(false, true) {
 		close(r.closeCh)
 		r.sess.mu.Lock()
-		// Once the last reader goes away, drop the sequential bias so the picker
-		// returns to its default priority + rarest-first strategy rather than
-		// streaming forever from a stale cursor.
-		if r.sess.sequentialReaders > 0 {
-			r.sess.sequentialReaders--
-		}
-		if r.sess.sequentialReaders == 0 {
-			r.sess.sequentialMode = false
+		// Drop only this reader's sequential window so remaining readers keep their
+		// own readahead and stale ranges do not keep biasing the picker after close.
+		if r.sess.sequentialReaderWindows != nil {
+			delete(r.sess.sequentialReaderWindows, r.sequentialID)
 		}
 		r.sess.mu.Unlock()
 	}
@@ -244,9 +241,22 @@ func (r *TorrentReader) Close() error {
 }
 
 func (r *TorrentReader) prioritize(globalOffset, length int64) {
+	if r.closed.Load() {
+		return
+	}
 	r.sess.mu.Lock()
-	r.sess.prioritizeSequentialReadLocked(globalOffset, length, r.readaheadPieces)
-	r.sess.mu.Unlock()
+	defer r.sess.mu.Unlock()
+	if r.closed.Load() {
+		if r.sess.sequentialReaderWindows != nil {
+			delete(r.sess.sequentialReaderWindows, r.sequentialID)
+		}
+		return
+	}
+	limitOffset := r.base + r.length
+	if limitOffset < r.base {
+		limitOffset = r.base
+	}
+	r.sess.prioritizeSequentialReadLocked(r.sequentialID, globalOffset, length, limitOffset, r.readaheadPieces)
 }
 
 func (r *TorrentReader) chunkFor(globalOffset int64, maxLen int) (storage.Storage, int64, int64, int, error) {
