@@ -2,22 +2,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/httpapi"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -154,8 +158,10 @@ type cliOptions struct {
 	configDir   string
 	persist     bool
 	confirm     bool
+	headless    bool
 	theme       string
 	listenPort  int
+	httpAddr    string
 	natEnabled  bool
 	encryption  mse.Policy
 	storage     storage.Backend
@@ -1085,6 +1091,8 @@ func parseCLIArgs(args []string) cliOptions {
 			opts.confirm = true
 		case "--no-confirm":
 			opts.confirm = false
+		case "--headless":
+			opts.headless = true
 		case "--theme":
 			if i+1 < len(args) {
 				opts.theme = args[i+1]
@@ -1102,6 +1110,13 @@ func parseCLIArgs(args []string) cliOptions {
 				continue
 			}
 			opts.listenPort = port
+		case "--http-addr", "--http":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires a listen address", args[i])
+				continue
+			}
+			opts.httpAddr = args[i+1]
+			i++
 		case "--no-nat":
 			opts.natEnabled = false
 		case "--encryption":
@@ -1222,19 +1237,10 @@ func writeFrame(conn net.Conn, payload []byte) error {
 	return nil
 }
 
-func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup, terminal terminalIdentity) {
+func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup, terminal terminalIdentity, headless bool) {
 	defer handlersWG.Done()
 	defer unregisterConn(conn)
 	defer conn.Close()
-
-	programMu.RLock()
-	p := teaProgram
-	programMu.RUnlock()
-
-	if p == nil {
-		sendResponse(conn, "starting", "saintTorrent is starting up", terminal)
-		return
-	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		sendResponse(conn, "error", fmt.Sprintf("set read deadline error: %v", err), terminal)
@@ -1272,6 +1278,23 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 		return
 	}
 
+	programMu.RLock()
+	p := teaProgram
+	programMu.RUnlock()
+
+	if p == nil {
+		if !headless {
+			sendResponse(conn, "starting", "saintTorrent is starting up", terminal)
+			return
+		}
+		if err := handleHeadlessSocketMessage(msg, mgr); err != nil {
+			sendResponse(conn, "error", err.Error(), terminal)
+		} else {
+			sendResponse(conn, "ok", "torrent request handled", terminal)
+		}
+		return
+	}
+
 	respChan := make(chan addTorrentResponse, 1)
 	select {
 	case <-shutdownChan:
@@ -1293,6 +1316,34 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	case <-time.After(3 * time.Second):
 		sendResponse(conn, "error", "TUI processing timeout", terminal)
 	}
+}
+
+func handleHeadlessSocketMessage(msg socketMessage, mgr *downloader.TorrentManager) error {
+	if msg.Confirm {
+		return fmt.Errorf("confirmation is unavailable in headless mode; retry with --no-confirm")
+	}
+
+	downloadDir := msg.DownloadDir
+	if downloadDir == "" {
+		downloadDir = "."
+	}
+
+	var errs []error
+	for _, item := range msg.Items {
+		var sess *downloader.Session
+		var err error
+		if strings.HasPrefix(item, "magnet:?") {
+			sess, err = mgr.AddMagnet(item, downloadDir)
+		} else {
+			sess, err = mgr.AddTorrentFile(item, downloadDir)
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		sess.Start()
+	}
+	return errors.Join(errs...)
 }
 
 func sendResponse(conn net.Conn, status string, message string, terminal terminalIdentity) {
@@ -1577,7 +1628,7 @@ func main() {
 			}
 			registerConn(conn)
 			handlersWG.Add(1)
-			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG, terminal)
+			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG, terminal, opts.headless)
 		}
 	}()
 
@@ -1590,6 +1641,23 @@ func main() {
 		}
 	}
 	perfMarkf("dht")
+
+	var statsServer *httpapi.Server
+	if opts.httpAddr != "" {
+		statsServer, err = httpapi.Start(opts.httpAddr, mgr)
+		if err != nil {
+			listener.Close()
+			acceptLoopWG.Wait()
+			close(shutdownChan)
+			closeActiveConns()
+			handlersWG.Wait()
+			mgr.Close()
+			fmt.Fprintf(os.Stderr, "Error starting HTTP stats endpoint on %s: %v\n", opts.httpAddr, err)
+			os.Exit(1)
+		}
+		startupWarns = append(startupWarns, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
+	}
+	perfMarkf("http-stats")
 
 	if persist {
 		if configDir == "" {
@@ -1614,6 +1682,22 @@ func main() {
 
 	var initialPending []pendingItem
 	for _, item := range filesToAdd {
+		if opts.headless {
+			var sess *downloader.Session
+			var err error
+			if strings.HasPrefix(item, "magnet:?") {
+				sess, err = mgr.AddMagnet(item, downloadDir)
+			} else {
+				sess, err = mgr.AddTorrentFile(item, downloadDir)
+			}
+			if err != nil {
+				startupWarns = append(startupWarns, fmt.Sprintf("Failed to load torrent %s: %v", item, err))
+				continue
+			}
+			sess.Start()
+			continue
+		}
+
 		name, hashHex, err := parseItem(item)
 		isDuplicate := false
 		if err == nil && hashHex != "" {
@@ -1640,18 +1724,23 @@ func main() {
 		startupWarn = strings.Join(startupWarns, "; ")
 	}
 
-	startModel := initialModel(mgr, downloadDir, startupWarn, initialPending)
-	startModel.theme = selectedTheme
-	startModel.configDir = configDir
-	startModel.persistEnabled = persist
-	// This is a full-screen TUI. The alternate screen prevents terminal
-	// scrollback reflow during resize from leaving stale copies of prior frames.
-	p := newTUIProgram(startModel)
-	perfMarkf("tui-build")
+	var p *tea.Program
+	if !opts.headless {
+		startModel := initialModel(mgr, downloadDir, startupWarn, initialPending)
+		startModel.theme = selectedTheme
+		startModel.configDir = configDir
+		startModel.persistEnabled = persist
+		// This is a full-screen TUI. The alternate screen prevents terminal
+		// scrollback reflow during resize from leaving stale copies of prior frames.
+		p = newTUIProgram(startModel)
+		perfMarkf("tui-build")
 
-	programMu.Lock()
-	teaProgram = p
-	programMu.Unlock()
+		programMu.Lock()
+		teaProgram = p
+		programMu.Unlock()
+	} else {
+		perfMarkf("headless-ready")
+	}
 
 	benchMode := os.Getenv("SAINTTORRENT_BENCH") == "1"
 	if benchMode {
@@ -1663,6 +1752,18 @@ func main() {
 		}
 		perfMarkf("ui-ready")
 		fmt.Printf("startup_ms=%.1f\n", msOf(time.Since(perfStart)))
+	} else if opts.headless {
+		for _, s := range mgr.ListSessions() {
+			s.Start()
+		}
+		perfMarkf("ui-ready")
+		if statsServer != nil {
+			fmt.Fprintf(os.Stderr, "HTTP stats endpoint: http://%s/stats\n", statsServer.Addr())
+		}
+		for _, warn := range startupWarns {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", warn)
+		}
+		waitForShutdownSignal()
 	} else {
 		if _, err := p.Run(); err != nil {
 			fmt.Printf("Error running UI: %v\n", err)
@@ -1671,6 +1772,13 @@ func main() {
 	}
 
 	shutdownStart := time.Now()
+	if statsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := statsServer.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Error stopping HTTP stats endpoint: %v\n", err)
+		}
+		cancel()
+	}
 	listener.Close()
 	acceptLoopWG.Wait()
 	close(shutdownChan)
@@ -1703,4 +1811,11 @@ func main() {
 		perfReport(os.Stderr)
 		os.Exit(0)
 	}
+}
+
+func waitForShutdownSignal() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	signal.Stop(sigCh)
 }
