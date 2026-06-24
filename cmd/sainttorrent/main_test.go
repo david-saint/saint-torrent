@@ -73,6 +73,25 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
+	const endpoint = "HTTP stats endpoint: http://127.0.0.1:16666/stats"
+	const warning = "DHT unavailable: boom"
+
+	var out strings.Builder
+	writeHeadlessStartupMessages(&out, []string{endpoint}, []string{warning})
+
+	got := out.String()
+	if strings.Count(got, endpoint) != 1 {
+		t.Fatalf("endpoint message count = %d, want 1; output=%q", strings.Count(got, endpoint), got)
+	}
+	if strings.Contains(got, "Warning: "+endpoint) {
+		t.Fatalf("endpoint message was printed as warning: %q", got)
+	}
+	if !strings.Contains(got, "Warning: "+warning+"\n") {
+		t.Fatalf("warning message missing warning prefix: %q", got)
+	}
+}
+
 func TestGetIndicator(t *testing.T) {
 	tests := []struct {
 		isPaused    bool

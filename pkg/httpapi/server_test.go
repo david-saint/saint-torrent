@@ -42,6 +42,10 @@ func TestStatsHandlerReturnsManagerAndTorrentSnapshot(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &stats); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw stats: %v", err)
+	}
 
 	if stats.Version != statsVersion {
 		t.Fatalf("version = %d, want %d", stats.Version, statsVersion)
@@ -71,6 +75,25 @@ func TestStatsHandlerReturnsManagerAndTorrentSnapshot(t *testing.T) {
 	}
 	if len(got.Files) != 1 || got.Files[0].Path != "stats-test/file.bin" || got.Files[0].Priority != "normal" {
 		t.Fatalf("unexpected file stats: %+v", got.Files)
+	}
+
+	managerRaw, ok := raw["manager"].(map[string]any)
+	if !ok {
+		t.Fatalf("manager JSON is not an object: %#v", raw["manager"])
+	}
+	natRaw, ok := managerRaw["nat"].(map[string]any)
+	if !ok {
+		t.Fatalf("nat JSON is not an object: %#v", managerRaw["nat"])
+	}
+	for _, key := range []string{"enabled", "protocol", "external_ip", "listen_port", "advertised_port", "tcp_mapped", "udp_mapped"} {
+		if _, ok := natRaw[key]; !ok {
+			t.Fatalf("nat JSON missing snake_case key %q: %#v", key, natRaw)
+		}
+	}
+	for _, key := range []string{"Enabled", "Protocol", "ExternalIP", "ListenPort", "AdvertisedPort", "TCPMapped", "UDPMapped", "LastError"} {
+		if _, ok := natRaw[key]; ok {
+			t.Fatalf("nat JSON leaked Go field key %q: %#v", key, natRaw)
+		}
 	}
 }
 

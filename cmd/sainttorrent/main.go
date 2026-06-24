@@ -1571,6 +1571,7 @@ func main() {
 		}
 	}()
 
+	var startupInfos []string
 	var startupWarns []string
 
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
@@ -1655,7 +1656,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error starting HTTP stats endpoint on %s: %v\n", opts.httpAddr, err)
 			os.Exit(1)
 		}
-		startupWarns = append(startupWarns, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
+		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
 	}
 	perfMarkf("http-stats")
 
@@ -1757,12 +1758,7 @@ func main() {
 			s.Start()
 		}
 		perfMarkf("ui-ready")
-		if statsServer != nil {
-			fmt.Fprintf(os.Stderr, "HTTP stats endpoint: http://%s/stats\n", statsServer.Addr())
-		}
-		for _, warn := range startupWarns {
-			fmt.Fprintf(os.Stderr, "Warning: %s\n", warn)
-		}
+		writeHeadlessStartupMessages(os.Stderr, startupInfos, startupWarns)
 		waitForShutdownSignal()
 	} else {
 		if _, err := p.Run(); err != nil {
@@ -1818,4 +1814,13 @@ func waitForShutdownSignal() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	signal.Stop(sigCh)
+}
+
+func writeHeadlessStartupMessages(w io.Writer, infos []string, warns []string) {
+	for _, info := range infos {
+		fmt.Fprintln(w, info)
+	}
+	for _, warn := range warns {
+		fmt.Fprintf(w, "Warning: %s\n", warn)
+	}
 }

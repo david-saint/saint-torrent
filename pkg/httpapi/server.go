@@ -108,17 +108,29 @@ type Stats struct {
 
 // ManagerStats summarizes process-wide torrent manager state.
 type ManagerStats struct {
-	TorrentCount                int                  `json:"torrent_count"`
-	DownloadLimitBytesPerSecond int64                `json:"download_limit_bytes_per_second"`
-	UploadLimitBytesPerSecond   int64                `json:"upload_limit_bytes_per_second"`
-	DownloadSpeedBytesPerSecond float64              `json:"download_speed_bytes_per_second"`
-	UploadSpeedBytesPerSecond   float64              `json:"upload_speed_bytes_per_second"`
-	DownloadedBytes             int64                `json:"downloaded_bytes"`
-	UploadedBytes               int64                `json:"uploaded_bytes"`
-	PeerListenPort              uint16               `json:"peer_listen_port"`
-	AdvertisedPeerPort          uint16               `json:"advertised_peer_port"`
-	DHTListenPort               uint16               `json:"dht_listen_port"`
-	NAT                         downloader.NATStatus `json:"nat"`
+	TorrentCount                int      `json:"torrent_count"`
+	DownloadLimitBytesPerSecond int64    `json:"download_limit_bytes_per_second"`
+	UploadLimitBytesPerSecond   int64    `json:"upload_limit_bytes_per_second"`
+	DownloadSpeedBytesPerSecond float64  `json:"download_speed_bytes_per_second"`
+	UploadSpeedBytesPerSecond   float64  `json:"upload_speed_bytes_per_second"`
+	DownloadedBytes             int64    `json:"downloaded_bytes"`
+	UploadedBytes               int64    `json:"uploaded_bytes"`
+	PeerListenPort              uint16   `json:"peer_listen_port"`
+	AdvertisedPeerPort          uint16   `json:"advertised_peer_port"`
+	DHTListenPort               uint16   `json:"dht_listen_port"`
+	NAT                         NATStats `json:"nat"`
+}
+
+// NATStats describes the current automatic port-mapping state.
+type NATStats struct {
+	Enabled        bool   `json:"enabled"`
+	Protocol       string `json:"protocol"`
+	ExternalIP     string `json:"external_ip"`
+	ListenPort     uint16 `json:"listen_port"`
+	AdvertisedPort uint16 `json:"advertised_port"`
+	TCPMapped      bool   `json:"tcp_mapped"`
+	UDPMapped      bool   `json:"udp_mapped"`
+	LastError      string `json:"last_error,omitempty"`
 }
 
 // TorrentStats summarizes a single torrent session.
@@ -199,7 +211,7 @@ func SnapshotAt(manager *downloader.TorrentManager, generatedAt time.Time) Stats
 		PeerListenPort:              manager.PeerListenPort(),
 		AdvertisedPeerPort:          manager.AdvertisedPeerPort(),
 		DHTListenPort:               manager.DHTListenPort(),
-		NAT:                         manager.NATStatus(),
+		NAT:                         snapshotNAT(manager.NATStatus()),
 	}
 
 	for _, sess := range sessions {
@@ -212,6 +224,19 @@ func SnapshotAt(manager *downloader.TorrentManager, generatedAt time.Time) Stats
 	}
 
 	return stats
+}
+
+func snapshotNAT(status downloader.NATStatus) NATStats {
+	return NATStats{
+		Enabled:        status.Enabled,
+		Protocol:       status.Protocol,
+		ExternalIP:     status.ExternalIP,
+		ListenPort:     status.ListenPort,
+		AdvertisedPort: status.AdvertisedPort,
+		TCPMapped:      status.TCPMapped,
+		UDPMapped:      status.UDPMapped,
+		LastError:      status.LastError,
+	}
 }
 
 func snapshotSession(sess *downloader.Session) TorrentStats {
