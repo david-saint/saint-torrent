@@ -120,9 +120,11 @@ SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
 ./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
 ```
 
-Log levels are `debug`, `info`, `warn`, and `error`. Rotation defaults to
-10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE`
-(for example `25mb`) and `SAINTTORRENT_LOG_MAX_BACKUPS`.
+Log levels are `debug`, `info`, `warn`, and `error`. Logs are created
+owner-readable only, but they can include local paths and peer addresses, so keep
+them in a private location. Rotation defaults to 10 MiB with 3 backups and can be
+tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`) and a positive
+`SAINTTORRENT_LOG_MAX_BACKUPS`.
 
 ### macOS Magnet Handler
 

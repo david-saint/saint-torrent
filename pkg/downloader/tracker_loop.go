@@ -3,11 +3,16 @@ package downloader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/tracker"
-	"time"
 )
 
 const trackerDefaultNumWant = 200
@@ -108,17 +113,45 @@ type trackerAnnounceResult struct {
 	err        error
 }
 
+func trackerLogID(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return "invalid"
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := u.Hostname()
+	if host == "" {
+		return scheme + "://unknown"
+	}
+	if port := u.Port(); port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + host
+}
+
+func trackerLogErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("tracker URL error: %v", urlErr.Err)
+	}
+	return err
+}
+
 func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, timeout time.Duration) trackerAnnounceResult {
 	announceCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	trackerID := trackerLogID(tr)
 
 	if bytes.HasPrefix([]byte(tr), []byte("udp")) {
 		resp, err := tracker.UDPAnnounce(announceCtx, tr, infoHash, peerID, port, uploaded, downloaded, left, event, trackerDefaultNumWant)
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 		return trackerAnnounceResult{
-			tracker:    tr,
+			tracker:    trackerID,
 			peers:      resp.Peers,
 			interval:   resp.Interval,
 			complete:   resp.Complete,
@@ -129,18 +162,18 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 	if bytes.HasPrefix([]byte(tr), []byte("http")) {
 		u, err := tracker.BuildTrackerURL(tr, infoHash, peerID, port, uploaded, downloaded, left, true, event, trackerDefaultNumWant)
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 
 		req, err := http.NewRequestWithContext(announceCtx, "GET", u, nil)
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 
 		client := &http.Client{Timeout: timeout}
 		resp, err := client.Do(req)
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 
 		// Bound how much we buffer: a tracker announce reply is a few KB even at
@@ -149,16 +182,16 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		data, err := tracker.ReadCappedBody(resp.Body, maxTrackerResponse)
 		resp.Body.Close()
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 
 		trackerResp, err := tracker.ParseTrackerResponse(data)
 		if err != nil {
-			return trackerAnnounceResult{tracker: tr, err: err}
+			return trackerAnnounceResult{tracker: trackerID, err: trackerLogErr(err)}
 		}
 
 		return trackerAnnounceResult{
-			tracker:    tr,
+			tracker:    trackerID,
 			peers:      trackerResp.Peers,
 			interval:   trackerResp.Interval,
 			complete:   trackerResp.Complete,
@@ -166,7 +199,7 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		}
 	}
 
-	return trackerAnnounceResult{tracker: tr, err: fmt.Errorf("unsupported tracker scheme: %s", tr)}
+	return trackerAnnounceResult{tracker: trackerID, err: fmt.Errorf("unsupported tracker scheme: %s", trackerID)}
 }
 
 func (s *Session) announceAndConnect() int {

@@ -26,6 +26,7 @@ const (
 const (
 	defaultMaxSizeBytes = 10 * 1024 * 1024
 	defaultMaxBackups   = 3
+	logFileMode         = 0600
 )
 
 var levelNames = map[Level]string{
@@ -109,7 +110,7 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if raw := strings.TrimSpace(os.Getenv("SAINTTORRENT_LOG_MAX_BACKUPS")); raw != "" {
 		backups, err := strconv.Atoi(raw)
-		if err != nil || backups < 0 {
+		if err != nil || backups <= 0 {
 			return Config{}, fmt.Errorf("invalid SAINTTORRENT_LOG_MAX_BACKUPS %q", raw)
 		}
 		cfg.MaxBackups = backups
@@ -211,8 +212,12 @@ func New(cfg Config) (*Logger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(logFileMode); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	stat, err := f.Stat()
@@ -322,8 +327,12 @@ func (l *Logger) rotateLocked() error {
 		}
 	}
 
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
 	if err != nil {
+		return err
+	}
+	if err := f.Chmod(logFileMode); err != nil {
+		_ = f.Close()
 		return err
 	}
 	l.file = f
