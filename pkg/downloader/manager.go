@@ -20,6 +20,7 @@ import (
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -124,6 +125,12 @@ func (m *TorrentManager) SetStorageFactory(factory storage.Factory) {
 
 // StartDHT starts the global Kademlia DHT client.
 func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
+	if logging.Enabled() {
+		logging.Info("dht_starting",
+			logging.String("download_dir", downloadDir),
+			logging.Int("listen_port", listenPort),
+		)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -136,11 +143,23 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 
 	udpSocket, err := utp.NewSocket(listenPort)
 	if err != nil {
+		if logging.Enabled() {
+			logging.Warn("dht_start_failed",
+				logging.Int("listen_port", listenPort),
+				logging.Err(err),
+			)
+		}
 		return err
 	}
 	d, err := dht.NewDHTWithConn(downloadDir, udpSocket.DHTConn())
 	if err != nil {
 		_ = udpSocket.Close()
+		if logging.Enabled() {
+			logging.Warn("dht_start_failed",
+				logging.Int("listen_port", listenPort),
+				logging.Err(err),
+			)
+		}
 		return err
 	}
 	utpListener := udpSocket.Listen()
@@ -179,6 +198,11 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 		sess.attachUTPSocket(udpSocket)
 	}
 
+	if logging.Enabled() {
+		logging.Info("dht_started",
+			logging.Uint16("port", d.Port()),
+		)
+	}
 	return nil
 }
 
@@ -233,6 +257,16 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 
 	if m.dht != nil {
 		sess.AttachDHT(m.dht)
+	}
+	if logging.Enabled() {
+		name := ""
+		if sess != nil && sess.Torrent != nil {
+			name = sess.Torrent.Name
+		}
+		logging.Info("session_added",
+			logging.String("info_hash", infoHashHex),
+			logging.String("name", name),
+		)
 	}
 }
 
@@ -289,6 +323,13 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 
 	if !ok && !failedRemoved {
 		return fmt.Errorf("torrent with info hash %s not found", infoHashHex)
+	}
+	if logging.Enabled() {
+		logging.Info("session_removing",
+			logging.String("info_hash", infoHashHex),
+			logging.Bool("delete_files", deleteFiles),
+			logging.Bool("active_session", ok),
+		)
 	}
 
 	var downloadDir string
@@ -412,9 +453,22 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		for _, e := range errs {
 			errStrs = append(errStrs, e.Error())
 		}
-		return fmt.Errorf("removal completed with errors: %s", strings.Join(errStrs, "; "))
+		err := fmt.Errorf("removal completed with errors: %s", strings.Join(errStrs, "; "))
+		if logging.Enabled() {
+			logging.Warn("session_remove_failed",
+				logging.String("info_hash", infoHashHex),
+				logging.Err(err),
+			)
+		}
+		return err
 	}
 
+	if logging.Enabled() {
+		logging.Info("session_removed",
+			logging.String("info_hash", infoHashHex),
+			logging.Bool("delete_files", deleteFiles),
+		)
+	}
 	return nil
 }
 
@@ -529,6 +583,9 @@ func (m *TorrentManager) GlobalUploadLimit() int64 {
 
 // Close closes all managed sessions.
 func (m *TorrentManager) Close() {
+	if logging.Enabled() {
+		logging.Info("manager_closing")
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()

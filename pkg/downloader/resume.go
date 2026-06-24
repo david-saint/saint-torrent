@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/storage"
 	"sync"
 )
@@ -14,6 +15,21 @@ import (
 // verifyGate bounds how many piece hash checks run concurrently across all sessions,
 // so background verification saturates available cores without thrashing the disk.
 var verifyGate = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
+
+func (s *Session) logSessionEvent(level logging.Level, event string, fields ...logging.Field) {
+	if !logging.EnabledFor(level) {
+		return
+	}
+	s.mu.RLock()
+	infoHash, name := s.logIdentityLocked()
+	s.mu.RUnlock()
+	base := []logging.Field{
+		logging.String("info_hash", infoHash),
+		logging.String("name", name),
+	}
+	base = append(base, fields...)
+	logging.Log(level, event, base...)
+}
 
 // pieceWriteJob is a completed piece handed off to the async hash/write pool.
 type pieceWriteJob struct {
@@ -115,6 +131,10 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if job.conn != nil {
 			_ = job.conn.Close()
 		}
+		s.logSessionEvent(logging.LevelWarn, "piece_verification_failed",
+			logging.Int64("piece", job.index),
+			logging.Err(verifyErr),
+		)
 		job.sendResult(pieceWriteHashFailed, verifyErr)
 		return
 	}
@@ -123,12 +143,20 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	switch {
 	case err == nil:
 		s.markPieceCompleted(job.index)
+		s.logSessionEvent(logging.LevelDebug, "piece_verified",
+			logging.Int64("piece", job.index),
+			logging.Int("bytes", len(job.data)),
+		)
 		job.sendResult(pieceWriteCompleted, nil)
 	case errors.Is(err, storage.ErrFileRepaired):
 		s.mu.Lock()
 		s.lastErr = fmt.Errorf("download file was missing or resized; recreated target file")
 		s.mu.Unlock()
 		s.resetProgressAfterStorageRepair(job.index)
+		s.logSessionEvent(logging.LevelWarn, "piece_storage_repaired",
+			logging.Int64("piece", job.index),
+			logging.Err(err),
+		)
 		job.sendResult(pieceWriteCompleted, nil)
 	case errors.Is(err, storage.ErrStorageClosed):
 		// Session is tearing down; nothing to record.
@@ -146,6 +174,10 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		}
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
+		s.logSessionEvent(logging.LevelError, "piece_storage_failed",
+			logging.Int64("piece", job.index),
+			logging.Err(err),
+		)
 		job.sendResult(pieceWriteStorageFailed, err)
 	}
 }
@@ -239,6 +271,12 @@ func (s *Session) runVerification(ctx context.Context) bool {
 	if len(toCheck) == 0 {
 		return true
 	}
+	s.logSessionEvent(logging.LevelInfo, "resume_verification_started",
+		logging.Int("pieces", len(toCheck)),
+		logging.Bool("full_scan", fullScan),
+	)
+	verified := 0
+	failed := 0
 
 	// Take one verification slot for this session, bounding concurrent hashing across all
 	// sessions. Acquisition is cancellable, and the slot is reclaimed by Close() even if a
@@ -297,17 +335,31 @@ func (s *Session) runVerification(ctx context.Context) bool {
 				// Resume data was wrong: return the piece to the pool for re-download.
 				s.PieceStates[idx] = PieceEmpty
 				s.addNeededLocked(idx)
+				failed++
 			}
 		}
 		if nowCompleted {
 			s.signalPieceWaitersLocked(int64(idx))
+			verified++
 		}
 		s.mu.Unlock()
 
 		if nowCompleted {
 			s.broadcastHave(uint32(idx))
+		} else if !fullScan && (verifyErr != nil || !ok) {
+			s.logSessionEvent(logging.LevelWarn, "resume_piece_verification_failed",
+				logging.Int("piece", idx),
+				logging.Bool("hash_ok", ok),
+				logging.Err(verifyErr),
+			)
 		}
 	}
+	s.logSessionEvent(logging.LevelInfo, "resume_verification_finished",
+		logging.Int("pieces", len(toCheck)),
+		logging.Int("verified", verified),
+		logging.Int("failed", failed),
+		logging.Bool("full_scan", fullScan),
+	)
 	return true
 }
 

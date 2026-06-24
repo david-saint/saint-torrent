@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/tracker"
 	"sainttorrent/pkg/utp"
@@ -289,6 +290,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		case s.outboundSlots <- struct{}{}:
 			defer func() { <-s.outboundSlots }()
 		default:
+			if logging.Enabled() {
+				logging.Debug("peer_dial_skipped",
+					logging.String("peer", peerAddr),
+					logging.String("reason", "session_outbound_cap"),
+				)
+			}
 			return
 		}
 	}
@@ -300,6 +307,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		case s.globalOutboundSlots <- struct{}{}:
 			defer func() { <-s.globalOutboundSlots }()
 		default:
+			if logging.Enabled() {
+				logging.Debug("peer_dial_skipped",
+					logging.String("peer", peerAddr),
+					logging.String("reason", "global_outbound_cap"),
+				)
+			}
 			return
 		}
 	}
@@ -308,6 +321,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	conn, err := s.dialPeer(peerAddr)
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
+		if logging.Enabled() {
+			logging.Debug("peer_dial_failed",
+				logging.String("peer", peerAddr),
+				logging.Err(err),
+			)
+		}
 		return
 	}
 	tunePeerConn(conn)
@@ -335,6 +354,12 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn, connMonitor)
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
+		if logging.Enabled() {
+			logging.Debug("peer_negotiation_failed",
+				logging.String("peer", peerAddr),
+				logging.Err(err),
+			)
+		}
 		return
 	}
 	connMonitor.set(conn)
@@ -349,12 +374,24 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	handshake, err := client.Handshake()
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
+		if logging.Enabled() {
+			logging.Debug("peer_handshake_failed",
+				logging.String("peer", peerAddr),
+				logging.Err(err),
+			)
+		}
 		return
 	}
 	_ = conn.SetDeadline(time.Time{}) // clear deadline
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
 		s.markPeerAttemptFailed(peerAddr)
+		if logging.Enabled() {
+			logging.Warn("peer_handshake_rejected",
+				logging.String("peer", peerAddr),
+				logging.String("reason", "info_hash_mismatch"),
+			)
+		}
 		return
 	}
 
@@ -588,6 +625,10 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 
 func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte, outbound bool) {
 	fastEnabled := peer.SupportsFastExtension(peerReserved)
+	direction := "inbound"
+	if outbound {
+		direction = "outbound"
+	}
 
 	s.mu.Lock()
 	if s.paused || s.closed {
@@ -595,6 +636,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return
 	}
 	connectionPauseEpoch := s.pauseEpoch
+	logEnabled := logging.Enabled()
+	var logInfoHash, logName string
 	pState, ok := s.Peers[peerAddr]
 	if !ok {
 		pState = &PeerState{
@@ -614,8 +657,22 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 	pState.Active = true
 	s.activePeers[peerAddr] = client
+	if logEnabled {
+		logInfoHash, logName = s.logIdentityLocked()
+	}
 	s.mu.Unlock()
+	if logEnabled {
+		logging.Info("peer_connected",
+			logging.String("info_hash", logInfoHash),
+			logging.String("name", logName),
+			logging.String("peer", peerAddr),
+			logging.String("direction", direction),
+			logging.Bool("fast_extension", fastEnabled),
+		)
+	}
 
+	disconnectReason := "ended"
+	var disconnectErr error
 	defer func() {
 		s.mu.Lock()
 		reconnectAfterResume := false
@@ -639,6 +696,19 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			// discovery, so private torrents (which use trackers only) can still
 			// re-establish dropped connections after a resume.
 			s.addPeer(peerAddr, false)
+		}
+		if logging.Enabled() {
+			fields := []logging.Field{
+				logging.String("info_hash", logInfoHash),
+				logging.String("name", logName),
+				logging.String("peer", peerAddr),
+				logging.String("direction", direction),
+				logging.String("reason", disconnectReason),
+			}
+			if disconnectErr != nil {
+				fields = append(fields, logging.Err(disconnectErr))
+			}
+			logging.Info("peer_disconnected", fields...)
 		}
 	}()
 
@@ -1404,6 +1474,7 @@ peerLoop:
 		paused := s.paused
 		s.mu.RUnlock()
 		if paused {
+			disconnectReason = "paused"
 			break
 		}
 
@@ -1428,6 +1499,16 @@ peerLoop:
 			verifying := s.verifying
 			s.mu.RUnlock()
 			if !seeding && !verifying {
+				disconnectReason = "stalled"
+				if logging.Enabled() {
+					logging.Warn("peer_reaped",
+						logging.String("info_hash", logInfoHash),
+						logging.String("name", logName),
+						logging.String("peer", peerAddr),
+						logging.String("direction", direction),
+						logging.Duration("idle", time.Since(lastUsefulAt)),
+					)
+				}
 				break
 			}
 		}
@@ -1436,6 +1517,8 @@ peerLoop:
 		select {
 		case result := <-readCh:
 			if result.err != nil {
+				disconnectReason = "read_error"
+				disconnectErr = result.err
 				break peerLoop
 			}
 			msg = result.msg
@@ -1447,6 +1530,8 @@ peerLoop:
 			scheduleRateRetry(pump())
 			continue
 		case <-s.ctx.Done():
+			disconnectReason = "context_cancelled"
+			disconnectErr = s.ctx.Err()
 			break peerLoop
 		}
 
@@ -2150,12 +2235,12 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.paused || s.closed || !s.started {
+		s.mu.Unlock()
 		return
 	}
 	if fromDiscovery && !s.allowsDecentralizedPeerDiscoveryLocked() {
+		s.mu.Unlock()
 		return
 	}
 
@@ -2198,6 +2283,20 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 			defer s.wg.Done()
 			s.connectToPeer(tp)
 		}(tracker.Peer{IP: ip, Port: uint16(port)})
+	}
+	logEnabled := fromDiscovery && logging.Enabled()
+	var infoHash, name string
+	if logEnabled {
+		infoHash, name = s.logIdentityLocked()
+	}
+	s.mu.Unlock()
+	if logEnabled {
+		logging.Debug("peer_discovered",
+			logging.String("info_hash", infoHash),
+			logging.String("name", name),
+			logging.String("peer", peerAddr),
+			logging.Bool("dial_scheduled", shouldDial),
+		)
 	}
 }
 

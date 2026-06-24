@@ -16,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 )
@@ -47,9 +48,12 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap"})
+	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn"})
 	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
+	}
+	if overrides.logPath != "/tmp/sainttorrent.log" || !overrides.logLevelSet || overrides.logLevel != logging.LevelWarn {
+		t.Fatalf("unexpected logging overrides: %+v", overrides)
 	}
 
 	invalid := parseCLIArgs([]string{"--port", "70000"})
@@ -70,6 +74,11 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	invalidStorage := parseCLIArgs([]string{"--storage", "bogus"})
 	if invalidStorage.err == nil {
 		t.Fatal("expected invalid storage backend error")
+	}
+
+	invalidLogLevel := parseCLIArgs([]string{"--log-level", "verbose"})
+	if invalidLogLevel.err == nil {
+		t.Fatal("expected invalid log level error")
 	}
 }
 

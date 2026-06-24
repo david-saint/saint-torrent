@@ -112,6 +112,21 @@ experiments, select another backend:
 ./sainttorrent --storage mem    # in-memory content, not persistent
 ```
 
+Debug logging is off by default. For field troubleshooting, enable structured
+JSON-lines logging to a rotating file with either `SAINTTORRENT_LOG` or
+`--log`:
+
+```bash
+SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
+./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
+```
+
+Log levels are `debug`, `info`, `warn`, and `error`. On Unix-like systems logs
+are created owner-readable only, but they can include local paths and peer
+addresses, so keep them in a private location. Rotation defaults to 10 MiB with
+3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`)
+and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
+
 The HTTP stats endpoint is off by default. Enable the read-only JSON API with
 `--http-addr`:
 

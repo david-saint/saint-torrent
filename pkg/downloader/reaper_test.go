@@ -5,9 +5,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -155,6 +159,47 @@ func TestStalledPeerIsReaped(t *testing.T) {
 	waitForActivePeers(t, sess, 1, 2*time.Second, "peer never connected")
 	// ...then be reaped within roughly peerStallTimeout (+ keep-alive cadence + margin).
 	waitForActivePeers(t, sess, 0, 3*time.Second, "stalled peer was not reaped")
+}
+
+func TestStalledPeerReapIsLogged(t *testing.T) {
+	defer swapDuration(&peerStallTimeout, 1*time.Second)()
+	defer swapDuration(&blockRequestTimeout, 1*time.Hour)()
+
+	logPath := filepath.Join(t.TempDir(), "debug.log")
+	if err := logging.Configure(logging.Config{Path: logPath, Level: logging.LevelDebug}); err != nil {
+		t.Fatalf("configure logging: %v", err)
+	}
+	t.Cleanup(func() { _ = logging.Close() })
+
+	sess, bf, _ := newStallTestTorrent(t, 4)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	startStalledMockPeer(t, ln, bf)
+
+	sess.Start()
+	defer sess.Close()
+	sess.WaitVerified()
+
+	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	sess.AddPeerFromDiscovery("127.0.0.1:" + portStr)
+
+	waitForActivePeers(t, sess, 1, 2*time.Second, "peer never connected")
+	waitForActivePeers(t, sess, 0, 3*time.Second, "stalled peer was not reaped")
+
+	if err := logging.Close(); err != nil {
+		t.Fatalf("close logging: %v", err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"event":"peer_reaped"`) {
+		t.Fatalf("expected peer_reaped log, got:\n%s", text)
+	}
 }
 
 // TestKeepAliveTriggersRequestTimeout proves fix #2: a peer that unchokes us, takes

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
 )
 
@@ -65,6 +66,11 @@ func (m *TorrentManager) StartPeerListener(port uint16) error {
 	m.wg.Add(1)
 	m.mu.Unlock()
 
+	if logging.Enabled() {
+		logging.Info("peer_listener_started",
+			logging.Uint16("port", uint16(actualPort)),
+		)
+	}
 	go m.peerAcceptLoop(listener)
 	return nil
 }
@@ -160,6 +166,12 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		return
 	}
 
+	if logging.Enabled() {
+		logging.Debug("peer_inbound_routed",
+			logging.String("remote_addr", conn.RemoteAddr().String()),
+			logging.String("info_hash", fmt.Sprintf("%x", handshake.InfoHash)),
+		)
+	}
 	sess.handleRoutedIncomingConnection(conn, handshake)
 }
 
@@ -182,5 +194,10 @@ func (m *TorrentManager) setAdvertisedPeerPort(port uint16) {
 
 	for _, sess := range sessions {
 		sess.setAdvertisedPort(port)
+	}
+	if logging.Enabled() {
+		logging.Info("peer_advertised_port_changed",
+			logging.Uint16("port", port),
+		)
 	}
 }
