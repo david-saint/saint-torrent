@@ -111,6 +111,19 @@ experiments, select another backend:
 ./sainttorrent --storage mem    # in-memory content, not persistent
 ```
 
+Debug logging is off by default. For field troubleshooting, enable structured
+JSON-lines logging to a rotating file with either `SAINTTORRENT_LOG` or
+`--log`:
+
+```bash
+SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
+./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
+```
+
+Log levels are `debug`, `info`, `warn`, and `error`. Rotation defaults to
+10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE`
+(for example `25mb`) and `SAINTTORRENT_LOG_MAX_BACKUPS`.
+
 ### macOS Magnet Handler
 
 On macOS you can register saintTorrent as the default handler for `magnet:`

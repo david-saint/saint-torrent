@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sainttorrent/pkg/dht"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
@@ -327,6 +328,13 @@ func (s *Session) Files() []torrent.File {
 	return s.Torrent.Files
 }
 
+func (s *Session) logIdentityLocked() (string, string) {
+	if s == nil || s.Torrent == nil {
+		return "", ""
+	}
+	return fmt.Sprintf("%x", s.Torrent.InfoHash), s.Torrent.Name
+}
+
 // DownloadSpeed returns the average download speed since session start.
 func (s *Session) DownloadSpeed() float64 {
 	s.mu.RLock()
@@ -364,6 +372,15 @@ func (s *Session) Start() {
 		s.mu.Unlock()
 		s.lifecycleMu.Unlock()
 		if wasPaused {
+			if logging.Enabled() {
+				s.mu.RLock()
+				infoHash, name := s.logIdentityLocked()
+				s.mu.RUnlock()
+				logging.Info("session_resumed",
+					logging.String("info_hash", infoHash),
+					logging.String("name", name),
+				)
+			}
 			select {
 			case s.resumeCh <- struct{}{}:
 			default:
@@ -443,6 +460,21 @@ func (s *Session) Start() {
 		seed := seed
 		go s.webseedLoop(seed)
 	}
+	if logging.Enabled() {
+		s.mu.RLock()
+		port := s.Port
+		metadataMode := s.metadataMode
+		infoHash, name := s.logIdentityLocked()
+		s.mu.RUnlock()
+		logging.Info("session_started",
+			logging.String("info_hash", infoHash),
+			logging.String("name", name),
+			logging.Uint16("port", port),
+			logging.Bool("metadata_mode", metadataMode),
+			logging.Bool("dht_attached", hasDHT),
+			logging.Int("webseeds", len(webseeds)),
+		)
+	}
 
 	// Kick off background fast-resume verification (no-op if nothing to verify).
 	s.maybeStartVerification()
@@ -455,6 +487,17 @@ func (s *Session) Start() {
 // so capacity is never permanently lost, and it stops mutating the session once
 // s.closed is set.
 func (s *Session) Close() {
+	closeInfoHash := ""
+	closeName := ""
+	if logging.Enabled() {
+		s.mu.RLock()
+		closeInfoHash, closeName = s.logIdentityLocked()
+		s.mu.RUnlock()
+		logging.Info("session_closing",
+			logging.String("info_hash", closeInfoHash),
+			logging.String("name", closeName),
+		)
+	}
 	s.lifecycleMu.Lock()
 	var gateRelease func()
 	var verifyDone chan struct{}
@@ -510,6 +553,12 @@ func (s *Session) Close() {
 	}
 
 	s.wg.Wait()
+	if logging.Enabled() {
+		logging.Info("session_closed",
+			logging.String("info_hash", closeInfoHash),
+			logging.String("name", closeName),
+		)
+	}
 }
 
 func (s *Session) speedMonitorLoop() {
@@ -816,6 +865,15 @@ func (s *Session) Pause() {
 		}
 	}
 	s.mu.Unlock()
+	if logging.Enabled() {
+		s.mu.RLock()
+		infoHash, name := s.logIdentityLocked()
+		s.mu.RUnlock()
+		logging.Info("session_paused",
+			logging.String("info_hash", infoHash),
+			logging.String("name", name),
+		)
+	}
 
 	// Signal tracker loop to announce immediately
 	select {
@@ -845,6 +903,15 @@ func (s *Session) Resume() {
 		}
 	}
 	s.mu.Unlock()
+	if logging.Enabled() {
+		s.mu.RLock()
+		infoHash, name := s.logIdentityLocked()
+		s.mu.RUnlock()
+		logging.Info("session_resumed",
+			logging.String("info_hash", infoHash),
+			logging.String("name", name),
+		)
+	}
 
 	// Signal tracker loop to announce immediately
 	select {

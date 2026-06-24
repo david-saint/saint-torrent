@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"sainttorrent/pkg/downloader"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
@@ -159,6 +160,9 @@ type cliOptions struct {
 	natEnabled  bool
 	encryption  mse.Policy
 	storage     storage.Backend
+	logPath     string
+	logLevel    logging.Level
+	logLevelSet bool
 	err         error
 	items       []string
 }
@@ -1128,6 +1132,26 @@ func parseCLIArgs(args []string) cliOptions {
 				continue
 			}
 			opts.storage = backend
+		case "--log":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires a file path", args[i])
+				continue
+			}
+			opts.logPath = args[i+1]
+			i++
+		case "--log-level":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires debug, info, warn, or error", args[i])
+				continue
+			}
+			level, err := logging.ParseLevel(args[i+1])
+			i++
+			if err != nil {
+				opts.err = err
+				continue
+			}
+			opts.logLevel = level
+			opts.logLevelSet = true
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1374,11 +1398,38 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", opts.err)
 		os.Exit(2)
 	}
+	logConfig, err := logging.ConfigFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring debug log: %v\n", err)
+		os.Exit(2)
+	}
+	if opts.logPath != "" {
+		logConfig.Path = opts.logPath
+	}
+	if opts.logLevelSet {
+		logConfig.Level = opts.logLevel
+	}
+	if err := logging.Configure(logConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring debug log: %v\n", err)
+		os.Exit(1)
+	}
+	defer logging.Close()
+
 	downloadDir := opts.downloadDir
 	configDir := opts.configDir
 	persist := opts.persist
 	confirmFlag := opts.confirm
 	filesToAdd := opts.items
+
+	if logging.Enabled() {
+		logging.Info("app_start",
+			logging.String("download_dir", downloadDir),
+			logging.Int("listen_port", opts.listenPort),
+			logging.Bool("nat_enabled", opts.natEnabled),
+			logging.String("encryption", opts.encryption.String()),
+			logging.String("storage", string(opts.storage)),
+		)
+	}
 
 	ipcDir, err := resolveIPCDir()
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gonat "github.com/libp2p/go-nat"
+	"sainttorrent/pkg/logging"
 )
 
 const (
@@ -65,6 +66,12 @@ func (m *TorrentManager) StartNATTraversal(tcpPort, udpPort uint16) error {
 	m.wg.Add(1)
 	m.mu.Unlock()
 
+	if logging.Enabled() {
+		logging.Info("nat_traversal_started",
+			logging.Uint16("tcp_port", tcpPort),
+			logging.Uint16("udp_port", udpPort),
+		)
+	}
 	go m.natTraversalLoop(tcpPort, udpPort)
 	return nil
 }
@@ -93,6 +100,11 @@ func (m *TorrentManager) natTraversalLoop(tcpPort, udpPort uint16) {
 				return
 			}
 			continue
+		}
+		if logging.Enabled() {
+			logging.Info("nat_gateway_discovered",
+				logging.String("protocol", gateway.Type()),
+			)
 		}
 
 		if m.maintainNATMappings(gateway, tcpPort, udpPort) {
@@ -125,6 +137,13 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 			m.natStatus.UDPMapped = false
 		}
 		m.mu.Unlock()
+		if logging.Enabled() {
+			logging.Info("nat_mapping_cleaned_up",
+				logging.String("protocol", gateway.Type()),
+				logging.Bool("tcp_mapped", tcpMapped),
+				logging.Bool("udp_mapped", udpMapped),
+			)
+		}
 	}
 	defer cleanup()
 
@@ -165,6 +184,16 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 		m.natStatus.LastError = ""
 		m.mu.Unlock()
 		m.setAdvertisedPeerPort(uint16(externalTCPPort))
+		if logging.Enabled() {
+			logging.Info("nat_mapping_active",
+				logging.String("protocol", gateway.Type()),
+				logging.String("external_ip", externalIP),
+				logging.Int("external_tcp_port", externalTCPPort),
+				logging.Uint16("local_tcp_port", tcpPort),
+				logging.Uint16("local_udp_port", udpPort),
+				logging.Bool("udp_mapped", udpMapped),
+			)
+		}
 		return nil
 	}
 
@@ -196,6 +225,11 @@ func (m *TorrentManager) recordNATFailure(err error) {
 	m.natStatus.UDPMapped = false
 	m.natStatus.LastError = err.Error()
 	m.mu.Unlock()
+	if logging.Enabled() {
+		logging.Warn("nat_mapping_failed",
+			logging.Err(err),
+		)
+	}
 }
 
 func waitForContext(ctx context.Context, delay time.Duration) bool {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/tracker"
 	"time"
 )
@@ -99,6 +100,7 @@ func (s *Session) trackerLoop() {
 }
 
 type trackerAnnounceResult struct {
+	tracker    string
 	peers      []tracker.Peer
 	interval   int
 	complete   int
@@ -113,9 +115,10 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 	if bytes.HasPrefix([]byte(tr), []byte("udp")) {
 		resp, err := tracker.UDPAnnounce(announceCtx, tr, infoHash, peerID, port, uploaded, downloaded, left, event, trackerDefaultNumWant)
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 		return trackerAnnounceResult{
+			tracker:    tr,
 			peers:      resp.Peers,
 			interval:   resp.Interval,
 			complete:   resp.Complete,
@@ -126,18 +129,18 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 	if bytes.HasPrefix([]byte(tr), []byte("http")) {
 		u, err := tracker.BuildTrackerURL(tr, infoHash, peerID, port, uploaded, downloaded, left, true, event, trackerDefaultNumWant)
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 
 		req, err := http.NewRequestWithContext(announceCtx, "GET", u, nil)
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 
 		client := &http.Client{Timeout: timeout}
 		resp, err := client.Do(req)
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 
 		// Bound how much we buffer: a tracker announce reply is a few KB even at
@@ -146,15 +149,16 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		data, err := tracker.ReadCappedBody(resp.Body, maxTrackerResponse)
 		resp.Body.Close()
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 
 		trackerResp, err := tracker.ParseTrackerResponse(data)
 		if err != nil {
-			return trackerAnnounceResult{err: err}
+			return trackerAnnounceResult{tracker: tr, err: err}
 		}
 
 		return trackerAnnounceResult{
+			tracker:    tr,
 			peers:      trackerResp.Peers,
 			interval:   trackerResp.Interval,
 			complete:   trackerResp.Complete,
@@ -162,7 +166,7 @@ func announceTracker(ctx context.Context, tr string, infoHash [20]byte, peerID [
 		}
 	}
 
-	return trackerAnnounceResult{err: fmt.Errorf("unsupported tracker scheme: %s", tr)}
+	return trackerAnnounceResult{tracker: tr, err: fmt.Errorf("unsupported tracker scheme: %s", tr)}
 }
 
 func (s *Session) announceAndConnect() int {
@@ -226,12 +230,31 @@ func (s *Session) announceAndConnect() int {
 	for range trackers {
 		result := <-results
 		if result.err != nil {
+			if logging.Enabled() {
+				logging.Warn("tracker_announce_failed",
+					logging.String("tracker", result.tracker),
+					logging.String("event", event),
+					logging.String("info_hash", fmt.Sprintf("%x", infoHash)),
+					logging.Err(result.err),
+				)
+			}
 			if !trackerSuccess {
 				trackerErr = result.err
 			}
 			continue
 		}
 
+		if logging.Enabled() {
+			logging.Info("tracker_announce_succeeded",
+				logging.String("tracker", result.tracker),
+				logging.String("event", event),
+				logging.String("info_hash", fmt.Sprintf("%x", infoHash)),
+				logging.Int("peers", len(result.peers)),
+				logging.Int("interval", result.interval),
+				logging.Int("seeders", result.complete),
+				logging.Int("leechers", result.incomplete),
+			)
+		}
 		trackerSuccess = true
 		trackerErr = nil
 		if result.interval > 0 && (interval == 0 || result.interval < interval) {

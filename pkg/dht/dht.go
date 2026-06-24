@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"sainttorrent/pkg/bencode"
+	"sainttorrent/pkg/logging"
 )
 
 // Node represents a contact in the Kademlia routing table.
@@ -145,6 +146,11 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 		}
 	})
 
+	if logging.Enabled() {
+		logging.Info("dht_client_started",
+			logging.Uint16("port", d.Port()),
+		)
+	}
 	return d, nil
 }
 
@@ -1033,6 +1039,29 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 // LookupWithOptions queries the DHT swarm for a given torrent's info-hash.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	d.goTracked(func() {
+		logEnabled := logging.Enabled()
+		infoHashHex := ""
+		if logEnabled {
+			infoHashHex = fmt.Sprintf("%x", infoHash)
+			logging.Debug("dht_lookup_started",
+				logging.String("info_hash", infoHashHex),
+				logging.Uint16("peer_port", peerPort),
+				logging.Bool("announce", opts.Announce),
+			)
+		}
+		queriesCount := 0
+		discoveredPeers := 0
+		defer func(start time.Time) {
+			if logging.Enabled() {
+				logging.Debug("dht_lookup_finished",
+					logging.String("info_hash", infoHashHex),
+					logging.Int("queries", queriesCount),
+					logging.Int("peers", discoveredPeers),
+					logging.Duration("duration", time.Since(start)),
+				)
+			}
+		}(time.Now())
+
 		startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
 		if len(startNodes) == 0 {
 			d.bootstrap()
@@ -1049,7 +1078,6 @@ func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupO
 
 		visited := make(map[string]bool)
 		queue := append([]Node{}, startNodes...)
-		queriesCount := 0
 
 		for len(queue) > 0 && queriesCount < dhtLookupQueryLimit {
 			select {
@@ -1115,6 +1143,13 @@ func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupO
 						IP:       ip,
 						Port:     port,
 					}:
+						discoveredPeers++
+						if logging.Enabled() {
+							logging.Debug("dht_peer_discovered",
+								logging.String("info_hash", infoHashHex),
+								logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
+							)
+						}
 					case <-d.ctx.Done():
 						return
 					default:
@@ -1132,7 +1167,15 @@ func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupO
 						}
 						ctxAnn, cancelAnn := context.WithTimeout(d.ctx, 3*time.Second)
 						defer cancelAnn()
-						_ = d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr)
+						if err := d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr); err != nil {
+							if logging.Enabled() {
+								logging.Debug("dht_announce_peer_failed",
+									logging.String("info_hash", infoHashHex),
+									logging.String("node", n.Addr.String()),
+									logging.Err(err),
+								)
+							}
+						}
 					})
 				}
 
