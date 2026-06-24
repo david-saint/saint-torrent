@@ -13,6 +13,7 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 - 📂 **Interactive File Explorer:** Browse files inside multi-file torrents and set custom file-level priorities.
 - 📶 **DHT Support:** Bootstraps peer discovery via Distributed Hash Tables (DHT) if trackers are unavailable.
 - 🛑 **Rate Limiting:** Set global download and upload speed limits directly in the TUI.
+- 🔎 **Optional HTTP Stats:** Opt-in JSON stats endpoint for monitoring and headless scripting.
 
 ---
 
@@ -120,11 +121,28 @@ SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
 ./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
 ```
 
-Log levels are `debug`, `info`, `warn`, and `error`. Logs are created
-owner-readable only, but they can include local paths and peer addresses, so keep
-them in a private location. Rotation defaults to 10 MiB with 3 backups and can be
-tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`) and a positive
-`SAINTTORRENT_LOG_MAX_BACKUPS`.
+Log levels are `debug`, `info`, `warn`, and `error`. On Unix-like systems logs
+are created owner-readable only, but they can include local paths and peer
+addresses, so keep them in a private location. Rotation defaults to 10 MiB with
+3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`)
+and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
+
+The HTTP stats endpoint is off by default. Enable the read-only JSON API with
+`--http-addr`:
+
+```bash
+./sainttorrent --http-addr 127.0.0.1:16666
+./sainttorrent --headless --http-addr 127.0.0.1:16666
+curl http://127.0.0.1:16666/stats
+curl http://127.0.0.1:16666/healthz
+```
+
+`GET /stats` returns a snapshot of manager limits, listener/NAT ports, aggregate
+transfer counters, and per-torrent status, peer, piece, and file stats. The
+endpoint does not expose mutating controls; keep it bound to localhost unless
+you place it behind your own trusted network or reverse proxy. In headless mode,
+forwarded torrent requests that require confirmation are rejected; use
+`--no-confirm` when scripting additions into a headless instance.
 
 ### macOS Magnet Handler
 

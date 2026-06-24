@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,10 @@ func TestLoggerWritesStructuredJSON(t *testing.T) {
 }
 
 func TestLoggerCreatesPrivateLogFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix owner-only mode bits through os.FileMode")
+	}
+
 	path := filepath.Join(t.TempDir(), "debug.log")
 	logger, err := New(Config{Path: path, Level: LevelDebug})
 	if err != nil {
@@ -132,16 +137,18 @@ func TestLoggerRotatesFiles(t *testing.T) {
 		t.Fatal("expected retained log lines after rotation")
 	}
 
-	for _, file := range files {
-		info, err := os.Stat(file)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			t.Fatalf("stat %s: %v", file, err)
-		}
-		if got := info.Mode().Perm(); got != logFileMode {
-			t.Fatalf("%s mode = %o; want %o", file, got, logFileMode)
+	if runtime.GOOS != "windows" {
+		for _, file := range files {
+			info, err := os.Stat(file)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				t.Fatalf("stat %s: %v", file, err)
+			}
+			if got := info.Mode().Perm(); got != logFileMode {
+				t.Fatalf("%s mode = %o; want %o", file, got, logFileMode)
+			}
 		}
 	}
 }
