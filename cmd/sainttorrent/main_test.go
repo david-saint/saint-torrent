@@ -43,18 +43,23 @@ func TestGetSpaceActionHelp(t *testing.T) {
 
 func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	defaults := parseCLIArgs(nil)
-	if defaults.listenPort != defaultPeerPort || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
+	if defaults.listenPort != defaultPeerPort || defaults.httpAddr != "" || defaults.headless || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--no-nat", "--encryption", "require", "--storage", "mmap"})
-	if overrides.listenPort != 52000 || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
+	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap"})
+	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 
 	invalid := parseCLIArgs([]string{"--port", "70000"})
 	if invalid.err == nil {
 		t.Fatal("expected invalid port error")
+	}
+
+	missingHTTPAddr := parseCLIArgs([]string{"--http-addr"})
+	if missingHTTPAddr.err == nil {
+		t.Fatal("expected missing HTTP address error")
 	}
 
 	invalidEncryption := parseCLIArgs([]string{"--encryption", "bogus"})
@@ -65,6 +70,25 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	invalidStorage := parseCLIArgs([]string{"--storage", "bogus"})
 	if invalidStorage.err == nil {
 		t.Fatal("expected invalid storage backend error")
+	}
+}
+
+func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
+	const endpoint = "HTTP stats endpoint: http://127.0.0.1:16666/stats"
+	const warning = "DHT unavailable: boom"
+
+	var out strings.Builder
+	writeHeadlessStartupMessages(&out, []string{endpoint}, []string{warning})
+
+	got := out.String()
+	if strings.Count(got, endpoint) != 1 {
+		t.Fatalf("endpoint message count = %d, want 1; output=%q", strings.Count(got, endpoint), got)
+	}
+	if strings.Contains(got, "Warning: "+endpoint) {
+		t.Fatalf("endpoint message was printed as warning: %q", got)
+	}
+	if !strings.Contains(got, "Warning: "+warning+"\n") {
+		t.Fatalf("warning message missing warning prefix: %q", got)
 	}
 }
 
@@ -512,7 +536,7 @@ func TestHandleSocketConnection(t *testing.T) {
 			TTY:     "/dev/ttys042",
 			Program: "Apple_Terminal",
 			Title:   terminalWindowTitle,
-		})
+		}, false)
 	}()
 
 	msg := socketMessage{
@@ -544,6 +568,55 @@ func TestHandleSocketConnection(t *testing.T) {
 	}
 }
 
+func TestHandleSocketConnectionHeadlessNoConfirm(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+
+	programMu.Lock()
+	teaProgram = nil
+	programMu.Unlock()
+
+	var handlersWG sync.WaitGroup
+	handlersWG.Add(1)
+	shutdownChan := make(chan struct{})
+
+	go func() {
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, true)
+	}()
+
+	const infoHash = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
+	msg := socketMessage{
+		Items:       []string{"magnet:?xt=urn:btih:" + infoHash + "&dn=HeadlessNoConfirm"},
+		Confirm:     false,
+		DownloadDir: t.TempDir(),
+	}
+	data, _ := json.Marshal(msg)
+	_, _ = clientConn.Write(append(data, '\n'))
+
+	buf := make([]byte, 1024)
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+
+	var resp socketResponse
+	if err := json.Unmarshal(buf[:n], &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Status != "ok" {
+		t.Fatalf("expected status=ok, got status=%s message=%s", resp.Status, resp.Message)
+	}
+	if mgr.GetSession(infoHash) == nil {
+		t.Fatal("expected headless socket handler to add torrent immediately")
+	}
+
+	handlersWG.Wait()
+}
+
 func TestSocketLimitsAndMalformed(t *testing.T) {
 	mgr := downloader.NewTorrentManager()
 	defer mgr.Close()
@@ -567,7 +640,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG, terminalIdentity{})
+		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
 	}()
 
 	largeData := make([]byte, 70000)
@@ -609,7 +682,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 			handlersWG.Done()
 			return
 		}
-		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG, terminalIdentity{})
+		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
 	}()
 
 	rawClientConn2, err := net.Dial("tcp", listener.Addr().String())
@@ -664,7 +737,7 @@ func TestSocketPartialFailures(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{})
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
 	}()
 
 	msg := socketMessage{
@@ -729,7 +802,7 @@ func TestSocketShutdownUnblocksRead(t *testing.T) {
 
 	handlerDone := make(chan struct{})
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{})
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
 		close(handlerDone)
 	}()
 
