@@ -35,6 +35,12 @@ var (
 	teaProgram *tea.Program
 )
 
+// version is the build version of saintTorrent. It defaults to "dev" and can be
+// overridden at build time via:
+//
+//	go build -ldflags "-X main.version=v1.2.3" ./cmd/sainttorrent
+var version = "dev"
+
 // --- startup/shutdown timing ---
 // Enabled via SAINTTORRENT_TIMING=1 (and implicitly under SAINTTORRENT_BENCH=1).
 // Marks are buffered and printed after the TUI releases the terminal, so they never
@@ -169,6 +175,8 @@ type cliOptions struct {
 	logPath     string
 	logLevel    logging.Level
 	logLevelSet bool
+	help        bool
+	showVersion bool
 	err         error
 	items       []string
 }
@@ -1067,6 +1075,39 @@ func normalizeForwardedItems(items []string) []string {
 	return normalized
 }
 
+// usageText returns the help message printed for -h/--help.
+func usageText() string {
+	return `saintTorrent - a beautiful, high-performance BitTorrent client for the terminal.
+
+Usage:
+  sainttorrent [options] [torrent-file-or-magnet-uri ...]
+
+Options:
+  -d, --dir <path>          Download directory (default ".")
+  -c, --config <path>       Configuration/IPC directory
+  -p, --port <port>         Peer listen port (0 for ephemeral, default 51413)
+      --no-nat              Disable automatic UPnP/NAT-PMP port mapping
+      --encryption <mode>   Peer encryption: prefer, require, or disable (default prefer)
+      --storage <backend>   Storage backend: file, mmap, or mem (default file)
+      --theme <name>        Color theme
+      --headless            Run without the TUI
+      --confirm             Require confirmation before adding forwarded torrents
+      --no-confirm          Skip confirmation when adding forwarded torrents
+      --no-persist          Do not persist fast-resume state
+      --http-addr <addr>    Enable the read-only JSON stats API on this address
+      --log <path>          Write JSON-lines debug logs to a rotating file
+      --log-level <level>   Log level: debug, info, warn, or error
+      --write-config <path> Write a default config file and exit
+  -h, --help                Show this help message and exit
+  -v, --version             Show version information and exit
+
+Examples:
+  sainttorrent -d ~/Downloads
+  sainttorrent -d ~/Downloads "magnet:?xt=urn:btih:..."
+  sainttorrent --headless --http-addr 127.0.0.1:16666
+`
+}
+
 func parseCLIArgs(args []string) cliOptions {
 	opts := cliOptions{
 		downloadDir: ".",
@@ -1167,6 +1208,10 @@ func parseCLIArgs(args []string) cliOptions {
 			}
 			opts.logLevel = level
 			opts.logLevelSet = true
+		case "-h", "--help":
+			opts.help = true
+		case "-v", "--version":
+			opts.showVersion = true
 		default:
 			opts.items = append(opts.items, args[i])
 		}
@@ -1445,6 +1490,14 @@ func main() {
 	}
 
 	opts := parseCLIArgs(os.Args[1:])
+	if opts.help {
+		fmt.Fprint(os.Stdout, usageText())
+		os.Exit(0)
+	}
+	if opts.showVersion {
+		fmt.Fprintf(os.Stdout, "saintTorrent %s\n", version)
+		os.Exit(0)
+	}
 	if opts.err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", opts.err)
 		os.Exit(2)

@@ -82,6 +82,36 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestParseCLIArgsHelpAndVersion(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		opts := parseCLIArgs([]string{arg})
+		if !opts.help || opts.err != nil {
+			t.Fatalf("expected help flag for %q, got %+v", arg, opts)
+		}
+	}
+
+	for _, arg := range []string{"-v", "--version"} {
+		opts := parseCLIArgs([]string{arg})
+		if !opts.showVersion || opts.err != nil {
+			t.Fatalf("expected version flag for %q, got %+v", arg, opts)
+		}
+	}
+
+	defaults := parseCLIArgs(nil)
+	if defaults.help || defaults.showVersion {
+		t.Fatalf("expected help/version unset by default, got %+v", defaults)
+	}
+}
+
+func TestUsageTextMentionsKeyFlags(t *testing.T) {
+	usage := usageText()
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--encryption", "--storage"} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage text missing %q", want)
+		}
+	}
+}
+
 func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
 	const endpoint = "HTTP stats endpoint: http://127.0.0.1:16666/stats"
 	const warning = "DHT unavailable: boom"

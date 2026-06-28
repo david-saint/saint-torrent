@@ -58,9 +58,22 @@ cd saint-torrent
 go build -o sainttorrent ./cmd/sainttorrent
 ```
 
+To stamp a version into the binary (reported by `--version`):
+
+```bash
+go build -ldflags "-X main.version=v1.0.0" -o sainttorrent ./cmd/sainttorrent
+```
+
 ---
 
 ## Usage
+
+List all available flags or print the version:
+
+```bash
+./sainttorrent --help
+./sainttorrent --version
+```
 
 Start the client with default download directory (`.`):
 
