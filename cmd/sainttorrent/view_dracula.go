@@ -50,7 +50,8 @@ func renderListDracula(m *model) string {
 	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open Folder"},
-		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"}, {"t", "Theme"}, {"q", "Quit"},
+		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"},
+		{"x", "Delete Task"}, {"X", "Delete Task & Files"}, {"t", "Theme"}, {"q", "Quit"},
 	}, st, m.width)
 
 	var sb strings.Builder

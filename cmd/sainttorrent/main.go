@@ -219,6 +219,7 @@ type model struct {
 	addConfirmErr    error
 	deleteTargetName string
 	deleteTargetHash string
+	deleteOriginView viewMode
 	pendingItems     []pendingItem
 	pendingIdx       int
 
@@ -308,6 +309,21 @@ func (m *model) moveFileSelection(delta int) {
 		return
 	}
 	m.selectedFileIdx = clamp(m.selectedFileIdx+delta, 0, len(files)-1)
+}
+
+func (m *model) startDelete(withFiles bool, origin viewMode) {
+	m.viewMode = viewDeleteConfirm
+	m.deleteWithFiles = withFiles
+	m.deleteErr = nil
+	m.deleteOriginView = origin
+	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+		s := m.sessions[m.selectedIdx]
+		m.deleteTargetName = sanitizeText(s.Name())
+		m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
+	} else {
+		m.deleteTargetName = ""
+		m.deleteTargetHash = ""
+	}
 }
 
 func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string, pending []pendingItem) model {
@@ -558,6 +574,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Placeholder = "Upload limit in KB/s (0 for unlimited)"
 			case "o":
 				m.openSelectedLocation()
+			case "x":
+				m.startDelete(false, viewList)
+			case "X":
+				m.startDelete(true, viewList)
 			case "t":
 				m.cycleTheme()
 			}
@@ -606,29 +626,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "o":
 				m.openSelectedLocation()
 			case "x":
-				m.viewMode = viewDeleteConfirm
-				m.deleteWithFiles = false
-				m.deleteErr = nil
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = sanitizeText(s.Name())
-					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-				} else {
-					m.deleteTargetName = ""
-					m.deleteTargetHash = ""
-				}
+				m.startDelete(false, viewDetail)
 			case "X":
-				m.viewMode = viewDeleteConfirm
-				m.deleteWithFiles = true
-				m.deleteErr = nil
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = sanitizeText(s.Name())
-					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-				} else {
-					m.deleteTargetName = ""
-					m.deleteTargetHash = ""
-				}
+				m.startDelete(true, viewDetail)
 			case "t":
 				m.cycleTheme()
 			}
@@ -692,7 +692,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.deleteErr = nil
 				} else {
-					m.viewMode = viewDetail
+					m.viewMode = m.deleteOriginView
+					if m.pendingIdx < len(m.pendingItems) {
+						m.viewMode = viewAddConfirm
+					}
 				}
 			case "y", "Y":
 				if m.deleteErr != nil {

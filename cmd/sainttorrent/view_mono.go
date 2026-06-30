@@ -99,7 +99,7 @@ func renderListMono(m *model) string {
 	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open"}, {"a", "Add"},
-		{"d", "Down"}, {"u", "Up"}, {"t", "Theme"}, {"q", "Quit"},
+		{"d", "Down"}, {"u", "Up"}, {"x", "Delete"}, {"X", "Delete+Files"}, {"t", "Theme"}, {"q", "Quit"},
 	}, st, m.width)
 
 	var sb strings.Builder
