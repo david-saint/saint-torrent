@@ -50,8 +50,9 @@ func renderListDracula(m *model) string {
 	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open Folder"},
-		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width)
+		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"},
+		{"x", "Delete Task"}, {"X", "Delete Task & Files"}, {"t", "Theme"}, {"q", "Quit"},
+	}, listHelpColumns, st, m.width)
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
@@ -296,7 +297,7 @@ func renderDetailsDracula(m *model) string {
 		{"↑/↓", "Scroll"}, {"pgup/pgdn", "Page"},
 		{"esc", "Back"}, {"space", spaceActionHelp}, {"f", "Files"}, {"o", "Open Folder"},
 		{"x", "Delete Task"}, {"X", "Delete Task & Files"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }

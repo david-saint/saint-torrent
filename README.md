@@ -28,12 +28,16 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 - `a` - Add a new torrent (prompt accepts local filepath or Magnet URI)
 - `d` - Set a global download speed limit (in KB/s)
 - `u` - Set a global upload speed limit (in KB/s)
+- `x` - Delete the selected torrent task (keeps downloaded files)
+- `X` - Delete the selected torrent task and its downloaded files
 
 ### Torrent Details View
 - `esc` - Go back to the Torrent List view
 - `space` - Pause or resume the torrent
 - `f` - Open the File Explorer for this torrent
 - `o` - Open this torrent's file/folder location in your file manager (Finder on macOS)
+- `x` - Delete the torrent task (keeps downloaded files)
+- `X` - Delete the torrent task and its downloaded files
 - `q` or `Ctrl+C` - Quit
 
 ### File Explorer View
