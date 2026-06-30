@@ -47,12 +47,12 @@ func renderListDracula(m *model) string {
 	if m.flash != "" {
 		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
 	}
-	help := renderHelp([][2]string{
+	help := renderHelpColumns([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open Folder"},
 		{"a", "Add"}, {"d", "Down Limit"}, {"u", "Up Limit"},
 		{"x", "Delete Task"}, {"X", "Delete Task & Files"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width)
+	}, helpRowsPerColumn, st, m.width)
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
