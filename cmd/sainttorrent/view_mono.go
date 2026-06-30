@@ -96,11 +96,11 @@ func renderListMono(m *model) string {
 	if m.flash != "" {
 		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
 	}
-	help := renderHelpColumns([][2]string{
+	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open"}, {"a", "Add"},
 		{"d", "Down"}, {"u", "Up"}, {"x", "Delete"}, {"X", "Delete+Files"}, {"t", "Theme"}, {"q", "Quit"},
-	}, helpRowsPerColumn, st, m.width)
+	}, listHelpColumns, st, m.width)
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
@@ -339,7 +339,7 @@ func renderDetailsMono(m *model) string {
 		{"↑/↓", "Scroll"}, {"pgup/pgdn", "Page"},
 		{"esc", "Back"}, {"space", spaceActionHelp}, {"f", "Files"}, {"o", "Open"},
 		{"x", "Delete"}, {"X", "Delete+Files"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }

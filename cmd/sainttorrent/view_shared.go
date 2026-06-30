@@ -141,20 +141,19 @@ func dividerLine(st styles, termWidth int) string {
 	return gutterStr(termWidth) + st.Hairline.Render(strings.Repeat("─", bodyWidth(termWidth)))
 }
 
-// helpColumns is the preferred number of footer columns; the layout drops to
-// fewer when the body is too narrow to fit them.
-const helpColumns = 2
+// Preferred number of footer columns. Secondary views use helpColumns; the
+// list view passes listHelpColumns so its longer shortcut list stays short
+// instead of growing taller. The layout drops to fewer columns when the body
+// is too narrow to fit them.
+const (
+	helpColumns     = 2
+	listHelpColumns = 3
+)
 
-// helpRowsPerColumn is the target number of rows per column for the dashboard
-// footer. The list view fills each column up to this height (column-major)
-// before starting a new column, so adding shortcuts widens the footer instead
-// of growing it taller.
-const helpRowsPerColumn = 5
-
-// renderHelp lays out [key] Label pairs in an aligned grid of up to helpColumns
+// renderHelp lays out [key] Label pairs in an aligned grid of up to maxCols
 // columns (row-major), each row gutter-prefixed. Lines never overrun the body
 // width: the column count is chosen to fit, and clampLines is the final net.
-func renderHelp(items [][2]string, st styles, termWidth int) string {
+func renderHelp(items [][2]string, maxCols int, st styles, termWidth int) string {
 	g := gutterStr(termWidth)
 	bw := bodyWidth(termWidth)
 	if len(items) == 0 {
@@ -167,9 +166,9 @@ func renderHelp(items [][2]string, st styles, termWidth int) string {
 	}
 
 	const gap = 2
-	// Pick the widest column count (<= helpColumns) whose grid fits the body.
+	// Pick the widest column count (<= maxCols) whose grid fits the body.
 	cols := 1
-	for c := min(helpColumns, len(pieces)); c > 1; c-- {
+	for c := min(maxCols, len(pieces)); c > 1; c-- {
 		if helpGridWidth(pieces, c, gap) <= bw {
 			cols = c
 			break
@@ -205,97 +204,6 @@ func helpGridWidth(pieces []string, cols, gap int) int {
 	colW := make([]int, cols)
 	for i, p := range pieces {
 		if c := i % cols; dispWidth(p) > colW[c] {
-			colW[c] = dispWidth(p)
-		}
-	}
-	total := gap * (cols - 1)
-	for _, w := range colW {
-		total += w
-	}
-	return total
-}
-
-// renderHelpColumns lays out [key] Label pairs in a column-major grid where each
-// column holds at most rowsPerCol entries, so the footer stays rowsPerCol rows
-// tall as shortcuts are added (extra items flow into a new column instead of a
-// new row). When the body is too narrow for the ideal column count it drops
-// columns (and the footer grows taller) so width always wins, mirroring
-// renderHelp.
-func renderHelpColumns(items [][2]string, rowsPerCol int, st styles, termWidth int) string {
-	g := gutterStr(termWidth)
-	bw := bodyWidth(termWidth)
-	if len(items) == 0 || rowsPerCol < 1 {
-		return ""
-	}
-
-	pieces := make([]string, len(items))
-	for i, it := range items {
-		pieces[i] = "[" + it[0] + "] " + it[1]
-	}
-
-	const gap = 2
-	// Ideal column count keeps every column at most rowsPerCol tall.
-	idealCols := (len(pieces) + rowsPerCol - 1) / rowsPerCol
-	cols := 1
-	for c := idealCols; c > 1; c-- {
-		rows := rowsPerCol
-		if c*rowsPerCol < len(pieces) {
-			rows = (len(pieces) + c - 1) / c
-		}
-		if helpColumnMajorWidth(pieces, c, rows, gap) <= bw {
-			cols = c
-			break
-		}
-	}
-
-	// Column height: rowsPerCol when the chosen columns hold everything,
-	// otherwise ceil(n/cols) so nothing is dropped when width forced fewer cols.
-	rows := rowsPerCol
-	if cols*rowsPerCol < len(pieces) {
-		rows = (len(pieces) + cols - 1) / cols
-	}
-
-	colW := make([]int, cols)
-	for i, p := range pieces {
-		c := i / rows
-		if c >= cols {
-			c = cols - 1
-		}
-		if dispWidth(p) > colW[c] {
-			colW[c] = dispWidth(p)
-		}
-	}
-
-	var lines []string
-	for r := 0; r < rows; r++ {
-		var cells []string
-		for c := 0; c < cols; c++ {
-			idx := c*rows + r
-			if idx >= len(pieces) {
-				break
-			}
-			p := pieces[idx]
-			if c < cols-1 {
-				p = padTo(p, colW[c]) // align inner columns; trailing cell stays ragged
-			}
-			cells = append(cells, st.Help.Render(p))
-		}
-		lines = append(lines, g+strings.Join(cells, strings.Repeat(" ", gap)))
-	}
-	return strings.Join(lines, "\n")
-}
-
-// helpColumnMajorWidth returns the worst-case display width of a column-major
-// grid with the given column count and rows-per-column (sum of per-column
-// maxima plus inter-column gaps).
-func helpColumnMajorWidth(pieces []string, cols, rows, gap int) int {
-	colW := make([]int, cols)
-	for i, p := range pieces {
-		c := i / rows
-		if c >= cols {
-			c = cols - 1
-		}
-		if dispWidth(p) > colW[c] {
 			colW[c] = dispWidth(p)
 		}
 	}
@@ -592,7 +500,7 @@ func (m model) viewFileExplorer() string {
 
 	sb.WriteString(renderHelp([][2]string{
 		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -620,7 +528,7 @@ func (m model) viewInputBox() string {
 	if m.inputErr != "" {
 		sb.WriteString(g + st.Error.Render(truncateRight(sanitizeText(m.inputErr), bw)) + "\n\n")
 	}
-	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, st, m.width))
+	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -644,7 +552,7 @@ func (m model) viewAddConfirm() string {
 		label := "Error adding torrent: "
 		sb.WriteString(g + st.Error.Render("Error adding torrent") + ": " +
 			truncateRight(sanitizeText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
-		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, st, m.width))
+		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
 	}
@@ -663,7 +571,7 @@ func (m model) viewAddConfirm() string {
 
 	sb.WriteString(renderHelp([][2]string{
 		{"y", "Yes, Confirm Download"}, {"n", "No, Skip"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -697,7 +605,7 @@ func (m model) viewDeleteConfirm() string {
 		sb.WriteString(header("Deletion Failure:", m.deleteTargetName))
 		sb.WriteString(card.Render(st.Error.Render(sanitizeText(m.deleteErr.Error()))))
 		sb.WriteString("\n\n")
-		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, st, m.width))
+		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
 	}
@@ -717,7 +625,7 @@ func (m model) viewDeleteConfirm() string {
 	}
 	sb.WriteString(card.Render("Are you sure you want to delete this torrent?\n\n" + warnMsg))
 	sb.WriteString("\n\n")
-	sb.WriteString(renderHelp([][2]string{{"y", "Yes, Confirm Delete"}, {"n/esc", "Cancel"}}, st, m.width))
+	sb.WriteString(renderHelp([][2]string{{"y", "Yes, Confirm Delete"}, {"n/esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
