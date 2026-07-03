@@ -311,6 +311,17 @@ func (m *model) moveFileSelection(delta int) {
 	m.selectedFileIdx = clamp(m.selectedFileIdx+delta, 0, len(files)-1)
 }
 
+// resumePendingOr switches to fallback, unless queued magnet adds are waiting
+// (they can arrive at any moment, e.g. from a second instance), in which case
+// the add-confirm flow resumes instead.
+func (m *model) resumePendingOr(fallback viewMode) {
+	if m.pendingIdx < len(m.pendingItems) {
+		m.viewMode = viewAddConfirm
+	} else {
+		m.viewMode = fallback
+	}
+}
+
 func (m *model) startDelete(withFiles bool, origin viewMode) {
 	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
 		return
@@ -432,10 +443,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case viewInput:
 			switch msg.String() {
 			case "esc":
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 				m.inputMode = inputNone
 				m.inputErr = ""
 				m.textInput.Blur()
@@ -463,10 +471,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					sess.Start()
 					m.refreshSessions()
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -482,10 +487,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.manager.SetGlobalDownloadLimit(limitKb * 1024)
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -501,10 +503,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.manager.SetGlobalUploadLimit(limitKb * 1024)
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -587,11 +586,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "esc":
-				m.viewMode = viewList
 				m.detailScroll = 0
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 			case "up", "k":
 				m.scrollDetails(-1)
 			case "down", "j":
@@ -633,10 +629,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case viewFiles:
 			if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 				return m, nil
 			}
 			s := m.sessions[m.selectedIdx]
@@ -684,23 +677,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc", "n", "N":
 				if m.deleteErr != nil {
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.deleteErr = nil
 				} else {
-					m.viewMode = m.deleteOriginView
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(m.deleteOriginView)
 				}
 			case "y", "Y":
 				if m.deleteErr != nil {
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.deleteErr = nil
 					return m, nil
 				}
@@ -716,10 +700,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.refreshSessions()
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 			}
 
 		case viewAddConfirm:
@@ -905,10 +886,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewMode = viewDeleteConfirm
 			return m, nil
 		}
-		m.viewMode = viewList
-		if m.pendingIdx < len(m.pendingItems) {
-			m.viewMode = viewAddConfirm
-		}
+		m.resumePendingOr(viewList)
 		return m, nil
 
 	case tea.WindowSizeMsg:
