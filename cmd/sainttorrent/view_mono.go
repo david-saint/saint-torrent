@@ -89,8 +89,7 @@ func renderListMono(m *model) string {
 	}
 
 	spaceActionHelp := "Pause/Resume"
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
+	if s, ok := m.selectedSession(); ok {
 		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
 	}
 	if m.flash != "" {
@@ -224,11 +223,11 @@ func renderDetailsMono(m *model) string {
 	g := gutterStr(m.width)
 
 	var sb strings.Builder
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		sb.WriteString(g + st.Bold.Render("saintTorrent") + "\n")
 		return sb.String()
 	}
-	s := m.sessions[m.selectedIdx]
 	hashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
 	active := s.GetActivePeers()
 

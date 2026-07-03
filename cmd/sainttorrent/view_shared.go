@@ -458,10 +458,10 @@ func listColumns(bw int) listLayout {
 
 func (m model) viewFileExplorer() string {
 	st := m.theme.styles
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		return ""
 	}
-	s := m.sessions[m.selectedIdx]
 	files := s.Files()
 
 	bw := bodyWidth(m.width)
@@ -610,7 +610,7 @@ func (m model) viewDeleteConfirm() string {
 		return sb.String()
 	}
 
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	if _, ok := m.selectedSession(); !ok {
 		return ""
 	}
 

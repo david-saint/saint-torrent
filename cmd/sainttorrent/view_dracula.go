@@ -40,8 +40,7 @@ func renderListDracula(m *model) string {
 	head.WriteString(g + dracFooter(m, st) + "\n\n")
 
 	spaceActionHelp := "Pause/Resume"
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
+	if s, ok := m.selectedSession(); ok {
 		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
 	}
 	if m.flash != "" {
@@ -189,10 +188,10 @@ func renderDetailsDracula(m *model) string {
 	var sb strings.Builder
 	sb.WriteString(st.Title.Render(dracBanner) + "\n")
 
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		return sb.String()
 	}
-	s := m.sessions[m.selectedIdx]
 
 	label := "Torrent Details: "
 	sb.WriteString(g + st.Header.Render("Torrent Details:") + " " +
