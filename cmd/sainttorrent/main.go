@@ -312,18 +312,16 @@ func (m *model) moveFileSelection(delta int) {
 }
 
 func (m *model) startDelete(withFiles bool, origin viewMode) {
+	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		return
+	}
+	s := m.sessions[m.selectedIdx]
 	m.viewMode = viewDeleteConfirm
 	m.deleteWithFiles = withFiles
 	m.deleteErr = nil
 	m.deleteOriginView = origin
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
-		m.deleteTargetName = sanitizeText(s.Name())
-		m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-	} else {
-		m.deleteTargetName = ""
-		m.deleteTargetHash = ""
-	}
+	m.deleteTargetName = sanitizeText(s.Name())
+	m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 }
 
 func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string, pending []pendingItem) model {

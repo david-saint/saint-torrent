@@ -189,11 +189,23 @@ func TestGetSpeedStr(t *testing.T) {
 }
 
 func TestDeleteViewFlow(t *testing.T) {
-	// Initialize a dummy model
+	// Initialize a model with one real session selected, since the delete
+	// shortcuts ignore an empty selection.
 	mgr := downloader.NewTorrentManager()
 	defer mgr.Close()
+
+	const infoHashHex = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
+	_, err := mgr.AddMagnet("magnet:?xt=urn:btih:"+infoHashHex+"&dn=DetailDelete", t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to add session: %v", err)
+	}
+
 	m := initialModel(mgr, ".", "", nil)
 	m.viewMode = viewDetail
+	m.refreshSessions()
+	if len(m.sessions) == 0 {
+		t.Fatal("expected at least one session")
+	}
 	m.deleteWithFiles = false
 	m.deleteErr = nil
 
@@ -300,6 +312,25 @@ func TestDeleteFromListViewFlow(t *testing.T) {
 	}
 	if m.deleteErr != nil {
 		t.Error("expected deleteErr to be cleared after transitioning back to list")
+	}
+}
+
+func TestDeleteShortcutsIgnoreEmptyList(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+
+	m := initialModel(mgr, ".", "", nil)
+	m.viewMode = viewList
+	if len(m.sessions) != 0 {
+		t.Fatalf("expected an empty session list, got %d", len(m.sessions))
+	}
+
+	for _, key := range []string{"x", "X"} {
+		mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		m = mUpdated.(model)
+		if m.viewMode != viewList {
+			t.Errorf("expected %q on an empty list to stay in viewList, got %v", key, m.viewMode)
+		}
 	}
 }
 
