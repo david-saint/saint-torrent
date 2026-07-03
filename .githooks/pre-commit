@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit gate mirroring the first CI checks (.github/workflows/ci.yml).
+# Enable once per clone: git config core.hooksPath .githooks
+set -e
+
+unformatted="$(gofmt -l $(git ls-files '*.go'))"
+if [ -n "$unformatted" ]; then
+	echo "gofmt: these files need formatting (run gofmt -w on them):" >&2
+	echo "$unformatted" >&2
+	exit 1
+fi
+
+go vet ./...

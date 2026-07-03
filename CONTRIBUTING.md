@@ -45,6 +45,12 @@ Ensure you have Go 1.24+ installed. Clone the repository and run:
 go mod download
 ```
 
+Then enable the repo pre-commit hook, which runs the same formatting and vet checks CI enforces (`gofmt` and `go vet`) before each commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ### Running Tests
 We maintain a robust test suite covering rate limiting, session mechanics, and manager functions. Always verify your changes do not break existing code before submitting a PR:
 
