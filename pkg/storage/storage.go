@@ -562,34 +562,54 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return ErrStorageClosed
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed.Load() {
-		return ErrStorageClosed
-	}
-
-	return s.saveStateLocked(infoHashHex, completedPieces)
-}
-
-func (s *FileStorage) saveStateLocked(infoHashHex string, completedPieces []int) error {
 	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
 	if err != nil {
 		return err
 	}
+
+	type fileMeta struct {
+		path  string
+		size  int64
+		mtime int64
+	}
+	var filesMeta []fileMeta
+
+	s.mu.RLock()
+	closed := s.closed.Load()
+	if !closed {
+		filesMeta = make([]fileMeta, 0, len(s.files))
+		for _, f := range s.files {
+			mtime := int64(0)
+			if mt, ok := s.stateFileMt[f.path]; ok {
+				mtime = mt
+			}
+			filesMeta = append(filesMeta, fileMeta{
+				path:  f.path,
+				size:  f.length,
+				mtime: mtime,
+			})
+		}
+	}
+	s.mu.RUnlock()
+
+	if closed {
+		return ErrStorageClosed
+	}
+
 	state := FastResumeState{
 		InfoHashHex:     infoHashHex,
 		CompletedPieces: completedPieces,
 	}
 
-	for _, f := range s.files {
+	for _, fm := range filesMeta {
 		state.Files = append(state.Files, struct {
 			Path  string `json:"path"`
 			Size  int64  `json:"size"`
 			Mtime int64  `json:"mtime"`
 		}{
-			Path:  f.path,
-			Size:  f.length,
-			Mtime: s.stateMtimeLocked(f.path, 0),
+			Path:  fm.path,
+			Size:  fm.size,
+			Mtime: fm.mtime,
 		})
 	}
 
@@ -601,12 +621,7 @@ func (s *FileStorage) saveStateLocked(infoHashHex string, completedPieces []int)
 	return os.WriteFile(statePath, data, 0644)
 }
 
-func (s *FileStorage) stateMtimeLocked(path string, fallback int64) int64 {
-	if mt, ok := s.stateFileMt[path]; ok {
-		return mt
-	}
-	return fallback
-}
+
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
 func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {

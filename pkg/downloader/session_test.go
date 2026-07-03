@@ -359,8 +359,10 @@ func TestSessionSaveStateErrorsAreSurfaced(t *testing.T) {
 	}
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
-	sess.saveStateLocked()
+	sess.recomputeStatsLocked()
+	sess.stateDirty = true
 	sess.mu.Unlock()
+	sess.flushState()
 
 	if err := sess.LastError(); err == nil {
 		t.Fatal("expected fast-resume save failure to be surfaced")
@@ -475,6 +477,7 @@ func TestSessionFileSelectionCompletionUsesWantedBytes(t *testing.T) {
 	sess.SetFilePriority(0, PrioritySkip)
 	sess.mu.Lock()
 	sess.PieceStates[1] = PieceCompleted
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	if pct := sess.PercentComplete(); pct != 100.0 {
@@ -847,6 +850,7 @@ func TestSessionServesRequestedPieceAndCountsUpload(t *testing.T) {
 	defer sess.Close()
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	clientConn, remoteConn := net.Pipe()
@@ -944,6 +948,7 @@ func TestFastExtensionSendsHaveAllInsteadOfBitfield(t *testing.T) {
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
 	sess.recomputeNeededLocked()
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	clientConn, remoteConn := net.Pipe()
@@ -1137,6 +1142,7 @@ func TestFastExtensionServesAllowedFastUploadWhileChoked(t *testing.T) {
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
 	sess.recomputeNeededLocked()
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	clientConn, remoteConn := net.Pipe()
@@ -1850,6 +1856,7 @@ func TestSessionStatusStopped(t *testing.T) {
 	// Complete the session
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	if !sess.IsCompleted() {
@@ -2083,6 +2090,7 @@ func TestSessionStatusStoppedPrecedence(t *testing.T) {
 	// 1. Mark completed
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	// 2. Set a blocking storage error

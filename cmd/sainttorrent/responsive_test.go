@@ -48,6 +48,7 @@ func newResponsiveTestManager(t *testing.T) (*downloader.TorrentManager, *downlo
 	}
 	sess.PieceStates[0] = downloader.PieceCompleted
 	sess.PieceStates[1] = downloader.PieceDownloading
+	sess.RecomputeStats()
 	sess.Peers["203.0.113.10:51413"] = &downloader.PeerState{
 		IP:            "203.0.113.10",
 		Port:          51413,

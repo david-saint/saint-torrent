@@ -10,6 +10,7 @@ import (
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/storage"
 	"sync"
+	"time"
 )
 
 // verifyGate bounds how many piece hash checks run concurrently across all sessions,
@@ -79,11 +80,8 @@ const pieceWriteQueueDepth = 8
 func (s *Session) ensurePieceWritePool() {
 	s.pieceWriteOnce.Do(func() {
 		s.pieceWriteCh = make(chan pieceWriteJob, pieceWriteQueueDepth)
-		workers := runtime.GOMAXPROCS(0)
-		if workers < 1 {
-			workers = 1
-		}
-		for i := 0; i < workers; i++ {
+		workers := max(1, runtime.GOMAXPROCS(0))
+		for range workers {
 			go s.pieceWriteWorker()
 		}
 	})
@@ -212,6 +210,7 @@ func (s *Session) loadResumeState() {
 		s.verifyFullScan = true
 	}
 	s.recomputeNeededLocked()
+	s.recomputeStatsLocked()
 	s.verifying = true
 	s.verifyDone = make(chan struct{})
 }
@@ -325,11 +324,13 @@ func (s *Session) runVerification(ctx context.Context) bool {
 			if verifyErr == nil && ok && s.PieceStates[idx] == PieceEmpty {
 				s.PieceStates[idx] = PieceCompleted
 				s.removeNeededLocked(idx)
+				s.updateStatsOnPieceCompleteLocked(idx)
 				nowCompleted = true
 			}
 		} else if s.PieceStates[idx] == PieceUnverified {
 			if verifyErr == nil && ok {
 				s.PieceStates[idx] = PieceCompleted
+				s.updateStatsOnPieceCompleteLocked(idx)
 				nowCompleted = true
 			} else {
 				// Resume data was wrong: return the piece to the pool for re-download.
@@ -376,7 +377,7 @@ func (s *Session) finishVerify() {
 	// Skip the state write if the session is closing so a late finish can't resurrect a
 	// .state file that RemoveSession is deleting.
 	if !s.closed {
-		s.saveStateLocked()
+		s.stateDirty = true
 	}
 
 	var completedNow bool
@@ -391,6 +392,8 @@ func (s *Session) finishVerify() {
 	done := s.verifyDone
 	s.verifyDone = nil
 	s.mu.Unlock()
+
+	s.flushState()
 
 	if completedNow {
 		select {
@@ -427,8 +430,34 @@ func (s *Session) WaitVerified() {
 	}
 }
 
-func (s *Session) saveStateLocked() {
-	if s.Storage == nil {
+// statePersistLoop runs in a dedicated background goroutine, checking for dirty state
+// and flushing it to disk periodically.
+func (s *Session) statePersistLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.flushState()
+			return
+		case <-ticker.C:
+			s.flushState()
+		}
+	}
+}
+
+// flushState snapshots the current fast-resume completed pieces set under s.mu and
+// calls s.Storage.SaveState off-lock to serialize and write to disk, ensuring that
+// heavy JSON marshaling and slow filesystem I/O do not block peer loops or reads.
+func (s *Session) flushState() {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	s.mu.Lock()
+	if s.Storage == nil || !s.stateDirty {
+		s.mu.Unlock()
 		return
 	}
 	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
@@ -440,16 +469,24 @@ func (s *Session) saveStateLocked() {
 			completed = append(completed, i)
 		}
 	}
-	if err := s.Storage.SaveState(infoHashHex, completed); err != nil {
-		if err == storage.ErrStorageClosed && s.closed {
+	s.stateDirty = false
+	closed := s.closed
+	st := s.Storage
+	s.mu.Unlock()
+
+	if err := st.SaveState(infoHashHex, completed); err != nil {
+		if err == storage.ErrStorageClosed && closed {
 			return
 		}
+		s.mu.Lock()
+		s.stateDirty = true // Retry on next tick
 		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
 		s.lastErr = stateErr
 		s.statusErr = stateErr
 		// Wake any blocked readers so they observe the new statusErr rather than
 		// sleeping until the next unrelated state change.
 		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
 	}
 }
 
@@ -468,16 +505,18 @@ type completionStats struct {
 }
 
 func (s *Session) completionStatsLocked() completionStats {
-	var stats completionStats
-	if s.Storage == nil {
-		return stats
-	}
+	return s.stats
+}
 
-	stats.totalBytes = s.Storage.TotalSize()
-	ranges := s.wantedFileRangesLocked()
-	if len(ranges) == 0 && len(s.Torrent.Files) == 0 && stats.totalBytes > 0 {
-		ranges = []byteRange{{start: 0, end: stats.totalBytes}}
+// recomputeStatsLocked fully recalculates completion stats from scratch and caches them.
+func (s *Session) recomputeStatsLocked() {
+	if s.Storage == nil || s.Torrent == nil {
+		s.stats = completionStats{}
+		return
 	}
+	var stats completionStats
+	stats.totalBytes = s.Storage.TotalSize()
+	ranges := s.wantedStatsRangesLocked()
 
 	for _, r := range ranges {
 		if r.end > r.start {
@@ -486,21 +525,12 @@ func (s *Session) completionStatsLocked() completionStats {
 	}
 
 	for i, state := range s.PieceStates {
-		pieceStart := int64(i) * s.Storage.PieceLengthValue()
 		pieceLen := s.Storage.PieceLength(int64(i))
-		pieceEnd := pieceStart + pieceLen
 		if state == PieceCompleted {
 			stats.completedTotalBytes += pieceLen
 		}
 
-		wantedOverlap := int64(0)
-		for _, r := range ranges {
-			overlapStart := maxInt64(pieceStart, r.start)
-			overlapEnd := minInt64(pieceEnd, r.end)
-			if overlapEnd > overlapStart {
-				wantedOverlap += overlapEnd - overlapStart
-			}
-		}
+		wantedOverlap := s.pieceWantedOverlapLocked(i, ranges)
 		if wantedOverlap > 0 {
 			stats.wantedPieces++
 			if state == PieceCompleted {
@@ -509,8 +539,53 @@ func (s *Session) completionStatsLocked() completionStats {
 			}
 		}
 	}
+	s.stats = stats
+}
 
-	return stats
+// wantedStatsRangesLocked returns the wanted byte ranges used for completion stats,
+// synthesizing a whole-storage range for legacy single-file torrents whose metadata
+// carries no file list. Caller holds s.mu.
+func (s *Session) wantedStatsRangesLocked() []byteRange {
+	if s.Storage == nil || s.Torrent == nil {
+		return nil
+	}
+	ranges := s.wantedFileRangesLocked()
+	if len(ranges) == 0 && len(s.Torrent.Files) == 0 && s.Storage.TotalSize() > 0 {
+		ranges = []byteRange{{start: 0, end: s.Storage.TotalSize()}}
+	}
+	return ranges
+}
+
+// pieceWantedOverlapLocked returns the number of bytes the given piece overlaps with the
+// wanted ranges. Ranges are passed in (see wantedStatsRangesLocked) so bulk recomputes
+// build them once instead of per piece. Caller holds s.mu.
+func (s *Session) pieceWantedOverlapLocked(idx int, ranges []byteRange) int64 {
+	pieceStart := int64(idx) * s.Storage.PieceLengthValue()
+	pieceEnd := pieceStart + s.Storage.PieceLength(int64(idx))
+	wantedOverlap := int64(0)
+	for _, r := range ranges {
+		overlapStart := maxInt64(pieceStart, r.start)
+		overlapEnd := minInt64(pieceEnd, r.end)
+		if overlapEnd > overlapStart {
+			wantedOverlap += overlapEnd - overlapStart
+		}
+	}
+	return wantedOverlap
+}
+
+// updateStatsOnPieceCompleteLocked incrementally updates the cached completion stats when
+// a single piece transitions to PieceCompleted. Caller holds s.mu.
+func (s *Session) updateStatsOnPieceCompleteLocked(idx int) {
+	if s.Storage == nil {
+		return
+	}
+	pieceLen := s.Storage.PieceLength(int64(idx))
+	s.stats.completedTotalBytes += pieceLen
+	wantedOverlap := s.pieceWantedOverlapLocked(idx, s.wantedStatsRangesLocked())
+	if wantedOverlap > 0 {
+		s.stats.completedWantedBytes += wantedOverlap
+		s.stats.completedWantedPieces++
+	}
 }
 
 func (s *Session) wantedFileRangesLocked() []byteRange {
@@ -550,8 +625,13 @@ func maxInt64(a, b int64) int64 {
 
 func (s *Session) markPieceCompleted(index int64) {
 	s.mu.Lock()
+	if s.PieceStates[index] == PieceCompleted {
+		s.mu.Unlock()
+		return
+	}
 	s.PieceStates[index] = PieceCompleted
 	s.removeNeededLocked(int(index))
+	s.updateStatsOnPieceCompleteLocked(int(index))
 	s.lastErr = nil
 	s.statusErr = nil
 	s.signalPieceWaitersLocked(index)
@@ -559,7 +639,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	// async pool is not awaited by Close) cannot recreate a .state file a remove is
 	// deleting — mirroring finishVerify.
 	if !s.closed {
-		s.saveStateLocked()
+		s.stateDirty = true
 	}
 
 	var completedNow bool
@@ -591,11 +671,12 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	}
 	s.PieceStates[index] = PieceCompleted
 	s.recomputeNeededLocked()
+	s.recomputeStatsLocked()
 	s.lastErr = nil
 	s.statusErr = nil
 	s.signalPieceWaitersLocked(index)
 	if !s.closed {
-		s.saveStateLocked()
+		s.stateDirty = true
 	}
 
 	var completedNow bool
@@ -608,6 +689,8 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 		}
 	}
 	s.mu.Unlock()
+
+	s.flushState()
 
 	s.broadcastHave(uint32(index))
 

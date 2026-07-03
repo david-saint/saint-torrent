@@ -1093,6 +1093,7 @@ func createMockSession(t *testing.T, tempDir, name string, hash [20]byte, addedA
 	if completed {
 		sess.PieceStates[0] = PieceCompleted
 	}
+	sess.recomputeStatsLocked()
 	sess.mu.Unlock()
 
 	return sess

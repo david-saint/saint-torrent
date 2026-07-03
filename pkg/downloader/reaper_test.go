@@ -439,6 +439,7 @@ func TestMaintainPeerConnectionsSkipsWhenNotDownloading(t *testing.T) {
 			for i := range s.PieceStates {
 				s.PieceStates[i] = PieceCompleted
 			}
+			s.recomputeStatsLocked()
 		})
 	})
 }

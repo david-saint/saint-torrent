@@ -144,6 +144,10 @@ type Session struct {
 	pieceWriteCh   chan pieceWriteJob
 	pieceWriteOnce sync.Once
 
+	stateDirty bool
+	stats      completionStats
+	flushMu    sync.Mutex
+
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
 	cancel              context.CancelFunc
@@ -431,9 +435,9 @@ func (s *Session) Start() {
 		}
 	}
 
-	goroutineCount := 4 // tracker + speed monitor + choke loop + peer maintenance
+	goroutineCount := 5 // tracker + speed monitor + choke loop + peer maintenance + state persist loop
 	if listener != nil {
-		goroutineCount = 5 // + inbound listener
+		goroutineCount = 6 // + inbound listener
 	}
 	s.mu.RLock()
 	hasDHT := s.DHT != nil
@@ -450,6 +454,7 @@ func (s *Session) Start() {
 	go s.speedMonitorLoop()
 	go s.chokeLoop()
 	go s.peerMaintenanceLoop()
+	go s.statePersistLoop()
 	if listener != nil {
 		go s.inboundListenerLoop()
 	}
@@ -503,6 +508,8 @@ func (s *Session) Close() {
 	var verifyDone chan struct{}
 	var storageToClose storage.Storage
 	s.closeOnce.Do(func() {
+		s.flushState()
+
 		s.mu.Lock()
 		wasStarted := s.started
 		s.mu.Unlock()
@@ -865,6 +872,9 @@ func (s *Session) Pause() {
 		}
 	}
 	s.mu.Unlock()
+
+	s.flushState()
+
 	if logging.Enabled() {
 		s.mu.RLock()
 		infoHash, name := s.logIdentityLocked()
@@ -955,7 +965,15 @@ func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 // wanted pieces harmlessly re-check and resume waiting. Caller holds s.mu.
 func (s *Session) onFilePriorityChangedLocked() {
 	s.recomputeNeededLocked()
+	s.recomputeStatsLocked()
 	s.broadcastPieceWaitersLocked()
+}
+
+// RecomputeStats recomputes and updates the cached completion stats.
+func (s *Session) RecomputeStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recomputeStatsLocked()
 }
 
 // GetFilePriorities returns a copy of the current file priorities.

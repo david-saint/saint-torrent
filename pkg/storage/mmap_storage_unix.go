@@ -293,14 +293,21 @@ func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed.Load() {
+	closed := s.closed.Load()
+	var refreshErr error
+	if !closed {
+		refreshErr = s.refreshDirtyStateLocked()
+	}
+	s.mu.Unlock()
+
+	if closed {
 		return ErrStorageClosed
 	}
-	if err := s.refreshDirtyStateLocked(); err != nil {
-		return err
+	if refreshErr != nil {
+		return refreshErr
 	}
-	return s.saveStateLocked(infoHashHex, completedPieces)
+
+	return s.FileStorage.SaveState(infoHashHex, completedPieces)
 }
 
 func (s *MMapStorage) refreshDirtyStateLocked() error {

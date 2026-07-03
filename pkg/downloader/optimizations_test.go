@@ -272,6 +272,7 @@ func TestSelectNeededPieceSelfHealsStaleEntries(t *testing.T) {
 	// entry remains in the needed set.
 	sess.mu.Lock()
 	sess.PieceStates[0] = PieceCompleted
+	sess.recomputeStatsLocked()
 	sess.neededPieces[0] = struct{}{} // force the stale entry
 	got := sess.selectNeededPieceLocked(func(int64) bool { return true })
 	_, stillThere := sess.neededPieces[0]

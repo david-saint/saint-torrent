@@ -214,9 +214,32 @@ func (s *MemStorage) SaveState(infoHashHex string, completedPieces []int) error 
 		return ErrStorageClosed
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed.Load() {
+	type fileMeta struct {
+		path  string
+		size  int64
+		mtime int64
+	}
+	var filesMeta []fileMeta
+
+	s.mu.RLock()
+	closed := s.closed.Load()
+	if !closed {
+		filesMeta = make([]fileMeta, 0, len(s.files))
+		for _, f := range s.files {
+			mtime := int64(0)
+			if mt, ok := s.stateFileMt[f.path]; ok {
+				mtime = mt
+			}
+			filesMeta = append(filesMeta, fileMeta{
+				path:  f.path,
+				size:  f.length,
+				mtime: mtime,
+			})
+		}
+	}
+	s.mu.RUnlock()
+
+	if closed {
 		return ErrStorageClosed
 	}
 
@@ -224,15 +247,15 @@ func (s *MemStorage) SaveState(infoHashHex string, completedPieces []int) error 
 		InfoHashHex:     infoHashHex,
 		CompletedPieces: append([]int(nil), completedPieces...),
 	}
-	for _, f := range s.files {
+	for _, fm := range filesMeta {
 		state.Files = append(state.Files, struct {
 			Path  string `json:"path"`
 			Size  int64  `json:"size"`
 			Mtime int64  `json:"mtime"`
 		}{
-			Path:  f.path,
-			Size:  f.length,
-			Mtime: s.stateMtimeLocked(f.path, 0),
+			Path:  fm.path,
+			Size:  fm.size,
+			Mtime: fm.mtime,
 		})
 	}
 
@@ -240,7 +263,14 @@ func (s *MemStorage) SaveState(infoHashHex string, completedPieces []int) error 
 	if err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return ErrStorageClosed
+	}
 	s.states[infoHashHex] = append([]byte(nil), data...)
+	s.mu.Unlock()
 	return nil
 }
 
