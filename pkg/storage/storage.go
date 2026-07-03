@@ -621,8 +621,6 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 	return os.WriteFile(statePath, data, 0644)
 }
 
-
-
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
 func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 	if s.closed.Load() {
