@@ -219,6 +219,7 @@ type model struct {
 	addConfirmErr    error
 	deleteTargetName string
 	deleteTargetHash string
+	deleteOriginView viewMode
 	pendingItems     []pendingItem
 	pendingIdx       int
 
@@ -299,15 +300,49 @@ func (m *model) moveListSelection(delta int) {
 	m.selectedIdx = clamp(m.selectedIdx+delta, 0, len(m.sessions)-1)
 }
 
-func (m *model) moveFileSelection(delta int) {
+// selectedSession returns the session under the list cursor, or ok=false when
+// the list is empty or the cursor is out of range.
+func (m *model) selectedSession() (*downloader.Session, bool) {
 	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+		return nil, false
+	}
+	return m.sessions[m.selectedIdx], true
+}
+
+func (m *model) moveFileSelection(delta int) {
+	s, ok := m.selectedSession()
+	if !ok {
 		return
 	}
-	files := m.sessions[m.selectedIdx].Files()
+	files := s.Files()
 	if len(files) == 0 {
 		return
 	}
 	m.selectedFileIdx = clamp(m.selectedFileIdx+delta, 0, len(files)-1)
+}
+
+// resumePendingOr switches to fallback, unless queued magnet adds are waiting
+// (they can arrive at any moment, e.g. from a second instance), in which case
+// the add-confirm flow resumes instead.
+func (m *model) resumePendingOr(fallback viewMode) {
+	if m.pendingIdx < len(m.pendingItems) {
+		m.viewMode = viewAddConfirm
+	} else {
+		m.viewMode = fallback
+	}
+}
+
+func (m *model) startDelete(withFiles bool, origin viewMode) {
+	s, ok := m.selectedSession()
+	if !ok {
+		return
+	}
+	m.viewMode = viewDeleteConfirm
+	m.deleteWithFiles = withFiles
+	m.deleteErr = nil
+	m.deleteOriginView = origin
+	m.deleteTargetName = sanitizeText(s.Name())
+	m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 }
 
 func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWarn string, pending []pendingItem) model {
@@ -343,11 +378,8 @@ func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWar
 
 func (m *model) refreshSessions() {
 	var selectedHash string
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
-		if s.Torrent != nil {
-			selectedHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-		}
+	if s, ok := m.selectedSession(); ok && s.Torrent != nil {
+		selectedHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 	}
 
 	m.sessions = m.manager.ListSessions()
@@ -383,10 +415,10 @@ func (m *model) refreshSessions() {
 // location is not yet known (e.g. a magnet still fetching metadata) or the file
 // manager could not be launched.
 func (m *model) openSelectedLocation() {
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		return
 	}
-	s := m.sessions[m.selectedIdx]
 	path, ok := s.ContentPath()
 	if !ok {
 		m.flash = "Location not available yet (still fetching metadata)"
@@ -418,10 +450,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case viewInput:
 			switch msg.String() {
 			case "esc":
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 				m.inputMode = inputNone
 				m.inputErr = ""
 				m.textInput.Blur()
@@ -449,10 +478,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					sess.Start()
 					m.refreshSessions()
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -468,10 +494,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.manager.SetGlobalDownloadLimit(limitKb * 1024)
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -487,10 +510,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.manager.SetGlobalUploadLimit(limitKb * 1024)
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.inputMode = inputNone
 					m.inputErr = ""
 					m.textInput.Blur()
@@ -522,8 +542,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedIdx = len(m.sessions) - 1
 				}
 			case " ":
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
+				if s, ok := m.selectedSession(); ok {
 					if s.IsPaused() {
 						s.Resume()
 					} else {
@@ -531,7 +550,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			case "enter":
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
+				if _, ok := m.selectedSession(); ok {
 					m.viewMode = viewDetail
 					m.detailScroll = 0
 				}
@@ -558,6 +577,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Placeholder = "Upload limit in KB/s (0 for unlimited)"
 			case "o":
 				m.openSelectedLocation()
+			case "x":
+				m.startDelete(false, viewList)
+			case "X":
+				m.startDelete(true, viewList)
 			case "t":
 				m.cycleTheme()
 			}
@@ -569,11 +592,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "esc":
-				m.viewMode = viewList
 				m.detailScroll = 0
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 			case "up", "k":
 				m.scrollDetails(-1)
 			case "down", "j":
@@ -587,8 +607,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "end":
 				m.detailScroll = m.detailMaxScroll()
 			case " ":
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
+				if s, ok := m.selectedSession(); ok {
 					if s.IsPaused() {
 						s.Resume()
 					} else {
@@ -596,52 +615,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			case "f":
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
-					if !s.IsMetadataMode() {
-						m.viewMode = viewFiles
-						m.selectedFileIdx = 0
-					}
+				if s, ok := m.selectedSession(); ok && !s.IsMetadataMode() {
+					m.viewMode = viewFiles
+					m.selectedFileIdx = 0
 				}
 			case "o":
 				m.openSelectedLocation()
 			case "x":
-				m.viewMode = viewDeleteConfirm
-				m.deleteWithFiles = false
-				m.deleteErr = nil
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = sanitizeText(s.Name())
-					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-				} else {
-					m.deleteTargetName = ""
-					m.deleteTargetHash = ""
-				}
+				m.startDelete(false, viewDetail)
 			case "X":
-				m.viewMode = viewDeleteConfirm
-				m.deleteWithFiles = true
-				m.deleteErr = nil
-				if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-					s := m.sessions[m.selectedIdx]
-					m.deleteTargetName = sanitizeText(s.Name())
-					m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
-				} else {
-					m.deleteTargetName = ""
-					m.deleteTargetHash = ""
-				}
+				m.startDelete(true, viewDetail)
 			case "t":
 				m.cycleTheme()
 			}
 
 		case viewFiles:
-			if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+			s, ok := m.selectedSession()
+			if !ok {
+				m.resumePendingOr(viewList)
 				return m, nil
 			}
-			s := m.sessions[m.selectedIdx]
 			files := s.Files()
 
 			switch msg.String() {
@@ -686,20 +679,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc", "n", "N":
 				if m.deleteErr != nil {
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.deleteErr = nil
 				} else {
-					m.viewMode = viewDetail
+					m.resumePendingOr(m.deleteOriginView)
 				}
 			case "y", "Y":
 				if m.deleteErr != nil {
-					m.viewMode = viewList
-					if m.pendingIdx < len(m.pendingItems) {
-						m.viewMode = viewAddConfirm
-					}
+					m.resumePendingOr(viewList)
 					m.deleteErr = nil
 					return m, nil
 				}
@@ -715,10 +702,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.refreshSessions()
-				m.viewMode = viewList
-				if m.pendingIdx < len(m.pendingItems) {
-					m.viewMode = viewAddConfirm
-				}
+				m.resumePendingOr(viewList)
 			}
 
 		case viewAddConfirm:
@@ -904,10 +888,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewMode = viewDeleteConfirm
 			return m, nil
 		}
-		m.viewMode = viewList
-		if m.pendingIdx < len(m.pendingItems) {
-			m.viewMode = viewAddConfirm
-		}
+		m.resumePendingOr(viewList)
 		return m, nil
 
 	case tea.WindowSizeMsg:

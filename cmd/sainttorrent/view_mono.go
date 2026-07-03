@@ -89,8 +89,7 @@ func renderListMono(m *model) string {
 	}
 
 	spaceActionHelp := "Pause/Resume"
-	if len(m.sessions) > 0 && m.selectedIdx < len(m.sessions) {
-		s := m.sessions[m.selectedIdx]
+	if s, ok := m.selectedSession(); ok {
 		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
 	}
 	if m.flash != "" {
@@ -99,8 +98,8 @@ func renderListMono(m *model) string {
 	help := renderHelp([][2]string{
 		{"↑/↓", "Select"}, {"pgup/pgdn", "Page"},
 		{"enter", "Details"}, {"space", spaceActionHelp}, {"o", "Open"}, {"a", "Add"},
-		{"d", "Down"}, {"u", "Up"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width)
+		{"d", "Down"}, {"u", "Up"}, {"x", "Delete"}, {"X", "Delete+Files"}, {"t", "Theme"}, {"q", "Quit"},
+	}, listHelpColumns, st, m.width)
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
@@ -224,11 +223,11 @@ func renderDetailsMono(m *model) string {
 	g := gutterStr(m.width)
 
 	var sb strings.Builder
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		sb.WriteString(g + st.Bold.Render("saintTorrent") + "\n")
 		return sb.String()
 	}
-	s := m.sessions[m.selectedIdx]
 	hashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
 	active := s.GetActivePeers()
 
@@ -339,7 +338,7 @@ func renderDetailsMono(m *model) string {
 		{"↑/↓", "Scroll"}, {"pgup/pgdn", "Page"},
 		{"esc", "Back"}, {"space", spaceActionHelp}, {"f", "Files"}, {"o", "Open"},
 		{"x", "Delete"}, {"X", "Delete+Files"}, {"t", "Theme"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }

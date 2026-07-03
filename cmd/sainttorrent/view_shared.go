@@ -141,14 +141,19 @@ func dividerLine(st styles, termWidth int) string {
 	return gutterStr(termWidth) + st.Hairline.Render(strings.Repeat("─", bodyWidth(termWidth)))
 }
 
-// helpColumns is the preferred number of footer columns; the layout drops to
-// fewer when the body is too narrow to fit them.
-const helpColumns = 2
+// Preferred number of footer columns. Secondary views use helpColumns; the
+// list view passes listHelpColumns so its longer shortcut list stays short
+// instead of growing taller. The layout drops to fewer columns when the body
+// is too narrow to fit them.
+const (
+	helpColumns     = 2
+	listHelpColumns = 3
+)
 
-// renderHelp lays out [key] Label pairs in an aligned grid of up to helpColumns
+// renderHelp lays out [key] Label pairs in an aligned grid of up to maxCols
 // columns (row-major), each row gutter-prefixed. Lines never overrun the body
 // width: the column count is chosen to fit, and clampLines is the final net.
-func renderHelp(items [][2]string, st styles, termWidth int) string {
+func renderHelp(items [][2]string, maxCols int, st styles, termWidth int) string {
 	g := gutterStr(termWidth)
 	bw := bodyWidth(termWidth)
 	if len(items) == 0 {
@@ -161,9 +166,9 @@ func renderHelp(items [][2]string, st styles, termWidth int) string {
 	}
 
 	const gap = 2
-	// Pick the widest column count (<= helpColumns) whose grid fits the body.
+	// Pick the widest column count (<= maxCols) whose grid fits the body.
 	cols := 1
-	for c := min(helpColumns, len(pieces)); c > 1; c-- {
+	for c := min(maxCols, len(pieces)); c > 1; c-- {
 		if helpGridWidth(pieces, c, gap) <= bw {
 			cols = c
 			break
@@ -453,10 +458,10 @@ func listColumns(bw int) listLayout {
 
 func (m model) viewFileExplorer() string {
 	st := m.theme.styles
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	s, ok := m.selectedSession()
+	if !ok {
 		return ""
 	}
-	s := m.sessions[m.selectedIdx]
 	files := s.Files()
 
 	bw := bodyWidth(m.width)
@@ -495,7 +500,7 @@ func (m model) viewFileExplorer() string {
 
 	sb.WriteString(renderHelp([][2]string{
 		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -523,7 +528,7 @@ func (m model) viewInputBox() string {
 	if m.inputErr != "" {
 		sb.WriteString(g + st.Error.Render(truncateRight(sanitizeText(m.inputErr), bw)) + "\n\n")
 	}
-	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, st, m.width))
+	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -547,7 +552,7 @@ func (m model) viewAddConfirm() string {
 		label := "Error adding torrent: "
 		sb.WriteString(g + st.Error.Render("Error adding torrent") + ": " +
 			truncateRight(sanitizeText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
-		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, st, m.width))
+		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
 	}
@@ -566,7 +571,7 @@ func (m model) viewAddConfirm() string {
 
 	sb.WriteString(renderHelp([][2]string{
 		{"y", "Yes, Confirm Download"}, {"n", "No, Skip"}, {"q", "Quit"},
-	}, st, m.width))
+	}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -600,12 +605,12 @@ func (m model) viewDeleteConfirm() string {
 		sb.WriteString(header("Deletion Failure:", m.deleteTargetName))
 		sb.WriteString(card.Render(st.Error.Render(sanitizeText(m.deleteErr.Error()))))
 		sb.WriteString("\n\n")
-		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, st, m.width))
+		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
 	}
 
-	if len(m.sessions) == 0 || m.selectedIdx >= len(m.sessions) {
+	if _, ok := m.selectedSession(); !ok {
 		return ""
 	}
 
@@ -620,7 +625,7 @@ func (m model) viewDeleteConfirm() string {
 	}
 	sb.WriteString(card.Render("Are you sure you want to delete this torrent?\n\n" + warnMsg))
 	sb.WriteString("\n\n")
-	sb.WriteString(renderHelp([][2]string{{"y", "Yes, Confirm Delete"}, {"n/esc", "Cancel"}}, st, m.width))
+	sb.WriteString(renderHelp([][2]string{{"y", "Yes, Confirm Delete"}, {"n/esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
 	return sb.String()
 }
