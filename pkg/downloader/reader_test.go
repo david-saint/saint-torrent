@@ -579,10 +579,7 @@ func TestReaderFailsFastOnDeprioritizedFile(t *testing.T) {
 	pieces := threePieces()
 	sess := newPieceTestSession(t, int64(len(pieces[0])), pieces)
 
-	sess.mu.Lock()
-	sess.FilePriorities = []FilePriority{PrioritySkip}
-	sess.onFilePriorityChangedLocked()
-	sess.mu.Unlock()
+	sess.SetFilePriority(0, PrioritySkip)
 
 	reader, err := sess.NewFileReader(0, ReaderOptions{})
 	if err != nil {

@@ -57,12 +57,17 @@ func newTestSessionBuilder(t testing.TB, pieceLen int64, fileLengths []int64, pr
 	}
 
 	sess.mu.Lock()
-	// Set custom priorities if provided, otherwise defaults to PriorityNormal
+	// Set custom priorities if provided. Because applyFilePrioritiesLocked is an
+	// overlay, we pad the priorities vector up to the file count with PrioritySkip
+	// so trailing files are zero-filled/skipped rather than defaulting to Normal.
 	if len(priorities) > 0 {
-		sess.FilePriorities = make([]FilePriority, len(tor.Files))
-		copy(sess.FilePriorities, priorities)
+		fullPriorities := make([]FilePriority, len(tor.Files))
+		for i := range fullPriorities {
+			fullPriorities[i] = PrioritySkip
+		}
+		copy(fullPriorities, priorities)
+		sess.applyFilePrioritiesLocked(fullPriorities)
 	}
-	sess.recomputeNeededLocked()
 	sess.mu.Unlock()
 
 	t.Cleanup(func() {
@@ -124,6 +129,7 @@ func TestPiecePropertiesDifferential(t *testing.T) {
 			wantedFast := sess.isPieceWanted(idx)
 			wantedSlow := sess.isPieceWantedSlow(idx)
 			if wantedFast != wantedSlow {
+				sess.mu.Unlock()
 				t.Fatalf("Run %d: Piece %d wanted mismatch: fast=%t, slow=%t. PieceLength=%d, FileLengths=%v, Priorities=%v",
 					run, p, wantedFast, wantedSlow, pieceLen, fileLengths, priorities)
 			}
@@ -131,6 +137,7 @@ func TestPiecePropertiesDifferential(t *testing.T) {
 			priFast := sess.piecePriority(idx)
 			priSlow := sess.piecePrioritySlow(idx)
 			if priFast != priSlow {
+				sess.mu.Unlock()
 				t.Fatalf("Run %d: Piece %d priority mismatch: fast=%v, slow=%v. PieceLength=%d, FileLengths=%v, Priorities=%v",
 					run, p, priFast, priSlow, pieceLen, fileLengths, priorities)
 			}
@@ -287,7 +294,7 @@ func (s *Session) isPieceWantedSlow(pieceIndex int64) bool {
 	if s.Storage == nil || s.Torrent == nil {
 		return true
 	}
-	if len(s.FilePriorities) == 0 {
+	if len(s.filePriorities) == 0 {
 		return true
 	}
 
@@ -295,10 +302,10 @@ func (s *Session) isPieceWantedSlow(pieceIndex int64) bool {
 	pieceEnd := pieceStart + s.Storage.PieceLength(pieceIndex)
 
 	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
+		if i >= len(s.filePriorities) {
 			return true
 		}
-		if s.FilePriorities[i] == PrioritySkip {
+		if s.filePriorities[i] == PrioritySkip {
 			continue
 		}
 
@@ -320,7 +327,7 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 	if s.Storage == nil || s.Torrent == nil {
 		return PriorityNormal
 	}
-	if len(s.FilePriorities) == 0 {
+	if len(s.filePriorities) == 0 {
 		return PriorityNormal
 	}
 
@@ -329,7 +336,7 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 
 	maxPri := PrioritySkip
 	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
+		if i >= len(s.filePriorities) {
 			break
 		}
 		var fileStart int64
@@ -339,8 +346,8 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 		fileEnd := fileStart + f.Length
 
 		if pieceStart < fileEnd && pieceEnd > fileStart {
-			if s.FilePriorities[i] > maxPri {
-				maxPri = s.FilePriorities[i]
+			if s.filePriorities[i] > maxPri {
+				maxPri = s.filePriorities[i]
 			}
 		}
 	}

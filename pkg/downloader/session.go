@@ -201,10 +201,10 @@ type Session struct {
 
 	OnStateChange         func()
 	MagnetURI             string
-	PendingFilePriorities []FilePriority
+	pendingFilePriorities []FilePriority
 
-	// File selection and priorities
-	FilePriorities []FilePriority
+	// File selection and priorities (mutate only via locked setters/helpers)
+	filePriorities []FilePriority
 
 	// Bandwidth limiting
 	DownloadLimiter       *RateLimiter
@@ -265,7 +265,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		ctx:                 ctx,
 		cancel:              cancel,
 		resumeCh:            make(chan struct{}, 1),
-		FilePriorities:      priorities,
+		filePriorities:      priorities,
 		DownloadLimiter:     NewRateLimiter(0), // unlimited by default
 		UploadLimiter:       NewRateLimiter(0), // unlimited by default
 		metadataMode:        metadataMode,
@@ -942,21 +942,68 @@ func (s *Session) Resume() {
 // SetFilePriority sets the download priority for a specific file.
 func (s *Session) SetFilePriority(fileIndex int, priority FilePriority) {
 	s.mu.Lock()
-	changed := false
-	if fileIndex >= 0 && fileIndex < len(s.FilePriorities) {
-		if s.FilePriorities[fileIndex] != priority {
-			s.FilePriorities[fileIndex] = priority
-			changed = true
-			// Wanted-ness of the pieces overlapping this file may have flipped, so
-			// rebuild the needed set and wake any blocked readers (rare, user-initiated
-			// — O(pieces) is fine here).
-			s.onFilePriorityChangedLocked()
-		}
-	}
+	changed := s.setFilePriorityLocked(fileIndex, priority)
 	s.mu.Unlock()
 
 	if changed && s.OnStateChange != nil {
 		s.OnStateChange()
+	}
+}
+
+// setFilePriorityLocked updates the priority of a single file and rebuilds caches.
+// Caller holds s.mu. Returns true if the priority actually changed.
+func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bool {
+	if fileIndex < 0 || fileIndex >= len(s.filePriorities) {
+		return false
+	}
+	if priority < PrioritySkip || priority > PriorityHigh {
+		return false
+	}
+	if s.filePriorities[fileIndex] == priority {
+		return false
+	}
+	s.filePriorities[fileIndex] = priority
+	s.onFilePriorityChangedLocked()
+	return true
+}
+
+// applyFilePrioritiesNoRebuild applies priorities to filePriorities without rebuilding caches.
+// Caller holds s.mu. Returns true if any priorities actually changed.
+func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
+	changed := false
+	for i := 0; i < len(s.filePriorities) && i < len(prios); i++ {
+		prio := prios[i]
+		if prio >= PrioritySkip && prio <= PriorityHigh {
+			if s.filePriorities[i] != prio {
+				s.filePriorities[i] = prio
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// applyFilePrioritiesLocked overlays new priorities up to min(len(s.filePriorities), len(prios)).
+// Caller holds s.mu. Returns true if any priorities actually changed.
+func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
+	if s.applyFilePrioritiesNoRebuild(prios) {
+		s.onFilePriorityChangedLocked()
+		return true
+	}
+	return false
+}
+
+// resetFilePrioritiesLocked allocates a fresh PriorityNormal-filled slice of size numFiles,
+// overlays any valid priority values from s.pendingFilePriorities, and clears the pending slice.
+// Caller holds s.mu.
+func (s *Session) resetFilePrioritiesLocked(numFiles int) {
+	s.filePriorities = make([]FilePriority, numFiles)
+	for i := range s.filePriorities {
+		s.filePriorities[i] = PriorityNormal
+	}
+	if len(s.pendingFilePriorities) > 0 {
+		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
+		s.pendingFilePriorities = nil
 	}
 }
 
@@ -984,8 +1031,8 @@ func (s *Session) RecomputeStats() {
 func (s *Session) GetFilePriorities() []FilePriority {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	cp := make([]FilePriority, len(s.FilePriorities))
-	copy(cp, s.FilePriorities)
+	cp := make([]FilePriority, len(s.filePriorities))
+	copy(cp, s.filePriorities)
 	return cp
 }
 
@@ -1119,19 +1166,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	}
 
 	// Reinitialize priorities
-	s.FilePriorities = make([]FilePriority, len(s.Torrent.Files))
-	for i := range s.FilePriorities {
-		s.FilePriorities[i] = PriorityNormal
-	}
-	if len(s.PendingFilePriorities) > 0 {
-		for i := 0; i < len(s.FilePriorities) && i < len(s.PendingFilePriorities); i++ {
-			prio := s.PendingFilePriorities[i]
-			if prio >= PrioritySkip && prio <= PriorityHigh {
-				s.FilePriorities[i] = prio
-			}
-		}
-		s.PendingFilePriorities = nil
-	}
+	s.resetFilePrioritiesLocked(len(s.Torrent.Files))
 
 	// Reinitialize piece states
 	numPieces := len(s.Torrent.PieceHashes)

@@ -851,12 +851,12 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		sess.mu.RLock()
 		infoHashHex := fmt.Sprintf("%x", sess.Torrent.InfoHash)
 		var priorities []FilePriority
-		if len(sess.FilePriorities) > 0 {
-			priorities = make([]FilePriority, len(sess.FilePriorities))
-			copy(priorities, sess.FilePriorities)
-		} else if len(sess.PendingFilePriorities) > 0 {
-			priorities = make([]FilePriority, len(sess.PendingFilePriorities))
-			copy(priorities, sess.PendingFilePriorities)
+		if len(sess.filePriorities) > 0 {
+			priorities = make([]FilePriority, len(sess.filePriorities))
+			copy(priorities, sess.filePriorities)
+		} else if len(sess.pendingFilePriorities) > 0 {
+			priorities = make([]FilePriority, len(sess.pendingFilePriorities))
+			copy(priorities, sess.pendingFilePriorities)
 		}
 		magnetURI := sess.MagnetURI
 		downloadDir := sess.downloadDir
@@ -1206,19 +1206,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 							pending = append(pending, PriorityNormal)
 						}
 					}
-					sess.PendingFilePriorities = pending
+					sess.pendingFilePriorities = pending
 				} else {
-					changed := false
-					for i := 0; i < len(sess.FilePriorities) && i < len(entry.FilePriorities); i++ {
-						prio := entry.FilePriorities[i]
-						if prio >= PrioritySkip && prio <= PriorityHigh && sess.FilePriorities[i] != prio {
-							sess.FilePriorities[i] = prio
-							changed = true
-						}
-					}
-					if changed {
-						sess.onFilePriorityChangedLocked()
-					}
+					sess.applyFilePrioritiesLocked(entry.FilePriorities)
 				}
 				sess.mu.Unlock()
 			}

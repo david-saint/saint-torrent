@@ -592,8 +592,8 @@ func (s *Session) wantedFileRangesLocked() []byteRange {
 	for i, f := range s.Torrent.Files {
 		fileEnd := fileStart + f.Length
 		priority := PriorityNormal
-		if len(s.FilePriorities) > 0 && i < len(s.FilePriorities) {
-			priority = s.FilePriorities[i]
+		if len(s.filePriorities) > 0 && i < len(s.filePriorities) {
+			priority = s.filePriorities[i]
 		}
 		if priority != PrioritySkip && fileEnd > fileStart {
 			ranges = append(ranges, byteRange{start: fileStart, end: fileEnd})
