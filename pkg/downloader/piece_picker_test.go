@@ -57,12 +57,12 @@ func newTestSessionBuilder(t testing.TB, pieceLen int64, fileLengths []int64, pr
 	}
 
 	sess.mu.Lock()
-	// Set custom priorities if provided, otherwise defaults to PriorityNormal
+	// Set custom priorities if provided. Note: because applyFilePrioritiesLocked
+	// is an overlay, any tail files not covered by a short priorities vector
+	// will remain at PriorityNormal instead of being zero-filled (PrioritySkip).
 	if len(priorities) > 0 {
-		sess.FilePriorities = make([]FilePriority, len(tor.Files))
-		copy(sess.FilePriorities, priorities)
+		sess.applyFilePrioritiesLocked(priorities)
 	}
-	sess.recomputeNeededLocked()
 	sess.mu.Unlock()
 
 	t.Cleanup(func() {
@@ -287,7 +287,7 @@ func (s *Session) isPieceWantedSlow(pieceIndex int64) bool {
 	if s.Storage == nil || s.Torrent == nil {
 		return true
 	}
-	if len(s.FilePriorities) == 0 {
+	if len(s.filePriorities) == 0 {
 		return true
 	}
 
@@ -295,10 +295,10 @@ func (s *Session) isPieceWantedSlow(pieceIndex int64) bool {
 	pieceEnd := pieceStart + s.Storage.PieceLength(pieceIndex)
 
 	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
+		if i >= len(s.filePriorities) {
 			return true
 		}
-		if s.FilePriorities[i] == PrioritySkip {
+		if s.filePriorities[i] == PrioritySkip {
 			continue
 		}
 
@@ -320,7 +320,7 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 	if s.Storage == nil || s.Torrent == nil {
 		return PriorityNormal
 	}
-	if len(s.FilePriorities) == 0 {
+	if len(s.filePriorities) == 0 {
 		return PriorityNormal
 	}
 
@@ -329,7 +329,7 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 
 	maxPri := PrioritySkip
 	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
+		if i >= len(s.filePriorities) {
 			break
 		}
 		var fileStart int64
@@ -339,8 +339,8 @@ func (s *Session) piecePrioritySlow(pieceIndex int64) FilePriority {
 		fileEnd := fileStart + f.Length
 
 		if pieceStart < fileEnd && pieceEnd > fileStart {
-			if s.FilePriorities[i] > maxPri {
-				maxPri = s.FilePriorities[i]
+			if s.filePriorities[i] > maxPri {
+				maxPri = s.filePriorities[i]
 			}
 		}
 	}

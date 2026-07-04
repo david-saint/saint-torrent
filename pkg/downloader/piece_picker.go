@@ -351,11 +351,16 @@ func (s *Session) removeNeededLocked(idx int) {
 	s.neededBuckets.remove(idx)
 }
 
+// neededBucketsFreshLocked checks if the needed-piece bucket structures are fresh.
+// Note: When Storage == nil (e.g. before metadata completion completes), s.pieceWantedCache
+// and s.piecePriorityCache are nil, so len(nil) == 0 == len(PieceStates) holds and this check remains safe.
 func (s *Session) neededBucketsFreshLocked() bool {
 	return s.neededPieces != nil &&
 		s.neededBuckets.numPieces == len(s.PieceStates) &&
 		len(s.neededBuckets.refs) == len(s.PieceStates) &&
-		s.neededBuckets.total == len(s.neededPieces)
+		s.neededBuckets.total == len(s.neededPieces) &&
+		len(s.pieceWantedCache) == len(s.PieceStates) &&
+		len(s.piecePriorityCache) == len(s.PieceStates)
 }
 
 func (s *Session) ensureNeededBucketsLocked() {
@@ -861,32 +866,32 @@ func (s *Session) rebuildPieceCachesLocked() {
 	pieceLengthVal := s.Storage.PieceLengthValue()
 	fileIdx := 0
 
-	hasUnprioritized := len(s.FilePriorities) < numFiles
+	hasUnprioritized := len(s.filePriorities) < numFiles
 
 	for p := 0; p < numPieces; p++ {
 		pieceStart := int64(p) * pieceLengthVal
 		pieceEnd := pieceStart + s.Storage.PieceLength(int64(p))
 
 		maxPri := PrioritySkip
-		if len(s.FilePriorities) == 0 {
+		if len(s.filePriorities) == 0 {
 			maxPri = PriorityNormal
 		} else {
-			// Sweep only files below cutoff: i < len(s.FilePriorities)
-			for fileIdx < len(s.FilePriorities) && fileOffsets[fileIdx]+s.Torrent.Files[fileIdx].Length <= pieceStart {
+			// Sweep only files below cutoff: i < len(s.filePriorities)
+			for fileIdx < len(s.filePriorities) && fileOffsets[fileIdx]+s.Torrent.Files[fileIdx].Length <= pieceStart {
 				fileIdx++
 			}
-			for i := fileIdx; i < len(s.FilePriorities) && fileOffsets[i] < pieceEnd; i++ {
+			for i := fileIdx; i < len(s.filePriorities) && fileOffsets[i] < pieceEnd; i++ {
 				fileStart := fileOffsets[i]
 				fileEnd := fileStart + s.Torrent.Files[i].Length
 				if pieceStart < fileEnd && pieceEnd > fileStart {
-					if s.FilePriorities[i] > maxPri {
-						maxPri = s.FilePriorities[i]
+					if s.filePriorities[i] > maxPri {
+						maxPri = s.filePriorities[i]
 					}
 				}
 			}
 		}
 		s.piecePriorityCache[p] = maxPri
-		s.pieceWantedCache[p] = len(s.FilePriorities) == 0 || hasUnprioritized || maxPri != PrioritySkip
+		s.pieceWantedCache[p] = len(s.filePriorities) == 0 || hasUnprioritized || maxPri != PrioritySkip
 	}
 }
 

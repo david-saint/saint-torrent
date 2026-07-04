@@ -370,7 +370,7 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 
 	// Verify pending file priorities are stored
 	sess.mu.RLock()
-	pending := sess.PendingFilePriorities
+	pending := sess.pendingFilePriorities
 	announceBeforeMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 
@@ -391,8 +391,8 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 
 	// Verify priorities are applied
 	sess.mu.RLock()
-	priorities := sess.FilePriorities
-	clearedPending := sess.PendingFilePriorities
+	priorities := sess.filePriorities
+	clearedPending := sess.pendingFilePriorities
 	announceAfterMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 
