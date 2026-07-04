@@ -2,7 +2,6 @@ package downloader
 
 import (
 	"container/heap"
-	"fmt"
 	"sort"
 )
 
@@ -780,7 +779,7 @@ func (s *Session) selectEndgamePieceLocked(hasPiece func(pieceIndex int64) bool,
 	bestAvail := 0
 	for i := range s.downloadingPieces {
 		idx := int64(i)
-		if (owned != nil && owned[idx]) || !hasPiece(idx) || !s.isPieceWanted(idx) {
+		if owned[idx] || !hasPiece(idx) || !s.isPieceWanted(idx) {
 			continue
 		}
 		pri := s.piecePriority(idx)
@@ -861,7 +860,6 @@ func (s *Session) rebuildPieceCachesLocked() {
 
 	pieceLengthVal := s.Storage.PieceLengthValue()
 	fileIdx := 0
-	priFileIdx := 0
 
 	hasUnprioritized := len(s.FilePriorities) < numFiles
 
@@ -869,39 +867,15 @@ func (s *Session) rebuildPieceCachesLocked() {
 		pieceStart := int64(p) * pieceLengthVal
 		pieceEnd := pieceStart + s.Storage.PieceLength(int64(p))
 
-		// 1. Determine wanted cache
-		wanted := false
-		if len(s.FilePriorities) == 0 || hasUnprioritized {
-			wanted = true
-		} else {
-			// Advance fileIdx until the file ends after pieceStart (handles zero-length files correctly)
-			for fileIdx < numFiles && fileOffsets[fileIdx]+s.Torrent.Files[fileIdx].Length <= pieceStart {
-				fileIdx++
-			}
-			for i := fileIdx; i < numFiles && fileOffsets[i] < pieceEnd; i++ {
-				fileStart := fileOffsets[i]
-				fileEnd := fileStart + s.Torrent.Files[i].Length
-				// Check overlap
-				if pieceStart < fileEnd && pieceEnd > fileStart {
-					if i < len(s.FilePriorities) && s.FilePriorities[i] != PrioritySkip {
-						wanted = true
-						break
-					}
-				}
-			}
-		}
-		s.pieceWantedCache[p] = wanted
-
-		// 2. Determine priority cache
 		maxPri := PrioritySkip
 		if len(s.FilePriorities) == 0 {
 			maxPri = PriorityNormal
 		} else {
 			// Sweep only files below cutoff: i < len(s.FilePriorities)
-			for priFileIdx < len(s.FilePriorities) && fileOffsets[priFileIdx]+s.Torrent.Files[priFileIdx].Length <= pieceStart {
-				priFileIdx++
+			for fileIdx < len(s.FilePriorities) && fileOffsets[fileIdx]+s.Torrent.Files[fileIdx].Length <= pieceStart {
+				fileIdx++
 			}
-			for i := priFileIdx; i < len(s.FilePriorities) && fileOffsets[i] < pieceEnd; i++ {
+			for i := fileIdx; i < len(s.FilePriorities) && fileOffsets[i] < pieceEnd; i++ {
 				fileStart := fileOffsets[i]
 				fileEnd := fileStart + s.Torrent.Files[i].Length
 				if pieceStart < fileEnd && pieceEnd > fileStart {
@@ -912,6 +886,7 @@ func (s *Session) rebuildPieceCachesLocked() {
 			}
 		}
 		s.piecePriorityCache[p] = maxPri
+		s.pieceWantedCache[p] = len(s.FilePriorities) == 0 || hasUnprioritized || maxPri != PrioritySkip
 	}
 }
 
@@ -928,35 +903,9 @@ func (s *Session) recomputeDownloadingLocked() {
 	}
 }
 
-func (s *Session) addDownloadingLocked(idx int) {
-	if s.downloadingPieces == nil {
-		s.downloadingPieces = make(map[int]struct{})
-	}
-	s.downloadingPieces[idx] = struct{}{}
-}
-
-func (s *Session) removeDownloadingLocked(idx int) {
-	if s.downloadingPieces != nil {
-		delete(s.downloadingPieces, idx)
-	}
-}
-
 // setPieceStateLocked updates a piece state and maintains needed/downloading sets and stats.
-//
-// Contract:
-//  1. Replaces the assignment only — call-site guards (preventing clobbering completed pieces or
-//     endgame double-downloading checks) must remain at call-sites.
-//  2. Write s.PieceStates[idx] first, then maintain sets. This ensures any nested call to
-//     recomputeNeededLocked (on addNeededLocked self-heal path) reads the fresh state.
-//  3. Centralizes bounds checking on idx.
-//  4. Maintains neededPieces/neededBuckets, downloadingPieces, and completion stats in one place.
-//
-// addDownloadingLocked/removeDownloadingLocked/recomputeDownloadingLocked are internals of
-// setPieceStateLocked and recomputeNeededLocked only and must not be called directly.
-//
-// Deliberate bulk bypass exceptions:
-//   - loadResumeState: reallocates PieceStates and calls recomputeNeededLocked() to build sets from scratch.
-//   - resetProgressAfterStorageRepair: bulk-zeroes PieceStates and calls recomputeNeededLocked() to rebuild.
+// Write s.PieceStates[idx] first, then maintain sets (neededPieces, downloadingPieces, stats).
+// Deliberate bulk bypass exceptions: loadResumeState, resetProgressAfterStorageRepair.
 func (s *Session) setPieceStateLocked(idx int, state PieceState) {
 	if idx < 0 || idx >= len(s.PieceStates) {
 		return
@@ -967,40 +916,19 @@ func (s *Session) setPieceStateLocked(idx int, state PieceState) {
 	}
 	s.PieceStates[idx] = state
 
-	// Fold the stats increment on oldState != PieceCompleted -> PieceCompleted transition
 	if oldState != PieceCompleted && state == PieceCompleted {
 		s.updateStatsOnPieceCompleteLocked(idx)
 	}
 
-	// Maintain neededPieces / neededBuckets
 	if state == PieceEmpty {
 		s.addNeededLocked(idx)
 	} else {
 		s.removeNeededLocked(idx)
 	}
 
-	// Maintain downloadingPieces (add if PieceDownloading, remove otherwise)
 	if state == PieceDownloading {
-		s.addDownloadingLocked(idx)
+		s.downloadingPieces[idx] = struct{}{}
 	} else {
-		s.removeDownloadingLocked(idx)
+		delete(s.downloadingPieces, idx)
 	}
-}
-
-func (s *Session) validateDownloadingIndexLocked() error {
-	expected := make(map[int]struct{})
-	for i, state := range s.PieceStates {
-		if state == PieceDownloading {
-			expected[i] = struct{}{}
-		}
-	}
-	if len(s.downloadingPieces) != len(expected) {
-		return fmt.Errorf("downloadingPieces len mismatch: got %d, expected %d", len(s.downloadingPieces), len(expected))
-	}
-	for k := range s.downloadingPieces {
-		if _, ok := expected[k]; !ok {
-			return fmt.Errorf("piece %d in downloadingPieces but not PieceDownloading", k)
-		}
-	}
-	return nil
 }

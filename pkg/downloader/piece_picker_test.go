@@ -357,7 +357,7 @@ func (s *Session) selectEndgamePieceSlow(hasPiece func(pieceIndex int64) bool, o
 			continue
 		}
 		idx := int64(i)
-		if (owned != nil && owned[idx]) || !hasPiece(idx) || !s.isPieceWanted(idx) {
+		if owned[idx] || !hasPiece(idx) || !s.isPieceWanted(idx) {
 			continue
 		}
 		pri := s.piecePriority(idx)
@@ -452,4 +452,22 @@ func BenchmarkEndgamePick(b *testing.B) {
 			_ = sess.selectEndgamePieceLocked(hasPiece, owned)
 		}
 	})
+}
+
+func (s *Session) validateDownloadingIndexLocked() error {
+	expectedCount := 0
+	for _, state := range s.PieceStates {
+		if state == PieceDownloading {
+			expectedCount++
+		}
+	}
+	if len(s.downloadingPieces) != expectedCount {
+		return fmt.Errorf("downloadingPieces len mismatch: got %d, expected %d", len(s.downloadingPieces), expectedCount)
+	}
+	for k := range s.downloadingPieces {
+		if k < 0 || k >= len(s.PieceStates) || s.PieceStates[k] != PieceDownloading {
+			return fmt.Errorf("piece %d in downloadingPieces but not in PieceDownloading state", k)
+		}
+	}
+	return nil
 }

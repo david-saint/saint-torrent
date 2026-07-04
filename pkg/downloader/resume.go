@@ -661,7 +661,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	for i := range s.PieceStates {
 		s.PieceStates[i] = PieceEmpty
 	}
-	s.setPieceStateLocked(int(index), PieceCompleted)
+	s.PieceStates[index] = PieceCompleted
 	s.recomputeNeededLocked()
 	s.recomputeStatsLocked()
 	s.lastErr = nil
