@@ -956,6 +956,9 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 	if fileIndex < 0 || fileIndex >= len(s.filePriorities) {
 		return false
 	}
+	if priority < PrioritySkip || priority > PriorityHigh {
+		return false
+	}
 	if s.filePriorities[fileIndex] == priority {
 		return false
 	}
@@ -964,9 +967,9 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 	return true
 }
 
-// applyFilePrioritiesLocked overlays new priorities up to min(len(s.filePriorities), len(prios)).
+// applyFilePrioritiesNoRebuild applies priorities to filePriorities without rebuilding caches.
 // Caller holds s.mu. Returns true if any priorities actually changed.
-func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
+func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
 	changed := false
 	for i := 0; i < len(s.filePriorities) && i < len(prios); i++ {
 		prio := prios[i]
@@ -977,30 +980,31 @@ func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
 			}
 		}
 	}
-	if changed {
-		s.onFilePriorityChangedLocked()
-	}
 	return changed
 }
 
+// applyFilePrioritiesLocked overlays new priorities up to min(len(s.filePriorities), len(prios)).
+// Caller holds s.mu. Returns true if any priorities actually changed.
+func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
+	if s.applyFilePrioritiesNoRebuild(prios) {
+		s.onFilePriorityChangedLocked()
+		return true
+	}
+	return false
+}
+
 // resetFilePrioritiesLocked allocates a fresh PriorityNormal-filled slice of size numFiles,
-// overlays any valid priority values from s.pendingFilePriorities, clears the pending slice,
-// and rebuilds the caches. Caller holds s.mu.
+// overlays any valid priority values from s.pendingFilePriorities, and clears the pending slice.
+// Caller holds s.mu.
 func (s *Session) resetFilePrioritiesLocked(numFiles int) {
 	s.filePriorities = make([]FilePriority, numFiles)
 	for i := range s.filePriorities {
 		s.filePriorities[i] = PriorityNormal
 	}
 	if len(s.pendingFilePriorities) > 0 {
-		for i := 0; i < len(s.filePriorities) && i < len(s.pendingFilePriorities); i++ {
-			prio := s.pendingFilePriorities[i]
-			if prio >= PrioritySkip && prio <= PriorityHigh {
-				s.filePriorities[i] = prio
-			}
-		}
+		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
 	}
-	s.onFilePriorityChangedLocked()
 }
 
 // onFilePriorityChangedLocked rebuilds the needed-piece set after a file-priority change

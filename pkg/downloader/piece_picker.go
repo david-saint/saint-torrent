@@ -352,15 +352,17 @@ func (s *Session) removeNeededLocked(idx int) {
 }
 
 // neededBucketsFreshLocked checks if the needed-piece bucket structures are fresh.
-// Note: When Storage == nil (e.g. before metadata completion completes), s.pieceWantedCache
-// and s.piecePriorityCache are nil, so len(nil) == 0 == len(PieceStates) holds and this check remains safe.
+// Note: When Storage == nil (e.g. if storage initialization fails), the caches are nil
+// while len(PieceStates) > 0. We treat the caches as fresh in this state to avoid
+// non-converging recompute loops.
 func (s *Session) neededBucketsFreshLocked() bool {
+	cachesFresh := (s.Storage == nil && s.pieceWantedCache == nil && s.piecePriorityCache == nil) ||
+		(len(s.pieceWantedCache) == len(s.PieceStates) && len(s.piecePriorityCache) == len(s.PieceStates))
 	return s.neededPieces != nil &&
 		s.neededBuckets.numPieces == len(s.PieceStates) &&
 		len(s.neededBuckets.refs) == len(s.PieceStates) &&
 		s.neededBuckets.total == len(s.neededPieces) &&
-		len(s.pieceWantedCache) == len(s.PieceStates) &&
-		len(s.piecePriorityCache) == len(s.PieceStates)
+		cachesFresh
 }
 
 func (s *Session) ensureNeededBucketsLocked() {

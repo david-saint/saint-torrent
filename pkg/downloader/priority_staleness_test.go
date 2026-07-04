@@ -12,8 +12,6 @@ func TestPriorityStalenessRegression(t *testing.T) {
 	// 1. Path 1 & Path 2: Test session with 2 files, piece length 16, total size 32 (2 pieces)
 	fileLengths := []int64{16, 16}
 	sess := newTestSessionBuilder(t, 16, fileLengths, nil)
-	defer sess.Close()
-
 	// Initially, both should be wanted (PriorityNormal)
 	sess.mu.RLock()
 	wanted0 := sess.isPieceWanted(0)
@@ -96,12 +94,7 @@ func TestPriorityStalenessRegression(t *testing.T) {
 
 	// Apply pending priorities (metadata mode)
 	sessMeta.mu.Lock()
-	// Stash it in pendingFilePriorities directly in test for metadataMode stashing
-	var pending []FilePriority
-	for _, prio := range []FilePriority{PriorityHigh, PrioritySkip} {
-		pending = append(pending, prio)
-	}
-	sessMeta.pendingFilePriorities = pending
+	sessMeta.pendingFilePriorities = []FilePriority{PriorityHigh, PrioritySkip}
 	sessMeta.mu.Unlock()
 
 	// Verify they are stored in pendingFilePriorities

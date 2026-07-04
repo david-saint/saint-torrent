@@ -57,11 +57,16 @@ func newTestSessionBuilder(t testing.TB, pieceLen int64, fileLengths []int64, pr
 	}
 
 	sess.mu.Lock()
-	// Set custom priorities if provided. Note: because applyFilePrioritiesLocked
-	// is an overlay, any tail files not covered by a short priorities vector
-	// will remain at PriorityNormal instead of being zero-filled (PrioritySkip).
+	// Set custom priorities if provided. Because applyFilePrioritiesLocked is an
+	// overlay, we pad the priorities vector up to the file count with PrioritySkip
+	// so trailing files are zero-filled/skipped rather than defaulting to Normal.
 	if len(priorities) > 0 {
-		sess.applyFilePrioritiesLocked(priorities)
+		fullPriorities := make([]FilePriority, len(tor.Files))
+		for i := range fullPriorities {
+			fullPriorities[i] = PrioritySkip
+		}
+		copy(fullPriorities, priorities)
+		sess.applyFilePrioritiesLocked(fullPriorities)
 	}
 	sess.mu.Unlock()
 
@@ -124,6 +129,7 @@ func TestPiecePropertiesDifferential(t *testing.T) {
 			wantedFast := sess.isPieceWanted(idx)
 			wantedSlow := sess.isPieceWantedSlow(idx)
 			if wantedFast != wantedSlow {
+				sess.mu.Unlock()
 				t.Fatalf("Run %d: Piece %d wanted mismatch: fast=%t, slow=%t. PieceLength=%d, FileLengths=%v, Priorities=%v",
 					run, p, wantedFast, wantedSlow, pieceLen, fileLengths, priorities)
 			}
@@ -131,6 +137,7 @@ func TestPiecePropertiesDifferential(t *testing.T) {
 			priFast := sess.piecePriority(idx)
 			priSlow := sess.piecePrioritySlow(idx)
 			if priFast != priSlow {
+				sess.mu.Unlock()
 				t.Fatalf("Run %d: Piece %d priority mismatch: fast=%v, slow=%v. PieceLength=%d, FileLengths=%v, Priorities=%v",
 					run, p, priFast, priSlow, pieceLen, fileLengths, priorities)
 			}
