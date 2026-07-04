@@ -531,26 +531,51 @@ func TestLockHeldAndSocketNotReadyRetry(t *testing.T) {
 	}
 	defer lockFile.Close()
 
+	// Simulate a primary instance that holds the lock but has not yet bound its
+	// socket. The listener comes up only once the dialer has observed the
+	// not-ready window, so the not-ready -> ready transition is deterministic
+	// rather than a race between two independent sleep timers (the old design
+	// gave the dialer only ~200ms to catch a listener that appeared at ~100ms,
+	// which flaked under load).
+	startListener := make(chan struct{})
+	listenResult := make(chan error, 1)
 	go func() {
-		time.Sleep(100 * time.Millisecond)
+		<-startListener
 		ln, err := net.Listen("unix", socketPath)
-		if err == nil {
-			defer ln.Close()
-			conn, err := ln.Accept()
-			if err == nil {
-				conn.Close()
-			}
+		if err != nil {
+			listenResult <- err
+			return
+		}
+		defer ln.Close()
+		listenResult <- nil
+		if conn, err := ln.Accept(); err == nil {
+			conn.Close()
 		}
 	}()
 
+	// The first dial must fail: the lock is held but the socket is not ready.
+	if c, err := net.Dial("unix", socketPath); err == nil {
+		c.Close()
+		t.Fatal("expected initial dial to fail while socket is not ready")
+	}
+
+	// Release the not-ready window and wait for the socket to bind.
+	close(startListener)
+	if err := <-listenResult; err != nil {
+		t.Fatalf("failed to bind socket: %v", err)
+	}
+
+	// The secondary retries until the socket accepts the connection. A generous
+	// budget keeps this robust under load; once the socket is bound the very
+	// first attempt normally succeeds.
 	var conn net.Conn
 	var connErr error
-	for retry := 0; retry < 5; retry++ {
+	for retry := 0; retry < 100; retry++ {
 		conn, connErr = net.Dial("unix", socketPath)
 		if connErr == nil {
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if connErr != nil {
