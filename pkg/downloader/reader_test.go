@@ -581,6 +581,7 @@ func TestReaderFailsFastOnDeprioritizedFile(t *testing.T) {
 
 	sess.mu.Lock()
 	sess.FilePriorities = []FilePriority{PrioritySkip}
+	sess.onFilePriorityChangedLocked()
 	sess.mu.Unlock()
 
 	reader, err := sess.NewFileReader(0, ReaderOptions{})

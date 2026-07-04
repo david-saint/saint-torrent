@@ -351,8 +351,7 @@ func (s *Session) claimWebseedPiece() (webseedPiece, bool, bool) {
 		return webseedPiece{}, false, false
 	}
 	if !endgame {
-		s.PieceStates[bestIdx] = PieceDownloading
-		s.removeNeededLocked(bestIdx)
+		s.setPieceStateLocked(bestIdx, PieceDownloading)
 	}
 	return webseedPiece{
 		index:         int64(bestIdx),
@@ -373,8 +372,7 @@ func (s *Session) releaseWebseedPiece(piece webseedPiece, err error) {
 		return
 	}
 	if piece.index >= 0 && piece.index < int64(len(s.PieceStates)) && s.PieceStates[piece.index] == PieceDownloading {
-		s.PieceStates[piece.index] = PieceEmpty
-		s.addNeededLocked(int(piece.index))
+		s.setPieceStateLocked(int(piece.index), PieceEmpty)
 	}
 }
 

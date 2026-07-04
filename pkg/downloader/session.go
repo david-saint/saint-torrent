@@ -123,8 +123,11 @@ type Session struct {
 	// piece while holding s.mu. The set is still kept for cheap endgame checks and
 	// tests; stale entries are re-verified before claiming. Guarded by s.mu like
 	// PieceStates.
-	neededPieces  map[int]struct{}
-	neededBuckets neededPieceBuckets
+	neededPieces       map[int]struct{}
+	neededBuckets      neededPieceBuckets
+	pieceWantedCache   []bool
+	piecePriorityCache []FilePriority
+	downloadingPieces  map[int]struct{}
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length
@@ -257,6 +260,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		pieceAvailability:   make([]int, numPieces),
 		Peers:               make(map[string]*PeerState),
 		activePeers:         make(map[string]*peer.Client),
+		downloadingPieces:   make(map[int]struct{}),
 		pipelineBudget:      newPipelineByteBudget(dynamicPipelineSessionBudgetBytes),
 		ctx:                 ctx,
 		cancel:              cancel,

@@ -300,6 +300,10 @@ func (s *Session) recomputeNeededLocked() {
 		clear(s.neededPieces)
 	}
 	s.neededBuckets.reset(len(s.PieceStates))
+
+	s.rebuildPieceCachesLocked()
+	s.recomputeDownloadingLocked()
+
 	if s.Storage == nil || s.Torrent == nil {
 		return
 	}
@@ -773,10 +777,7 @@ func (s *Session) selectEndgamePieceLocked(hasPiece func(pieceIndex int64) bool,
 	bestIdx := -1
 	bestPriority := PrioritySkip
 	bestAvail := 0
-	for i, state := range s.PieceStates {
-		if state != PieceDownloading {
-			continue
-		}
+	for i := range s.downloadingPieces {
 		idx := int64(i)
 		if owned[idx] || !hasPiece(idx) || !s.isPieceWanted(idx) {
 			continue
@@ -808,65 +809,126 @@ func (s *Session) fileStartOffsetLocked(fileIndex int) int64 {
 	return start
 }
 
-// isPieceWanted checks if a piece should be downloaded based on file selection.
+// isPieceWanted checks if a piece should be downloaded based on file selection (cached, O(1)).
 func (s *Session) isPieceWanted(pieceIndex int64) bool {
-	// If no file priorities set, all pieces are wanted
-	if len(s.FilePriorities) == 0 {
-		return true
+	if pieceIndex < 0 || pieceIndex >= int64(len(s.pieceWantedCache)) {
+		return true // default to wanted
 	}
-
-	pieceStart := pieceIndex * s.Storage.PieceLengthValue()
-	pieceEnd := pieceStart + s.Storage.PieceLength(pieceIndex)
-
-	// Check if any file overlapping this piece has non-skip priority
-	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
-			return true // default to wanted
-		}
-		if s.FilePriorities[i] == PrioritySkip {
-			continue
-		}
-
-		// Calculate file boundaries in the torrent
-		var fileStart int64
-		for j := 0; j < i; j++ {
-			fileStart += s.Torrent.Files[j].Length
-		}
-		fileEnd := fileStart + f.Length
-
-		// Check overlap
-		if pieceStart < fileEnd && pieceEnd > fileStart {
-			return true
-		}
-	}
-	return false
+	return s.pieceWantedCache[pieceIndex]
 }
 
-// piecePriority returns the highest priority among files that overlap this piece.
+// piecePriority returns the highest priority among files that overlap this piece (cached, O(1)).
 func (s *Session) piecePriority(pieceIndex int64) FilePriority {
-	if len(s.FilePriorities) == 0 {
-		return PriorityNormal
+	if pieceIndex < 0 || pieceIndex >= int64(len(s.piecePriorityCache)) {
+		return PriorityNormal // default to Normal
+	}
+	return s.piecePriorityCache[pieceIndex]
+}
+
+// rebuildPieceCachesLocked rebuilds the pieceWantedCache and piecePriorityCache
+// using an O(pieces + files) two-pointer sweep over pieces and files.
+func (s *Session) rebuildPieceCachesLocked() {
+	if s.Storage == nil || s.Torrent == nil {
+		s.pieceWantedCache = nil
+		s.piecePriorityCache = nil
+		return
 	}
 
-	pieceStart := pieceIndex * s.Storage.PieceLengthValue()
-	pieceEnd := pieceStart + s.Storage.PieceLength(pieceIndex)
+	numFiles := len(s.Torrent.Files)
+	numPieces := len(s.PieceStates)
 
-	maxPri := PrioritySkip
+	if cap(s.pieceWantedCache) >= numPieces {
+		s.pieceWantedCache = s.pieceWantedCache[:numPieces]
+	} else {
+		s.pieceWantedCache = make([]bool, numPieces)
+	}
+
+	if cap(s.piecePriorityCache) >= numPieces {
+		s.piecePriorityCache = s.piecePriorityCache[:numPieces]
+	} else {
+		s.piecePriorityCache = make([]FilePriority, numPieces)
+	}
+
+	// Precompute file start offsets to avoid repeated O(files) calculations
+	fileOffsets := make([]int64, numFiles+1)
+	var offset int64
 	for i, f := range s.Torrent.Files {
-		if i >= len(s.FilePriorities) {
-			break
-		}
-		var fileStart int64
-		for j := 0; j < i; j++ {
-			fileStart += s.Torrent.Files[j].Length
-		}
-		fileEnd := fileStart + f.Length
+		fileOffsets[i] = offset
+		offset += f.Length
+	}
+	fileOffsets[numFiles] = offset
 
-		if pieceStart < fileEnd && pieceEnd > fileStart {
-			if s.FilePriorities[i] > maxPri {
-				maxPri = s.FilePriorities[i]
+	pieceLengthVal := s.Storage.PieceLengthValue()
+	fileIdx := 0
+
+	hasUnprioritized := len(s.FilePriorities) < numFiles
+
+	for p := 0; p < numPieces; p++ {
+		pieceStart := int64(p) * pieceLengthVal
+		pieceEnd := pieceStart + s.Storage.PieceLength(int64(p))
+
+		maxPri := PrioritySkip
+		if len(s.FilePriorities) == 0 {
+			maxPri = PriorityNormal
+		} else {
+			// Sweep only files below cutoff: i < len(s.FilePriorities)
+			for fileIdx < len(s.FilePriorities) && fileOffsets[fileIdx]+s.Torrent.Files[fileIdx].Length <= pieceStart {
+				fileIdx++
+			}
+			for i := fileIdx; i < len(s.FilePriorities) && fileOffsets[i] < pieceEnd; i++ {
+				fileStart := fileOffsets[i]
+				fileEnd := fileStart + s.Torrent.Files[i].Length
+				if pieceStart < fileEnd && pieceEnd > fileStart {
+					if s.FilePriorities[i] > maxPri {
+						maxPri = s.FilePriorities[i]
+					}
+				}
 			}
 		}
+		s.piecePriorityCache[p] = maxPri
+		s.pieceWantedCache[p] = len(s.FilePriorities) == 0 || hasUnprioritized || maxPri != PrioritySkip
 	}
-	return maxPri
+}
+
+func (s *Session) recomputeDownloadingLocked() {
+	if s.downloadingPieces == nil {
+		s.downloadingPieces = make(map[int]struct{})
+	} else {
+		clear(s.downloadingPieces)
+	}
+	for i, state := range s.PieceStates {
+		if state == PieceDownloading {
+			s.downloadingPieces[i] = struct{}{}
+		}
+	}
+}
+
+// setPieceStateLocked updates a piece state and maintains needed/downloading sets and stats.
+// Write s.PieceStates[idx] first, then maintain sets (neededPieces, downloadingPieces, stats).
+// Deliberate bulk bypass exceptions: loadResumeState, resetProgressAfterStorageRepair.
+func (s *Session) setPieceStateLocked(idx int, state PieceState) {
+	if idx < 0 || idx >= len(s.PieceStates) {
+		return
+	}
+	oldState := s.PieceStates[idx]
+	if oldState == state {
+		return
+	}
+	s.PieceStates[idx] = state
+
+	if oldState != PieceCompleted && state == PieceCompleted {
+		s.updateStatsOnPieceCompleteLocked(idx)
+	}
+
+	if state == PieceEmpty {
+		s.addNeededLocked(idx)
+	} else {
+		s.removeNeededLocked(idx)
+	}
+
+	if state == PieceDownloading {
+		s.downloadingPieces[idx] = struct{}{}
+	} else {
+		delete(s.downloadingPieces, idx)
+	}
 }

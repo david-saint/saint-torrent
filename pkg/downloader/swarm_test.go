@@ -227,9 +227,9 @@ func TestEndgameActiveAndSelection(t *testing.T) {
 	}
 
 	// No PieceDownloading candidates -> -1.
-	sess.PieceStates[0] = PieceCompleted
-	sess.PieceStates[1] = PieceCompleted
-	sess.PieceStates[2] = PieceCompleted
+	sess.setPieceStateLocked(0, PieceCompleted)
+	sess.setPieceStateLocked(1, PieceCompleted)
+	sess.setPieceStateLocked(2, PieceCompleted)
 	if got := sess.selectEndgamePieceLocked(func(int64) bool { return true }, nil); got != -1 {
 		t.Fatalf("expected no endgame candidate when nothing is downloading, got %d", got)
 	}
@@ -421,6 +421,13 @@ func TestEndgameRedundantFetchAndCancel(t *testing.T) {
 		t.Fatal("slow peer never claimed the piece; cannot exercise endgame")
 	}
 
+	sess.mu.Lock()
+	if err := sess.validateDownloadingIndexLocked(); err != nil {
+		sess.mu.Unlock()
+		t.Fatalf("Invariant validation failed during download: %v", err)
+	}
+	sess.mu.Unlock()
+
 	// Only now bring in the fast peer; it can only get the piece via endgame duplication.
 	_, fastPort, _ := net.SplitHostPort(fastLn.Addr().String())
 	sess.AddPeerFromDiscovery("127.0.0.1:" + fastPort)
@@ -436,6 +443,13 @@ func TestEndgameRedundantFetchAndCancel(t *testing.T) {
 	if !completed {
 		t.Fatalf("endgame redundant fetch did not complete the download; %.1f%% done", sess.PercentComplete())
 	}
+
+	sess.mu.Lock()
+	if err := sess.validateDownloadingIndexLocked(); err != nil {
+		sess.mu.Unlock()
+		t.Fatalf("Invariant validation failed after completion: %v", err)
+	}
+	sess.mu.Unlock()
 
 	cancelled := false
 	for i := 0; i < 200; i++ {

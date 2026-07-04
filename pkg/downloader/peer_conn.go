@@ -942,8 +942,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
 				s.PieceStates[dl.pieceIndex] == PieceDownloading {
-				s.PieceStates[dl.pieceIndex] = PieceEmpty
-				s.addNeededLocked(int(dl.pieceIndex))
+				s.setPieceStateLocked(int(dl.pieceIndex), PieceEmpty)
 			}
 		}
 		s.mu.Unlock()
@@ -965,8 +964,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.Lock()
 			if dl.pieceIndex >= 0 && dl.pieceIndex < int64(len(s.PieceStates)) &&
 				s.PieceStates[dl.pieceIndex] == PieceDownloading {
-				s.PieceStates[dl.pieceIndex] = PieceEmpty
-				s.addNeededLocked(int(dl.pieceIndex))
+				s.setPieceStateLocked(int(dl.pieceIndex), PieceEmpty)
 			}
 			s.mu.Unlock()
 		}
@@ -1085,8 +1083,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 		if !endgame {
-			s.PieceStates[bestIdx] = PieceDownloading
-			s.removeNeededLocked(bestIdx)
+			s.setPieceStateLocked(bestIdx, PieceDownloading)
 		}
 		numBlocks := s.blocksInPiece(int64(bestIdx))
 		return &activeDownload{
@@ -1166,8 +1163,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			return true
 		}
 		if s.endgameActiveLocked() {
-			for i, state := range s.PieceStates {
-				if state == PieceDownloading && canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
+			for i := range s.downloadingPieces {
+				if canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
 					return true
 				}
 			}
@@ -1960,8 +1957,7 @@ peerLoop:
 				// Assembly invariant violated (shouldn't happen): return to the pool.
 				s.mu.Lock()
 				if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
-					s.PieceStates[pieceIdx] = PieceEmpty
-					s.addNeededLocked(int(pieceIdx))
+					s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
 				}
 				s.mu.Unlock()
 				break
