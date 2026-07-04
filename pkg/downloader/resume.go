@@ -122,8 +122,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		s.mu.Lock()
 		s.lastErr = verifyErr
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
-			s.PieceStates[job.index] = PieceEmpty
-			s.addNeededLocked(int(job.index))
+			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
 		s.mu.Unlock()
 		if job.conn != nil {
@@ -167,8 +166,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			s.statusErr = err
 		}
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
-			s.PieceStates[job.index] = PieceEmpty
-			s.addNeededLocked(int(job.index))
+			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
@@ -322,20 +320,16 @@ func (s *Session) runVerification(ctx context.Context) bool {
 			// Adopt only positively-verified pieces, and only if the downloader has not
 			// already claimed the slot in the meantime.
 			if verifyErr == nil && ok && s.PieceStates[idx] == PieceEmpty {
-				s.PieceStates[idx] = PieceCompleted
-				s.removeNeededLocked(idx)
-				s.updateStatsOnPieceCompleteLocked(idx)
+				s.setPieceStateLocked(idx, PieceCompleted)
 				nowCompleted = true
 			}
 		} else if s.PieceStates[idx] == PieceUnverified {
 			if verifyErr == nil && ok {
-				s.PieceStates[idx] = PieceCompleted
-				s.updateStatsOnPieceCompleteLocked(idx)
+				s.setPieceStateLocked(idx, PieceCompleted)
 				nowCompleted = true
 			} else {
 				// Resume data was wrong: return the piece to the pool for re-download.
-				s.PieceStates[idx] = PieceEmpty
-				s.addNeededLocked(idx)
+				s.setPieceStateLocked(idx, PieceEmpty)
 				failed++
 			}
 		}
@@ -629,9 +623,7 @@ func (s *Session) markPieceCompleted(index int64) {
 		s.mu.Unlock()
 		return
 	}
-	s.PieceStates[index] = PieceCompleted
-	s.removeNeededLocked(int(index))
-	s.updateStatsOnPieceCompleteLocked(int(index))
+	s.setPieceStateLocked(int(index), PieceCompleted)
 	s.lastErr = nil
 	s.statusErr = nil
 	s.signalPieceWaitersLocked(index)
@@ -669,7 +661,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	for i := range s.PieceStates {
 		s.PieceStates[i] = PieceEmpty
 	}
-	s.PieceStates[index] = PieceCompleted
+	s.setPieceStateLocked(int(index), PieceCompleted)
 	s.recomputeNeededLocked()
 	s.recomputeStatsLocked()
 	s.lastErr = nil
