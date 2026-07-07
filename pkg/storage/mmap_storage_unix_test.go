@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -166,6 +167,63 @@ func TestMMapStorageMapsFilesLazily(t *testing.T) {
 	}
 	if st.maps[0].data == nil {
 		t.Fatal("ReadBlock should mmap the file lazily")
+	}
+}
+
+// TestMMapStorageConcurrentReadsAfterMapping drives many concurrent readers and a
+// verifier once every file is mapped, exercising the shared-read-lock fast path in
+// ensureMappedRange (no exclusive lock in steady state) for correctness under -race.
+func TestMMapStorageConcurrentReadsAfterMapping(t *testing.T) {
+	const pieceLen = 1 << 14 // 16 KB
+	const numPieces = 16
+	total := int64(pieceLen * numPieces)
+
+	st, err := NewMMapStorage(t.TempDir(), []FileInfo{{Path: "data.bin", Length: total}}, pieceLen)
+	if err != nil {
+		t.Fatalf("NewMMapStorage: %v", err)
+	}
+	defer st.Close()
+
+	pieceBytes := func(p int) []byte {
+		b := make([]byte, pieceLen)
+		for i := range b {
+			b[i] = byte((p*97 + i) & 0xff)
+		}
+		return b
+	}
+	for p := 0; p < numPieces; p++ {
+		if err := st.WriteBlock(int64(p), 0, pieceBytes(p)); err != nil {
+			t.Fatalf("seed write piece %d: %v", p, err)
+		}
+	}
+	// Force the single file fully mapped so subsequent reads take the fast path.
+	if _, err := st.VerifyPiece(0, sha1.Sum(pieceBytes(0))); err != nil {
+		t.Fatalf("prime mapping: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numPieces*4)
+	for g := 0; g < numPieces*4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			p := g % numPieces
+			buf := make([]byte, pieceLen)
+			if _, err := st.ReadBlock(int64(p), 0, buf); err != nil {
+				errCh <- err
+				return
+			}
+			if !bytes.Equal(buf, pieceBytes(p)) {
+				errCh <- errors.New("content mismatch")
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent mmap read failed: %v", err)
+		}
 	}
 }
 

@@ -196,11 +196,37 @@ func (s *MMapStorage) Close() error {
 	}
 	for _, file := range s.files {
 		file.tryInvalidateReader()
+		file.tryInvalidateWriter()
 	}
 	return firstErr
 }
 
 func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
+	// Fast path: in steady state every file overlapping the range is already mapped,
+	// so a shared read lock suffices and reads/verifies run in parallel instead of
+	// serializing through the exclusive mapping lock. mapped.data is only ever
+	// assigned under the exclusive lock, so reading it under the read lock is safe.
+	s.mu.RLock()
+	if s.closed.Load() {
+		s.mu.RUnlock()
+		return ErrStorageClosed
+	}
+	allMapped := true
+	for _, mapped := range s.maps {
+		file := mapped.layout
+		if globalStart < file.endOffset && globalEnd > file.startOffset {
+			if file.length != 0 && len(mapped.data) == 0 {
+				allMapped = false
+				break
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if allMapped {
+		return nil
+	}
+
+	// Slow path: at least one overlapping file still needs its initial mapping.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed.Load() {
