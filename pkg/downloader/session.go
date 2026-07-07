@@ -829,6 +829,68 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	}
 }
 
+// SessionSnapshot is a point-in-time copy of the display-facing fields the TUI
+// needs for one session, gathered under a single read lock. The TUI takes one
+// snapshot per data tick and renders every animation frame from it, so the
+// ~10 Hz frame loop never re-locks the session on its download hot path (piece
+// completion takes s.mu for writes). All fields are read O(1): completion stats
+// come from the incrementally-maintained cache, never a fresh piece scan.
+type SessionSnapshot struct {
+	Name          string
+	InfoHash      [20]byte
+	TotalSize     int64
+	Percent       float64
+	Status        string
+	Paused        bool
+	Completed     bool
+	MetadataMode  bool
+	DownloadSpeed float64 // rolling 1s download rate, bytes/sec
+	UploadSpeed   float64 // rolling 1s upload rate, bytes/sec
+	UploadedBytes int64
+	LastError     error
+}
+
+// Snapshot gathers this session's display state under a single read lock,
+// consolidating what were previously six-plus separate locked getter calls per
+// row per frame (IsCompleted, Status, PercentComplete, CurrentSpeed, …). It is
+// O(1), so it is cheap to call for every session on each UI tick.
+func (s *Session) Snapshot() SessionSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	snap := SessionSnapshot{
+		Paused:        s.paused,
+		MetadataMode:  s.metadataMode,
+		DownloadSpeed: s.currentSpeed,
+		UploadSpeed:   s.currentUploadSpeed,
+		UploadedBytes: s.Uploaded.Load(),
+		Status:        s.statusLocked(),
+		Completed:     s.isCompletedLocked(),
+	}
+	if s.Torrent != nil {
+		snap.Name = s.Torrent.Name
+		snap.InfoHash = s.Torrent.InfoHash
+	}
+	if s.Storage != nil {
+		snap.TotalSize = s.Storage.TotalSize()
+		stats := s.completionStatsLocked()
+		if stats.wantedBytes == 0 {
+			snap.Percent = 100.0
+		} else {
+			snap.Percent = (float64(stats.completedWantedBytes) / float64(stats.wantedBytes)) * 100.0
+		}
+	}
+	// Mirror LastError()'s precedence exactly.
+	if s.statusErr != nil {
+		snap.LastError = s.statusErr
+	} else if s.lastErr == nil {
+		snap.LastError = s.lastTrackerErr
+	} else {
+		snap.LastError = s.lastErr
+	}
+	return snap
+}
+
 // Name returns the torrent name, protected by a read lock.
 func (s *Session) Name() string {
 	s.mu.RLock()

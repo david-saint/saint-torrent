@@ -247,13 +247,6 @@ func lineCount(s string) int {
 	return n
 }
 
-func maxVerticalOffset(s string, height int) int {
-	if height <= 0 {
-		return 0
-	}
-	return max(0, renderedLineCount(s)-height)
-}
-
 func verticalSlice(s string, offset, height int) string {
 	if s == "" || height <= 0 {
 		return s
@@ -458,11 +451,11 @@ func listColumns(bw int) listLayout {
 
 func (m model) viewFileExplorer() string {
 	st := m.theme.styles
-	s, ok := m.selectedSession()
-	if !ok {
+	data := m.filesData()
+	if !data.valid {
 		return ""
 	}
-	files := s.Files()
+	files := data.files
 
 	bw := bodyWidth(m.width)
 	g := gutterStr(m.width)
@@ -470,12 +463,12 @@ func (m model) viewFileExplorer() string {
 	var sb strings.Builder
 	label := "File Explorer: "
 	sb.WriteString(g + st.Header.Render("File Explorer:") + " " +
-		truncateRight(sanitizeText(s.Name()), bw-dispWidth(label)) + "\n\n")
+		truncateRight(data.name, bw-dispWidth(label)) + "\n\n")
 
 	if len(files) == 0 {
 		sb.WriteString(g + "No files in metadata.\n\n")
 	} else {
-		priorities := s.GetFilePriorities()
+		priorities := data.priorities
 		const badgeW = 6 // " HIGH " / "NORMAL" / " SKIP "
 		const sizeW = 10
 		pathW := bw - (sizeW + 1 + badgeW + 1)
