@@ -210,7 +210,9 @@ func TestUDPAnnounce_InvalidURL(t *testing.T) {
 }
 
 // TestUDPConnect_TransactionIDMismatch verifies that a response with a
-// mismatched transaction ID is rejected.
+// mismatched transaction ID is ignored (BEP 15) rather than hard-failing the
+// round trip: the client keeps reading and, when no matching response ever
+// arrives, the operation times out on the bounded context.
 func TestUDPConnect_TransactionIDMismatch(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -246,16 +248,130 @@ func TestUDPConnect_TransactionIDMismatch(t *testing.T) {
 		<-done
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Short deadline: the mismatched responses are discarded and the read loop
+	// blocks until the context deadline fires, yielding a timeout error.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 
 	infoHash := [20]byte{}
 	peerID := [20]byte{}
 	_, err = UDPAnnounce(ctx, "udp://"+pc.LocalAddr().String()+"/announce", infoHash, peerID, 6881, 0, 0, 0, "")
 	if err == nil {
-		t.Fatal("expected transaction ID mismatch error, got nil")
+		t.Fatal("expected timeout after ignoring mismatched transaction IDs, got nil")
 	}
 	t.Logf("got expected error: %v", err)
+}
+
+// TestUDPAnnounce_IgnoresStaleDuplicate verifies the BEP 15 fix (issue #66): a
+// datagram with an unexpected transaction ID — e.g. a late duplicate of the
+// connect response arriving on the shared connect/announce socket while the
+// announce reply is pending — is discarded and the announce still succeeds,
+// rather than the stray packet aborting the whole round trip.
+func TestUDPAnnounce_IgnoresStaleDuplicate(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			action := binary.BigEndian.Uint32(buf[8:12])
+			switch action {
+			case actionConnect:
+				if n < udpConnectRequestSize {
+					continue
+				}
+				txnID := binary.BigEndian.Uint32(buf[12:16])
+				var resp [16]byte
+				binary.BigEndian.PutUint32(resp[0:4], actionConnect)
+				binary.BigEndian.PutUint32(resp[4:8], txnID)
+				binary.BigEndian.PutUint64(resp[8:16], 0xDEADBEEFCAFEBABE)
+				pc.WriteTo(resp[:], addr)
+			case actionAnnounce:
+				if n < udpAnnounceRequestSize {
+					continue
+				}
+				txnID := binary.BigEndian.Uint32(buf[12:16])
+				// Inject a stale connect-shaped datagram carrying a different
+				// transaction ID *before* the real announce response. XOR with
+				// all-ones guarantees a mismatch. The client must ignore it and
+				// keep reading rather than hard-fail.
+				var stale [16]byte
+				binary.BigEndian.PutUint32(stale[0:4], actionConnect)
+				binary.BigEndian.PutUint32(stale[4:8], txnID^0xFFFFFFFF)
+				binary.BigEndian.PutUint64(stale[8:16], 0xDEADBEEFCAFEBABE)
+				pc.WriteTo(stale[:], addr)
+				// Real announce response with the matching transaction ID.
+				var resp [20]byte
+				binary.BigEndian.PutUint32(resp[0:4], actionAnnounce)
+				binary.BigEndian.PutUint32(resp[4:8], txnID)
+				binary.BigEndian.PutUint32(resp[8:12], 1800) // interval
+				binary.BigEndian.PutUint32(resp[12:16], 5)   // leechers
+				binary.BigEndian.PutUint32(resp[16:20], 100) // seeders
+				pc.WriteTo(resp[:], addr)
+			}
+		}
+	}()
+	defer func() {
+		pc.Close()
+		<-done
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := UDPAnnounce(ctx, "udp://"+pc.LocalAddr().String()+"/announce", [20]byte{}, [20]byte{}, 6881, 0, 0, 0, "")
+	if err != nil {
+		t.Fatalf("UDPAnnounce failed despite recoverable stale datagram: %v", err)
+	}
+	if resp.Interval != 1800 {
+		t.Errorf("expected interval 1800, got %d", resp.Interval)
+	}
+	if resp.Complete != 100 {
+		t.Errorf("expected 100 seeders, got %d", resp.Complete)
+	}
+}
+
+// TestEnsureUDPDeadline verifies that an unbounded caller context gains the
+// default deadline cap (issue #66), while a context that already has a deadline
+// is passed through unchanged, mirroring HTTPScrape on the UDP path.
+func TestEnsureUDPDeadline(t *testing.T) {
+	// No deadline: a default should be injected close to defaultUDPTimeout.
+	before := time.Now()
+	ctx, cancel := ensureUDPDeadline(context.Background())
+	defer cancel()
+	dl, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("expected a default deadline to be injected for an unbounded context")
+	}
+	got := dl.Sub(before)
+	if got < defaultUDPTimeout-time.Second || got > defaultUDPTimeout+time.Second {
+		t.Errorf("injected deadline %v not within 1s of default %v", got, defaultUDPTimeout)
+	}
+
+	// Existing deadline: must be preserved, not overridden.
+	parent, parentCancel := context.WithTimeout(context.Background(), 123*time.Millisecond)
+	defer parentCancel()
+	wantDL, _ := parent.Deadline()
+	ctx2, cancel2 := ensureUDPDeadline(parent)
+	defer cancel2()
+	gotDL, ok := ctx2.Deadline()
+	if !ok {
+		t.Fatal("expected the existing deadline to be preserved")
+	}
+	if !gotDL.Equal(wantDL) {
+		t.Errorf("expected preserved deadline %v, got %v", wantDL, gotDL)
+	}
 }
 
 // TestUDPConnect_InvalidResponse verifies that a truncated connect response
