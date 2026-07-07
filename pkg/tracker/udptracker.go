@@ -63,6 +63,25 @@ const (
 	eventNone uint32 = 0
 )
 
+// defaultUDPTimeout bounds a UDP announce or scrape when the caller passes a
+// context without its own deadline, so an exported call can never pin a
+// goroutine and UDP socket indefinitely. Across the connect and announce
+// phases, BEP 15 backoff (15s * 2^n up to n=8) otherwise totals ~7650s (~2h)
+// for a dead tracker. It mirrors defaultScrapeTimeout on the HTTP path.
+const defaultUDPTimeout = 60 * time.Second
+
+// ensureUDPDeadline returns ctx unchanged when it already carries a deadline,
+// otherwise it derives a child bounded by defaultUDPTimeout. The returned
+// cancel func must always be called. It lets UDPAnnounce and UDPScrape apply a
+// default cap the same way HTTPScrape does, so an unbounded caller context
+// cannot hang a round trip for the full BEP 15 backoff.
+func ensureUDPDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultUDPTimeout)
+}
+
 // udpDial parses a "udp://host:port/..." announce URL, dials the tracker, and
 // starts a watchdog that closes the connection when ctx is cancelled. The
 // returned cleanup func stops the watchdog and closes the connection; callers
@@ -137,39 +156,59 @@ func udpRoundTrip(ctx context.Context, conn net.Conn, req []byte, txnID, expecte
 			return nil, fmt.Errorf("setting read deadline: %w", err)
 		}
 
+		// Read responses until one carries our transaction ID or the deadline
+		// fires. The connect and announce phases share a single connected
+		// socket, and udpRoundTrip retransmits with the same transaction ID, so
+		// a slow tracker can leave a late, stale response queued on the socket.
+		// BEP 15 requires ignoring any datagram whose transaction ID does not
+		// match the pending request and continuing to read for the remaining
+		// deadline, rather than aborting the round trip over a recoverable
+		// duplicate. The absolute read deadline (unchanged across reads) bounds
+		// the total time spent draining stray datagrams.
 		var buf [4096]byte
-		nRead, err := conn.Read(buf[:])
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
+		for {
+			nRead, err := conn.Read(buf[:])
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					break // deadline reached; retransmit on the next attempt
+				}
+				return nil, fmt.Errorf("reading %s response: %w", opName, err)
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+
+			// A datagram needs at least the 8-byte action+transaction_id header
+			// to be identifiable; discard shorter runts and keep reading.
+			if nRead < 8 {
 				continue
 			}
-			return nil, fmt.Errorf("reading %s response: %w", opName, err)
-		}
 
-		if nRead < minRespSize {
-			return nil, fmt.Errorf("%s response too short: %d bytes", opName, nRead)
-		}
+			respAction := binary.BigEndian.Uint32(buf[0:4])
+			respTxnID := binary.BigEndian.Uint32(buf[4:8])
 
-		respAction := binary.BigEndian.Uint32(buf[0:4])
-		respTxnID := binary.BigEndian.Uint32(buf[4:8])
+			// Ignore stale duplicates and unrelated datagrams (BEP 15): discard
+			// and keep reading within the deadline instead of failing the round
+			// trip. Only once the transaction ID matches do we hold the tracker
+			// to a well-formed response.
+			if respTxnID != txnID {
+				continue
+			}
+			if nRead < minRespSize {
+				return nil, fmt.Errorf("%s response too short: %d bytes", opName, nRead)
+			}
+			if respAction == actionError {
+				return nil, fmt.Errorf("tracker error: %s", string(buf[8:nRead]))
+			}
+			if respAction != expectedAction {
+				return nil, fmt.Errorf("unexpected %s response action: %d", opName, respAction)
+			}
 
-		if respTxnID != txnID {
-			return nil, fmt.Errorf("%s response transaction ID mismatch: expected %d, got %d", opName, txnID, respTxnID)
+			// Copy out of the stack buffer so the returned slice stays valid.
+			out := make([]byte, nRead)
+			copy(out, buf[:nRead])
+			return out, nil
 		}
-		if respAction == actionError {
-			return nil, fmt.Errorf("tracker error: %s", string(buf[8:nRead]))
-		}
-		if respAction != expectedAction {
-			return nil, fmt.Errorf("unexpected %s response action: %d", opName, respAction)
-		}
-
-		// Copy out of the stack buffer so the returned slice stays valid.
-		out := make([]byte, nRead)
-		copy(out, buf[:nRead])
-		return out, nil
 	}
 
 	return nil, fmt.Errorf("%s timed out after %d retries", opName, udpMaxRetries+1)
@@ -202,8 +241,13 @@ func newTransactionID() (uint32, error) {
 // The announceURL should be of the form "udp://host:port/announce".
 // The function respects context cancellation and applies exponential backoff
 // retries on timeouts. Callers should pass a bounded context for app-level
-// tracker fallback; cancellation closes the UDP connection promptly.
+// tracker fallback; cancellation closes the UDP connection promptly. When the
+// caller's context has no deadline, defaultUDPTimeout is injected so a dead
+// tracker cannot pin the goroutine and socket for the full BEP 15 backoff.
 func UDPAnnounce(ctx context.Context, announceURL string, infoHash [20]byte, peerID [20]byte, port uint16, uploaded, downloaded, left int64, event string, numWant ...int) (*TrackerResponse, error) {
+	ctx, cancel := ensureUDPDeadline(ctx)
+	defer cancel()
+
 	conn, cleanup, err := udpDial(ctx, announceURL)
 	if err != nil {
 		return nil, err
@@ -363,7 +407,9 @@ func parseUDPAnnounceResponse(data []byte) (*TrackerResponse, error) {
 //
 // The announceURL should be of the form "udp://host:port/announce". The
 // function respects context cancellation and applies the same exponential
-// backoff retries on timeouts as UDPAnnounce.
+// backoff retries on timeouts as UDPAnnounce. When the caller's context has no
+// deadline, defaultUDPTimeout is injected so a dead tracker cannot pin the
+// goroutine and socket for the full BEP 15 backoff.
 func UDPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
 	if len(infoHashes) == 0 {
 		return nil, fmt.Errorf("UDP scrape requires at least one info hash")
@@ -371,6 +417,9 @@ func UDPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) 
 	if len(infoHashes) > udpMaxScrapeHashes {
 		return nil, fmt.Errorf("UDP scrape supports at most %d info hashes, got %d", udpMaxScrapeHashes, len(infoHashes))
 	}
+
+	ctx, cancel := ensureUDPDeadline(ctx)
+	defer cancel()
 
 	conn, cleanup, err := udpDial(ctx, announceURL)
 	if err != nil {
