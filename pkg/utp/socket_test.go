@@ -311,6 +311,88 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 	}
 }
 
+func TestDeliverDropsWhenDHTQueueFull(t *testing.T) {
+	socket, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	defer socket.Close()
+
+	pc := socket.DHTConn()
+	// Saturate the DHT queue with no consumer draining it.
+	for i := 0; i < dhtQueueSize; i++ {
+		pc.incoming <- udpPacket{data: []byte("x")}
+	}
+
+	// deliver runs on the shared UDP read loop, so it must drop rather than
+	// block when the queue is full.
+	done := make(chan struct{})
+	go func() {
+		pc.deliver(udpPacket{data: []byte("dropme")})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deliver blocked on a full DHT queue")
+	}
+	if got := pc.DroppedPackets(); got != 1 {
+		t.Fatalf("DroppedPackets() = %d, want 1", got)
+	}
+}
+
+func TestUTPHandshakeSurvivesFullDHTQueue(t *testing.T) {
+	server, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("server socket: %v", err)
+	}
+	defer server.Close()
+	ln := server.Listen()
+	defer ln.Close()
+
+	// Saturate the DHT queue and leave it undrained so every further non-uTP
+	// packet the read loop delivers must be dropped, never block.
+	pc := server.DHTConn()
+	for i := 0; i < dhtQueueSize; i++ {
+		pc.incoming <- udpPacket{data: []byte("x")}
+	}
+
+	rawClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("raw client: %v", err)
+	}
+	defer rawClient.Close()
+	_ = rawClient.SetDeadline(time.Now().Add(2 * time.Second))
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(server.Port())}
+
+	// Non-uTP traffic that would head-of-line block a blocking deliver, sent
+	// ahead of the uTP SYN on the same ordered loopback path.
+	for i := 0; i < 8; i++ {
+		if _, err := rawClient.WriteToUDP([]byte("d1:t2:aa1:y1:qe"), target); err != nil {
+			t.Fatalf("write dht packet: %v", err)
+		}
+	}
+	syn := packet{typ: packetTypeSyn, connID: 4242, timestamp: uint32(time.Now().UnixMicro()), seqNr: 5}
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("send SYN: %v", err)
+	}
+
+	// A blocked read loop would never emit the STATE reply, tripping the deadline.
+	buf := make([]byte, 1500)
+	n, _, err := rawClient.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read STATE (read loop head-of-line blocked?): %v", err)
+	}
+	state, err := parsePacket(buf[:n])
+	if err != nil {
+		t.Fatalf("parse STATE: %v", err)
+	}
+	if state.typ != packetTypeState || state.connID != syn.connID || state.ackNr != syn.seqNr {
+		t.Fatalf("unexpected STATE: type=%d connID=%d ack=%d", state.typ, state.connID, state.ackNr)
+	}
+}
+
 func TestSocketDemuxesDHTPackets(t *testing.T) {
 	socket, err := NewSocket(0)
 	if err != nil {
