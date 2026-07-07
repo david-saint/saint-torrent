@@ -235,3 +235,42 @@ func TestFastMessageSendHelpers(t *testing.T) {
 		t.Fatalf("send helper failed: %v", err)
 	}
 }
+
+// TestSendPieceWireFormat verifies the zero-copy SendPiece framing is byte-for-byte
+// identical to the message a Message{ID: MsgPiece, ...}.Serialize would produce,
+// and that the block bytes stream through unchanged.
+func TestSendPieceWireFormat(t *testing.T) {
+	infoHash := [20]byte{1}
+	peerID := [20]byte{2}
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	const index, begin = uint32(7), uint32(16384)
+	block := []byte("the quick brown fox jumps over")
+
+	errCh := make(chan error, 1)
+	go func() {
+		client := NewClient(clientConn, infoHash, peerID)
+		errCh <- client.SendPiece(index, begin, block)
+	}()
+
+	serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	msg, err := ParseMessage(serverConn)
+	if err != nil {
+		t.Fatalf("ParseMessage failed: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("SendPiece failed: %v", err)
+	}
+
+	// The framed message must decode to exactly the SendMessage/Serialize form.
+	wantPayload := make([]byte, 8+len(block))
+	binary.BigEndian.PutUint32(wantPayload[0:4], index)
+	binary.BigEndian.PutUint32(wantPayload[4:8], begin)
+	copy(wantPayload[8:], block)
+	if msg == nil || msg.ID != MsgPiece || !bytes.Equal(msg.Payload, wantPayload) {
+		t.Fatalf("got %#v, want id=%d payload=%v", msg, MsgPiece, wantPayload)
+	}
+}

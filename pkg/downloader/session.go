@@ -161,6 +161,15 @@ type Session struct {
 	pieceWriteCh   chan pieceWriteJob
 	pieceWriteOnce sync.Once
 
+	// pieceBufPool recycles full-piece assembly buffers so a completed piece no
+	// longer costs a fresh allocation on the peer hot path; the write worker returns
+	// each buffer once the piece is written. uploadBlockPool recycles the block-sized
+	// buffers the seed path reads served blocks into before SendPiece streams them.
+	// Both hold *[]byte so Put boxes only a pointer, and sync.Pool Get/Put are per-P
+	// and lock-free — no contention added to the hot path.
+	pieceBufPool    sync.Pool
+	uploadBlockPool sync.Pool
+
 	stateDirty bool
 	stats      completionStats
 	flushMu    sync.Mutex
@@ -301,6 +310,59 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 
 func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
 	return s.Torrent == nil || !s.Torrent.Private
+}
+
+// getPieceBuf borrows a piece-assembly buffer sliced to exactly length. Buffers
+// are allocated at the standard piece length so every piece but the last reuses
+// them directly; putPieceBuf (from the write worker) returns them afterward.
+func (s *Session) getPieceBuf(length int64) *[]byte {
+	if v := s.pieceBufPool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if int64(cap(*bp)) >= length {
+			*bp = (*bp)[:length]
+			return bp
+		}
+	}
+	// Empty pool: allocate at the standard piece length (never smaller than any
+	// individual piece) so the buffer is reusable for subsequent full pieces.
+	n := length
+	if s.Storage != nil {
+		if std := s.Storage.PieceLengthValue(); std > n {
+			n = std
+		}
+	}
+	b := make([]byte, n)
+	b = b[:length]
+	return &b
+}
+
+// putPieceBuf returns a piece-assembly buffer to the pool, restored to full
+// capacity so the next borrow can slice it to any piece length.
+func (s *Session) putPieceBuf(bp *[]byte) {
+	if bp == nil {
+		return
+	}
+	*bp = (*bp)[:cap(*bp)]
+	s.pieceBufPool.Put(bp)
+}
+
+// getUploadBlockBuf borrows a block-sized buffer (capacity BlockSize) for reading
+// a served block off storage; the caller slices it to the request length.
+func (s *Session) getUploadBlockBuf() *[]byte {
+	if v := s.uploadBlockPool.Get(); v != nil {
+		return v.(*[]byte)
+	}
+	b := make([]byte, BlockSize)
+	return &b
+}
+
+// putUploadBlockBuf returns a served-block buffer to the pool at full capacity.
+func (s *Session) putUploadBlockBuf(bp *[]byte) {
+	if bp == nil {
+		return
+	}
+	*bp = (*bp)[:cap(*bp)]
+	s.uploadBlockPool.Put(bp)
 }
 
 func (s *Session) allowsDHTAnnounceLocked() bool {

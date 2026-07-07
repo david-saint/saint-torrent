@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -155,6 +156,119 @@ func TestParseMessage(t *testing.T) {
 				t.Errorf("Expected payload %v, got %v", tt.expectedMsg.Payload, got.Payload)
 			}
 		})
+	}
+}
+
+// pieceWire builds the on-wire bytes for a piece message carrying the given block.
+func pieceWire(index, begin uint32, block []byte) []byte {
+	length := uint32(9 + len(block)) // id + index + begin + block
+	buf := make([]byte, 4+length)
+	binary.BigEndian.PutUint32(buf[0:4], length)
+	buf[4] = byte(MsgPiece)
+	binary.BigEndian.PutUint32(buf[5:9], index)
+	binary.BigEndian.PutUint32(buf[9:13], begin)
+	copy(buf[13:], block)
+	return buf
+}
+
+// TestReadMessageMatchesParseMessage checks the pooled reader decodes the same
+// fields as the allocating ParseMessage across representative message shapes.
+func TestReadMessageMatchesParseMessage(t *testing.T) {
+	inputs := [][]byte{
+		{0, 0, 0, 0},                // keep-alive
+		{0, 0, 0, 1, 0},             // choke
+		{0, 0, 0, 5, 4, 0, 0, 0, 5}, // have
+		pieceWire(3, 16384, []byte("a block of data")),
+	}
+	for i, in := range inputs {
+		want, werr := ParseMessage(bytes.NewReader(in))
+		got, gerr := readMessage(bytes.NewReader(in), make([]byte, 4))
+		if (werr == nil) != (gerr == nil) {
+			t.Fatalf("input %d: error mismatch: ParseMessage=%v readMessage=%v", i, werr, gerr)
+		}
+		if want == nil {
+			if got != nil {
+				t.Fatalf("input %d: expected nil message, got %v", i, got)
+			}
+			continue
+		}
+		if got.ID != want.ID || !bytes.Equal(got.Payload, want.Payload) {
+			t.Fatalf("input %d: got {ID:%d Payload:%v}, want {ID:%d Payload:%v}", i, got.ID, got.Payload, want.ID, want.Payload)
+		}
+	}
+}
+
+// TestReadMessagePoolsBlockBuffers verifies that a block-sized message is read
+// into a pooled buffer and that Release returns the buffer to the pool.
+func TestReadMessagePoolsBlockBuffers(t *testing.T) {
+	block := make([]byte, 16384)
+	for i := range block {
+		block[i] = byte(i)
+	}
+	in := pieceWire(1, 0, block) // length == maxPooledMessageLen, poolable
+
+	msg, err := readMessage(bytes.NewReader(in), make([]byte, 4))
+	if err != nil {
+		t.Fatalf("readMessage failed: %v", err)
+	}
+	if msg.pooled == nil {
+		t.Fatal("expected a pooled backing buffer for a block-sized message")
+	}
+	if !bytes.Equal(msg.Payload[8:], block) {
+		t.Fatal("payload block does not round-trip")
+	}
+
+	msg.Release()
+	if msg.pooled != nil || msg.Payload != nil {
+		t.Fatal("Release must clear the pooled buffer and payload")
+	}
+	// sync.Pool gives no identity guarantee (GC or the race runtime may reshuffle
+	// slots), so assert on shape like the short-read test: whatever Get hands out
+	// next must be a full-size pooled buffer.
+	if reused := inboundBufPool.Get().(*[]byte); cap(*reused) != maxPooledMessageLen {
+		t.Fatalf("pool returned a buffer of cap %d, want %d", cap(*reused), maxPooledMessageLen)
+	} else {
+		inboundBufPool.Put(reused)
+	}
+
+	// Release is safe to call again (and on a heap-backed message / nil receiver).
+	msg.Release()
+	var nilMsg *Message
+	nilMsg.Release()
+}
+
+// TestReadMessageOversizedNotPooled checks messages larger than the pooled buffer
+// size fall back to a heap allocation with Release as a no-op.
+func TestReadMessageOversizedNotPooled(t *testing.T) {
+	block := make([]byte, maxPooledMessageLen) // 9-byte header pushes length over the cap
+	in := pieceWire(0, 0, block)
+	msg, err := readMessage(bytes.NewReader(in), make([]byte, 4))
+	if err != nil {
+		t.Fatalf("readMessage failed: %v", err)
+	}
+	if msg.pooled != nil {
+		t.Fatal("oversized message must not borrow a pooled buffer")
+	}
+	if len(msg.Payload) != 8+len(block) {
+		t.Fatalf("unexpected payload length %d", len(msg.Payload))
+	}
+	msg.Release() // no-op, must not panic
+}
+
+// TestReadMessageReleaseOnShortReadReclaimsBuffer ensures a truncated payload
+// returns its borrowed buffer to the pool rather than leaking it.
+func TestReadMessageReleaseOnShortReadReclaimsBuffer(t *testing.T) {
+	// Advertise a poolable length but supply fewer payload bytes than promised.
+	in := []byte{0, 0, 0, 10, 7, 1, 2, 3} // length 10, only 3 payload bytes follow
+	if _, err := readMessage(bytes.NewReader(in), make([]byte, 4)); err == nil {
+		t.Fatal("expected a short-read error")
+	}
+	// The borrowed buffer must have been Put back on the error path; draining it
+	// here must not observe a wrongly-sized buffer.
+	if bp := inboundBufPool.Get().(*[]byte); cap(*bp) != maxPooledMessageLen {
+		t.Fatalf("pool returned a buffer of cap %d, want %d", cap(*bp), maxPooledMessageLen)
+	} else {
+		inboundBufPool.Put(bp)
 	}
 }
 
