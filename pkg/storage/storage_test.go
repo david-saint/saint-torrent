@@ -510,6 +510,238 @@ func TestStorageWriteBlockRepairsMissingFile(t *testing.T) {
 	}
 }
 
+// TestStorageWriteBlockCachesWriteHandle verifies WriteBlock opens the O_RDWR
+// handle once and reuses it, so completed pieces no longer pay open/stat/close
+// churn per write.
+func TestStorageWriteBlockCachesWriteHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "cached.bin", Length: 128}}, 64)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	fs := s.(*FileStorage)
+	if fs.files[0].writeHandle != nil {
+		t.Fatal("write handle should be lazily opened, not present before first write")
+	}
+
+	data := bytes.Repeat([]byte{'a'}, 64)
+	if err := s.WriteBlock(0, 0, data); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	h1 := fs.files[0].writeHandle
+	if h1 == nil {
+		t.Fatal("write handle should be cached after first write")
+	}
+
+	if err := s.WriteBlock(1, 0, data); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if fs.files[0].writeHandle != h1 {
+		t.Fatal("second write should reuse the cached write handle, not reopen it")
+	}
+}
+
+// TestStorageWriteRepairInvalidatesReadHandle proves that when a mid-session write
+// recreates a vanished file, the cached read handle pointing at the orphaned inode
+// is dropped so subsequent reads observe the freshly written bytes.
+func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "repair.bin", Length: 16}}, 16)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	first := bytes.Repeat([]byte{'1'}, 16)
+	if err := s.WriteBlock(0, 0, first); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+	// Cache a read handle bound to the current inode.
+	if _, err := s.ReadBlock(0, 0, make([]byte, 16)); err != nil {
+		t.Fatalf("initial read: %v", err)
+	}
+
+	// Drop both cached handles so the next write reopens (and repairs) the file.
+	fs := s.(*FileStorage)
+	fs.files[0].invalidateWriter()
+	if err := os.Remove(filepath.Join(tmpDir, "repair.bin")); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+
+	second := bytes.Repeat([]byte{'2'}, 16)
+	if err := s.WriteBlock(0, 0, second); !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("repair write = %v, want ErrFileRepaired", err)
+	}
+
+	got := make([]byte, 16)
+	if _, err := s.ReadBlock(0, 0, got); err != nil {
+		t.Fatalf("post-repair read: %v", err)
+	}
+	if !bytes.Equal(got, second) {
+		t.Fatalf("post-repair read returned stale data %q, want %q", got, second)
+	}
+}
+
+// TestStorageVerifyPieceStreaming exercises the streaming verifier across a file
+// boundary and multiple chunk iterations (the piece is larger than the reused
+// buffer), guarding against ordering/offset regressions in the chunked read loop.
+func TestStorageVerifyPieceStreaming(t *testing.T) {
+	tmpDir := t.TempDir()
+	// f1 length is deliberately not a multiple of verifyChunkSize so the boundary
+	// between files lands mid-chunk.
+	const f1Len = 300 * 1024
+	const f2Len = 400 * 1024
+	const pieceLen = 500 * 1024
+	total := int64(f1Len + f2Len)
+	if pieceLen <= verifyChunkSize {
+		t.Fatalf("test piece length %d must exceed verifyChunkSize %d", pieceLen, verifyChunkSize)
+	}
+
+	s, err := NewStorage(tmpDir, []FileInfo{
+		{Path: "a.bin", Length: f1Len},
+		{Path: "b.bin", Length: f2Len},
+	}, pieceLen)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	pattern := make([]byte, total)
+	for i := range pattern {
+		pattern[i] = byte((i*7 + 3) & 0xff)
+	}
+
+	// Piece 0 spans f1 fully plus part of f2; piece 1 is the final short piece.
+	if err := s.WriteBlock(0, 0, pattern[:pieceLen]); err != nil {
+		t.Fatalf("write piece 0: %v", err)
+	}
+	if err := s.WriteBlock(1, 0, pattern[pieceLen:total]); err != nil {
+		t.Fatalf("write piece 1: %v", err)
+	}
+
+	for _, p := range []int64{0, 1} {
+		start := p * pieceLen
+		end := start + s.PieceLength(p)
+		want := sha1.Sum(pattern[start:end])
+		ok, err := s.VerifyPiece(p, want)
+		if err != nil {
+			t.Fatalf("verify piece %d: %v", p, err)
+		}
+		if !ok {
+			t.Fatalf("piece %d failed verification against correct hash", p)
+		}
+		var wrong [20]byte
+		copy(wrong[:], want[:])
+		wrong[0] ^= 0xff
+		ok, err = s.VerifyPiece(p, wrong)
+		if err != nil {
+			t.Fatalf("verify piece %d wrong hash: %v", p, err)
+		}
+		if ok {
+			t.Fatalf("piece %d verified against a corrupted hash", p)
+		}
+	}
+}
+
+// TestStorageConcurrentWritesAndReads drives many writers (distinct pieces) and
+// readers concurrently through the shared-read-lock write path, proving under
+// -race that concurrent WriteBlock/ReadBlock and the cached write handles are safe
+// and that every piece lands correctly.
+func TestStorageConcurrentWritesAndReads(t *testing.T) {
+	tmpDir := t.TempDir()
+	const pieceLen = 1 << 15 // 32 KB
+	const numPieces = 24
+	total := int64(pieceLen * numPieces)
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "big.bin", Length: total}}, pieceLen)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	pieceBytes := func(p int) []byte {
+		b := make([]byte, pieceLen)
+		for i := range b {
+			b[i] = byte((p*181 + i*3) & 0xff)
+		}
+		return b
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numPieces*2)
+
+	for p := 0; p < numPieces; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			if err := s.WriteBlock(int64(p), 0, pieceBytes(p)); err != nil {
+				errCh <- err
+			}
+		}(p)
+	}
+	// Concurrent readers race the writers; a read may land before its piece is
+	// written, so only the error (not the contents) is asserted here.
+	for g := 0; g < numPieces; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			buf := make([]byte, pieceLen)
+			if _, err := s.ReadBlock(int64(g), 0, buf); err != nil {
+				errCh <- err
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent write/read failed: %v", err)
+		}
+	}
+
+	// Every piece must now read back exactly what was written.
+	for p := 0; p < numPieces; p++ {
+		buf := make([]byte, pieceLen)
+		if _, err := s.ReadBlock(int64(p), 0, buf); err != nil {
+			t.Fatalf("verify read piece %d: %v", p, err)
+		}
+		if !bytes.Equal(buf, pieceBytes(p)) {
+			t.Fatalf("piece %d content mismatch after concurrent writes", p)
+		}
+	}
+}
+
+// TestStorageSaveStateCapturesWrittenMtime verifies the deferred-mtime path: after
+// writing a piece and persisting, a matching LoadState round-trips (the written
+// file's fresh mtime was captured in SaveState rather than left stale).
+func TestStorageSaveStateCapturesWrittenMtime(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "state.bin", Length: 64}}, 64)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.WriteBlock(0, 0, bytes.Repeat([]byte{'q'}, 64)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	infoHash := "0123456789abcdef0123456789abcdef01234567"
+	if err := s.SaveState(infoHash, []int{0}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	loaded, err := s.LoadState(infoHash)
+	if err != nil {
+		t.Fatalf("load state after write: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0] != 0 {
+		t.Fatalf("loaded pieces = %v, want [0]", loaded)
+	}
+}
+
 func TestOpenNoFollowSymlink(t *testing.T) {
 	tmpDir := t.TempDir()
 	targetFile := filepath.Join(tmpDir, "target.bin")

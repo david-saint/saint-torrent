@@ -119,6 +119,14 @@ type fileLayout struct {
 	// recreates/resizes the file so a stale handle to an orphaned inode is dropped.
 	rmu        sync.Mutex
 	readHandle *os.File
+
+	// writeHandle is an O_RDWR handle opened (and, if the file vanished or was
+	// resized, repaired) on first write and reused for every subsequent block write
+	// of this file — the write-side analogue of readHandle, eliminating the
+	// open/stat/close syscall churn per completed piece on the download path. Guarded
+	// by wmu. Invalidated when a repair recreates/resizes the file or on Close.
+	wmu         sync.Mutex
+	writeHandle *os.File
 }
 
 // reader returns the cached O_RDONLY handle, opening it on first use.
@@ -158,17 +166,89 @@ func (f *fileLayout) invalidateReaderLocked() {
 	}
 }
 
+// writer returns the cached O_RDWR handle, opening it on first use. The open
+// doubles as the repair check: if the file vanished it is recreated, and if its
+// size drifted it is truncated back to the declared length — either case reports
+// repaired=true and drops the now-stale read handle. Once cached, subsequent
+// writes reuse the handle, so the open/stat/close syscall churn is paid once per
+// file rather than once per completed piece. Guarded by wmu.
+func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+	if f.writeHandle != nil {
+		return f.writeHandle, false, nil
+	}
+
+	h, err = openNoFollow(f.absPath, os.O_RDWR, 0644)
+	if os.IsNotExist(err) {
+		if mkErr := os.MkdirAll(filepath.Dir(f.absPath), 0755); mkErr != nil {
+			return nil, false, mkErr
+		}
+		h, err = openNoFollow(f.absPath, os.O_CREATE|os.O_RDWR, 0644)
+		if err == nil {
+			repaired = true
+			// The file was recreated as a fresh inode; any cached read handle now
+			// points at the orphaned old inode and must be dropped.
+			f.invalidateReader()
+		}
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	fi, statErr := h.Stat()
+	if statErr != nil {
+		_ = h.Close()
+		return nil, false, statErr
+	}
+	if fi.Size() != f.length {
+		if err := h.Truncate(f.length); err != nil {
+			_ = h.Close()
+			return nil, false, err
+		}
+		repaired = true
+		f.invalidateReader()
+	}
+
+	f.writeHandle = h
+	return h, repaired, nil
+}
+
+// invalidateWriter closes and drops the cached write handle.
+func (f *fileLayout) invalidateWriter() {
+	f.wmu.Lock()
+	f.invalidateWriterLocked()
+	f.wmu.Unlock()
+}
+
+func (f *fileLayout) tryInvalidateWriter() {
+	if !f.wmu.TryLock() {
+		return
+	}
+	f.invalidateWriterLocked()
+	f.wmu.Unlock()
+}
+
+func (f *fileLayout) invalidateWriterLocked() {
+	if f.writeHandle != nil {
+		_ = f.writeHandle.Close()
+		f.writeHandle = nil
+	}
+}
+
 // FileStorage manages the files on disk for a torrent and provides thread-safe
 // block read/write and piece verification.
 //
-// Concurrency model: mu is an RWMutex. Block reads (ReadBlock/VerifyPiece) take
-// the read lock and run concurrently — positional ReadAt on a cached handle is
-// safe for parallel use, so the seed path is no longer serialized through one
-// mutex. Writes, repair, and fast-resume state take the write lock; they are
-// infrequent (per piece, not per block) and run on the background write pool, so
-// they never block peer goroutines. Close marks the storage closed atomically
-// before invalidating cached read handles so session teardown cannot wedge behind
-// a blocked VerifyPiece/read lock.
+// Concurrency model: mu is an RWMutex. Block reads AND writes (ReadBlock,
+// VerifyPiece, WriteBlock) take the read lock and run concurrently — positional
+// ReadAt/WriteAt on the cached per-file handles is safe for parallel use, so
+// neither the seed path nor a multi-MB piece write serializes behind one mutex or
+// stalls peer goroutines. The exclusive write lock is reserved for fast-resume
+// state (LoadState), which is infrequent and off the block path. The only shared
+// write-path bookkeeping — the cached handles and the deferred-mtime dirty set —
+// is guarded by finer-grained locks (fileLayout.wmu/rmu and mtMu). Close marks the
+// storage closed atomically before invalidating cached handles so session teardown
+// cannot wedge behind a blocked VerifyPiece/read lock.
 type FileStorage struct {
 	mu          sync.RWMutex
 	resolver    *PathResolver
@@ -176,7 +256,13 @@ type FileStorage struct {
 	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
+	// mtMu guards stateFileMt and dirty, which the shared-read-lock WriteBlock and
+	// SaveState paths mutate concurrently. dirty records files written since the last
+	// persist; their mtimes are captured lazily in SaveState instead of via a stat
+	// syscall on every completed piece (mirrors the mmap backend).
+	mtMu        sync.Mutex
 	stateFileMt map[string]int64
+	dirty       map[*fileLayout]struct{}
 	closed      atomic.Bool
 }
 
@@ -295,6 +381,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		pieceLength: pieceLength,
 		totalSize:   currentOffset,
 		stateFileMt: stateFileMt,
+		dirty:       make(map[*fileLayout]struct{}, len(layouts)),
 	}, nil
 }
 
@@ -408,11 +495,12 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 		return fmt.Errorf("block exceeds piece boundaries: pieceLen=%d, offset=%d, writeLen=%d", pieceLen, offset, len(data))
 	}
 
-	// Writes take the exclusive lock. They happen once per completed piece (on the
-	// background write pool, never on a peer's read loop), so serializing them — and
-	// briefly excluding concurrent reads — does not throttle the per-block seed path.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Writes take the shared read lock: positional WriteAt on the cached O_RDWR
+	// handle is concurrency-safe, so completed-piece writes (on the background write
+	// pool) run in parallel with each other and with the per-block seed reads instead
+	// of stalling every peer goroutine behind an exclusive lock for a multi-MB write.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
@@ -431,46 +519,32 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			absPath := file.absPath
-			f, err := openNoFollow(absPath, os.O_WRONLY, 0644)
-			if os.IsNotExist(err) {
-				if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
-					return fmt.Errorf("failed to recreate directories for file %s: %w", file.path, err)
-				}
-				f, err = openNoFollow(absPath, os.O_CREATE|os.O_RDWR, 0644)
-				if err == nil {
-					repaired = true
-					// The file was recreated as a fresh inode; any cached read handle
-					// now points at the orphaned old inode and must be dropped.
-					file.invalidateReader()
-				}
-			}
+			f, fileRepaired, err := file.writer()
 			if err != nil {
 				return fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
 			}
-			if fi, err := f.Stat(); err != nil {
-				f.Close()
-				return fmt.Errorf("failed to stat file %s for writing: %w", file.path, err)
-			} else if fi.Size() != file.length {
-				if err := f.Truncate(file.length); err != nil {
-					f.Close()
-					return fmt.Errorf("failed to repair size for file %s: %w", file.path, err)
-				}
+			if fileRepaired {
 				repaired = true
-				file.invalidateReader()
+			}
+			if s.closed.Load() {
+				file.invalidateWriter()
+				return ErrStorageClosed
 			}
 
 			n, err := f.WriteAt(data[bufOffset:bufOffset+nBytes], fileOffset)
-			f.Close()
 			if err != nil {
 				return fmt.Errorf("write error on file %s: %w", file.path, err)
 			}
 			if int64(n) != nBytes {
 				return fmt.Errorf("short write on file %s: expected %d bytes, got %d", file.path, nBytes, n)
 			}
-			if fi, err := os.Stat(absPath); err == nil {
-				s.stateFileMt[file.path] = fi.ModTime().UnixNano()
-			}
+
+			// Defer the mtime refresh to SaveState: mark the file dirty rather than
+			// paying a stat syscall on every completed piece. SaveState is infrequent
+			// (~once per second) and off the block path.
+			s.mtMu.Lock()
+			s.dirty[file] = struct{}{}
+			s.mtMu.Unlock()
 		}
 	}
 
@@ -479,6 +553,12 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	}
 	return nil
 }
+
+// verifyChunkSize bounds the reusable buffer VerifyPiece streams file bytes
+// through. It is comfortably larger than a 16 KB block (so ReadAt syscall overhead
+// is amortized) while staying small enough that re-checking a multi-GB torrent on
+// resume no longer allocates a full piece — potentially many MB — per call.
+const verifyChunkSize = 1 << 18 // 256 KiB
 
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
 func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
@@ -493,7 +573,16 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 		return false, ErrStorageClosed
 	}
 
-	buf := make([]byte, pieceLen)
+	// Stream the piece through the hasher via a single reusable chunk buffer instead
+	// of materializing the whole piece. Files are laid out in ascending offset order,
+	// so iterating s.files feeds the hasher the piece bytes in order across file
+	// boundaries. The buffer is capped to the piece length so tiny pieces stay tiny.
+	h := sha1.New()
+	chunkLen := pieceLen
+	if chunkLen > verifyChunkSize {
+		chunkLen = verifyChunkSize
+	}
+	chunk := make([]byte, chunkLen)
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
@@ -501,10 +590,6 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
-
-			fileOffset := overlapStart - file.startOffset
-			bufOffset := overlapStart - globalStart
-			nBytes := overlapEnd - overlapStart
 
 			f, err := file.reader()
 			if err != nil {
@@ -515,17 +600,31 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 				return false, ErrStorageClosed
 			}
 
-			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
-			if err != nil && err != io.EOF {
-				return false, fmt.Errorf("read error on file %s: %w", file.path, err)
-			}
-			if int64(n) != nBytes {
-				return false, fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, nBytes, n)
+			fileOffset := overlapStart - file.startOffset
+			remaining := overlapEnd - overlapStart
+			for remaining > 0 {
+				readLen := int64(len(chunk))
+				if readLen > remaining {
+					readLen = remaining
+				}
+				n, err := f.ReadAt(chunk[:readLen], fileOffset)
+				if err != nil && err != io.EOF {
+					return false, fmt.Errorf("read error on file %s: %w", file.path, err)
+				}
+				if int64(n) != readLen {
+					return false, fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, readLen, n)
+				}
+				if _, err := h.Write(chunk[:readLen]); err != nil {
+					return false, err
+				}
+				fileOffset += readLen
+				remaining -= readLen
 			}
 		}
 	}
 
-	actualHash := sha1.Sum(buf)
+	var actualHash [20]byte
+	copy(actualHash[:], h.Sum(nil))
 	return actualHash == expectedHash, nil
 }
 
@@ -541,6 +640,7 @@ func (s *FileStorage) Close() error {
 	}
 	for _, file := range s.files {
 		file.tryInvalidateReader()
+		file.tryInvalidateWriter()
 	}
 	return nil
 }
@@ -554,6 +654,20 @@ type FastResumeState struct {
 		Mtime int64  `json:"mtime"`
 	} `json:"files"`
 	CompletedPieces []int `json:"completed_pieces"`
+}
+
+// refreshDirtyLocked captures the on-disk mtime of every file written since the
+// last persist and clears the dirty set. WriteAt already bumps the mtime, so a
+// plain stat suffices; failures are ignored (mirroring the previous per-write
+// behavior) since a stale mtime only costs an extra re-verify on the next resume.
+// The caller must hold mtMu.
+func (s *FileStorage) refreshDirtyLocked() {
+	for file := range s.dirty {
+		if fi, err := os.Stat(file.absPath); err == nil {
+			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+		}
+		delete(s.dirty, file)
+	}
 }
 
 // SaveState writes the completed pieces and file metadata to a fast-resume state file.
@@ -577,6 +691,10 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 	s.mu.RLock()
 	closed := s.closed.Load()
 	if !closed {
+		s.mtMu.Lock()
+		// Capture the current mtime of every file written since the last persist
+		// (deferred from WriteBlock) before snapshotting the metadata.
+		s.refreshDirtyLocked()
 		filesMeta = make([]fileMeta, 0, len(s.files))
 		for _, f := range s.files {
 			mtime := int64(0)
@@ -589,6 +707,7 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 				mtime: mtime,
 			})
 		}
+		s.mtMu.Unlock()
 	}
 	s.mu.RUnlock()
 
