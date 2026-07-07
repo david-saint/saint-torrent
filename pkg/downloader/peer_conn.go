@@ -79,10 +79,36 @@ type blockRequest struct {
 	pipelineBudgetBytes int64
 }
 
+// uploadRequest is a peer's pending block request awaiting upload bandwidth. It is
+// queued (rather than served inline in the message loop) so the upload limiter is
+// consulted non-blockingly and never stalls the download pump — see issue #59.
+type uploadRequest struct {
+	index  int64
+	begin  int64
+	length int64
+}
+
 type transportDialResult struct {
 	transport string
 	conn      net.Conn
 	err       error
+}
+
+// minRetry returns the sooner of two limiter retry delays, treating 0 ("no retry
+// needed") as the absence of a deadline. The peer message loop drives both a
+// download request pump and an upload serve pump off a single retry timer, so it
+// arms that timer for whichever pump wants to run again first.
+func minRetry(a, b time.Duration) time.Duration {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
@@ -1188,6 +1214,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	lastRequestAt := time.Time{}
 	waitingForBandwidth := false
 
+	// uploadQueue holds this peer's block requests awaiting upload bandwidth. It is
+	// owned by this peer goroutine and drained FIFO by uploadPump; never touched by
+	// other goroutines, so it needs no lock.
+	var uploadQueue []uploadRequest
+
 	// pump re-arms timed-out requests, then fills the request window across all
 	// active pieces, opening new pieces as needed. Called after each inbound
 	// message — INCLUDING keep-alives — so the pipeline stays full across piece
@@ -1369,6 +1400,52 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return 0
 	}
 
+	// uploadPump serves this peer's queued block requests as fast as the upload
+	// limiters allow, WITHOUT ever blocking: a request is served only when its bytes
+	// can be reserved without waiting, so this goroutine keeps running pump() and
+	// draining the socket instead of stalling on a limiter Wait (issue #59 — the
+	// download side was already converted to this non-blocking discipline). It returns
+	// the delay after which it should run again (0 when the queue is empty or fully
+	// drained) so the caller can arm the shared rate-retry timer alongside pump().
+	uploadPump := func() time.Duration {
+		for len(uploadQueue) > 0 {
+			r := uploadQueue[0]
+			reserved, retryAfter, refund := s.reserveUploadWithRefund(int(r.length))
+			if !reserved {
+				// Not enough tokens yet: leave this request (and the rest) queued and
+				// ask the loop to retry once the limiter says they should be available.
+				return retryAfter
+			}
+			buf := make([]byte, r.length)
+			if _, err := s.Storage.ReadBlock(r.index, r.begin, buf); err != nil {
+				// Shouldn't happen for a completed piece, but if the read fails don't
+				// leak the reserved tokens; tell a fast peer the request is dead so its
+				// per-request accounting stays consistent, then drop it.
+				if refund != nil {
+					refund()
+				}
+				if fastEnabled {
+					_ = client.SendRejectRequest(uint32(r.index), uint32(r.begin), uint32(r.length))
+				}
+				uploadQueue = uploadQueue[1:]
+				continue
+			}
+			if err := client.SendPiece(uint32(r.index), uint32(r.begin), buf); err != nil {
+				// Dead socket: refund the reservation and let teardown handle the rest.
+				if refund != nil {
+					refund()
+				}
+				_ = conn.Close()
+				return 0
+			}
+			// Lock-free counter update (see the download hot path above).
+			s.Uploaded.Add(r.length)
+			atomic.AddInt64(&pState.Uploaded, r.length)
+			uploadQueue = uploadQueue[1:]
+		}
+		return 0
+	}
+
 	// dropCompletedElsewhere is the endgame "cancel on receipt" path: it drops any
 	// in-progress piece that another peer has finished (so its state is no longer
 	// PieceDownloading) and sends a Cancel for each of our still-outstanding blocks so
@@ -1524,7 +1601,9 @@ peerLoop:
 			continue
 		case <-rateRetry:
 			rateRetry = nil
-			scheduleRateRetry(pump())
+			// The timer covers whichever pump was waiting on bandwidth: re-run both the
+			// download request pump and the upload serve pump, then re-arm for the sooner.
+			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		case <-s.ctx.Done():
 			disconnectReason = "context_cancelled"
@@ -1535,8 +1614,9 @@ peerLoop:
 		if msg == nil {
 			// Keep alive: still run pump so outstanding requests to a now-silent peer
 			// time out (and the peer is dropped after its retry budget) instead of the
-			// keep-alive merely resetting the read deadline and stalling forever.
-			scheduleRateRetry(pump())
+			// keep-alive merely resetting the read deadline and stalling forever. Also
+			// drain any queued uploads that have since accrued bandwidth.
+			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		}
 
@@ -2002,23 +2082,17 @@ peerLoop:
 				}
 
 				if isCompleted && length > 0 && length <= BlockSize && begin >= 0 && begin+length <= pieceLen {
-					// Apply upload rate limiting
-					if err := s.UploadLimiter.Wait(s.ctx, int(length)); err != nil {
-						continue
-					}
-					if s.GlobalUploadLimiter != nil {
-						if err := s.GlobalUploadLimiter.Wait(s.ctx, int(length)); err != nil {
-							continue
-						}
-					}
-					buf := make([]byte, length)
-					_, err := s.Storage.ReadBlock(index, begin, buf)
-					if err == nil {
-						if err := client.SendPiece(uint32(index), uint32(begin), buf); err == nil {
-							// Lock-free counter update (see the download hot path above).
-							s.Uploaded.Add(length)
-							atomic.AddInt64(&pState.Uploaded, length)
-						}
+					// Queue the block for upload rather than blocking on the limiter here:
+					// waiting for upload tokens inside the message loop would stop this
+					// goroutine running pump(), stalling the download side (issue #59).
+					// uploadPump (below, after every message) serves the queue as tokens
+					// accrue. A full queue means the peer is asking faster than the upload
+					// limit allows; reject (fast-extension) or drop as backpressure so a
+					// greedy peer can't grow the queue without bound.
+					if len(uploadQueue) < maxUploadQueue {
+						uploadQueue = append(uploadQueue, uploadRequest{index: index, begin: begin, length: length})
+					} else if fastEnabled {
+						_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
 					}
 				} else if fastEnabled && length > 0 {
 					_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
@@ -2045,9 +2119,11 @@ peerLoop:
 
 		// Cancel and drop pieces another peer finished (endgame), then keep the
 		// request pipeline full across all active pieces, opening new pieces as
-		// needed (pump no-ops when paused, choked, or seeding).
+		// needed (pump no-ops when paused, choked, or seeding). Also serve any block
+		// requests this peer queued (e.g. a MsgRequest just handled above), draining
+		// them without blocking so upload limiting never stalls the download pump.
 		dropCompletedElsewhere()
-		scheduleRateRetry(pump())
+		scheduleRateRetry(minRetry(pump(), uploadPump()))
 	}
 
 	// If we disconnected while holding pieces, return them to empty so other

@@ -43,6 +43,14 @@ var blockRequestTimeout = 20 * time.Second
 
 const maxBlockRequestRetries = 2
 
+// maxUploadQueue bounds the number of pending block requests a single peer may have
+// queued for upload while the upload limiter accrues tokens. Serving is non-blocking
+// (see uploadPump in runPeerMessageLoop), so a peer requesting faster than the upload
+// limit allows would otherwise grow this queue without bound; past the cap we reject
+// (fast-extension) or drop the request as backpressure. Sized generously so it never
+// throttles a normally pipelining peer: 512 blocks * ~24 bytes ~= 12 KB per connection.
+const maxUploadQueue = 512
+
 // PeerState holds per-peer state visible to the TUI.
 type PeerState struct {
 	// Downloaded and Uploaded are cumulative byte counters bumped on the peer's
@@ -1074,6 +1082,40 @@ func (s *Session) reserveDownloadWithRefund(n int) (reserved bool, retryAfter ti
 		}
 		if globalCharged && s.GlobalDownloadLimiter != nil {
 			s.GlobalDownloadLimiter.refund(n)
+		}
+	}
+}
+
+// reserveUploadWithRefund is the upload-side mirror of reserveDownloadWithRefund: a
+// non-blocking attempt to charge n bytes against both the per-session and global
+// upload limiters. It never waits, so the caller (uploadPump) keeps the peer message
+// loop pumping the download side instead of stalling on a blocking limiter Wait
+// (issue #59). On success it returns a refund closure that returns exactly the tokens
+// that were actually charged (unlimited limiters charge nothing), so a failed disk
+// read or socket write doesn't leak bandwidth. On failure it returns the sooner
+// retry hint from whichever limiter was short.
+func (s *Session) reserveUploadWithRefund(n int) (reserved bool, retryAfter time.Duration, refund func()) {
+	localOK, localCharged, localRetry := s.UploadLimiter.tryReserve(n)
+	if !localOK {
+		return false, localRetry, nil
+	}
+	globalCharged := false
+	if s.GlobalUploadLimiter != nil {
+		globalOK, charged, globalRetry := s.GlobalUploadLimiter.tryReserve(n)
+		if !globalOK {
+			if localCharged {
+				s.UploadLimiter.refund(n)
+			}
+			return false, globalRetry, nil
+		}
+		globalCharged = charged
+	}
+	return true, 0, func() {
+		if localCharged {
+			s.UploadLimiter.refund(n)
+		}
+		if globalCharged && s.GlobalUploadLimiter != nil {
+			s.GlobalUploadLimiter.refund(n)
 		}
 	}
 }

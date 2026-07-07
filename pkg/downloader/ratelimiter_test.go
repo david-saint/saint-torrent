@@ -351,6 +351,90 @@ func TestRateLimiterZeroBytes(t *testing.T) {
 	}
 }
 
+// TestReserveUploadWithRefundNeverBlocks pins issue #59: the upload path must reserve
+// bandwidth without ever blocking the peer message loop. A drained limiter has to fail
+// the reservation immediately (with a bounded retry hint) rather than wait for tokens
+// to accrue the way the old blocking UploadLimiter.Wait did.
+func TestReserveUploadWithRefundNeverBlocks(t *testing.T) {
+	s := &Session{
+		UploadLimiter:       NewRateLimiter(BlockSize),
+		GlobalUploadLimiter: NewRateLimiter(0), // unlimited global
+	}
+
+	// The fresh per-session burst covers exactly one block.
+	reserved, retryAfter, refund := s.reserveUploadWithRefund(BlockSize)
+	if !reserved || retryAfter != 0 || refund == nil {
+		t.Fatalf("first reservation = (reserved=%v, retry=%v, refund!=nil=%v), want (true, 0, true)", reserved, retryAfter, refund != nil)
+	}
+
+	// Bucket now empty: the next reservation must return immediately (non-blocking),
+	// report failure with a bounded retry hint, and hand back no refund closure.
+	start := time.Now()
+	reserved, retryAfter, refund = s.reserveUploadWithRefund(BlockSize)
+	elapsed := time.Since(start)
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("reserveUploadWithRefund blocked for %v; the upload path must never wait (issue #59)", elapsed)
+	}
+	if reserved || refund != nil {
+		t.Fatalf("drained reservation = (reserved=%v, refund!=nil=%v), want (false, false)", reserved, refund != nil)
+	}
+	if retryAfter < 10*time.Millisecond || retryAfter > 100*time.Millisecond {
+		t.Fatalf("retry hint %v outside the bounded scheduler range [10ms, 100ms]", retryAfter)
+	}
+}
+
+// TestReserveUploadWithRefundChargesAndRefundsGlobal verifies the dual-limiter
+// accounting: when only the global limiter is finite it is the one charged, and the
+// returned refund closure restores exactly those tokens so a failed disk read or
+// socket write never leaks global upload bandwidth.
+func TestReserveUploadWithRefundChargesAndRefundsGlobal(t *testing.T) {
+	s := &Session{
+		UploadLimiter:       NewRateLimiter(0),         // unlimited per-session
+		GlobalUploadLimiter: NewRateLimiter(BlockSize), // one block of global burst
+	}
+
+	reserved, _, refund := s.reserveUploadWithRefund(BlockSize)
+	if !reserved || refund == nil {
+		t.Fatal("reservation against the fresh global burst should succeed")
+	}
+
+	// Global bucket drained: the next reservation fails without blocking.
+	if reserved2, retry, _ := s.reserveUploadWithRefund(BlockSize); reserved2 || retry <= 0 {
+		t.Fatalf("drained-global reservation = (reserved=%v, retry=%v), want (false, >0)", reserved2, retry)
+	}
+
+	// Refunding the first reservation restores the global tokens for the next block.
+	refund()
+	if reserved3, _, refund3 := s.reserveUploadWithRefund(BlockSize); !reserved3 || refund3 == nil {
+		t.Fatal("reservation should succeed again once the refund restored global tokens")
+	}
+}
+
+// TestReserveUploadWithRefundLocalFailureLeavesGlobalUncharged verifies the limiters
+// are consulted local-first and short-circuit: when the per-session limiter is the one
+// that's short, the global limiter must not be charged (its burst stays intact).
+func TestReserveUploadWithRefundLocalFailureLeavesGlobalUncharged(t *testing.T) {
+	s := &Session{
+		UploadLimiter:       NewRateLimiter(BlockSize),     // one block of per-session burst
+		GlobalUploadLimiter: NewRateLimiter(2 * BlockSize), // two blocks of global burst
+	}
+
+	// The first reservation succeeds and charges BOTH limiters, draining the
+	// per-session bucket and leaving one block of global burst behind.
+	if reserved, _, _ := s.reserveUploadWithRefund(BlockSize); !reserved {
+		t.Fatal("initial reservation should succeed")
+	}
+	// The per-session bucket is now empty, so this reservation fails on the LOCAL
+	// limiter and must short-circuit before charging the global limiter again.
+	if reserved, _, _ := s.reserveUploadWithRefund(BlockSize); reserved {
+		t.Fatal("reservation should fail with the per-session bucket drained")
+	}
+	// The global limiter must still hold the block the local failure didn't consume.
+	if ok, _, _ := s.GlobalUploadLimiter.tryReserve(BlockSize); !ok {
+		t.Fatal("global limiter was charged even though the per-session reservation failed first")
+	}
+}
+
 func TestRateLimiterNewLimiterState(t *testing.T) {
 	rl := NewRateLimiter(1024)
 
