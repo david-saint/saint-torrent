@@ -17,6 +17,28 @@ const (
 	maxRetransmitTimeout     = 2 * time.Second
 	receiveWindowSize        = 1 << 20
 	sendWindowSize           = 1 << 20
+
+	// ackCoalesceCount is how many in-order data packets we let accumulate
+	// before forcing a STATE. Acking every other packet halves the ack
+	// syscalls on receive without slowing the ack clock: the coalescing is
+	// count-based (never a fixed delay in steady state), so it cannot cap
+	// throughput the way a delayed-ack timer would on a low-latency link.
+	ackCoalesceCount = 2
+	// delayedAckTimeout bounds how long a lone in-order packet's ack is held
+	// waiting for a follow-up packet to coalesce with. It only fires when the
+	// stream pauses on an odd packet; it is well under the retransmit timeout
+	// so it never provokes a spurious retransmit.
+	delayedAckTimeout = 5 * time.Millisecond
+)
+
+// ackDisposition tells handlePacket whether and how promptly a received packet
+// must be acknowledged.
+type ackDisposition int
+
+const (
+	ackNone      ackDisposition = iota // no STATE owed (e.g. closed, or receive window full)
+	ackCoalesce                        // in-order data: may be batched with the next ack
+	ackImmediate                       // out-of-order/duplicate/control: ack right away
 )
 
 var errReset = errors.New("utp: connection reset")
@@ -53,6 +75,9 @@ type Conn struct {
 	closed            bool
 	closeErr          error
 	waiters           map[uint16]chan struct{}
+	waiterBase        uint16 // oldest seq that may still have a waiter; ack processing walks forward from here
+	unsentAcks        int    // in-order data packets received since the last STATE we sent
+	ackTimer          *time.Timer
 	lastTimestampDiff uint32
 	readDeadline      time.Time
 	writeDeadline     time.Time
@@ -144,21 +169,26 @@ func (c *Conn) handlePacket(p packet) {
 		c.mu.Unlock()
 	}
 
-	ackAfter := false
 	switch p.typ {
 	case packetTypeSyn:
-		ackAfter = c.handleSyn(p)
+		if c.handleSyn(p) {
+			c.flushAck()
+		}
 	case packetTypeState:
 		c.handleState(p)
 	case packetTypeData:
-		ackAfter = c.handleData(p)
+		switch c.handleData(p) {
+		case ackImmediate:
+			c.flushAck()
+		case ackCoalesce:
+			c.scheduleAck()
+		}
 	case packetTypeFin:
-		ackAfter = c.handleFin(p)
+		if c.handleFin(p) {
+			c.flushAck()
+		}
 	case packetTypeReset:
 		c.closeWithError(errReset, false)
-	}
-	if ackAfter {
-		c.sendState()
 	}
 }
 
@@ -194,11 +224,11 @@ func (c *Conn) handleState(p packet) {
 	}
 }
 
-func (c *Conn) handleData(p packet) bool {
+func (c *Conn) handleData(p packet) ackDisposition {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return false
+		return ackNone
 	}
 	c.updateTimestampDiffLocked(p)
 	if !c.remoteSeqSet {
@@ -210,7 +240,9 @@ func (c *Conn) handleData(p packet) bool {
 	case p.seqNr == next:
 		if len(p.payload) > 0 {
 			if !c.canBufferLocked(len(p.payload)) {
-				return false
+				// Receive window is full: drop without acking so the sender
+				// backs off and retransmits once the app drains the buffer.
+				return ackNone
 			}
 			_, _ = c.readBuf.Write(p.payload)
 			c.signalReadLocked()
@@ -231,13 +263,20 @@ func (c *Conn) handleData(p packet) bool {
 			c.remoteSeq = next
 		}
 		c.applyPendingFinLocked()
+		return ackCoalesce
 	case seqLT(next, p.seqNr):
 		if _, exists := c.pending[p.seqNr]; !exists && c.canBufferLocked(len(p.payload)) {
 			c.pending[p.seqNr] = append([]byte(nil), p.payload...)
 			c.pendingBytes += len(p.payload)
 		}
+		// A gap means loss: ack immediately so the sender sees the duplicate
+		// ack and can retransmit without waiting on its timer.
+		return ackImmediate
+	default:
+		// Old/duplicate packet: ack immediately in case our earlier ack was
+		// lost. This is rare and off the steady-state path.
+		return ackImmediate
 	}
-	return true
 }
 
 func (c *Conn) handleFin(p packet) bool {
@@ -278,13 +317,24 @@ func (c *Conn) updateTimestampDiffLocked(p packet) {
 	c.lastTimestampDiff = c.socket.nowMicros() - p.timestamp
 }
 
+// processAckLocked wakes every write waiter whose sequence number is covered by
+// the cumulative ack. Waiters are assigned in increasing seq order, so instead
+// of scanning the whole map (O(window) per incoming packet) we walk forward
+// from the oldest outstanding seq and touch only the newly-acked entries. The
+// walk is bounded by localSeq so a bogus far-future ack cannot loop.
 func (c *Conn) processAckLocked(ack uint16) {
-	for seq, ch := range c.waiters {
-		if seqLTE(seq, ack) {
-			close(ch)
-			delete(c.waiters, seq)
-		}
+	if len(c.waiters) == 0 {
+		return
 	}
+	base := c.waiterBase
+	for seqLTE(base, ack) && seqLT(base, c.localSeq) {
+		if ch, ok := c.waiters[base]; ok {
+			close(ch)
+			delete(c.waiters, base)
+		}
+		base++
+	}
+	c.waiterBase = base
 }
 
 func (c *Conn) packetLocked(typ packetType, seq uint16, payload []byte) packet {
@@ -297,7 +347,7 @@ func (c *Conn) packetLocked(typ packetType, seq uint16, payload []byte) packet {
 		connID:        connID,
 		timestamp:     c.socket.nowMicros(),
 		timestampDiff: c.lastTimestampDiff,
-		wndSize:       uint32(max(0, receiveWindowSize-c.readBuf.Len()-c.pendingBytes)),
+		wndSize:       uint32(c.availableWindowLocked()),
 		seqNr:         seq,
 		ackNr:         c.remoteSeq,
 		payload:       payload,
@@ -310,12 +360,79 @@ func (c *Conn) packetForSeq(typ packetType, seq uint16, payload []byte) packet {
 	return c.packetLocked(typ, seq, payload)
 }
 
-func (c *Conn) sendState() {
+func (c *Conn) availableWindowLocked() int {
+	w := receiveWindowSize - c.readBuf.Len() - c.pendingBytes
+	if w < 0 {
+		return 0
+	}
+	return w
+}
+
+// flushAck sends a STATE now and clears any coalesced/held ack. Used for
+// control packets, out-of-order data, and receive-window updates that must
+// reach the peer promptly.
+func (c *Conn) flushAck() {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
+	c.unsentAcks = 0
+	if c.ackTimer != nil {
+		c.ackTimer.Stop()
+	}
+	seq := c.localSeq - 1
+	p := c.packetLocked(packetTypeState, seq, nil)
+	c.mu.Unlock()
+	_ = c.socket.writePacket(p, c.remote)
+}
+
+// scheduleAck records an in-order data packet and acks in bursts: it sends a
+// STATE immediately once ackCoalesceCount packets have accumulated (no time
+// delay, so the ack clock is not slowed), otherwise it arms a short timer to
+// flush a lone trailing ack if the stream pauses.
+func (c *Conn) scheduleAck() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.unsentAcks++
+	if c.unsentAcks >= ackCoalesceCount {
+		c.unsentAcks = 0
+		if c.ackTimer != nil {
+			c.ackTimer.Stop()
+		}
+		seq := c.localSeq - 1
+		p := c.packetLocked(packetTypeState, seq, nil)
+		c.mu.Unlock()
+		_ = c.socket.writePacket(p, c.remote)
+		return
+	}
+	c.armAckTimerLocked()
+	c.mu.Unlock()
+}
+
+func (c *Conn) armAckTimerLocked() {
+	if c.ackTimer == nil {
+		c.ackTimer = time.AfterFunc(delayedAckTimeout, c.flushDelayedAck)
+		return
+	}
+	// The timer is not running here (a prior flush stopped it or it fired and
+	// reset unsentAcks), so reusing it avoids allocating a timer per hold.
+	c.ackTimer.Reset(delayedAckTimeout)
+}
+
+// flushDelayedAck runs from the ack timer and sends the held STATE. It is
+// idempotent: if the ack was already flushed (unsentAcks == 0) or the conn is
+// closed it does nothing, so a race with scheduleAck cannot double-ack.
+func (c *Conn) flushDelayedAck() {
+	c.mu.Lock()
+	if c.closed || c.unsentAcks == 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.unsentAcks = 0
 	seq := c.localSeq - 1
 	p := c.packetLocked(packetTypeState, seq, nil)
 	c.mu.Unlock()
@@ -330,9 +447,18 @@ func (c *Conn) Read(b []byte) (int, error) {
 	for {
 		c.mu.Lock()
 		if c.readBuf.Len() > 0 {
+			// Only advertise a reopened window when it was small enough that
+			// the sender may have stalled on it (below one packet). In the
+			// common fast-reader case the window never shrinks that far, so we
+			// skip the per-Read STATE entirely; when it does, the retransmit
+			// timer is the correctness backstop regardless.
+			wndBefore := c.availableWindowLocked()
 			n, _ := c.readBuf.Read(b)
+			sendUpdate := wndBefore < maxPayloadSize && c.availableWindowLocked() >= maxPayloadSize
 			c.mu.Unlock()
-			c.sendState()
+			if sendUpdate {
+				c.flushAck()
+			}
 			return n, nil
 		}
 		if c.remoteClosed {
@@ -507,6 +633,10 @@ func (c *Conn) queueWritePacket(chunk []byte) (outPacket, error) {
 	seq := c.localSeq
 	c.localSeq++
 	waiter := make(chan struct{})
+	if len(c.waiters) == 0 {
+		// First outstanding packet in this batch: anchor the ack walk here.
+		c.waiterBase = seq
+	}
 	c.waiters[seq] = waiter
 	return outPacket{
 		seq:     seq,
@@ -517,31 +647,42 @@ func (c *Conn) queueWritePacket(chunk []byte) (outPacket, error) {
 }
 
 func (c *Conn) waitAck(seq uint16, waiter <-chan struct{}, payload []byte) error {
+	// One retransmit timer (and at most one deadline timer) is allocated for
+	// the whole wait and reset each iteration, instead of allocating fresh
+	// timers per loop — up to two per in-flight packet — which churns the
+	// runtime timer heap proportionally to packets sent.
 	timeout := initialRetransmitTimeout
+	retryTimer := time.NewTimer(timeout)
+	defer stopTimer(retryTimer)
+	var deadlineTimer *time.Timer
+	defer func() { stopTimer(deadlineTimer) }()
+
+	first := true
 	for {
 		deadline := c.writeDeadlineSnapshot()
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return timeoutError{}
 		}
+		if first {
+			first = false
+		} else {
+			resetTimer(retryTimer, timeout)
+		}
 
-		retryTimer := time.NewTimer(timeout)
 		var deadlineC <-chan time.Time
-		var deadlineTimer *time.Timer
 		if !deadline.IsZero() {
-			deadlineTimer = time.NewTimer(time.Until(deadline))
+			if deadlineTimer == nil {
+				deadlineTimer = time.NewTimer(time.Until(deadline))
+			} else {
+				resetTimer(deadlineTimer, time.Until(deadline))
+			}
 			deadlineC = deadlineTimer.C
 		}
 
 		select {
 		case <-waiter:
-			stopTimer(retryTimer)
-			stopTimer(deadlineTimer)
-			if err := c.errIfClosed(); err != nil {
-				return err
-			}
-			return nil
+			return c.errIfClosed()
 		case <-retryTimer.C:
-			stopTimer(deadlineTimer)
 			p := c.packetForSeq(packetTypeData, seq, payload)
 			if err := c.socket.writePacket(p, c.remote); err != nil {
 				return err
@@ -551,15 +692,10 @@ func (c *Conn) waitAck(seq uint16, waiter <-chan struct{}, payload []byte) error
 				timeout = maxRetransmitTimeout
 			}
 		case <-c.writeDeadlineSet:
-			stopTimer(retryTimer)
-			stopTimer(deadlineTimer)
+			// Deadline changed; loop re-reads it and re-arms the timers.
 		case <-c.done:
-			stopTimer(retryTimer)
-			stopTimer(deadlineTimer)
 			return c.currentErr()
 		case <-deadlineC:
-			stopTimer(retryTimer)
-			stopTimer(deadlineTimer)
 			return timeoutError{}
 		}
 	}
@@ -575,6 +711,18 @@ func stopTimer(t *time.Timer) {
 		default:
 		}
 	}
+}
+
+// resetTimer safely re-arms a running or already-fired timer for a new
+// duration, draining a pending fire so the next select sees only the new one.
+func resetTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 func (c *Conn) removeWaiter(seq uint16, waiter <-chan struct{}) {
@@ -633,6 +781,9 @@ func (c *Conn) closeWithError(err error, sendFin bool) {
 		}
 		c.closed = true
 		c.closeErr = err
+		if c.ackTimer != nil {
+			c.ackTimer.Stop()
+		}
 		if sendFin && c.establishedClosed && !c.remoteClosed {
 			seq := c.localSeq
 			c.localSeq++

@@ -86,17 +86,30 @@ func parsePacket(data []byte) (packet, error) {
 }
 
 func (p packet) marshal() []byte {
-	out := make([]byte, headerSize+len(p.payload))
-	out[0] = byte(p.typ)<<4 | protocolVersion
-	out[1] = p.extension
-	binary.BigEndian.PutUint16(out[2:4], p.connID)
-	binary.BigEndian.PutUint32(out[4:8], p.timestamp)
-	binary.BigEndian.PutUint32(out[8:12], p.timestampDiff)
-	binary.BigEndian.PutUint32(out[12:16], p.wndSize)
-	binary.BigEndian.PutUint16(out[16:18], p.seqNr)
-	binary.BigEndian.PutUint16(out[18:20], p.ackNr)
-	copy(out[headerSize:], p.payload)
-	return out
+	return p.marshalInto(nil)
+}
+
+// marshalInto serializes p into buf, reusing buf's storage when it is large
+// enough. The read/write hot paths hand it a pooled scratch buffer so the
+// per-packet header allocation from marshal is avoided. The returned slice may
+// alias buf; callers that pool buf must store the return value back.
+func (p packet) marshalInto(buf []byte) []byte {
+	need := headerSize + len(p.payload)
+	if cap(buf) < need {
+		buf = make([]byte, need)
+	} else {
+		buf = buf[:need]
+	}
+	buf[0] = byte(p.typ)<<4 | protocolVersion
+	buf[1] = p.extension
+	binary.BigEndian.PutUint16(buf[2:4], p.connID)
+	binary.BigEndian.PutUint32(buf[4:8], p.timestamp)
+	binary.BigEndian.PutUint32(buf[8:12], p.timestampDiff)
+	binary.BigEndian.PutUint32(buf[12:16], p.wndSize)
+	binary.BigEndian.PutUint16(buf[16:18], p.seqNr)
+	binary.BigEndian.PutUint16(buf[18:20], p.ackNr)
+	copy(buf[headerSize:], p.payload)
+	return buf
 }
 
 func seqLTE(a, b uint16) bool {

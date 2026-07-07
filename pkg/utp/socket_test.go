@@ -393,6 +393,108 @@ func TestUTPHandshakeSurvivesFullDHTQueue(t *testing.T) {
 	}
 }
 
+func TestLargeTransferWithCoalescedAcks(t *testing.T) {
+	server, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("server socket: %v", err)
+	}
+	defer server.Close()
+
+	client, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("client socket: %v", err)
+	}
+	defer client.Close()
+
+	ln := server.Listen()
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(); err == nil {
+			accepted <- conn
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clientConn, err := client.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", server.Port()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	var serverConn net.Conn
+	select {
+	case serverConn = <-accepted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("listener did not accept uTP connection")
+	}
+	defer serverConn.Close()
+
+	// Push several send windows' worth of data in one direction (the shape of
+	// a real download) so the sender slides its window many times. This
+	// exercises ack coalescing on the receiver, the seq-ordered ack walk over
+	// a full window of waiters on the sender, and the pooled marshal buffers.
+	const size = 4 << 20
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i*7 + 3)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		got := make([]byte, size)
+		if _, err := io.ReadFull(serverConn, got); err != nil {
+			readErr <- err
+			return
+		}
+		if !bytes.Equal(got, payload) {
+			readErr <- fmt.Errorf("payload mismatch")
+			return
+		}
+		readErr <- nil
+	}()
+
+	if n, err := clientConn.Write(payload); err != nil || n != size {
+		t.Fatalf("client write got n=%d err=%v", n, err)
+	}
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatalf("receiver: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("receiver did not drain payload")
+	}
+}
+
+func TestListenerCloseClosesQueuedConns(t *testing.T) {
+	s, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	defer s.Close()
+
+	ln := s.Listen()
+
+	// A conn accepted into the queue but never handed to a caller must be
+	// closed by Listener.Close rather than lingering with its receive buffer.
+	queued := newInboundConn(s, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}, 4242, 1)
+	if !ln.enqueue(queued) {
+		t.Fatal("failed to enqueue conn")
+	}
+
+	if err := ln.Close(); err != nil {
+		t.Fatalf("listener close: %v", err)
+	}
+
+	if _, err := queued.Read(make([]byte, 1)); err == nil {
+		t.Fatal("queued conn was not closed by Listener.Close")
+	}
+}
+
 func TestSocketDemuxesDHTPackets(t *testing.T) {
 	socket, err := NewSocket(0)
 	if err != nil {
