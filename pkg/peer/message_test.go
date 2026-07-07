@@ -199,7 +199,7 @@ func TestReadMessageMatchesParseMessage(t *testing.T) {
 }
 
 // TestReadMessagePoolsBlockBuffers verifies that a block-sized message is read
-// into a pooled buffer and that Release returns that exact buffer to the pool.
+// into a pooled buffer and that Release returns the buffer to the pool.
 func TestReadMessagePoolsBlockBuffers(t *testing.T) {
 	block := make([]byte, 16384)
 	for i := range block {
@@ -218,15 +218,15 @@ func TestReadMessagePoolsBlockBuffers(t *testing.T) {
 		t.Fatal("payload block does not round-trip")
 	}
 
-	ptr := msg.pooled
 	msg.Release()
 	if msg.pooled != nil || msg.Payload != nil {
 		t.Fatal("Release must clear the pooled buffer and payload")
 	}
-	// Put then Get on the same goroutine returns the private-slotted buffer, so the
-	// just-released buffer must be the next one handed out.
-	if reused := inboundBufPool.Get().(*[]byte); reused != ptr {
-		t.Fatal("released buffer was not returned to the pool")
+	// sync.Pool gives no identity guarantee (GC or the race runtime may reshuffle
+	// slots), so assert on shape like the short-read test: whatever Get hands out
+	// next must be a full-size pooled buffer.
+	if reused := inboundBufPool.Get().(*[]byte); cap(*reused) != maxPooledMessageLen {
+		t.Fatalf("pool returned a buffer of cap %d, want %d", cap(*reused), maxPooledMessageLen)
 	} else {
 		inboundBufPool.Put(reused)
 	}
