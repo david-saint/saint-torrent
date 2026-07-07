@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -342,6 +343,11 @@ type PacketConn struct {
 	incoming chan udpPacket
 	closed   chan struct{}
 	once     sync.Once
+
+	// dropped counts non-uTP packets discarded because the incoming queue was
+	// full. DHT traffic is loss-tolerant, so deliver drops rather than block the
+	// shared UDP read loop; this counter is for diagnostics only.
+	dropped atomic.Uint64
 }
 
 func newPacketConn(socket *Socket) *PacketConn {
@@ -389,10 +395,23 @@ func (c *PacketConn) Close() error {
 	return nil
 }
 
+// deliver hands a non-uTP packet to the DHT consumer. It runs on the shared UDP
+// read loop, the only goroutine reading the socket, so it must never block: if
+// the incoming queue is full it drops the packet (DHT traffic is loss-tolerant
+// by design) instead of head-of-line blocking throughput-critical uTP data and
+// ACK processing on a slow or stalled DHT consumer.
 func (c *PacketConn) deliver(pkt udpPacket) {
 	select {
 	case <-c.closed:
 	case <-c.socket.done:
 	case c.incoming <- pkt:
+	default:
+		c.dropped.Add(1)
 	}
+}
+
+// DroppedPackets returns the number of non-uTP packets dropped because the DHT
+// queue was full. Exposed for diagnostics.
+func (c *PacketConn) DroppedPackets() uint64 {
+	return c.dropped.Load()
 }
