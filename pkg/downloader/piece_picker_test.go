@@ -146,6 +146,76 @@ func TestPiecePropertiesDifferential(t *testing.T) {
 	}
 }
 
+// TestFileStartOffsetTable verifies that the precomputed cumulative offset table is
+// built after a recompute, that fileStartOffsetLocked returns the same values as a
+// naive prefix sum for every file (including the out-of-range/total case), and that
+// the prefix-sum fallback path stays correct when the table is absent.
+func TestFileStartOffsetTable(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+
+	naiveStart := func(files []torrent.File, fileIndex int) int64 {
+		var start int64
+		for i := 0; i < fileIndex && i < len(files); i++ {
+			start += files[i].Length
+		}
+		return start
+	}
+
+	for run := 0; run < 40; run++ {
+		pieceLen := int64(1 << (14 + rng.Intn(4))) // 16KiB..128KiB
+		numFiles := rng.Intn(40) + 1
+		fileLengths := make([]int64, numFiles)
+		for i := range fileLengths {
+			if rng.Float64() < 0.15 {
+				fileLengths[i] = 0 // exercise zero-length files
+			} else {
+				fileLengths[i] = int64(rng.Intn(1024*1024) + 1)
+			}
+		}
+
+		sess := newTestSessionBuilder(t, pieceLen, fileLengths, nil)
+
+		sess.mu.Lock()
+		// NewSession -> loadResumeState -> recomputeNeededLocked builds the table.
+		if len(sess.fileStartOffsets) != numFiles+1 {
+			sess.mu.Unlock()
+			t.Fatalf("run %d: offset table len=%d, want %d", run, len(sess.fileStartOffsets), numFiles+1)
+		}
+		// Every table entry and lookup (0..numFiles, plus out of range) must match
+		// the naive prefix sum.
+		for i := 0; i <= numFiles+2; i++ {
+			want := naiveStart(sess.Torrent.Files, i)
+			if i < len(sess.fileStartOffsets) && sess.fileStartOffsets[i] != want {
+				sess.mu.Unlock()
+				t.Fatalf("run %d: table[%d]=%d, want %d", run, i, sess.fileStartOffsets[i], want)
+			}
+			if got := sess.fileStartOffsetLocked(i); got != want {
+				sess.mu.Unlock()
+				t.Fatalf("run %d: fileStartOffsetLocked(%d)=%d, want %d", run, i, got, want)
+			}
+		}
+
+		// Fallback path: with the table cleared, the O(files) prefix sum must yield
+		// identical results.
+		sess.fileStartOffsets = nil
+		for i := 0; i <= numFiles; i++ {
+			want := naiveStart(sess.Torrent.Files, i)
+			if got := sess.fileStartOffsetLocked(i); got != want {
+				sess.mu.Unlock()
+				t.Fatalf("run %d: fallback fileStartOffsetLocked(%d)=%d, want %d", run, i, got, want)
+			}
+		}
+
+		// Rebuilding must repopulate the table and keep the caches consistent.
+		sess.recomputeNeededLocked()
+		if len(sess.fileStartOffsets) != numFiles+1 {
+			sess.mu.Unlock()
+			t.Fatalf("run %d: table not rebuilt, len=%d", run, len(sess.fileStartOffsets))
+		}
+		sess.mu.Unlock()
+	}
+}
+
 // TestDownloadingIndexInvariant exercises state transition paths and verifies that downloadingPieces map matches PieceStates.
 func TestDownloadingIndexInvariant(t *testing.T) {
 	fileLengths := []int64{100000, 200000, 300000}

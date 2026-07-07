@@ -127,7 +127,13 @@ type Session struct {
 	neededBuckets      neededPieceBuckets
 	pieceWantedCache   []bool
 	piecePriorityCache []FilePriority
-	downloadingPieces  map[int]struct{}
+	// fileStartOffsets is the cumulative byte offset of each file within the
+	// concatenated torrent (entry i is file i's start; the final entry is the total
+	// size). Built once per file set (metadata arrival) so fileStartOffsetLocked and
+	// the piece-cache sweep are O(1)/O(files) instead of recomputing a prefix sum on
+	// every lookup. Guarded by s.mu.
+	fileStartOffsets  []int64
+	downloadingPieces map[int]struct{}
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length

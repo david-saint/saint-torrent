@@ -806,9 +806,45 @@ func (s *Session) blocksInPiece(pieceIndex int64) int64 {
 	return (length + BlockSize - 1) / BlockSize
 }
 
+// ensureFileStartOffsetsLocked builds (once per file set) and returns the cumulative
+// per-file byte-offset table: entry i is file i's start offset within the
+// concatenated torrent and the final entry is the total size. File lengths are
+// immutable once metadata is known, so a matching size means the table is already
+// current and is reused as-is. Caller holds s.mu (write) because it may allocate.
+func (s *Session) ensureFileStartOffsetsLocked() []int64 {
+	if s.Torrent == nil {
+		s.fileStartOffsets = nil
+		return nil
+	}
+	numFiles := len(s.Torrent.Files)
+	if len(s.fileStartOffsets) == numFiles+1 {
+		return s.fileStartOffsets
+	}
+	if cap(s.fileStartOffsets) >= numFiles+1 {
+		s.fileStartOffsets = s.fileStartOffsets[:numFiles+1]
+	} else {
+		s.fileStartOffsets = make([]int64, numFiles+1)
+	}
+	var offset int64
+	for i, f := range s.Torrent.Files {
+		s.fileStartOffsets[i] = offset
+		offset += f.Length
+	}
+	s.fileStartOffsets[numFiles] = offset
+	return s.fileStartOffsets
+}
+
 // fileStartOffsetLocked returns the byte offset of file fileIndex within the
-// concatenated torrent. Caller holds s.mu (read or write).
+// concatenated torrent. It reads the precomputed offset table (kept fresh by
+// rebuildPieceCachesLocked) for an O(1) lookup, falling back to a prefix sum only in
+// the brief window before the table is first built. Caller holds s.mu (read or write).
 func (s *Session) fileStartOffsetLocked(fileIndex int) int64 {
+	if fileIndex <= 0 || s.Torrent == nil {
+		return 0
+	}
+	if len(s.fileStartOffsets) == len(s.Torrent.Files)+1 && fileIndex < len(s.fileStartOffsets) {
+		return s.fileStartOffsets[fileIndex]
+	}
 	var start int64
 	for i := 0; i < fileIndex && i < len(s.Torrent.Files); i++ {
 		start += s.Torrent.Files[i].Length
@@ -856,14 +892,9 @@ func (s *Session) rebuildPieceCachesLocked() {
 		s.piecePriorityCache = make([]FilePriority, numPieces)
 	}
 
-	// Precompute file start offsets to avoid repeated O(files) calculations
-	fileOffsets := make([]int64, numFiles+1)
-	var offset int64
-	for i, f := range s.Torrent.Files {
-		fileOffsets[i] = offset
-		offset += f.Length
-	}
-	fileOffsets[numFiles] = offset
+	// Reuse the persistent cumulative file-offset table (built once per file set) so
+	// the sweep avoids recomputing a prefix sum and fileStartOffsetLocked stays O(1).
+	fileOffsets := s.ensureFileStartOffsetsLocked()
 
 	pieceLengthVal := s.Storage.PieceLengthValue()
 	fileIdx := 0
