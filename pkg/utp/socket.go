@@ -22,9 +22,30 @@ type udpPacket struct {
 	addr *net.UDPAddr
 }
 
+// connKey identifies a Conn by remote address and connection id. The IP is
+// stored as a normalized 16-byte array (v4 addresses map to the v4-in-v6 form)
+// so the key stays comparable and can be built per received datagram without
+// the addr.String() allocation the read loop would otherwise pay per packet.
 type connKey struct {
-	addr string
+	ip   [16]byte
+	zone string
+	port uint16
 	id   uint16
+}
+
+// newConnKey builds a connKey from addr without allocating. To4/To16 return
+// sub-slices (or the input) rather than fresh buffers for the shapes UDP
+// sockets hand us, so no garbage is generated on the hot path.
+func newConnKey(addr *net.UDPAddr, id uint16) connKey {
+	k := connKey{zone: addr.Zone, port: uint16(addr.Port), id: id}
+	ip := addr.IP
+	if v4 := ip.To4(); v4 != nil {
+		k.ip[10], k.ip[11] = 0xff, 0xff
+		copy(k.ip[12:], v4)
+	} else {
+		copy(k.ip[:], ip.To16())
+	}
+	return k
 }
 
 // Socket owns one UDP socket and demultiplexes BEP 29 uTP packets from DHT
@@ -37,6 +58,11 @@ type Socket struct {
 	conns    map[connKey]*Conn
 	listener *Listener
 	closed   bool
+
+	// bufPool hands out scratch buffers for packet marshaling so writePacket
+	// does not allocate a fresh header+payload slice per send. sync.Pool keeps
+	// this contention-free across the read loop and per-conn write goroutines.
+	bufPool sync.Pool
 
 	dhtConn *PacketConn
 	done    chan struct{}
@@ -66,6 +92,10 @@ func NewSocketFromUDP(conn *net.UDPConn) *Socket {
 		conn:  conn,
 		conns: make(map[connKey]*Conn),
 		done:  make(chan struct{}),
+	}
+	s.bufPool.New = func() any {
+		b := make([]byte, 0, headerSize+maxPayloadSize)
+		return &b
 	}
 	s.dhtConn = newPacketConn(s)
 	go s.readLoop()
@@ -145,7 +175,7 @@ func (s *Socket) register(c *Conn) error {
 	if s.closed {
 		return net.ErrClosed
 	}
-	key := connKey{addr: c.remote.String(), id: c.recvID}
+	key := newConnKey(c.remote, c.recvID)
 	if _, exists := s.conns[key]; exists {
 		return fmt.Errorf("utp: connection id collision for %s", c.remote)
 	}
@@ -156,14 +186,18 @@ func (s *Socket) register(c *Conn) error {
 func (s *Socket) unregister(c *Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := connKey{addr: c.remote.String(), id: c.recvID}
+	key := newConnKey(c.remote, c.recvID)
 	if current := s.conns[key]; current == c {
 		delete(s.conns, key)
 	}
 }
 
 func (s *Socket) writePacket(p packet, addr *net.UDPAddr) error {
-	_, err := s.conn.WriteToUDP(p.marshal(), addr)
+	bufp := s.bufPool.Get().(*[]byte)
+	b := p.marshalInto((*bufp)[:0])
+	_, err := s.conn.WriteToUDP(b, addr)
+	*bufp = b
+	s.bufPool.Put(bufp)
 	return err
 }
 
@@ -180,11 +214,16 @@ func (s *Socket) readLoop() {
 				return
 			}
 		}
-		data := append([]byte(nil), buf[:n]...)
-		if IsPacket(data) {
-			s.handleUTPPacket(data, addr)
+		if IsPacket(buf[:n]) {
+			// handleUTPPacket runs synchronously in this goroutine and the
+			// Conn copies any payload it retains (into readBuf or the pending
+			// map), so buf can be reused immediately without a per-packet copy.
+			s.handleUTPPacket(buf[:n], addr)
 			continue
 		}
+		// The DHT path hands the datagram to another goroutine via a channel,
+		// so it must own a copy that outlives the next ReadFromUDP.
+		data := append([]byte(nil), buf[:n]...)
 		s.dhtConn.deliver(udpPacket{data: data, addr: cloneUDPAddr(addr)})
 	}
 }
@@ -195,13 +234,13 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	key := connKey{addr: addr.String(), id: p.connID}
+	key := newConnKey(addr, p.connID)
 	s.mu.Lock()
 	c := s.conns[key]
 	listener := s.listener
 	closed := s.closed
 	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
-		recvKey := connKey{addr: addr.String(), id: p.connID + 1}
+		recvKey := newConnKey(addr, p.connID+1)
 		c = s.conns[recvKey]
 		if c == nil {
 			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
@@ -299,6 +338,9 @@ func (l *Listener) Accept() (net.Conn, error) {
 }
 
 func (l *Listener) enqueue(c *Conn) bool {
+	if l.isClosed() {
+		return false
+	}
 	select {
 	case <-l.closed:
 		return false
@@ -318,7 +360,10 @@ func (l *Listener) isClosed() bool {
 	}
 }
 
-// Close closes the listener without closing the shared UDP socket.
+// Close closes the listener without closing the shared UDP socket. Conns that
+// were accepted into the queue but never handed to a caller are drained and
+// closed here so their receive buffers (up to the receive window each) are
+// released instead of lingering until the whole Socket is closed.
 func (l *Listener) Close() error {
 	l.once.Do(func() {
 		close(l.closed)
@@ -327,6 +372,14 @@ func (l *Listener) Close() error {
 			l.socket.listener = nil
 		}
 		l.socket.mu.Unlock()
+		for {
+			select {
+			case c := <-l.acceptCh:
+				c.closeWithError(errListenerClosed, true)
+			default:
+				return
+			}
+		}
 	})
 	return nil
 }
