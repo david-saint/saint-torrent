@@ -37,6 +37,11 @@ type pieceWriteJob struct {
 	index int64
 	hash  [20]byte
 	data  []byte
+	// pieceBuf, when non-nil, is the pooled buffer backing data. The worker returns
+	// it to the session's piece-buffer pool once the piece is hashed and written, so
+	// the per-piece assembly allocation becomes buffer reuse. Nil for jobs whose
+	// data is not pooled (e.g. the webseed path allocates its own buffer).
+	pieceBuf *[]byte
 	// conn is the connection of the peer that supplied the piece. If the assembled
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
@@ -103,6 +108,13 @@ func (s *Session) pieceWriteWorker() {
 // feeding peer; on a storage repair it resets progress; otherwise it marks the piece
 // complete (which persists fast-resume state and advertises Have).
 func (s *Session) processCompletedPiece(job pieceWriteJob) {
+	// Return the pooled assembly buffer once the piece is verified and written. The
+	// worker fully owns job.data, and neither sha1.Sum, WriteBlock, nor sendResult
+	// retain it past this call, so a single deferred Put covers every exit path.
+	if job.pieceBuf != nil {
+		defer s.putPieceBuf(job.pieceBuf)
+	}
+
 	// Drop the write if the session is shutting down: the piece will be re-fetched on
 	// the next run, and a late state persist must not resurrect a .state file a remove
 	// is deleting. Also drop a piece already completed by another peer (#8 endgame

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // MessageID is the type for BitTorrent peer message identifiers.
@@ -40,6 +41,43 @@ const (
 type Message struct {
 	ID      MessageID
 	Payload []byte
+	// pooled is the backing buffer this message's Payload was read into, when it
+	// came from the inbound buffer pool (see readMessage). It is nil for messages
+	// built in memory (Serialize round-trips, ParseMessage) or read into a fresh
+	// heap allocation because they were too large to pool. Release returns it.
+	pooled *[]byte
+}
+
+// maxPooledMessageLen is the capacity of buffers recycled through inboundBufPool:
+// a full 16 KiB block payload plus its 9-byte piece header (1 id + 4 index +
+// 4 begin). Piece messages dominate the inbound hot path, so pooling their
+// buffers turns the old per-message heap allocation into buffer reuse. Rarer,
+// larger messages (a big bitfield, an extension payload) fall back to a one-off
+// heap allocation and are never returned to the pool.
+const maxPooledMessageLen = 9 + 16*1024
+
+// inboundBufPool recycles the buffers ParseMessage-style reads decode into. It
+// holds *[]byte rather than []byte so returning a buffer boxes only a pointer,
+// keeping Put itself allocation-free on the wire hot path.
+var inboundBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxPooledMessageLen)
+		return &b
+	},
+}
+
+// Release returns a pooled inbound-message buffer to the shared pool. Call it
+// exactly once, after the message's Payload is no longer referenced (for a piece
+// message, after its block has been copied into the piece buffer). It is a no-op
+// for messages whose buffer was heap-allocated, and safe on a nil receiver.
+func (m *Message) Release() {
+	if m == nil || m.pooled == nil {
+		return
+	}
+	buf := m.pooled
+	m.pooled = nil
+	m.Payload = nil
+	inboundBufPool.Put(buf)
 }
 
 // Handshake represents the initial BitTorrent connection handshake.
@@ -104,6 +142,51 @@ func ParseMessage(r io.Reader) (*Message, error) {
 	return &Message{
 		ID:      MessageID(messageBuf[0]),
 		Payload: messageBuf[1:],
+	}, nil
+}
+
+// readMessage parses a peer message like ParseMessage, but keeps the wire hot
+// path allocation-free: the 4-byte length prefix is read into the caller-owned
+// lengthBuf scratch, and the payload is read into a buffer borrowed from
+// inboundBufPool when it fits. The returned Message owns that pooled buffer until
+// Release is called; ownership of a piece block passes to the downloader, which
+// releases it after copying the block into the piece buffer. Oversized messages
+// fall back to a fresh heap allocation with Release as a no-op. lengthBuf must be
+// at least 4 bytes and is only valid for the duration of the call.
+func readMessage(r io.Reader, lengthBuf []byte) (*Message, error) {
+	if _, err := io.ReadFull(r, lengthBuf[:4]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(lengthBuf[:4])
+	if length == 0 {
+		return nil, nil // Keep-Alive message
+	}
+	if length > MaxMessageLength {
+		return nil, fmt.Errorf("message length %d exceeds maximum limit %d", length, MaxMessageLength)
+	}
+
+	var (
+		messageBuf []byte
+		pooled     *[]byte
+	)
+	if length <= maxPooledMessageLen {
+		pooled = inboundBufPool.Get().(*[]byte)
+		messageBuf = (*pooled)[:length]
+	} else {
+		messageBuf = make([]byte, length)
+	}
+
+	if _, err := io.ReadFull(r, messageBuf); err != nil {
+		if pooled != nil {
+			inboundBufPool.Put(pooled)
+		}
+		return nil, err
+	}
+
+	return &Message{
+		ID:      MessageID(messageBuf[0]),
+		Payload: messageBuf[1:],
+		pooled:  pooled,
 	}, nil
 }
 

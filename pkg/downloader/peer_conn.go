@@ -868,6 +868,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		length         int64
 		numBlocks      int64
 		blocks         [][]byte                // received block data, nil until received
+		blockMsgs      []*peer.Message         // pooled wire buffers backing blocks; released after assembly
 		pending        map[int64]*blockRequest // begin offset -> request
 		blocksReceived int64
 		nextBlock      int64   // index of the next never-requested block (cursor)
@@ -896,9 +897,22 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		return nil
 	}
+	// releaseDownloadBuffers returns any pooled wire buffers still held by an
+	// abandoned (never-assembled) download to the inbound pool. The completion path
+	// releases and nils them itself before assembly, so this only reclaims buffers
+	// from pieces dropped on choke, reject, endgame, or disconnect.
+	releaseDownloadBuffers := func(dl *activeDownload) {
+		for i, m := range dl.blockMsgs {
+			if m != nil {
+				m.Release()
+				dl.blockMsgs[i] = nil
+			}
+		}
+	}
 	removeDownload := func(index int64) {
 		for i, dl := range activeDownloads {
 			if dl.pieceIndex == index {
+				releaseDownloadBuffers(dl)
 				activeDownloads = append(activeDownloads[:i], activeDownloads[i+1:]...)
 				return
 			}
@@ -972,6 +986,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 		s.mu.Unlock()
+		// Reclaim pooled wire buffers outside the lock — none of this touches
+		// s.mu-guarded state, and Put must stay off the critical section.
+		for _, dl := range dls {
+			releaseDownloadBuffers(dl)
+		}
 	}
 	abandonRejectedDownload := func(dl *activeDownload, rejectedBegin int64, now time.Time) {
 		if dl == nil {
@@ -1118,6 +1137,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			length:     s.Storage.PieceLength(int64(bestIdx)),
 			numBlocks:  numBlocks,
 			blocks:     make([][]byte, numBlocks),
+			blockMsgs:  make([]*peer.Message, numBlocks),
 			pending:    make(map[int64]*blockRequest),
 			endgame:    endgame,
 		}
@@ -1416,11 +1436,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				// ask the loop to retry once the limiter says they should be available.
 				return retryAfter
 			}
-			buf := make([]byte, r.length)
+			// Borrow a pooled block-sized buffer for the disk read instead of
+			// allocating one per served block. SendPiece flushes synchronously, so
+			// the buffer is fully on the wire by the time it returns and can be
+			// recycled — the seed hot path allocates nothing (issue #55).
+			bufPtr := s.getUploadBlockBuf()
+			buf := (*bufPtr)[:r.length]
 			if _, err := s.Storage.ReadBlock(r.index, r.begin, buf); err != nil {
 				// Shouldn't happen for a completed piece, but if the read fails don't
 				// leak the reserved tokens; tell a fast peer the request is dead so its
 				// per-request accounting stays consistent, then drop it.
+				s.putUploadBlockBuf(bufPtr)
 				if refund != nil {
 					refund()
 				}
@@ -1432,12 +1458,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 			if err := client.SendPiece(uint32(r.index), uint32(r.begin), buf); err != nil {
 				// Dead socket: refund the reservation and let teardown handle the rest.
+				s.putUploadBlockBuf(bufPtr)
 				if refund != nil {
 					refund()
 				}
 				_ = conn.Close()
 				return 0
 			}
+			s.putUploadBlockBuf(bufPtr)
 			// Lock-free counter update (see the download hot path above).
 			s.Uploaded.Add(r.length)
 			atomic.AddInt64(&pState.Uploaded, r.length)
@@ -1542,8 +1570,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// Read and scheduling event loop. Socket parsing stays in one dedicated goroutine,
 	// while limiter retry timers can wake the request pump without interrupting a
 	// partially-read peer-wire message.
+	//
+	// pooledMsg holds the message read in the previous iteration so its pooled wire
+	// buffer is returned to the pool at the top of the next one, once we are fully
+	// done with it. Piece blocks whose ownership passed to an activeDownload detach
+	// themselves (pooledMsg = nil) and are released after piece assembly instead.
+	var pooledMsg *peer.Message
+	defer func() { pooledMsg.Release() }()
 peerLoop:
 	for {
+		pooledMsg.Release()
+		pooledMsg = nil
+
 		s.mu.RLock()
 		paused := s.paused
 		s.mu.RUnlock()
@@ -1596,6 +1634,7 @@ peerLoop:
 				break peerLoop
 			}
 			msg = result.msg
+			pooledMsg = msg // release its pooled buffer at the top of the next iteration
 		case <-pexTick:
 			sendPEXDelta()
 			continue
@@ -1998,6 +2037,11 @@ peerLoop:
 			}
 			finishRequest(req, requestFinishAccepted, now)
 			dl.blocks[blockIndex] = blockData
+			// Ownership of the pooled wire buffer passes to this download until the
+			// piece is assembled; detach it from the per-iteration release so it is
+			// not recycled while blockData still aliases it.
+			dl.blockMsgs[blockIndex] = msg
+			pooledMsg = nil
 			req.received = true
 			dl.blocksReceived++
 			lastProgressAt = now // forward progress; keeps the stall reaper off
@@ -2011,12 +2055,14 @@ peerLoop:
 				break // piece not complete yet; pump tops up at the loop bottom
 			}
 
-			// Piece complete: assemble the buffer and hand it to the async hash/write
-			// pool. The peer goroutine keeps draining the socket and requesting instead
-			// of stalling on sha1 + WriteBlock + the fast-resume persist. The pool
-			// verifies the hash, writes, persists state, and — on a hash failure —
-			// disconnects this peer (via its conn) and returns the piece to the pool.
-			pieceData := make([]byte, dl.length)
+			// Piece complete: assemble into a pooled buffer and hand it to the async
+			// hash/write pool. The peer goroutine keeps draining the socket and
+			// requesting instead of stalling on sha1 + WriteBlock + the fast-resume
+			// persist. The pool verifies the hash, writes, persists state, returns the
+			// piece buffer to the pool, and — on a hash failure — disconnects this peer
+			// (via its conn) and returns the piece to the empty pool.
+			pieceBuf := s.getPieceBuf(dl.length)
+			pieceData := *pieceBuf
 			var offset int64
 			validPiece := true
 			for b := int64(0); b < dl.numBlocks; b++ {
@@ -2028,13 +2074,20 @@ peerLoop:
 				copy(pieceData[offset:], block)
 				offset += int64(len(block))
 			}
+			// The blocks are now copied into pieceData (an independent buffer), so the
+			// pooled wire buffers backing them can go back to the inbound pool.
+			for b := int64(0); b < dl.numBlocks; b++ {
+				dl.blockMsgs[b].Release()
+				dl.blockMsgs[b] = nil
+			}
 
 			pieceIdx := dl.pieceIndex
 			pieceHash := dl.hash
 			removeDownload(dl.pieceIndex)
 
 			if !validPiece || offset != int64(len(pieceData)) {
-				// Assembly invariant violated (shouldn't happen): return to the pool.
+				// Assembly invariant violated (shouldn't happen): return both buffers.
+				s.putPieceBuf(pieceBuf)
 				s.mu.Lock()
 				if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
 					s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
@@ -2046,12 +2099,13 @@ peerLoop:
 			s.ensurePieceWritePool()
 			writeQueueStarted := time.Now()
 			select {
-			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, conn: conn}:
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn}:
 				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
 					pipeline.OnWriterLimited(time.Now())
 					publishPipelineSnapshot(time.Now(), true)
 				}
 			case <-s.ctx.Done():
+				s.putPieceBuf(pieceBuf)
 				return
 			}
 

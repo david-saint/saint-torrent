@@ -19,14 +19,16 @@ const peerWriteBufferSize = 32 * 1024
 
 // Client represents a connection to a BitTorrent peer.
 type Client struct {
-	Conn       net.Conn
-	InfoHash   [20]byte
-	PeerID     [20]byte
-	r          *bufio.Reader // buffers inbound framing so reads coalesce syscalls
-	writeMu    sync.Mutex    // protects concurrent writes to w (and reqBuf)
-	w          *bufio.Writer // buffers outbound messages; flushed explicitly
-	reqBuf     [17]byte      // reusable scratch for WriteRequest framing
-	DisableDHT bool          // Disable advertising DHT support in handshake
+	Conn        net.Conn
+	InfoHash    [20]byte
+	PeerID      [20]byte
+	r           *bufio.Reader // buffers inbound framing so reads coalesce syscalls
+	writeMu     sync.Mutex    // protects concurrent writes to w (and reqBuf/pieceBuf)
+	w           *bufio.Writer // buffers outbound messages; flushed explicitly
+	reqBuf      [17]byte      // reusable scratch for WriteRequest framing
+	pieceHdrBuf [13]byte      // reusable scratch for SendPiece header framing
+	readLenBuf  [4]byte       // reusable 4-byte length-prefix scratch for ReadMessage
+	DisableDHT  bool          // Disable advertising DHT support in handshake
 }
 
 // NewClient initializes a new peer wire client.
@@ -155,13 +157,28 @@ func (c *Client) SendHaveNone() error {
 	return c.SendMessage(&Message{ID: MsgHaveNone})
 }
 
-// SendPiece sends a piece block message to the peer.
+// SendPiece sends a piece block message to the peer. Like WriteRequest it frames
+// the fixed header (4-byte length prefix + id + index + begin) into a reused
+// per-client scratch buffer under writeMu, then streams the caller's block
+// straight into the bufio writer. This avoids the payload copy and the
+// Message.Serialize copy the SendMessage path would incur, so serving a block
+// allocates nothing here — the dominant cost on the seed hot path.
 func (c *Client) SendPiece(index, begin uint32, block []byte) error {
-	payload := make([]byte, 8+len(block))
-	binary.BigEndian.PutUint32(payload[0:4], index)
-	binary.BigEndian.PutUint32(payload[4:8], begin)
-	copy(payload[8:], block)
-	return c.SendMessage(&Message{ID: MsgPiece, Payload: payload})
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	buf := &c.pieceHdrBuf // 4-byte length prefix + 1-byte ID + 8-byte index/begin
+	length := uint32(9 + len(block))
+	binary.BigEndian.PutUint32(buf[0:4], length)
+	buf[4] = byte(MsgPiece)
+	binary.BigEndian.PutUint32(buf[5:9], index)
+	binary.BigEndian.PutUint32(buf[9:13], begin)
+	if _, err := c.w.Write(buf[:]); err != nil {
+		return err
+	}
+	if _, err := c.w.Write(block); err != nil {
+		return err
+	}
+	return c.w.Flush()
 }
 
 // SendPort sends a PORT message (id 9, BEP 5) advertising our DHT UDP port so a
@@ -201,5 +218,8 @@ func (c *Client) SendAllowedFast(index uint32) error {
 // reader, so the length prefix and payload are typically served from a single
 // underlying read.
 func (c *Client) ReadMessage() (*Message, error) {
-	return ParseMessage(c.r)
+	// Single dedicated read goroutine per client, so the length-prefix scratch is
+	// unshared. The payload is read into a pooled buffer that the caller returns
+	// via Message.Release once it is done with the message.
+	return readMessage(c.r, c.readLenBuf[:])
 }
