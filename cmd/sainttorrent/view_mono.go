@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"sainttorrent/pkg/downloader"
 )
 
 // view_mono.go renders the "Mono Hairline" look (ported from
@@ -16,8 +15,8 @@ import (
 
 var brailleRamp = []rune{' ', '⡀', '⣀', '⣄', '⣆', '⣇', '⣧', '⣷', '⣿'}
 
-func monoStatusIcon(st styles, s *downloader.Session) (string, lipgloss.Style) {
-	switch s.Status() {
+func monoStatusIcon(st styles, status string) (string, lipgloss.Style) {
+	switch status {
 	case "Seeding":
 		return "▲", st.Dim
 	case "Metadata":
@@ -31,11 +30,11 @@ func monoStatusIcon(st styles, s *downloader.Session) (string, lipgloss.Style) {
 	}
 }
 
-// sessionTotals sums instantaneous transfer rates across all sessions.
-func sessionTotals(sessions []*downloader.Session) (down, up float64) {
-	for _, s := range sessions {
-		down += s.CurrentSpeed()
-		up += s.CurrentUploadSpeed()
+// sessionTotals sums instantaneous transfer rates across the snapshot rows.
+func sessionTotals(rows []sessionRow) (down, up float64) {
+	for _, row := range rows {
+		down += row.downloadSpeed
+		up += row.uploadSpeed
 	}
 	return down, up
 }
@@ -46,17 +45,17 @@ func renderListMono(m *model) string {
 	g := gutterStr(m.width)
 	col := listColumns(bw)
 
-	count := fmt.Sprintf("%d torrents", len(m.sessions))
-	if len(m.sessions) == 1 {
+	count := fmt.Sprintf("%d torrents", len(m.rows))
+	if len(m.rows) == 1 {
 		count = "1 torrent"
 	}
-	totalDown, totalUp := sessionTotals(m.sessions)
+	totalDown, totalUp := sessionTotals(m.rows)
 	left := st.Bold.Render("saintTorrent") + "   " + st.Dim.Render(count)
 	right := st.Dim.Render("▲ "+formatSpeed(totalUp)) + "  " + st.AccentBold.Render("↓ "+formatSpeed(totalDown))
 	prefix := g + spread(left, right, bw) + "\n"
 	prefix += dividerLine(st, m.width) + "\n"
 
-	if len(m.sessions) == 0 {
+	if len(m.rows) == 0 {
 		prefix += "\n" + g + st.Muted.Render("No active torrents. Press [a] to add a torrent or magnet link.") + "\n\n"
 	} else {
 		prefix += g + st.Dim.Render(monoHeaderRow(col)) + "\n"
@@ -89,8 +88,8 @@ func renderListMono(m *model) string {
 	}
 
 	spaceActionHelp := "Pause/Resume"
-	if s, ok := m.selectedSession(); ok {
-		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	if row, ok := m.selectedRow(); ok {
+		spaceActionHelp = getSpaceActionHelp(row.paused, row.completed)
 	}
 	if m.flash != "" {
 		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
@@ -103,11 +102,11 @@ func renderListMono(m *model) string {
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
-	if len(m.sessions) > 0 {
-		capacity := dashboardCapacity(m.height, prefix, head.String(), help, 3, len(m.sessions))
-		start, end := visibleSessionRange(len(m.sessions), m.selectedIdx, capacity)
+	if len(m.rows) > 0 {
+		capacity := dashboardCapacity(m.height, prefix, head.String(), help, 3, len(m.rows))
+		start, end := visibleSessionRange(len(m.rows), m.selectedIdx, capacity)
 		for i := start; i < end; i++ {
-			sb.WriteString(monoRow(m, st, col, i, m.sessions[i]))
+			sb.WriteString(monoRow(m, st, col, i == m.selectedIdx, m.rows[i]))
 		}
 	}
 	sb.WriteString(head.String())
@@ -139,24 +138,23 @@ func monoHeaderRow(col listLayout) string {
 	return b.String()
 }
 
-func monoRow(m *model, st styles, col listLayout, i int, s *downloader.Session) string {
+func monoRow(m *model, st styles, col listLayout, selected bool, row sessionRow) string {
 	cell := func(v string, w int) string { return padTo(truncateRight(v, w), w) }
 
-	icon, iconSt := monoStatusIcon(st, s)
-	name := sanitizeText(s.Name())
-	sizeStr := formatBytes(s.TotalSize())
-	if s.IsMetadataMode() {
+	icon, iconSt := monoStatusIcon(st, row.status)
+	name := row.name
+	sizeStr := formatBytes(row.totalSize)
+	if row.metadataMode {
 		sizeStr = "unknown"
 	}
-	pctStr := fmt.Sprintf("%.1f%%", s.PercentComplete())
-	if s.IsMetadataMode() {
+	pctStr := fmt.Sprintf("%.1f%%", row.percent)
+	if row.metadataMode {
 		pctStr = "0.0%"
 	}
-	statusLabel, statusSt := statusLabelStyle(st, s.Status())
-	speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), currentTransferSpeed(s))
-	spdSt := speedStyle(st, s.Status() == "Downloading")
+	statusLabel, statusSt := statusLabelStyle(st, row.status)
+	speedStr := getSpeedStr(row.paused, row.completed, row.transferSpeed)
+	spdSt := speedStyle(st, row.status == "Downloading")
 
-	selected := i == m.selectedIdx
 	g := gutterStr(m.width)
 	if selected && effGutter(m.width) >= 2 {
 		g = st.Accent.Render("▏") + " "
@@ -179,7 +177,7 @@ func monoRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 		b.WriteString(" " + st.Primary.Render(cell(pctStr, col.doneW)))
 	}
 	if col.showEta {
-		b.WriteString(" " + st.Muted.Render(cell(sessionETA(s), col.etaW)))
+		b.WriteString(" " + st.Muted.Render(cell(row.eta, col.etaW)))
 	}
 	if col.showStatus {
 		b.WriteString(" " + statusSt.Render(cell(statusLabel, col.statusW)))
@@ -203,12 +201,12 @@ func monoRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 	}
 	var bar string
 	switch {
-	case s.IsMetadataMode():
+	case row.metadataMode:
 		bar = st.Track.Render(strings.Repeat("─", meterW))
-	case s.Status() == "Downloading" || s.Status() == "Checking":
-		bar = hairBar(s.PercentComplete(), meterW, st.Accent, st.Track)
+	case row.status == "Downloading" || row.status == "Checking":
+		bar = hairBar(row.percent, meterW, st.Accent, st.Track)
 	default:
-		bar = hairBar(s.PercentComplete(), meterW, st.Muted, st.Track)
+		bar = hairBar(row.percent, meterW, st.Muted, st.Track)
 	}
 	if meterSuffix != "" {
 		bar += " " + spdSt.Render(meterSuffix)
@@ -223,47 +221,47 @@ func renderDetailsMono(m *model) string {
 	g := gutterStr(m.width)
 
 	var sb strings.Builder
-	s, ok := m.selectedSession()
-	if !ok {
+	d := m.detailData()
+	if !d.valid {
 		sb.WriteString(g + st.Bold.Render("saintTorrent") + "\n")
 		return sb.String()
 	}
-	hashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	active := s.GetActivePeers()
+	row := d.row
+	hashHex := row.infoHashHex
+	active := d.peers
 
 	// header
 	sb.WriteString(g + st.Dim.Render("TORRENT") + "   " +
-		st.Bold.Render(truncateRight(sanitizeText(s.Name()), bw-dispWidth("TORRENT   "))) + "\n")
+		st.Bold.Render(truncateRight(row.name, bw-dispWidth("TORRENT   "))) + "\n")
 	sb.WriteString(g + st.Dim.Render("hash") + "  " +
 		st.Faint.Render(truncateRight(hashHex, bw-dispWidth("hash  "))) + "\n")
 	sb.WriteString(dividerLine(st, m.width) + "\n")
 
-	statusLabel, statusSt := statusLabelStyle(st, s.Status())
-	upSpeed := s.CurrentUploadSpeed()
-	uploadPeers := s.GetUploadPeerStats()
-	seeders, leechers, completed := s.TrackerSwarmStats()
-	stats := st.Dim.Render("SIZE") + " " + st.Primary.Render(formatBytes(s.TotalSize())) + "   " +
+	statusLabel, statusSt := statusLabelStyle(st, row.status)
+	upSpeed := row.uploadSpeed
+	uploadPeers := d.uploadPeers
+	stats := st.Dim.Render("SIZE") + " " + st.Primary.Render(formatBytes(row.totalSize)) + "   " +
 		st.Dim.Render("STATUS") + " " + statusSt.Render(statusLabel) + "   " +
-		st.Dim.Render("ETA") + " " + st.Emphasis.Render(sessionETA(s)) + "   " +
-		st.Dim.Render("RATIO") + " " + st.Muted.Render(monoRatio(s))
+		st.Dim.Render("ETA") + " " + st.Emphasis.Render(row.eta) + "   " +
+		st.Dim.Render("RATIO") + " " + st.Muted.Render(monoRatio(row))
 	sb.WriteString(g + stats + "\n")
 	line2 := st.Dim.Render("PEERS") + " " + st.Primary.Render(strconv.Itoa(len(active))+" connected") + "   " +
-		st.Dim.Render("DOWN") + " " + st.AccentBold.Render("↓ "+formatSpeed(s.CurrentSpeed())) + "   " +
+		st.Dim.Render("DOWN") + " " + st.AccentBold.Render("↓ "+formatSpeed(row.downloadSpeed)) + "   " +
 		st.Dim.Render("UP") + " " + st.Muted.Render("↑ "+formatSpeed(upSpeed))
 	sb.WriteString(g + line2 + "\n")
 	sb.WriteString(g + st.Dim.Render("UPLOAD") + " " +
 		st.Muted.Render(fmt.Sprintf("%d interested / %d slots", uploadPeers.Interested, uploadPeers.Unchoked)) + "   " +
 		st.Dim.Render("SWARM") + " " +
-		st.Muted.Render(fmt.Sprintf("%d seeds / %d leechers / %d completed", seeders, leechers, completed)) + "\n")
+		st.Muted.Render(fmt.Sprintf("%d seeds / %d leechers / %d completed", d.seeders, d.leechers, d.completed)) + "\n")
 	sb.WriteString(g + st.Dim.Render("PORT") + " " + st.Muted.Render(peerPortStatus(m.manager)) + "\n\n")
 
-	pct := s.PercentComplete()
+	pct := row.percent
 	sb.WriteString(g + st.Dim.Render("COMPLETE") + "  " + st.Bold.Render(fmt.Sprintf("%.1f%%", pct)) + "\n")
 	sb.WriteString(g + hairBar(pct, bw, st.Accent, st.Track) + "\n\n")
 
-	transferSpeed := currentTransferSpeed(s)
+	transferSpeed := row.transferSpeed
 	direction := "↓ "
-	if s.IsCompleted() {
+	if row.completed {
 		direction = "↑ "
 	}
 	spark := monoSparkline(m.speedHistory[hashHex], st)
@@ -273,7 +271,7 @@ func renderDetailsMono(m *model) string {
 	sb.WriteString(g + st.Dim.Render("CONNECTED PEERS") + "\n")
 	sb.WriteString(dividerLine(st, m.width) + "\n")
 	if len(active) == 0 {
-		if s.IsPaused() {
+		if row.paused {
 			sb.WriteString(g + st.Muted.Render("Session is paused.") + "\n")
 		} else {
 			sb.WriteString(g + st.Muted.Render("No connected peers. Searching via DHT/Tracker…") + "\n")
@@ -302,34 +300,13 @@ func renderDetailsMono(m *model) string {
 	}
 	sb.WriteString("\n")
 
-	if !s.IsMetadataMode() {
-		pieces := s.GetPieceStates()
+	if !row.metadataMode {
+		pieces := d.pieceStates
 		sb.WriteString(g + st.Dim.Render("PIECE MAP") + "   " + st.Muted.Render(strconv.Itoa(len(pieces))+" pieces") + "\n")
-		perRow := bw
-		if perRow < 1 {
-			perRow = 1
-		}
-		var pm strings.Builder
-		for i, state := range pieces {
-			if i%perRow == 0 {
-				if i > 0 {
-					pm.WriteString("\n")
-				}
-				pm.WriteString(g)
-			}
-			switch state {
-			case downloader.PieceCompleted:
-				pm.WriteString(st.PieceHave.Render("█"))
-			case downloader.PieceDownloading:
-				pm.WriteString(st.PieceDownloading.Render("▒"))
-			default:
-				pm.WriteString(st.PiecePending.Render("·"))
-			}
-		}
-		sb.WriteString(pm.String() + "\n\n")
+		sb.WriteString(renderPieceMap(st, pieces, bw, g, "█", "▒", "·") + "\n\n")
 	}
 
-	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	spaceActionHelp := getSpaceActionHelp(row.paused, row.completed)
 	if m.flash != "" {
 		sb.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
 	}
@@ -367,11 +344,11 @@ func monoSparkline(vals []float64, st styles) string {
 	return st.Accent.Render(b.String())
 }
 
-func monoRatio(s *downloader.Session) string {
-	size := s.TotalSize()
-	downloaded := int64(s.PercentComplete() / 100.0 * float64(size))
+func monoRatio(row sessionRow) string {
+	size := row.totalSize
+	downloaded := int64(row.percent / 100.0 * float64(size))
 	if downloaded <= 0 {
 		return "—"
 	}
-	return fmt.Sprintf("%.2f", float64(s.UploadedBytes())/float64(downloaded))
+	return fmt.Sprintf("%.2f", float64(row.uploadedBytes)/float64(downloaded))
 }

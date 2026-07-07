@@ -232,6 +232,24 @@ type model struct {
 	// speedHistory is a UI-only per-torrent ring of recent download speeds
 	// (keyed by info-hash hex), used to draw the Mono throughput sparkline.
 	speedHistory map[string][]float64
+
+	// Per-tick display snapshots (issue #57). The views render from these so the
+	// ~10 Hz animation frame loop never re-locks a session on its download hot
+	// path. rows parallels sessions; detail/files cover the selected session.
+	rows           []sessionRow
+	detail         detailSnapshot
+	files          filesSnapshot
+	hasDownloading bool   // any session is Downloading (drives the speed pulse)
+	animRunning    bool   // an animCmd loop is currently scheduled
+	detailVersion  uint64 // bumped when the detail snapshot changes; keys detailBody
+
+	// Detail body cache: renderDetails is memoized so a scroll keypress or resize
+	// clamps against the cached line count instead of re-rendering the whole
+	// detail view (which View would then render again).
+	detailBody  string
+	detailLines int
+	detailSig   detailSig
+	detailBuilt bool
 }
 
 // speedHistoryLen bounds the per-torrent speed ring (samples at the tick rate).
@@ -243,14 +261,13 @@ func (m *model) recordSpeeds() {
 	if m.speedHistory == nil {
 		m.speedHistory = make(map[string][]float64)
 	}
-	live := make(map[string]struct{}, len(m.sessions))
-	for _, s := range m.sessions {
-		if s.Torrent == nil {
-			continue
-		}
-		key := fmt.Sprintf("%x", s.Torrent.InfoHash)
+	// Sample from the per-tick snapshot rows so this refresh (like the render
+	// path) stays off the session lock.
+	live := make(map[string]struct{}, len(m.rows))
+	for _, row := range m.rows {
+		key := row.infoHashHex
 		live[key] = struct{}{}
-		ring := append(m.speedHistory[key], currentTransferSpeed(s))
+		ring := append(m.speedHistory[key], row.transferSpeed)
 		if len(ring) > speedHistoryLen {
 			ring = ring[len(ring)-speedHistoryLen:]
 		}
@@ -276,12 +293,59 @@ func (m *model) cycleTheme() {
 	}
 }
 
+// detailSignature captures the inputs that determine the rendered detail body.
+func (m *model) detailSignature() detailSig {
+	return detailSig{
+		width:   m.width,
+		theme:   m.theme,
+		version: m.detailVersion,
+		flash:   m.flash,
+	}
+}
+
+// ensureDetailBody renders the detail view body (pre vertical slice) into the
+// cache when its inputs have changed. Scrolling changes only detailScroll, not
+// the body, so a scroll keypress reuses the cache and does not re-render — this
+// is what removes the double render (clamp render + View render) on every scroll
+// notch or resize.
+func (m *model) ensureDetailBody() {
+	sig := m.detailSignature()
+	if m.detailBuilt && m.detailSig == sig {
+		return
+	}
+	// clampLines never changes the line count (it only truncates within a line),
+	// so the cached count matches what View ultimately slices.
+	m.detailBody = m.theme.renderDetails(m)
+	m.detailLines = renderedLineCount(m.detailBody)
+	m.detailSig = sig
+	m.detailBuilt = true
+}
+
+// detailViewBody returns the rendered detail body, reusing the memoized copy when
+// it is current. View has a value receiver and cannot populate the cache, so it
+// falls back to a fresh render when the cache is stale (the next Update refills
+// it); the common per-frame path hits the cache.
+func (m model) detailViewBody() string {
+	if m.detailBuilt && m.detailSig == m.detailSignature() {
+		return m.detailBody
+	}
+	return m.theme.renderDetails(&m)
+}
+
 func (m *model) detailMaxScroll() int {
 	if m.viewMode != viewDetail || m.height <= 0 {
 		return 0
 	}
-	rendered := clampLines(m.theme.renderDetails(m), outerWidth(m.width))
-	return maxVerticalOffset(rendered, m.height)
+	m.ensureDetailBody()
+	return max(0, m.detailLines-m.height)
+}
+
+// wantAnim reports whether the 10 Hz pulse tick should run: only the list view
+// animates (its download-speed cells pulse), and only while something is actually
+// downloading. Everything else (seeding, paused, detail/files/input views) is
+// static between data ticks, so the frame loop pauses.
+func (m *model) wantAnim() bool {
+	return m.viewMode == viewList && m.hasDownloading
 }
 
 func (m *model) clampDetailScroll() {
@@ -359,7 +423,7 @@ func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWar
 	p.Width = bodyWidth(width)
 	ti.Width = bodyWidth(width) - dispWidth(ti.Prompt)
 
-	return model{
+	m := model{
 		manager:        mgr,
 		downloadDir:    downloadDir,
 		progress:       p,
@@ -374,6 +438,10 @@ func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWar
 		persistEnabled: false,
 		speedHistory:   make(map[string][]float64),
 	}
+	// Prime the display snapshots so the first View (which can arrive before any
+	// data tick) renders from cached data rather than live session getters.
+	m.buildSnapshots()
+	return m
 }
 
 func (m *model) refreshSessions() {
@@ -408,6 +476,10 @@ func (m *model) refreshSessions() {
 			m.selectedIdx = 0
 		}
 	}
+
+	// Refresh the per-tick display snapshots now that sessions and the selection
+	// index are settled.
+	m.buildSnapshots()
 }
 
 // openSelectedLocation reveals the currently selected torrent's content in the
@@ -435,7 +507,9 @@ func (m model) Init() tea.Cmd {
 	for _, s := range m.sessions {
 		s.Start()
 	}
-	return tea.Batch(tickCmd(), animCmd(), textinput.Blink, tea.SetWindowTitle(terminalWindowTitle))
+	// The animation (pulse) tick is started on demand by the data tick once a
+	// download is in progress, so an idle client does no per-frame rendering.
+	return tea.Batch(tickCmd(), textinput.Blink, tea.SetWindowTitle(terminalWindowTitle))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -553,6 +627,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if _, ok := m.selectedSession(); ok {
 					m.viewMode = viewDetail
 					m.detailScroll = 0
+					// Refresh the detail snapshot for the session just selected
+					// (the cursor may have moved since the last data tick).
+					m.buildDetailSnapshot()
 				}
 			case "a":
 				m.viewMode = viewInput
@@ -618,6 +695,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if s, ok := m.selectedSession(); ok && !s.IsMetadataMode() {
 					m.viewMode = viewFiles
 					m.selectedFileIdx = 0
+					m.buildFilesSnapshot()
 				}
 			case "o":
 				m.openSelectedLocation()
@@ -665,6 +743,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						next = downloader.PriorityNormal
 					}
 					s.SetFilePriority(m.selectedFileIdx, next)
+					m.buildFilesSnapshot()
 				}
 			}
 
@@ -909,11 +988,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshSessions()
 		m.recordSpeeds()
+		if m.viewMode == viewFiles {
+			m.buildFilesSnapshot()
+		}
+		if m.viewMode == viewDetail {
+			// Refresh the cached body now so the following View reuses it and a
+			// scroll before the next tick clamps without re-rendering.
+			m.ensureDetailBody()
+		}
+		// Restart the pulse loop if a download began while it was paused. The
+		// animRunning guard keeps exactly one animCmd loop alive at a time.
+		if m.wantAnim() && !m.animRunning {
+			m.animRunning = true
+			return m, tea.Batch(tickCmd(), animCmd())
+		}
 		return m, tickCmd()
 
 	case animMsg:
-		// Pure re-render to advance time-based animations; no data refresh.
+		// Pure re-render to advance time-based animations; no data refresh. The
+		// loop stops itself whenever nothing on screen is animating, and the data
+		// tick restarts it when a download resumes.
 		if m.quitting {
+			return m, nil
+		}
+		if !m.wantAnim() {
+			m.animRunning = false
 			return m, nil
 		}
 		return m, animCmd()
@@ -939,7 +1038,7 @@ func (m model) View() string {
 		// list/details own their full screen (incl. theme-specific banner).
 		out = m.theme.renderList(&m)
 	case viewDetail:
-		out = m.theme.renderDetails(&m)
+		out = m.detailViewBody()
 	default:
 		// secondary screens share a layout under a themed banner.
 		var sb strings.Builder

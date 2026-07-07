@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	"sainttorrent/pkg/downloader"
 )
 
 // view_dracula.go renders the original tabular list + details look. It owns its
@@ -22,7 +20,7 @@ func renderListDracula(m *model) string {
 
 	prefix := st.Title.Render(dracBanner) + "\n"
 
-	if len(m.sessions) == 0 {
+	if len(m.rows) == 0 {
 		prefix += "\n" + g + "No active torrents. Press 'a' to add a torrent or magnet link.\n\n"
 	} else {
 		prefix += g + st.Subtle.Render(dracHeaderRow(col)) + "\n"
@@ -40,8 +38,8 @@ func renderListDracula(m *model) string {
 	head.WriteString(g + dracFooter(m, st) + "\n\n")
 
 	spaceActionHelp := "Pause/Resume"
-	if s, ok := m.selectedSession(); ok {
-		spaceActionHelp = getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	if row, ok := m.selectedRow(); ok {
+		spaceActionHelp = getSpaceActionHelp(row.paused, row.completed)
 	}
 	if m.flash != "" {
 		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
@@ -55,11 +53,11 @@ func renderListDracula(m *model) string {
 
 	var sb strings.Builder
 	sb.WriteString(prefix)
-	if len(m.sessions) > 0 {
-		capacity := dashboardCapacity(m.height, prefix, head.String(), help, 1, len(m.sessions))
-		start, end := visibleSessionRange(len(m.sessions), m.selectedIdx, capacity)
+	if len(m.rows) > 0 {
+		capacity := dashboardCapacity(m.height, prefix, head.String(), help, 1, len(m.rows))
+		start, end := visibleSessionRange(len(m.rows), m.selectedIdx, capacity)
 		for i := start; i < end; i++ {
-			sb.WriteString(g + dracRow(m, st, col, i, m.sessions[i]) + "\n")
+			sb.WriteString(g + dracRow(st, col, i == m.selectedIdx, m.rows[i]) + "\n")
 		}
 	}
 	sb.WriteString(head.String())
@@ -91,24 +89,24 @@ func dracHeaderRow(col listLayout) string {
 	return b.String()
 }
 
-func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) string {
+func dracRow(st styles, col listLayout, selected bool, row sessionRow) string {
 	cell := func(v string, w int) string { return padTo(truncateRight(v, w), w) }
 
-	indicator := getIndicator(s.IsPaused(), s.IsCompleted())
-	name := sanitizeText(s.Name())
-	sizeStr := formatBytes(s.TotalSize())
-	if s.IsMetadataMode() {
+	indicator := getIndicator(row.paused, row.completed)
+	name := row.name
+	sizeStr := formatBytes(row.totalSize)
+	if row.metadataMode {
 		sizeStr = "unknown"
 	}
-	pctStr := fmt.Sprintf("%.1f%%", s.PercentComplete())
-	if s.IsMetadataMode() {
+	pctStr := fmt.Sprintf("%.1f%%", row.percent)
+	if row.metadataMode {
 		pctStr = "0.0%"
 	}
-	statusLabel, statusSt := statusLabelStyle(st, s.Status())
-	speedStr := getSpeedStr(s.IsPaused(), s.IsCompleted(), currentTransferSpeed(s))
-	spdSt := speedStyle(st, s.Status() == "Downloading")
+	statusLabel, statusSt := statusLabelStyle(st, row.status)
+	speedStr := getSpeedStr(row.paused, row.completed, row.transferSpeed)
+	spdSt := speedStyle(st, row.status == "Downloading")
 
-	if i == m.selectedIdx {
+	if selected {
 		// Solid highlight across the whole row (single style).
 		var b strings.Builder
 		if col.showAct {
@@ -122,7 +120,7 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 			b.WriteString(" " + cell(pctStr, col.doneW))
 		}
 		if col.showEta {
-			b.WriteString(" " + cell(sessionETA(s), col.etaW))
+			b.WriteString(" " + cell(row.eta, col.etaW))
 		}
 		if col.showStatus {
 			b.WriteString(" " + cell(statusLabel, col.statusW))
@@ -145,7 +143,7 @@ func dracRow(m *model, st styles, col listLayout, i int, s *downloader.Session) 
 		b.WriteString(" " + st.NormalRow.Render(cell(pctStr, col.doneW)))
 	}
 	if col.showEta {
-		b.WriteString(" " + st.NormalRow.Render(cell(sessionETA(s), col.etaW)))
+		b.WriteString(" " + st.NormalRow.Render(cell(row.eta, col.etaW)))
 	}
 	if col.showStatus {
 		b.WriteString(" " + statusSt.Render(cell(statusLabel, col.statusW)))
@@ -163,9 +161,9 @@ func dracFooter(m *model, st styles) string {
 	}
 	var totalDown float64
 	var totalUp float64
-	for _, s := range m.sessions {
-		totalDown += s.CurrentSpeed()
-		totalUp += s.CurrentUploadSpeed()
+	for _, row := range m.rows {
+		totalDown += row.downloadSpeed
+		totalUp += row.uploadSpeed
 	}
 	downLimitStr := "Unlimited"
 	if v := m.manager.GlobalDownloadLimit(); v > 0 {
@@ -188,17 +186,18 @@ func renderDetailsDracula(m *model) string {
 	var sb strings.Builder
 	sb.WriteString(st.Title.Render(dracBanner) + "\n")
 
-	s, ok := m.selectedSession()
-	if !ok {
+	d := m.detailData()
+	if !d.valid {
 		return sb.String()
 	}
+	row := d.row
 
 	label := "Torrent Details: "
 	sb.WriteString(g + st.Header.Render("Torrent Details:") + " " +
-		truncateRight(sanitizeText(s.Name()), bw-dispWidth(label)) + "\n\n")
+		truncateRight(row.name, bw-dispWidth(label)) + "\n\n")
 
-	pct := s.PercentComplete() / 100.0
-	statusLabel, statusSt := statusLabelStyle(st, s.Status())
+	pct := row.percent / 100.0
+	statusLabel, statusSt := statusLabelStyle(st, row.status)
 
 	inner := outerWidth(m.width) - st.Card.GetHorizontalFrameSize()
 	if inner < 1 {
@@ -206,35 +205,34 @@ func renderDetailsDracula(m *model) string {
 	}
 	m.progress.Width = inner
 	card := cardWidth(st.Card, m.width)
-	uploadPeers := s.GetUploadPeerStats()
-	seeders, leechers, completed := s.TrackerSwarmStats()
+	uploadPeers := d.uploadPeers
 
-	cardContent := st.Header.Render("Hash") + ": " + fmt.Sprintf("%x", s.Torrent.InfoHash) + "\n" +
-		st.Header.Render("Total Size") + ": " + formatBytes(s.TotalSize()) + "\n" +
-		st.Header.Render("Complete") + ": " + fmt.Sprintf("%.2f%%", pct*100) + "\n" +
+	cardContent := st.Header.Render("Hash") + ": " + row.infoHashHex + "\n" +
+		st.Header.Render("Total Size") + ": " + formatBytes(row.totalSize) + "\n" +
+		st.Header.Render("Complete") + ": " + fmt.Sprintf("%.2f%%", row.percent) + "\n" +
 		st.Header.Render("Status") + ": " + statusSt.Render(statusLabel) + "\n" +
-		st.Header.Render("Speed") + ": ↓ " + formatSpeed(s.CurrentSpeed()) +
-		" / ↑ " + formatSpeed(s.CurrentUploadSpeed()) + "\n" +
+		st.Header.Render("Speed") + ": ↓ " + formatSpeed(row.downloadSpeed) +
+		" / ↑ " + formatSpeed(row.uploadSpeed) + "\n" +
 		st.Header.Render("Upload Demand") + ": " +
 		fmt.Sprintf("%d interested / %d slots", uploadPeers.Interested, uploadPeers.Unchoked) + "\n" +
 		st.Header.Render("Tracker Swarm") + ": " +
-		fmt.Sprintf("%d seeds / %d leechers / %d completed", seeders, leechers, completed) + "\n" +
+		fmt.Sprintf("%d seeds / %d leechers / %d completed", d.seeders, d.leechers, d.completed) + "\n" +
 		st.Header.Render("Peer Port") + ": " + peerPortStatus(m.manager) + "\n\n" +
 		m.progress.ViewAs(pct)
-	if err := s.LastError(); err != nil {
-		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + sanitizeText(err.Error())
+	if row.lastErrText != "" {
+		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + sanitizeText(row.lastErrText)
 	}
 	sb.WriteString(card.Render(cardContent))
 	sb.WriteString("\n")
 
 	var peers strings.Builder
 	peers.WriteString(st.Header.Render("Connected Peers:") + "\n")
-	active := s.GetActivePeers()
+	active := d.peers
 	if len(active) == 0 {
 		switch {
-		case s.IsPaused() && s.IsCompleted():
+		case row.paused && row.completed:
 			peers.WriteString(st.Subtle.Render("  Session is stopped.") + "\n")
-		case s.IsPaused():
+		case row.paused:
 			peers.WriteString(st.Subtle.Render("  Session is paused.") + "\n")
 		default:
 			peers.WriteString(st.Subtle.Render("  No connected peers. Searching via DHT/Tracker...") + "\n")
@@ -261,34 +259,12 @@ func renderDetailsDracula(m *model) string {
 	sb.WriteString(cardWidth(st.PeersCard, m.width).Render(peers.String()))
 	sb.WriteString("\n")
 
-	if !s.IsMetadataMode() {
+	if !row.metadataMode {
 		sb.WriteString(g + st.Header.Render("Pieces Visual Map:") + "\n")
-		pieces := s.GetPieceStates()
-		perRow := bw
-		if perRow < 1 {
-			perRow = 1
-		}
-		var pm strings.Builder
-		for i, state := range pieces {
-			if i%perRow == 0 {
-				if i > 0 {
-					pm.WriteString("\n")
-				}
-				pm.WriteString(g)
-			}
-			switch state {
-			case downloader.PieceCompleted:
-				pm.WriteString(st.PieceHave.Render("█"))
-			case downloader.PieceDownloading:
-				pm.WriteString(st.PieceDownloading.Render("░"))
-			default:
-				pm.WriteString(st.PiecePending.Render("."))
-			}
-		}
-		sb.WriteString(pm.String() + "\n\n")
+		sb.WriteString(renderPieceMap(st, d.pieceStates, bw, g, "█", "░", ".") + "\n\n")
 	}
 
-	spaceActionHelp := getSpaceActionHelp(s.IsPaused(), s.IsCompleted())
+	spaceActionHelp := getSpaceActionHelp(row.paused, row.completed)
 	if m.flash != "" {
 		sb.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.flash), bw)) + "\n")
 	}

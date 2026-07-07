@@ -5,6 +5,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -12,9 +13,11 @@ import (
 )
 
 // animInterval is how often the UI re-renders to advance time-based animations
-// (e.g. the download-speed pulse). It only rebuilds the view from the cached
-// session snapshot — no session/network work happens here — so a smooth cadence
-// is cheap and never competes with download throughput.
+// (e.g. the download-speed pulse). It rebuilds the view purely from the per-tick
+// display snapshot (model.rows / model.detail) — it takes no session locks and
+// does no network work — so a smooth cadence is cheap and never competes with
+// download throughput. The loop is also paused whenever nothing on screen is
+// animating (see model.wantAnim), so an idle or non-list view costs nothing.
 const animInterval = 100 * time.Millisecond
 
 // animMsg ticks the animation clock. Distinct from tickMsg (the 500ms data
@@ -50,6 +53,44 @@ func dimHex(hex string, f float64) string {
 	return fmt.Sprintf("#%02x%02x%02x", int(r), int(g), int(b))
 }
 
+// pulseBuckets quantizes the continuous pulse opacity into a small fixed set of
+// shades. Every downloading row on a given frame shares the same instant, so the
+// pulse only ever needs a handful of distinct styles; bucketing lets them be
+// built once and cached rather than re-parsing the accent hex and allocating a
+// fresh lipgloss.Style per downloading row per frame.
+const pulseBuckets = 24
+
+type pulseKey struct {
+	hex    string
+	bucket int
+}
+
+var (
+	pulseStyleMu    sync.Mutex
+	pulseStyleCache = map[pulseKey]lipgloss.Style{}
+)
+
+// pulseStyleFor returns the cached accent style for the quantized opacity bucket,
+// building and memoizing it on first use.
+func pulseStyleFor(accentHex string, opacity float64) lipgloss.Style {
+	bucket := int(opacity * pulseBuckets)
+	if bucket < 0 {
+		bucket = 0
+	} else if bucket >= pulseBuckets {
+		bucket = pulseBuckets - 1
+	}
+	key := pulseKey{hex: accentHex, bucket: bucket}
+	pulseStyleMu.Lock()
+	defer pulseStyleMu.Unlock()
+	if s, ok := pulseStyleCache[key]; ok {
+		return s
+	}
+	f := (float64(bucket) + 0.5) / pulseBuckets
+	s := lipgloss.NewStyle().Foreground(lipgloss.Color(dimHex(accentHex, f)))
+	pulseStyleCache[key] = s
+	return s
+}
+
 // speedStyle returns the style for a row's download-speed cell: active downloads
 // pulse in the theme accent (blinking between full and ~0.4 brightness once a
 // second); everything else stays muted.
@@ -57,5 +98,5 @@ func speedStyle(st styles, downloading bool) lipgloss.Style {
 	if !downloading || st.AccentHex == "" {
 		return st.Muted
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(dimHex(st.AccentHex, pulseOpacity(time.Now()))))
+	return pulseStyleFor(st.AccentHex, pulseOpacity(time.Now()))
 }
