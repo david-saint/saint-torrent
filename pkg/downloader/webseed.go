@@ -17,13 +17,12 @@ import (
 )
 
 var (
-	webseedHTTPClient        = http.DefaultClient
-	webseedRequestTimeout    = 30 * time.Second
-	webseedIdleDelay         = 500 * time.Millisecond
-	webseedRetryBaseDelay    = time.Second
-	webseedRetryMaxDelay     = 30 * time.Second
-	webseedPausePollInterval = 50 * time.Millisecond
-	errWebseedPaused         = errors.New("webseed paused")
+	webseedHTTPClient     = http.DefaultClient
+	webseedRequestTimeout = 30 * time.Second
+	webseedIdleDelay      = 500 * time.Millisecond
+	webseedRetryBaseDelay = time.Second
+	webseedRetryMaxDelay  = 30 * time.Second
+	errWebseedPaused      = errors.New("webseed paused")
 )
 
 type webseedSpec struct {
@@ -420,6 +419,16 @@ func (s *Session) webseedPaused() bool {
 	return s.paused || s.closed
 }
 
+// pauseStateSignal reports whether the session is currently paused or closed,
+// along with the channel that will be closed on the next pause/resume
+// transition. Callers block on the returned channel instead of polling
+// webseedPaused on a timer.
+func (s *Session) pauseStateSignal() (bool, <-chan struct{}) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.paused || s.closed, s.pauseStateCh
+}
+
 func (spec webseedSpec) fileForOffset(offset int64) (webseedFile, bool) {
 	i := sort.Search(len(spec.files), func(i int) bool {
 		return spec.files[i].end > offset
@@ -496,19 +505,18 @@ func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client
 func (s *Session) webseedRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
 	timeoutCtx, timeoutCancel := context.WithTimeout(parent, webseedRequestTimeout)
 	ctx, cancel := context.WithCancel(timeoutCtx)
-	pollInterval := webseedPausePollInterval
 	go func() {
-		ticker := time.NewTicker(pollInterval)
-		defer ticker.Stop()
 		for {
+			paused, changed := s.pauseStateSignal()
+			if paused {
+				cancel()
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				if s.webseedPaused() {
-					cancel()
-					return
-				}
+			case <-changed:
+				// Pause state changed; loop to re-check rather than polling.
 			}
 		}
 	}()

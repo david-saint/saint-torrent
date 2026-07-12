@@ -1188,6 +1188,149 @@ func TestFastExtensionServesAllowedFastUploadWhileChoked(t *testing.T) {
 	}
 }
 
+// TestFastExtensionPendingAllowedFastCappedAndDeduped covers issue #68:
+// pendingAllowedFast (buffered allowed_fast offers received before metadata
+// is known) must be capped at allowedFastSetSize and dedup repeated indices,
+// so a peer flooding allowed_fast on a magnet session can't grow session
+// memory at wire rate. It floods more distinct indices than the cap plus a
+// duplicate before metadata "arrives" (via onMetadataDownloaded, mirroring
+// the real ut_metadata completion path), then asserts every resulting
+// allowed-fast request falls within the capped set.
+func TestFastExtensionPendingAllowedFastCappedAndDeduped(t *testing.T) {
+	const numPieces = allowedFastSetSize + 15
+	const pieceLength = 4
+
+	tempDir := t.TempDir()
+	info := map[string]interface{}{
+		"name":         "pending-allowed-fast.bin",
+		"piece length": int64(pieceLength),
+		"pieces":       string(make([]byte, 20*numPieces)),
+		"length":       int64(pieceLength * numPieces),
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatalf("failed to marshal metadata: %v", err)
+	}
+	tor := &torrent.Torrent{
+		Name:     "pending-allowed-fast",
+		InfoHash: sha1.Sum(infoBytes),
+	}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, tempDir)
+	if err != nil {
+		t.Fatalf("failed to create session: %v", err)
+	}
+	defer sess.Close()
+
+	clientConn, remoteConn := net.Pipe()
+	defer remoteConn.Close()
+	client := peer.NewClient(clientConn, tor.InfoHash, sess.PeerID)
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	done := make(chan struct{})
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, "127.0.0.1:6110", "127.0.0.1", 6110, reserved, true)
+		close(done)
+	}()
+
+	incoming := make(chan *peer.Message, 256)
+	go func() {
+		for {
+			msg, err := peer.ParseMessage(remoteConn)
+			if err != nil {
+				close(incoming)
+				return
+			}
+			if msg == nil {
+				continue // keep-alive
+			}
+			incoming <- msg
+		}
+	}()
+
+	send := func(m *peer.Message) {
+		t.Helper()
+		if _, err := remoteConn.Write(m.Serialize()); err != nil {
+			t.Fatalf("write %v failed: %v", m.ID, err)
+		}
+	}
+	allowedFastMsg := func(idx uint32) *peer.Message {
+		payload := make([]byte, 4)
+		binary.BigEndian.PutUint32(payload, idx)
+		return &peer.Message{ID: peer.MsgAllowedFast, Payload: payload}
+	}
+
+	// The peer claims to have every piece; buffered until metadata is known.
+	send(&peer.Message{ID: peer.MsgHaveAll})
+
+	// Flood exactly the cap worth of distinct allowed_fast offers...
+	for i := uint32(0); i < allowedFastSetSize; i++ {
+		send(allowedFastMsg(i))
+	}
+	// ...a duplicate of an already-buffered index (must not grow the buffer)...
+	send(allowedFastMsg(0))
+	// ...and more distinct indices beyond the cap (must be dropped).
+	for i := uint32(allowedFastSetSize); i < numPieces; i++ {
+		send(allowedFastMsg(i))
+	}
+
+	// Metadata "arrives" via the real completion path, unblocking the deferred
+	// allowed_fast replay.
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded failed: %v", err)
+	}
+
+	// Any further message triggers the deferred initialization/replay.
+	send(allowedFastMsg(0))
+
+	// Collect every message until the connection has been quiet for a bit,
+	// rather than stopping as soon as allowedFastSetSize requests are seen: a
+	// broken cap would keep producing requests past that count, and stopping
+	// early would hide it.
+	requested := map[int64]bool{}
+	overallDeadline := time.After(2 * time.Second)
+	idle := time.NewTimer(300 * time.Millisecond)
+	defer idle.Stop()
+collect:
+	for {
+		select {
+		case msg, ok := <-incoming:
+			if !ok {
+				break collect
+			}
+			if msg.ID == peer.MsgRequest {
+				requested[int64(binary.BigEndian.Uint32(msg.Payload[0:4]))] = true
+			}
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(300 * time.Millisecond)
+		case <-idle.C:
+			break collect
+		case <-overallDeadline:
+			break collect
+		}
+	}
+
+	if len(requested) == 0 {
+		t.Fatal("expected at least one allowed-fast request, got none")
+	}
+	for idx := range requested {
+		if idx >= allowedFastSetSize {
+			t.Fatalf("requested piece %d is beyond the pendingAllowedFast cap %d; cap/dedup not enforced", idx, allowedFastSetSize)
+		}
+	}
+
+	_ = remoteConn.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer loop did not exit")
+	}
+}
+
 func TestFastExtensionRejectRequestImmediatelyRotatesPiece(t *testing.T) {
 	defer swapDuration(&blockRequestTimeout, time.Hour)()
 	pieces := [][]byte{[]byte("aaaa"), []byte("bbbb")}

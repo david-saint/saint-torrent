@@ -237,3 +237,45 @@ func TestDynamicWindowSessionBudgetCoversLegacyOutboundDepth(t *testing.T) {
 		t.Fatalf("session pipeline budget = %d, want at least %d", dynamicPipelineSessionBudgetBytes, want)
 	}
 }
+
+// TestLatencyP95CachedAndUpdatedOnRecord verifies latencyP95() is a cheap
+// read of a value recomputed only inside recordLatency (issue #68): it must
+// match a fresh sort/percentile computation right after a sample is
+// recorded, and must NOT change if the underlying sample window is mutated
+// without going through recordLatency again.
+func TestLatencyP95CachedAndUpdatedOnRecord(t *testing.T) {
+	now := time.Unix(100, 0)
+	p := newPeerPipelineController(testPipelineConfig())
+
+	if got := p.latencyP95(); got != 0 {
+		t.Fatalf("latencyP95 with no samples = %v, want 0", got)
+	}
+
+	samples := []time.Duration{
+		10 * time.Millisecond, 20 * time.Millisecond, 30 * time.Millisecond,
+		40 * time.Millisecond, 50 * time.Millisecond, 60 * time.Millisecond,
+		70 * time.Millisecond, 80 * time.Millisecond, 90 * time.Millisecond,
+		100 * time.Millisecond,
+	}
+	for i, s := range samples {
+		p.recordLatency(s, now.Add(time.Duration(i)*time.Millisecond))
+	}
+
+	want := p.computeLatencyP95()
+	if got := p.latencyP95(); got != want {
+		t.Fatalf("latencyP95() = %v, want freshly computed %v", got, want)
+	}
+
+	// Mutate the sample window directly (bypassing recordLatency) and confirm
+	// the cached read does not pick up the change.
+	p.metrics.latencySamples[0] = 5 * time.Hour
+	if got := p.latencyP95(); got != want {
+		t.Fatalf("latencyP95() changed without a recordLatency call: got %v, want cached %v", got, want)
+	}
+
+	// A new recorded sample must refresh the cache to match a fresh computation.
+	p.recordLatency(200*time.Millisecond, now.Add(11*time.Millisecond))
+	if got, recomputed := p.latencyP95(), p.computeLatencyP95(); got != recomputed {
+		t.Fatalf("latencyP95() after new sample = %v, want recomputed %v", got, recomputed)
+	}
+}

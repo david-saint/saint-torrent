@@ -758,7 +758,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// (a seed sends have_all exactly once, right after the handshake — well before
 	// a magnet transfer has finished fetching metadata).
 	peerHaveAllPending := false
+	// pendingAllowedFast is capped and deduped at allowedFastSetSize (the same
+	// bound applied to peerAllowedFast once metadata arrives) so a peer cannot
+	// grow our memory at wire rate by spamming allowed_fast before metadata is
+	// known.
 	var pendingAllowedFast []int64
+	pendingAllowedFastSet := make(map[int64]struct{}, allowedFastSetSize)
 
 	// maybeAdvertiseAllowedFast offers (once each) the allowed-fast pieces we have
 	// completed. It is re-run as we complete more pieces so a client that finishes
@@ -1683,6 +1688,7 @@ peerLoop:
 				}
 			}
 			pendingAllowedFast = nil
+			pendingAllowedFastSet = nil
 		}
 
 		// A peer that never negotiated the fast extension shouldn't be sending its
@@ -1966,7 +1972,12 @@ peerLoop:
 			index := int64(binary.BigEndian.Uint32(msg.Payload))
 			if numPiecesNow == 0 {
 				// Before metadata: buffer and validate once the count is known.
-				pendingAllowedFast = append(pendingAllowedFast, index)
+				// Capped and deduped so a malicious peer can't grow memory at
+				// wire rate before we know how many pieces exist.
+				if _, dup := pendingAllowedFastSet[index]; !dup && len(pendingAllowedFast) < allowedFastSetSize {
+					pendingAllowedFast = append(pendingAllowedFast, index)
+					pendingAllowedFastSet[index] = struct{}{}
+				}
 				continue
 			}
 			if index >= 0 && index < int64(numPiecesNow) {

@@ -123,6 +123,7 @@ type peerPipelineMetrics struct {
 	latencySamples [32]time.Duration
 	latencyIndex   int
 	latencyCount   int
+	latencyP95     time.Duration
 	rttMin         time.Duration
 
 	requestsSent          uint64
@@ -649,6 +650,7 @@ func (p *peerPipelineController) recordLatency(latency time.Duration, now time.T
 	if p.metrics.latencyCount < len(p.metrics.latencySamples) {
 		p.metrics.latencyCount++
 	}
+	p.metrics.latencyP95 = p.computeLatencyP95()
 }
 
 func (p *peerPipelineController) targetHorizon() time.Duration {
@@ -677,21 +679,30 @@ func (p *peerPipelineController) smoothedRTT() time.Duration {
 	return 0
 }
 
+// latencyP95 returns the cached 95th-percentile latency, recomputed only
+// when recordLatency adds a new sample rather than on every read.
 func (p *peerPipelineController) latencyP95() time.Duration {
+	return p.metrics.latencyP95
+}
+
+// computeLatencyP95 sorts the current latency sample window and returns the
+// 95th-percentile value. Call only when the sample set changes.
+func (p *peerPipelineController) computeLatencyP95() time.Duration {
 	if p.metrics.latencyCount == 0 {
 		return 0
 	}
-	samples := make([]time.Duration, p.metrics.latencyCount)
-	copy(samples, p.metrics.latencySamples[:p.metrics.latencyCount])
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	idx := int(math.Ceil(float64(len(samples))*0.95)) - 1
+	var samples [32]time.Duration
+	n := copy(samples[:], p.metrics.latencySamples[:p.metrics.latencyCount])
+	sorted := samples[:n]
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := int(math.Ceil(float64(len(sorted))*0.95)) - 1
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= len(samples) {
-		idx = len(samples) - 1
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
 	}
-	return samples[idx]
+	return sorted[idx]
 }
 
 func (p *peerPipelineController) probeGap() time.Duration {

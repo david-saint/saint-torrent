@@ -199,9 +199,14 @@ type Session struct {
 	closed              bool
 	started             bool
 	resumeCh            chan struct{} // signal to wake tracker loop on resume
-	trackerEvents       []string      // Queue of pending tracker events
-	completedAnnounced  bool
-	stoppedAnnounced    bool
+	// pauseStateCh is closed and replaced with a fresh channel on every
+	// Pause/Resume transition. Waiters (e.g. webseed request goroutines) read
+	// it under s.mu via pauseStateSignal and block on it instead of polling
+	// s.mu on a timer for pause changes.
+	pauseStateCh       chan struct{}
+	trackerEvents      []string // Queue of pending tracker events
+	completedAnnounced bool
+	stoppedAnnounced   bool
 
 	// Background fast-resume verification. Pieces claimed by resume data start as
 	// PieceUnverified and are hash-checked off the startup path (kicked off by Start).
@@ -288,6 +293,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		ctx:                 ctx,
 		cancel:              cancel,
 		resumeCh:            make(chan struct{}, 1),
+		pauseStateCh:        make(chan struct{}),
 		filePriorities:      priorities,
 		DownloadLimiter:     NewRateLimiter(0), // unlimited by default
 		UploadLimiter:       NewRateLimiter(0), // unlimited by default
@@ -602,6 +608,7 @@ func (s *Session) Close() {
 
 		s.mu.Lock()
 		s.closed = true
+		s.renewPauseStateChLocked()
 		s.verifying = false
 		s.verifyFullScan = false
 		verifyDone = s.verifyDone
@@ -991,6 +998,18 @@ func (s *Session) ContentPath() (path string, ok bool) {
 	return filepath.Join(s.downloadDir, root[0]), true
 }
 
+// renewPauseStateChLocked closes the current pause-state channel (waking any
+// webseed goroutines blocked in pauseStateSignal) and installs a fresh one for
+// subsequent waiters. Must be called with s.mu held for writing. Tests that
+// construct a Session literal directly (bypassing NewSession) may leave
+// pauseStateCh nil, so this tolerates a nil channel instead of closing it.
+func (s *Session) renewPauseStateChLocked() {
+	if s.pauseStateCh != nil {
+		close(s.pauseStateCh)
+	}
+	s.pauseStateCh = make(chan struct{})
+}
+
 // IsMetadataMode returns whether the session is currently in metadata download mode.
 func (s *Session) IsMetadataMode() bool {
 	s.mu.RLock()
@@ -1007,6 +1026,7 @@ func (s *Session) Pause() {
 	}
 	s.paused = true
 	s.pauseEpoch++
+	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("stopped")
 	for _, client := range s.activePeers {
 		if client.Conn != nil {
@@ -1048,6 +1068,7 @@ func (s *Session) Resume() {
 		return
 	}
 	s.paused = false
+	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("started")
 	for _, pState := range s.Peers {
 		if !pState.Active {
