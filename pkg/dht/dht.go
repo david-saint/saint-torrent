@@ -14,7 +14,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -57,6 +56,7 @@ type DHT struct {
 	conn         PacketConn
 	mu           sync.RWMutex
 	buckets      [160]*bucket
+	peersMu      sync.Mutex                        // guards peersMap; separate from mu so announce_peer eviction never blocks getCloserNodes/generateToken/addNode
 	peersMap     map[[20]byte]map[string]time.Time // infoHash -> peerAddr -> lastSeen
 	tokenSecrets [2][20]byte
 	tokenCreated time.Time
@@ -449,8 +449,8 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 }
 
 func (d *DHT) getPeersForInfoHash(infoHash [20]byte) []interface{} {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.peersMu.Lock()
+	defer d.peersMu.Unlock()
 
 	peers, ok := d.peersMap[infoHash]
 	if !ok {
@@ -497,8 +497,8 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 		return
 	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.peersMu.Lock()
+	defer d.peersMu.Unlock()
 
 	now := time.Now()
 
@@ -570,32 +570,65 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 	d.peersMap[infoHash][addrStr] = now
 }
 
+// getCloserNodes returns up to count nodes from the routing table closest to
+// target, ordered nearest-first. Rather than copying every node out of the
+// table and sorting the copy (which recomputes each XOR distance on every
+// comparison), it keeps a small sorted candidate slice of size <= count and
+// inserts each node into it in place, computing its distance exactly once.
 func (d *DHT) getCloserNodes(target [20]byte, count int) []Node {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	var allNodes []Node
-	for _, b := range d.buckets {
-		if b != nil {
-			allNodes = append(allNodes, b.nodes...)
-		}
+	if count <= 0 {
+		return nil
 	}
 
-	sort.Slice(allNodes, func(i, j int) bool {
-		distI := xorDistance(allNodes[i].ID, target)
-		distJ := xorDistance(allNodes[j].ID, target)
-		for b := 0; b < 20; b++ {
-			if distI[b] != distJ[b] {
-				return distI[b] < distJ[b]
+	type candidate struct {
+		node Node
+		dist [20]byte
+	}
+
+	best := make([]candidate, 0, count)
+
+	for _, b := range d.buckets {
+		if b == nil {
+			continue
+		}
+		for _, n := range b.nodes {
+			dist := xorDistance(n.ID, target)
+
+			if len(best) < count {
+				best = append(best, candidate{node: n, dist: dist})
+				for i := len(best) - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
+					best[i], best[i-1] = best[i-1], best[i]
+				}
+				continue
+			}
+
+			if lessXor(dist, best[count-1].dist) {
+				best[count-1] = candidate{node: n, dist: dist}
+				for i := count - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
+					best[i], best[i-1] = best[i-1], best[i]
+				}
 			}
 		}
-		return false
-	})
-
-	if len(allNodes) > count {
-		return allNodes[:count]
 	}
-	return allNodes
+
+	result := make([]Node, len(best))
+	for i, c := range best {
+		result[i] = c.node
+	}
+	return result
+}
+
+// lessXor reports whether XOR distance a is closer (smaller) than b.
+func lessXor(a, b [20]byte) bool {
+	for i := 0; i < 20; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
 }
 
 func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
