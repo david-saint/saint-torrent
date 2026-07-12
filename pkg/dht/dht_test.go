@@ -151,12 +151,10 @@ func TestGetCloserNodesReturnsNearestFirst(t *testing.T) {
 
 	// Insert nodes across several buckets so getCloserNodes has to pick the
 	// closest ones out of more candidates than it returns.
-	var all []Node
 	for i := 0; i < 40; i++ {
 		id := sha1.Sum([]byte(fmt.Sprintf("node-%d", i)))
 		addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2000 + i}
 		d.addNode(id, addr)
-		all = append(all, Node{ID: id, Addr: addr})
 	}
 
 	const count = 8
@@ -176,9 +174,16 @@ func TestGetCloserNodesReturnsNearestFirst(t *testing.T) {
 	// Verify it actually returned the true closest nodes out of everything
 	// that made it into the routing table (bucket size limits may have
 	// dropped some of the 40 inserted nodes, so only compare against what
-	// addNode actually kept).
+	// addNode actually kept). Enumerate the buckets directly so the ground
+	// truth does not depend on getCloserNodes itself.
 	var inTable []Node
-	inTable = append(inTable, d.getCloserNodes(target, 200)...)
+	d.mu.RLock()
+	for _, b := range d.buckets {
+		if b != nil {
+			inTable = append(inTable, b.nodes...)
+		}
+	}
+	d.mu.RUnlock()
 
 	sortedByDist := append([]Node(nil), inTable...)
 	for i := 0; i < len(sortedByDist); i++ {
