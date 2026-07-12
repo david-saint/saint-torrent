@@ -675,6 +675,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			LastAttempt: time.Now(),
 		}
 		s.Peers[peerAddr] = pState
+		// Inserting into the map is the only reliable eviction trigger available on
+		// the inbound path: reconnect churn keys on an ephemeral source port, so it
+		// never hits the discovery-path !exists branches (addPeer, tracker dials)
+		// that otherwise drive prunePeersLocked, and a seeding/private session can
+		// get no other prunes at all.
+		s.prunePeersLocked()
 	}
 	// An outbound connection confirms this is a listening endpoint. An inbound
 	// connection does not erase prior tracker/DHT evidence for the same endpoint.
@@ -711,6 +717,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					reconnectAfterResume = true
 				} else {
 					ps.LastAttempt = time.Now()
+				}
+				// Inbound-only entries (never confirmed dialable by tracker/DHT
+				// discovery or a successful outbound dial) are keyed by an ephemeral
+				// source port: they're worthless as redial candidates, so retaining
+				// them past disconnect only feeds unbounded growth from reconnect
+				// churn. Drop them outright rather than leaving them inactive forever.
+				if !ps.Dialable && !reconnectAfterResume {
+					delete(s.Peers, peerAddr)
 				}
 			}
 			delete(s.activePeers, peerAddr)

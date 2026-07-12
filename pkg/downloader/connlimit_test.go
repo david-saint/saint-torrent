@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 	"sainttorrent/pkg/tracker"
@@ -100,6 +101,140 @@ func TestPrunePeersLockedNoOpUnderCap(t *testing.T) {
 	s.mu.Unlock()
 	if len(s.Peers) != 100 {
 		t.Errorf("prune evicted peers while under the cap: got %d, want 100", len(s.Peers))
+	}
+}
+
+// dialInboundTestPeer opens a real TCP connection to addr and completes a minimal
+// BitTorrent handshake + empty bitfield, so the session's inbound accept path
+// creates a genuine PeerState keyed by this dial's ephemeral source port. It
+// returns the connection (so the test controls exactly when it closes) and that
+// source address, which is the s.Peers key the session will use.
+func dialInboundTestPeer(t *testing.T, addr string, infoHash [20]byte) (net.Conn, string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	var pid [20]byte
+	copy(pid[:], "-MOCKconnlimittest01")
+	client := peer.NewClient(conn, infoHash, pid)
+	if _, err := client.Handshake(); err != nil {
+		conn.Close()
+		t.Fatalf("handshake: %v", err)
+	}
+	if err := client.SendBitfield(nil); err != nil {
+		conn.Close()
+		t.Fatalf("send bitfield: %v", err)
+	}
+	return conn, conn.LocalAddr().String()
+}
+
+// TestInboundConnectDeletesUndialablePeerOnDisconnect covers issue #62: an
+// inbound-only PeerState (never confirmed dialable by tracker/DHT discovery or a
+// successful outbound dial, and keyed by an ephemeral source port that can never
+// be redialed) must be dropped from s.Peers outright on disconnect rather than
+// retained inactive forever — otherwise inbound reconnect churn on a seeding or
+// private session grows the map without bound.
+func TestInboundConnectDeletesUndialablePeerOnDisconnect(t *testing.T) {
+	sess, bf, _ := newStallTestTorrent(t, 4)
+	sess.Start()
+	defer sess.Close()
+	sess.WaitVerified()
+
+	sess.mu.RLock()
+	port := sess.Port
+	infoHash := sess.Torrent.InfoHash
+	sess.mu.RUnlock()
+	if port == 0 {
+		t.Skip("session did not bind an inbound listener")
+	}
+	_ = bf
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, peerAddr := dialInboundTestPeer(t, addr, infoHash)
+
+	waitForActivePeers(t, sess, 1, 2*time.Second, "inbound peer never connected")
+
+	sess.mu.RLock()
+	ps, ok := sess.Peers[peerAddr]
+	sess.mu.RUnlock()
+	if !ok {
+		t.Fatalf("inbound peer %s missing from Peers map while connected", peerAddr)
+	}
+	if ps.Dialable {
+		t.Fatalf("inbound-only peer %s should not be marked Dialable", peerAddr)
+	}
+
+	conn.Close()
+	waitForActivePeers(t, sess, 0, 2*time.Second, "inbound peer never disconnected")
+
+	// The disconnect defer runs asynchronously relative to activePeers hitting 0
+	// (it clears activePeers first, deletes the map entry second), so poll briefly.
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		sess.mu.RLock()
+		_, stillPresent := sess.Peers[peerAddr]
+		sess.mu.RUnlock()
+		if !stillPresent {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("inbound-only peer %s was retained in Peers after disconnect", peerAddr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestInboundConnectPrunesOversizedPeersMap covers issue #62: a session with no
+// tracker/DHT discovery churn (seeding, or a private torrent with a static peer
+// list) never hits the discovery-path insert branches that normally drive
+// prunePeersLocked. A single inbound connection's map insert must trigger pruning
+// too, or such a session's Peers map can grow without bound from inbound reconnect
+// churn alone.
+func TestInboundConnectPrunesOversizedPeersMap(t *testing.T) {
+	sess, bf, _ := newStallTestTorrent(t, 4)
+	_ = bf
+
+	// Pre-fill the map with far more inactive entries than the cap, before the
+	// listener is up, so nothing else can touch it first.
+	sess.mu.Lock()
+	// Every prefilled entry's LastAttempt must be well in the past so the real
+	// inbound connection dialed below (whose LastAttempt is set to time.Now() at
+	// insert time) sorts as the newest entry and survives the prune.
+	base := time.Now().Add(-24 * time.Hour)
+	for i := 0; i < maxKnownPeers+200; i++ {
+		a := fmt.Sprintf("192.168.%d.%d:%d", i/256, i%256, 7000+i%1000)
+		sess.Peers[a] = &PeerState{Active: false, LastAttempt: base.Add(time.Duration(i) * time.Second), Dialable: true}
+	}
+	preCount := len(sess.Peers)
+	sess.mu.Unlock()
+
+	sess.Start()
+	defer sess.Close()
+	sess.WaitVerified()
+
+	sess.mu.RLock()
+	port := sess.Port
+	infoHash := sess.Torrent.InfoHash
+	sess.mu.RUnlock()
+	if port == 0 {
+		t.Skip("session did not bind an inbound listener")
+	}
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, _ := dialInboundTestPeer(t, addr, infoHash)
+	defer conn.Close()
+
+	waitForActivePeers(t, sess, 1, 5*time.Second, "inbound peer never connected")
+
+	sess.mu.RLock()
+	after := len(sess.Peers)
+	sess.mu.RUnlock()
+	if after >= preCount {
+		t.Fatalf("a single inbound connect did not prune the oversized Peers map: before=%d after=%d", preCount, after)
+	}
+	if after > maxKnownPeers {
+		t.Fatalf("Peers map still over cap after inbound-triggered prune: %d > %d", after, maxKnownPeers)
 	}
 }
 

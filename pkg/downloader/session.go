@@ -702,6 +702,21 @@ func (s *Session) speedMonitorLoop() {
 					delete(lastPeerUploaded, addr)
 				}
 			}
+			// A peer can vanish from s.Peers entirely between ticks (pruned for the
+			// cap, or dropped outright on inbound disconnect) without ever being
+			// observed here as present-but-inactive, which is the only case the loop
+			// above cleans up. Diff against the current map so those entries can't
+			// orphan in these two maps forever.
+			for addr := range lastPeerDownloaded {
+				if _, ok := s.Peers[addr]; !ok {
+					delete(lastPeerDownloaded, addr)
+				}
+			}
+			for addr := range lastPeerUploaded {
+				if _, ok := s.Peers[addr]; !ok {
+					delete(lastPeerUploaded, addr)
+				}
+			}
 			s.mu.Unlock()
 
 		case <-s.ctx.Done():
