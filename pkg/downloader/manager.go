@@ -268,6 +268,10 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	// (which calls back into m.saveState, taking m.mu) and performs network/lifecycle
 	// teardown that must not run while holding the manager lock.
 	if old != nil && old != sess {
+		// Bound the best-effort stopped announce before Close so an unreachable
+		// tracker cannot add the session-level two-second timeout to the racing
+		// duplicate-add caller, matching RemoveSession and manager Close teardown.
+		m.announceStoppedAll([]*Session{old})
 		old.Close()
 	}
 
