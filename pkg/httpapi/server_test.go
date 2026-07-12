@@ -138,6 +138,31 @@ func TestStartServesHealthzAndShutdown(t *testing.T) {
 	}
 }
 
+func TestStartConfiguresWriteAndIdleTimeouts(t *testing.T) {
+	server, err := Start("127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+
+	if server.server.WriteTimeout != 10*time.Second {
+		t.Fatalf("WriteTimeout = %s, want %s", server.server.WriteTimeout, 10*time.Second)
+	}
+	if server.server.IdleTimeout != 60*time.Second {
+		t.Fatalf("IdleTimeout = %s, want %s", server.server.IdleTimeout, 60*time.Second)
+	}
+	if server.server.ReadTimeout != 10*time.Second {
+		t.Fatalf("ReadTimeout = %s, want %s", server.server.ReadTimeout, 10*time.Second)
+	}
+	if server.server.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want %s", server.server.ReadHeaderTimeout, 5*time.Second)
+	}
+}
+
 func TestSnapshotAtUsesProvidedTimestampAndEmptyManager(t *testing.T) {
 	ts := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
 
