@@ -200,11 +200,16 @@ func TestInboundConnectPrunesOversizedPeersMap(t *testing.T) {
 	sess.mu.Lock()
 	// Every prefilled entry's LastAttempt must be well in the past so the real
 	// inbound connection dialed below (whose LastAttempt is set to time.Now() at
-	// insert time) sorts as the newest entry and survives the prune.
+	// insert time) sorts as the newest entry and survives the prune. Entries are
+	// non-Dialable: they model the inbound-only endpoints that accumulate under
+	// issue #62, and this keeps the live peerMaintenanceLoop (running on its 5s
+	// tick once Start() is called) from ever treating them as redial candidates.
+	// prunePeersLocked ignores Dialable (it only spares Active peers), so the
+	// prune assertions below are unchanged either way.
 	base := time.Now().Add(-24 * time.Hour)
 	for i := 0; i < maxKnownPeers+200; i++ {
 		a := fmt.Sprintf("192.168.%d.%d:%d", i/256, i%256, 7000+i%1000)
-		sess.Peers[a] = &PeerState{Active: false, LastAttempt: base.Add(time.Duration(i) * time.Second), Dialable: true}
+		sess.Peers[a] = &PeerState{Active: false, LastAttempt: base.Add(time.Duration(i) * time.Second), Dialable: false}
 	}
 	preCount := len(sess.Peers)
 	sess.mu.Unlock()
