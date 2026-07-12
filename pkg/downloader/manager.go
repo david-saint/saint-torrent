@@ -225,11 +225,15 @@ func (m *TorrentManager) DHTListenPort() uint16 {
 
 // AddSession adds a session to the manager. If global rate limiters or DHT are set on the manager,
 // they are automatically linked to the session.
+//
+// If a session already exists for infoHashHex, it is replaced and the replaced session is
+// closed (storage, trackers, and lifecycle goroutines released) after the lock is dropped,
+// so callers racing to add the same torrent never leak the loser's storage file handles.
 func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
-	if old := m.sessions[infoHashHex]; old != nil {
+	old := m.sessions[infoHashHex]
+	if old != nil {
 		m.removeSessionSecretLocked(old)
 	}
 	m.sessions[infoHashHex] = sess
@@ -258,6 +262,19 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	if m.dht != nil {
 		sess.AttachDHT(m.dht)
 	}
+	m.mu.Unlock()
+
+	// Close the replaced session outside m.mu: Close() can invoke sess.OnStateChange
+	// (which calls back into m.saveState, taking m.mu) and performs network/lifecycle
+	// teardown that must not run while holding the manager lock.
+	if old != nil && old != sess {
+		// Bound the best-effort stopped announce before Close so an unreachable
+		// tracker cannot add the session-level two-second timeout to the racing
+		// duplicate-add caller, matching RemoveSession and manager Close teardown.
+		m.announceStoppedAll([]*Session{old})
+		old.Close()
+	}
+
 	if logging.Enabled() {
 		name := ""
 		if sess != nil && sess.Torrent != nil {

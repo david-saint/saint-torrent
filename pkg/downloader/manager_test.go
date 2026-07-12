@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1329,5 +1330,62 @@ func TestAddSessionBackfillsAddedAt(t *testing.T) {
 	}
 	if time.Since(addedAt) > 10*time.Second {
 		t.Errorf("expected AddedAt to be close to time.Now(), got %v", addedAt)
+	}
+}
+
+// closeTrackingStorage is a minimal storage.Storage fake that records whether Close was called,
+// so tests can assert a session's storage was released without touching the filesystem.
+type closeTrackingStorage struct {
+	closed atomic.Bool
+}
+
+func (s *closeTrackingStorage) BaseDir() string                    { return "" }
+func (s *closeTrackingStorage) TotalSize() int64                   { return 0 }
+func (s *closeTrackingStorage) PieceLengthValue() int64            { return 0 }
+func (s *closeTrackingStorage) PieceLength(pieceIndex int64) int64 { return 0 }
+func (s *closeTrackingStorage) ReadBlock(int64, int64, []byte) (int, error) {
+	return 0, nil
+}
+func (s *closeTrackingStorage) WriteBlock(int64, int64, []byte) error { return nil }
+func (s *closeTrackingStorage) VerifyPiece(int64, [20]byte) (bool, error) {
+	return false, nil
+}
+func (s *closeTrackingStorage) SaveState(string, []int) error   { return nil }
+func (s *closeTrackingStorage) LoadState(string) ([]int, error) { return nil, nil }
+func (s *closeTrackingStorage) Close() error {
+	s.closed.Store(true)
+	return nil
+}
+
+// TestAddSessionClosesReplacedSession is a regression test for issue #61: replacing a session
+// for an info hash that already has one (e.g. via a racing AddTorrentFile check-then-insert)
+// must close the displaced session's storage instead of leaking its file handles.
+func TestAddSessionClosesReplacedSession(t *testing.T) {
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	oldStorage := &closeTrackingStorage{}
+	oldSess := &Session{
+		Torrent: &torrent.Torrent{InfoHash: [20]byte{9, 9, 9}},
+		Storage: oldStorage,
+	}
+
+	newStorage := &closeTrackingStorage{}
+	newSess := &Session{
+		Torrent: &torrent.Torrent{InfoHash: [20]byte{9, 9, 9}},
+		Storage: newStorage,
+	}
+
+	mgr.AddSession("090909", oldSess)
+	mgr.AddSession("090909", newSess)
+
+	if !oldStorage.closed.Load() {
+		t.Error("expected replaced session's storage to be closed, but it was left open (FD leak)")
+	}
+	if newStorage.closed.Load() {
+		t.Error("did not expect the surviving session's storage to be closed")
+	}
+	if got := mgr.GetSession("090909"); got != newSess {
+		t.Errorf("expected surviving session to be the most recently added one, got %v", got)
 	}
 }
