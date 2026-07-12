@@ -758,10 +758,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// (a seed sends have_all exactly once, right after the handshake — well before
 	// a magnet transfer has finished fetching metadata).
 	peerHaveAllPending := false
-	// pendingAllowedFast is capped and deduped at allowedFastSetSize (the same
-	// bound applied to peerAllowedFast once metadata arrives) so a peer cannot
-	// grow our memory at wire rate by spamming allowed_fast before metadata is
-	// known.
+	// pendingAllowedFast buffers allowed_fast offers that arrive before metadata,
+	// deduped and capped at pendingAllowedFastCap. The cap sits far above any real
+	// client's allowed-fast set so legitimate offers all replay once metadata lands
+	// (matching the post-metadata path, which is bounded only by the piece count),
+	// while still preventing a peer from growing our memory at wire rate by spamming
+	// distinct indices we cannot yet validate. The map is sized for the common case
+	// (~allowedFastSetSize offers); it grows on its own if a peer sends more.
 	var pendingAllowedFast []int64
 	pendingAllowedFastSet := make(map[int64]struct{}, allowedFastSetSize)
 
@@ -1972,9 +1975,11 @@ peerLoop:
 			index := int64(binary.BigEndian.Uint32(msg.Payload))
 			if numPiecesNow == 0 {
 				// Before metadata: buffer and validate once the count is known.
-				// Capped and deduped so a malicious peer can't grow memory at
-				// wire rate before we know how many pieces exist.
-				if _, dup := pendingAllowedFastSet[index]; !dup && len(pendingAllowedFast) < allowedFastSetSize {
+				// Deduped and capped at pendingAllowedFastCap (generously above any
+				// real allowed-fast set, so legitimate offers survive to replay) so a
+				// malicious peer can't grow memory at wire rate before we know how
+				// many pieces exist.
+				if _, dup := pendingAllowedFastSet[index]; !dup && len(pendingAllowedFast) < pendingAllowedFastCap {
 					pendingAllowedFast = append(pendingAllowedFast, index)
 					pendingAllowedFastSet[index] = struct{}{}
 				}

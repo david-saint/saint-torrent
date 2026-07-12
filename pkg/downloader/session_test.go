@@ -1190,14 +1190,14 @@ func TestFastExtensionServesAllowedFastUploadWhileChoked(t *testing.T) {
 
 // TestFastExtensionPendingAllowedFastCappedAndDeduped covers issue #68:
 // pendingAllowedFast (buffered allowed_fast offers received before metadata
-// is known) must be capped at allowedFastSetSize and dedup repeated indices,
+// is known) must be capped at pendingAllowedFastCap and dedup repeated indices,
 // so a peer flooding allowed_fast on a magnet session can't grow session
 // memory at wire rate. It floods more distinct indices than the cap plus a
 // duplicate before metadata "arrives" (via onMetadataDownloaded, mirroring
 // the real ut_metadata completion path), then asserts every resulting
 // allowed-fast request falls within the capped set.
 func TestFastExtensionPendingAllowedFastCappedAndDeduped(t *testing.T) {
-	const numPieces = allowedFastSetSize + 15
+	const numPieces = pendingAllowedFastCap + 15
 	const pieceLength = 4
 
 	tempDir := t.TempDir()
@@ -1263,13 +1263,13 @@ func TestFastExtensionPendingAllowedFastCappedAndDeduped(t *testing.T) {
 	send(&peer.Message{ID: peer.MsgHaveAll})
 
 	// Flood exactly the cap worth of distinct allowed_fast offers...
-	for i := uint32(0); i < allowedFastSetSize; i++ {
+	for i := uint32(0); i < pendingAllowedFastCap; i++ {
 		send(allowedFastMsg(i))
 	}
 	// ...a duplicate of an already-buffered index (must not grow the buffer)...
 	send(allowedFastMsg(0))
 	// ...and more distinct indices beyond the cap (must be dropped).
-	for i := uint32(allowedFastSetSize); i < numPieces; i++ {
+	for i := uint32(pendingAllowedFastCap); i < numPieces; i++ {
 		send(allowedFastMsg(i))
 	}
 
@@ -1344,8 +1344,8 @@ collect:
 		t.Fatal("expected at least one allowed-fast request, got none")
 	}
 	for idx := range requested {
-		if idx >= allowedFastSetSize {
-			t.Fatalf("requested piece %d is beyond the pendingAllowedFast cap %d; cap/dedup not enforced", idx, allowedFastSetSize)
+		if idx >= pendingAllowedFastCap {
+			t.Fatalf("requested piece %d is beyond the pendingAllowedFast cap %d; cap/dedup not enforced", idx, pendingAllowedFastCap)
 		}
 	}
 

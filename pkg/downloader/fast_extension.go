@@ -8,6 +8,15 @@ import (
 
 const allowedFastSetSize = 10
 
+// pendingAllowedFastCap bounds how many distinct allowed_fast offers we buffer
+// before metadata is known and we can validate indices against the piece count.
+// It sits far above any real client's allowed-fast set (allowedFastSetSize) so a
+// legitimate seed's offers all survive to be replayed once metadata lands —
+// matching the post-metadata path, which honors every valid index up to the piece
+// count — while still capping memory so a peer can't grow the buffer at wire rate
+// by flooding distinct indices we cannot yet validate.
+const pendingAllowedFastCap = 256
+
 func completedPieceBitfield(states []PieceState) (bitfield []byte, hasAny bool, hasAll bool) {
 	if len(states) == 0 {
 		return nil, false, false
