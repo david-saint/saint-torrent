@@ -319,7 +319,6 @@ func TestWebseedWaitsForFullScanVerification(t *testing.T) {
 
 func TestWebseedPauseCancelsInFlightRequest(t *testing.T) {
 	t.Cleanup(swapDuration(&webseedIdleDelay, 10*time.Millisecond))
-	t.Cleanup(swapDuration(&webseedPausePollInterval, 10*time.Millisecond))
 
 	data := []byte("pause me")
 	requestStarted := make(chan struct{})

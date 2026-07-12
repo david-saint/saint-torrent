@@ -149,13 +149,22 @@ func (r *cipherReader) Read(p []byte) (int, error) {
 type cipherWriter struct {
 	c *rc4.Cipher
 	w io.Writer
+
+	// scratch is a grow-on-demand buffer reused across Write calls. Callers
+	// (peer.Client) serialize writes under a single writeMu, so reusing this
+	// buffer across calls is safe and keeps a permanently installed
+	// cipherWriter allocation-free on the steady-state write path.
+	scratch []byte
 }
 
 func (w *cipherWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	encrypted := make([]byte, len(p))
+	if cap(w.scratch) < len(p) {
+		w.scratch = make([]byte, len(p))
+	}
+	encrypted := w.scratch[:len(p)]
 	w.c.XORKeyStream(encrypted, p)
 	written := 0
 	for written < len(encrypted) {
