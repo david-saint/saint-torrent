@@ -37,6 +37,7 @@ func Start(addr string, manager *downloader.TorrentManager) (*Server, error) {
 	srv := &http.Server{
 		Handler:           NewHandler(manager),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}

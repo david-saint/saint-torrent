@@ -155,6 +155,9 @@ func TestStartConfiguresWriteAndIdleTimeouts(t *testing.T) {
 	if server.server.IdleTimeout != 60*time.Second {
 		t.Fatalf("IdleTimeout = %s, want %s", server.server.IdleTimeout, 60*time.Second)
 	}
+	if server.server.ReadTimeout != 10*time.Second {
+		t.Fatalf("ReadTimeout = %s, want %s", server.server.ReadTimeout, 10*time.Second)
+	}
 	if server.server.ReadHeaderTimeout != 5*time.Second {
 		t.Fatalf("ReadHeaderTimeout = %s, want %s", server.server.ReadHeaderTimeout, 5*time.Second)
 	}
