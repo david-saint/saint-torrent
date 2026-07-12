@@ -1273,6 +1273,32 @@ func TestFastExtensionPendingAllowedFastCappedAndDeduped(t *testing.T) {
 		send(allowedFastMsg(i))
 	}
 
+	// Barrier before metadata: the pipe write returning does not mean the
+	// message loop has processed the offers, and any offer still in flight
+	// when metadata lands takes the legitimate post-metadata direct path
+	// (bounded by piece count, exempt from the buffer cap) and gets
+	// requested. Pre-metadata we are choking and have granted no
+	// allowed-fast pieces, so an unserviceable request draws an immediate
+	// reject_request; once it arrives, in-order delivery guarantees every
+	// offer above was consumed while the buffer cap still applied.
+	barrierReq := make([]byte, 12)
+	binary.BigEndian.PutUint32(barrierReq[8:12], uint32(BlockSize))
+	send(&peer.Message{ID: peer.MsgRequest, Payload: barrierReq})
+barrier:
+	for {
+		select {
+		case msg, ok := <-incoming:
+			if !ok {
+				t.Fatal("connection closed before the reject_request barrier")
+			}
+			if msg.ID == peer.MsgRejectRequest {
+				break barrier
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the reject_request barrier")
+		}
+	}
+
 	// Metadata "arrives" via the real completion path, unblocking the deferred
 	// allowed_fast replay.
 	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
