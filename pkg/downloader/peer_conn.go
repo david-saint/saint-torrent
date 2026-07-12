@@ -913,7 +913,15 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		for i, dl := range activeDownloads {
 			if dl.pieceIndex == index {
 				releaseDownloadBuffers(dl)
+				n := len(activeDownloads)
 				activeDownloads = append(activeDownloads[:i], activeDownloads[i+1:]...)
+				// Nil the now-vacated tail slot so the backing array drops its
+				// reference to the removed *activeDownload (and the block buffers
+				// it may still hold), instead of pinning it until overwritten by a
+				// future append (#63). Index through the full-length reslice since
+				// n-1 is beyond activeDownloads' new (shrunk) length but still
+				// within its capacity.
+				activeDownloads[:n][n-1] = nil
 				return
 			}
 		}
@@ -2083,6 +2091,10 @@ peerLoop:
 
 			pieceIdx := dl.pieceIndex
 			pieceHash := dl.hash
+			// The block data has been copied into pieceData; drop the reference to
+			// the (now empty) block slice so the removed activeDownload doesn't pin
+			// it for the life of the connection (e.g. an idle seeding conn, #63).
+			dl.blocks = nil
 			removeDownload(dl.pieceIndex)
 
 			if !validPiece || offset != int64(len(pieceData)) {
