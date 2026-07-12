@@ -140,6 +140,72 @@ func TestDHTRoutingTableLimits(t *testing.T) {
 	}
 }
 
+func TestGetCloserNodesReturnsNearestFirst(t *testing.T) {
+	d, err := NewDHT(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+	defer d.Close()
+
+	target := sha1.Sum([]byte("target"))
+
+	// Insert nodes across several buckets so getCloserNodes has to pick the
+	// closest ones out of more candidates than it returns.
+	var all []Node
+	for i := 0; i < 40; i++ {
+		id := sha1.Sum([]byte(fmt.Sprintf("node-%d", i)))
+		addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 2000 + i}
+		d.addNode(id, addr)
+		all = append(all, Node{ID: id, Addr: addr})
+	}
+
+	const count = 8
+	got := d.getCloserNodes(target, count)
+	if len(got) > count {
+		t.Fatalf("expected at most %d nodes, got %d", count, len(got))
+	}
+
+	// Verify the result is sorted nearest-first.
+	for i := 1; i < len(got); i++ {
+		if !lessXor(xorDistance(got[i-1].ID, target), xorDistance(got[i].ID, target)) &&
+			xorDistance(got[i-1].ID, target) != xorDistance(got[i].ID, target) {
+			t.Errorf("result not sorted nearest-first at index %d", i)
+		}
+	}
+
+	// Verify it actually returned the true closest nodes out of everything
+	// that made it into the routing table (bucket size limits may have
+	// dropped some of the 40 inserted nodes, so only compare against what
+	// addNode actually kept).
+	var inTable []Node
+	inTable = append(inTable, d.getCloserNodes(target, 200)...)
+
+	sortedByDist := append([]Node(nil), inTable...)
+	for i := 0; i < len(sortedByDist); i++ {
+		for j := i + 1; j < len(sortedByDist); j++ {
+			di := xorDistance(sortedByDist[i].ID, target)
+			dj := xorDistance(sortedByDist[j].ID, target)
+			if lessXor(dj, di) {
+				sortedByDist[i], sortedByDist[j] = sortedByDist[j], sortedByDist[i]
+			}
+		}
+	}
+
+	want := sortedByDist
+	if len(want) > count {
+		want = want[:count]
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("expected %d nodes, got %d", len(want), len(got))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID {
+			t.Errorf("index %d: expected node %x, got %x", i, want[i].ID, got[i].ID)
+		}
+	}
+}
+
 func TestDHTResponseTransactionValidatesSourceAddress(t *testing.T) {
 	d, err := NewDHT(t.TempDir(), 0)
 	if err != nil {
