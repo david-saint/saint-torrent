@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -48,12 +49,15 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn"})
+	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn", "--fallback-dir", "/fallback/one", "--fallback-dir", "/fallback/two"})
 	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 	if overrides.logPath != "/tmp/sainttorrent.log" || !overrides.logLevelSet || overrides.logLevel != logging.LevelWarn {
 		t.Fatalf("unexpected logging overrides: %+v", overrides)
+	}
+	if got, want := overrides.fallbackDownloadDirs, []string{"/fallback/one", "/fallback/two"}; !slices.Equal(got, want) {
+		t.Fatalf("fallback directories = %v, want %v", got, want)
 	}
 
 	invalid := parseCLIArgs([]string{"--port", "70000"})
@@ -80,6 +84,16 @@ func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	if invalidLogLevel.err == nil {
 		t.Fatal("expected invalid log level error")
 	}
+
+	missingFallbackDir := parseCLIArgs([]string{"--fallback-dir"})
+	if missingFallbackDir.err == nil {
+		t.Fatal("expected missing fallback directory error")
+	}
+
+	missingConfigDir := parseCLIArgs([]string{"--config"})
+	if missingConfigDir.err == nil {
+		t.Fatal("expected missing config directory error")
+	}
 }
 
 func TestParseCLIArgsHelpAndVersion(t *testing.T) {
@@ -105,10 +119,151 @@ func TestParseCLIArgsHelpAndVersion(t *testing.T) {
 
 func TestUsageTextMentionsKeyFlags(t *testing.T) {
 	usage := usageText()
-	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--encryption", "--storage"} {
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage text missing %q", want)
 		}
+	}
+}
+
+func TestLoadAndApplyUserDownloadConfig(t *testing.T) {
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.json")
+	data := []byte(`{
+  "terminalApp": "Terminal",
+  "defaultDownloadDir": "/configured/primary",
+  "fallbackDownloadDirs": ["/configured/fallback-one", "/configured/fallback-two"]
+}`)
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, gotPath, err := loadUserConfig(configDir)
+	if err != nil {
+		t.Fatalf("loadUserConfig: %v", err)
+	}
+	if gotPath != configPath {
+		t.Fatalf("config path = %q, want %q", gotPath, configPath)
+	}
+
+	opts := parseCLIArgs(nil)
+	applyUserDownloadConfig(&opts, cfg)
+	if opts.downloadDir != "/configured/primary" {
+		t.Fatalf("download directory = %q", opts.downloadDir)
+	}
+	if want := []string{"/configured/fallback-one", "/configured/fallback-two"}; !slices.Equal(opts.fallbackDownloadDirs, want) {
+		t.Fatalf("fallback directories = %v, want %v", opts.fallbackDownloadDirs, want)
+	}
+}
+
+func TestCLIPathFlagsOverrideUserConfig(t *testing.T) {
+	cfg := appConfig{
+		DefaultDownloadDir:   "/configured/primary",
+		FallbackDownloadDirs: []string{"/configured/fallback"},
+	}
+	opts := parseCLIArgs([]string{
+		"--dir", "/cli/primary",
+		"--fallback-dir", "/cli/fallback-one",
+		"--fallback-dir", "/cli/fallback-two",
+	})
+	applyUserDownloadConfig(&opts, cfg)
+
+	if opts.downloadDir != "/cli/primary" {
+		t.Fatalf("download directory = %q, want CLI value", opts.downloadDir)
+	}
+	if want := []string{"/cli/fallback-one", "/cli/fallback-two"}; !slices.Equal(opts.fallbackDownloadDirs, want) {
+		t.Fatalf("fallback directories = %v, want CLI values %v", opts.fallbackDownloadDirs, want)
+	}
+}
+
+func TestEmptyConfiguredFallbackListStaysExplicit(t *testing.T) {
+	opts := parseCLIArgs(nil)
+	applyUserDownloadConfig(&opts, appConfig{FallbackDownloadDirs: []string{}})
+	if opts.fallbackDownloadDirs == nil {
+		t.Fatal("explicit empty configured fallback list became nil")
+	}
+	paths := (downloadPathOptions{
+		primary:   t.TempDir(),
+		fallbacks: opts.fallbackDownloadDirs,
+	}).normalized()
+	payload, err := json.Marshal(socketMessage{
+		DownloadDir:          paths.primary,
+		FallbackDownloadDirs: paths.fallbacks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"fallback_download_dirs":[]`) {
+		t.Fatalf("empty configured fallbacks were not sent explicitly: %s", payload)
+	}
+}
+
+func TestPartialUserConfigRetainsDownloadsPrimary(t *testing.T) {
+	configDir := t.TempDir()
+	data := []byte(`{"terminalApp":"Terminal","fallbackDownloadDirs":["/configured/fallback"]}`)
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := loadUserConfig(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "Downloads"); cfg.DefaultDownloadDir != want {
+		t.Fatalf("partial config primary = %q, want %q", cfg.DefaultDownloadDir, want)
+	}
+}
+
+func TestEmptyConfiguredPrimaryUsesDownloads(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"defaultDownloadDir":""}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := loadUserConfig(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "Downloads"); cfg.DefaultDownloadDir != want {
+		t.Fatalf("empty configured primary = %q, want %q", cfg.DefaultDownloadDir, want)
+	}
+}
+
+func TestLoadUserConfigMissingAndMalformed(t *testing.T) {
+	configDir := t.TempDir()
+	cfg, _, err := loadUserConfig(configDir)
+	if err != nil {
+		t.Fatalf("missing config should be ignored: %v", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "Downloads"); cfg.DefaultDownloadDir != want {
+		t.Fatalf("missing config default = %q, want %q", cfg.DefaultDownloadDir, want)
+	}
+
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadUserConfig(configDir); err == nil {
+		t.Fatal("expected malformed config error")
+	}
+}
+
+func TestLoadUserConfigRejectsNullFallbackElement(t *testing.T) {
+	configDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"fallbackDownloadDirs":[null]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadUserConfig(configDir); err == nil {
+		t.Fatal("expected null fallback element to be rejected")
 	}
 }
 
@@ -640,10 +795,11 @@ func TestWriteConfigSubprocess(t *testing.T) {
 	}
 
 	var cfg struct {
-		BinaryPath         string `json:"binaryPath"`
-		SocketPath         string `json:"socketPath"`
-		DefaultDownloadDir string `json:"defaultDownloadDir"`
-		TerminalApp        string `json:"terminalApp"`
+		BinaryPath           string   `json:"binaryPath"`
+		SocketPath           string   `json:"socketPath"`
+		DefaultDownloadDir   string   `json:"defaultDownloadDir"`
+		FallbackDownloadDirs []string `json:"fallbackDownloadDirs"`
+		TerminalApp          string   `json:"terminalApp"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("Failed to unmarshal output config: %v", err)
@@ -655,6 +811,9 @@ func TestWriteConfigSubprocess(t *testing.T) {
 
 	if cfg.TerminalApp != "Terminal" {
 		t.Errorf("Expected default terminalApp %q, got %q", "Terminal", cfg.TerminalApp)
+	}
+	if cfg.FallbackDownloadDirs == nil || len(cfg.FallbackDownloadDirs) != 0 {
+		t.Errorf("Expected empty fallbackDownloadDirs, got %v", cfg.FallbackDownloadDirs)
 	}
 }
 
@@ -695,7 +854,7 @@ func TestHandleSocketConnection(t *testing.T) {
 			TTY:     "/dev/ttys042",
 			Program: "Apple_Terminal",
 			Title:   terminalWindowTitle,
-		}, false)
+		}, false, downloadPathOptions{primary: "."})
 	}()
 
 	msg := socketMessage{
@@ -744,7 +903,7 @@ func TestHandleSocketConnectionHeadlessNoConfirm(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, true)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, true, downloadPathOptions{primary: "."})
 	}()
 
 	const infoHash = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
@@ -799,7 +958,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
+		handleSocketConnection(serverConn1, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false, downloadPathOptions{primary: "."})
 	}()
 
 	largeData := make([]byte, 70000)
@@ -841,7 +1000,7 @@ func TestSocketLimitsAndMalformed(t *testing.T) {
 			handlersWG.Done()
 			return
 		}
-		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
+		handleSocketConnection(serverConn2, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false, downloadPathOptions{primary: "."})
 	}()
 
 	rawClientConn2, err := net.Dial("tcp", listener.Addr().String())
@@ -896,7 +1055,7 @@ func TestSocketPartialFailures(t *testing.T) {
 	shutdownChan := make(chan struct{})
 
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false, downloadPathOptions{primary: "."})
 	}()
 
 	msg := socketMessage{
@@ -961,7 +1120,7 @@ func TestSocketShutdownUnblocksRead(t *testing.T) {
 
 	handlerDone := make(chan struct{})
 	go func() {
-		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false)
+		handleSocketConnection(serverConn, shutdownChan, mgr, &handlersWG, terminalIdentity{}, false, downloadPathOptions{primary: "."})
 		close(handlerDone)
 	}()
 
@@ -1116,12 +1275,14 @@ func TestForwardedDownloadDir(t *testing.T) {
 	mgr := downloader.NewTorrentManager()
 	defer mgr.Close()
 
-	m := initialModel(mgr, "/default/dir", "", nil)
+	defaultDir := t.TempDir()
+	customDir := t.TempDir()
+	m := initialModel(mgr, defaultDir, "", nil)
 	msg := addTorrentMsg{
 		msg: socketMessage{
 			Items:       []string{"magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626&dn=TestMortalKombat"},
 			Confirm:     true,
-			DownloadDir: "/custom/dir",
+			DownloadDir: customDir,
 		},
 	}
 	mUpdated, _ := m.Update(msg)
@@ -1130,16 +1291,17 @@ func TestForwardedDownloadDir(t *testing.T) {
 	if len(m.pendingItems) != 1 {
 		t.Fatalf("expected 1 pending item, got %d", len(m.pendingItems))
 	}
-	if m.pendingItems[0].downloadDir != "/custom/dir" {
-		t.Errorf("expected downloadDir to be /custom/dir, got %s", m.pendingItems[0].downloadDir)
+	if m.pendingItems[0].downloadDir != customDir {
+		t.Errorf("expected downloadDir to be %s, got %s", customDir, m.pendingItems[0].downloadDir)
 	}
 
 	// Test case where Confirm is false (added immediately)
+	immediateDir := t.TempDir()
 	msgNoConfirm := addTorrentMsg{
 		msg: socketMessage{
 			Items:       []string{"magnet:?xt=urn:btih:642e85596f7a0dd05eefdb78b0ac1736496f8626&dn=TestNoConfirm"},
 			Confirm:     false,
-			DownloadDir: "/custom/dir/immediate",
+			DownloadDir: immediateDir,
 		},
 	}
 	mUpdated, _ = m.Update(msgNoConfirm)
@@ -1150,7 +1312,7 @@ func TestForwardedDownloadDir(t *testing.T) {
 		t.Fatalf("expected session to be added")
 	}
 	gotDir := sess.DownloadDir()
-	expectedImmediateDir, err := filepath.Abs("/custom/dir/immediate")
+	expectedImmediateDir, err := filepath.Abs(immediateDir)
 	if err != nil {
 		expectedImmediateDir = "/custom/dir/immediate"
 	}

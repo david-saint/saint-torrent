@@ -289,6 +289,46 @@ func TestPrivateMetadataDisablesAttachedDHT(t *testing.T) {
 	}
 }
 
+func TestMagnetMetadataStorageUsesFallbackDirectory(t *testing.T) {
+	info := map[string]interface{}{
+		"name":         "fallback-magnet.txt",
+		"piece length": int64(1),
+		"pieces":       string(make([]byte, 20)),
+		"length":       int64(1),
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := t.TempDir()
+	fallback := t.TempDir()
+	sess, err := NewSession(&torrent.Torrent{InfoHash: sha1.Sum(infoBytes)}, nil, [20]byte{}, 0, primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	sess.SetFallbackDownloadDirs([]string{fallback})
+
+	var calls []string
+	sess.storageFactory = func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		calls = append(calls, dir)
+		if dir == primary {
+			return nil, fmt.Errorf("primary unavailable")
+		}
+		return storage.NewMemStorage(dir, files, pieceLength)
+	}
+
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded: %v", err)
+	}
+	if len(calls) != 2 || calls[0] != primary || calls[1] != fallback {
+		t.Fatalf("storage calls = %v, want primary then fallback", calls)
+	}
+	if got, want := sess.DownloadDir(), sess.Storage.BaseDir(); got != want {
+		t.Fatalf("download directory = %q, want selected storage base %q", got, want)
+	}
+}
+
 func TestMetadataModeSuppressesDHTAnnounceUntilPublicMetadata(t *testing.T) {
 	tempDir := t.TempDir()
 	info := map[string]interface{}{

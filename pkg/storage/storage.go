@@ -104,14 +104,15 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 }
 
 // fileLayout holds a file's byte range within the torrent plus a lazily-opened,
-// cached read handle. The absolute path is validated once at construction (see
-// NewStorage) so the hot read path never re-walks/EvalSymlinks the path.
+// cached read handle. Paths are validated once and every operation is anchored
+// to downloadRoot, so a later symlink swap cannot redirect payload I/O.
 type fileLayout struct {
-	path        string // relative path (torrent-declared)
-	absPath     string // validated absolute path, resolved once at construction
-	length      int64
-	startOffset int64
-	endOffset   int64
+	path         string // relative path (torrent-declared)
+	downloadRoot *os.Root
+	volumeGuard  *externalVolumeGuard
+	length       int64
+	startOffset  int64
+	endOffset    int64
 
 	// readHandle is an O_RDONLY handle opened on first read and reused for every
 	// subsequent block read of this file — eliminating the open/close syscall pair
@@ -136,7 +137,10 @@ func (f *fileLayout) reader() (*os.File, error) {
 	if f.readHandle != nil {
 		return f.readHandle, nil
 	}
-	h, err := openNoFollow(f.absPath, os.O_RDONLY, 0)
+	if err := f.volumeGuard.validate(); err != nil {
+		return nil, err
+	}
+	h, err := rootOpenNoFollow(f.downloadRoot, f.path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -178,13 +182,16 @@ func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 	if f.writeHandle != nil {
 		return f.writeHandle, false, nil
 	}
+	if err := f.volumeGuard.validate(); err != nil {
+		return nil, false, err
+	}
 
-	h, err = openNoFollow(f.absPath, os.O_RDWR, 0644)
+	h, err = rootOpenNoFollow(f.downloadRoot, f.path, os.O_RDWR, 0644)
 	if os.IsNotExist(err) {
-		if mkErr := os.MkdirAll(filepath.Dir(f.absPath), 0755); mkErr != nil {
+		if mkErr := mkdirAllInRoot(f.downloadRoot, filepath.Dir(f.path), 0755); mkErr != nil {
 			return nil, false, mkErr
 		}
-		h, err = openNoFollow(f.absPath, os.O_CREATE|os.O_RDWR, 0644)
+		h, err = rootOpenNoFollow(f.downloadRoot, f.path, os.O_CREATE|os.O_RDWR, 0644)
 		if err == nil {
 			repaired = true
 			// The file was recreated as a fresh inode; any cached read handle now
@@ -260,10 +267,11 @@ type FileStorage struct {
 	// SaveState paths mutate concurrently. dirty records files written since the last
 	// persist; their mtimes are captured lazily in SaveState instead of via a stat
 	// syscall on every completed piece (mirrors the mmap backend).
-	mtMu        sync.Mutex
-	stateFileMt map[string]int64
-	dirty       map[*fileLayout]struct{}
-	closed      atomic.Bool
+	mtMu         sync.Mutex
+	stateFileMt  map[string]int64
+	dirty        map[*fileLayout]struct{}
+	downloadRoot *os.Root
+	closed       atomic.Bool
 }
 
 // NewFileStorage creates the target directories and pre-allocates files to their
@@ -273,14 +281,23 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		return nil, fmt.Errorf("piece length must be positive, got %d", pieceLength)
 	}
 
-	// Create base directory if it doesn't exist
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	downloadRoot, err := OpenDownloadRoot(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open base directory: %w", err)
 	}
-
+	keepDownloadRoot := false
+	defer func() {
+		if !keepDownloadRoot {
+			_ = downloadRoot.Close()
+		}
+	}()
 	// Resolve the base directory once; every per-file path is validated against
 	// this single canonical base instead of re-running EvalSymlinks per file.
 	resolver, err := NewPathResolver(baseDir)
+	if err != nil {
+		return nil, err
+	}
+	volumeGuard, err := newExternalVolumeGuard(resolver.BaseDir())
 	if err != nil {
 		return nil, err
 	}
@@ -321,33 +338,35 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		seenPaths[lowerPath] = true
 
-		// Construct absolute path and verify containment / no symlinks. Validated
-		// here once and cached on the layout for the lifetime of the storage.
-		absPath, err := resolver.ResolveAndValidate(file.Path)
-		if err != nil {
+		// Verify containment and reject symlinks before opening the same relative
+		// path through the anchored root used for all later operations.
+		if _, err := resolver.ResolveAndValidate(file.Path); err != nil {
 			return nil, err
 		}
 
 		layout := &fileLayout{
-			path:        file.Path,
-			absPath:     absPath,
-			length:      file.Length,
-			startOffset: currentOffset,
-			endOffset:   currentOffset + file.Length,
+			path:         file.Path,
+			downloadRoot: downloadRoot,
+			volumeGuard:  volumeGuard,
+			length:       file.Length,
+			startOffset:  currentOffset,
+			endOffset:    currentOffset + file.Length,
 		}
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
 
-		parentDir := filepath.Dir(absPath)
-		if err := os.MkdirAll(parentDir, 0755); err != nil {
+		if err := mkdirAllInRoot(downloadRoot, filepath.Dir(file.Path), 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directories for file %s: %w", file.Path, err)
+		}
+		if err := volumeGuard.validate(); err != nil {
+			return nil, err
 		}
 
 		// Open/Create the file and set its size without following a final symlink.
 		// We do not retain this handle: read handles are cached lazily on first read
 		// (see fileLayout.reader) and writes open on demand, which keeps construction
 		// cheap and lets tests that swap a file for a FIFO still block on first access.
-		f, err := openNoFollow(absPath, os.O_CREATE|os.O_RDWR, 0644)
+		f, err := rootOpenNoFollow(downloadRoot, file.Path, os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open/create file %s: %w", file.Path, err)
 		}
@@ -374,14 +393,16 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 	}
 
+	keepDownloadRoot = true
 	return &FileStorage{
-		resolver:    resolver,
-		baseDir:     resolver.BaseDir(),
-		files:       layouts,
-		pieceLength: pieceLength,
-		totalSize:   currentOffset,
-		stateFileMt: stateFileMt,
-		dirty:       make(map[*fileLayout]struct{}, len(layouts)),
+		resolver:     resolver,
+		baseDir:      resolver.BaseDir(),
+		files:        layouts,
+		pieceLength:  pieceLength,
+		totalSize:    currentOffset,
+		stateFileMt:  stateFileMt,
+		dirty:        make(map[*fileLayout]struct{}, len(layouts)),
+		downloadRoot: downloadRoot,
 	}, nil
 }
 
@@ -642,6 +663,9 @@ func (s *FileStorage) Close() error {
 		file.tryInvalidateReader()
 		file.tryInvalidateWriter()
 	}
+	if s.downloadRoot != nil {
+		return s.downloadRoot.Close()
+	}
 	return nil
 }
 
@@ -663,7 +687,7 @@ type FastResumeState struct {
 // The caller must hold mtMu.
 func (s *FileStorage) refreshDirtyLocked() {
 	for file := range s.dirty {
-		if fi, err := os.Stat(file.absPath); err == nil {
+		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
 			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
 		}
 		delete(s.dirty, file)
@@ -676,8 +700,8 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return ErrStorageClosed
 	}
 
-	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
-	if err != nil {
+	stateName := "." + infoHashHex + ".state"
+	if _, err := s.resolver.ResolveAndValidate(stateName); err != nil {
 		return err
 	}
 
@@ -737,7 +761,23 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return err
 	}
 
-	return os.WriteFile(statePath, data, 0644)
+	stateFile, err := rootOpenNoFollow(s.downloadRoot, stateName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	for written := 0; written < len(data); {
+		n, writeErr := stateFile.Write(data[written:])
+		if writeErr != nil {
+			_ = stateFile.Close()
+			return writeErr
+		}
+		if n == 0 {
+			_ = stateFile.Close()
+			return io.ErrNoProgress
+		}
+		written += n
+	}
+	return stateFile.Close()
 }
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
@@ -752,13 +792,21 @@ func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 		return nil, ErrStorageClosed
 	}
 
-	statePath, err := s.resolver.ResolveAndValidate("." + infoHashHex + ".state")
+	stateName := "." + infoHashHex + ".state"
+	if _, err := s.resolver.ResolveAndValidate(stateName); err != nil {
+		return nil, err
+	}
+	stateFile, err := rootOpenNoFollow(s.downloadRoot, stateName, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(statePath)
+	data, err := io.ReadAll(stateFile)
+	closeErr := stateFile.Close()
 	if err != nil {
 		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
 	}
 
 	var state FastResumeState
@@ -780,7 +828,7 @@ func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file path mismatch at index %d", i)
 		}
 
-		fi, err := os.Stat(f.absPath)
+		fi, err := f.downloadRoot.Stat(f.path)
 		if err != nil {
 			return nil, fmt.Errorf("file stat error: %w", err)
 		}

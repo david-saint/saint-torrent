@@ -79,7 +79,8 @@ List all available flags or print the version:
 ./sainttorrent --version
 ```
 
-Start the client with default download directory (`.`):
+Start the client with the configured download directory (`~/Downloads` when no
+override is configured):
 
 ```bash
 ./sainttorrent
@@ -90,6 +91,29 @@ Specify a custom download directory:
 ```bash
 ./sainttorrent -d /path/to/downloads
 ```
+
+Add one or more fallback directories in priority order. saintTorrent checks the
+preferred directory and then each fallback whenever a torrent is added:
+
+```bash
+./sainttorrent -d "/Volumes/SAINT SSD/saintTorrent" \
+  --fallback-dir ~/Downloads
+```
+
+The selected directory must be creatable and pass a durable write test. On
+macOS, an unavailable `/Volumes/<name>` path is never recreated on the internal
+disk. If a removable drive is reconnected while saintTorrent is running, new
+torrents prefer it again. Existing torrents stay bound to the directory where
+they were added; saintTorrent does not split or migrate an active torrent after
+a drive disconnects.
+
+The CLI also reads `defaultDownloadDir` and `fallbackDownloadDirs` from
+`~/.config/sainttorrent/config.json`. When `--config <path>` is supplied, it
+reads `<path>/config.json` instead. Explicit `--dir` and `--fallback-dir` flags
+override their corresponding configured values.
+
+If an existing config file is unreadable or malformed, saintTorrent exits
+without adding torrents rather than silently reverting to another directory.
 
 Start the client and automatically queue a torrent or magnet link:
 
@@ -198,6 +222,19 @@ The terminal used for that fallback is configurable. Edit
 
 This file is **not** overwritten when you re-run `register_magnet.sh`, so your
 choice persists across upgrades.
+
+The CLI and magnet launcher share download-directory defaults from this file.
+For example:
+
+```json
+{
+  "terminalApp": "Terminal",
+  "defaultDownloadDir": "/Volumes/SAINT SSD/saintTorrent",
+  "fallbackDownloadDirs": ["/Users/your-name/Downloads"]
+}
+```
+
+`fallbackDownloadDirs` is ordered and may contain more than one path.
 
 ### Startup, verification & performance
 

@@ -67,11 +67,8 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		}
 
 		cleanPath := filepath.Clean(file.Path)
-		var absPath string
 		if resolver != nil {
-			var err error
-			absPath, err = resolver.ResolveAndValidate(file.Path)
-			if err != nil {
+			if _, err := resolver.ResolveAndValidate(file.Path); err != nil {
 				return nil, err
 			}
 		} else if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
@@ -97,7 +94,6 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 
 		layout := &fileLayout{
 			path:        file.Path,
-			absPath:     absPath,
 			length:      file.Length,
 			startOffset: currentOffset,
 			endOffset:   currentOffset + file.Length,

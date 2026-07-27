@@ -5,6 +5,7 @@ struct Config: Decodable {
     let binaryPath: String
     let socketPath: String
     let defaultDownloadDir: String
+    let fallbackDownloadDirs: [String]
     let terminalApp: String
 }
 
@@ -15,37 +16,71 @@ struct PartialConfig: Decodable {
     let binaryPath: String?
     let socketPath: String?
     let defaultDownloadDir: String?
+    let fallbackDownloadDirs: [String]?
     let terminalApp: String?
 }
 
+struct ConfigLoadError: LocalizedError {
+    let path: String
+    let underlying: Error
+
+    var errorDescription: String? {
+        return "Failed to load config \(path): \(underlying.localizedDescription)"
+    }
+}
+
+struct ConfigValidationError: LocalizedError {
+    let message: String
+
+    var errorDescription: String? { message }
+}
+
 func overlay(base: Config, partial: PartialConfig) -> Config {
+    let configuredDownloadDir = partial.defaultDownloadDir.flatMap { $0.isEmpty ? nil : $0 }
     return Config(
         binaryPath: partial.binaryPath ?? base.binaryPath,
         socketPath: partial.socketPath ?? base.socketPath,
-        defaultDownloadDir: partial.defaultDownloadDir ?? base.defaultDownloadDir,
+        defaultDownloadDir: configuredDownloadDir ?? base.defaultDownloadDir,
+        fallbackDownloadDirs: partial.fallbackDownloadDirs ?? base.fallbackDownloadDirs,
         terminalApp: partial.terminalApp ?? base.terminalApp
     )
 }
 
-func decodePartialConfig(at path: String) -> PartialConfig? {
-    guard let data = FileManager.default.contents(atPath: path) else {
-        return nil
+func validate(partial: PartialConfig) throws {
+    if let fallbacks = partial.fallbackDownloadDirs,
+       let index = fallbacks.firstIndex(where: { $0.isEmpty }) {
+        throw ConfigValidationError(
+            message: "fallbackDownloadDirs[\(index)] must be a non-empty string"
+        )
     }
-    return try? JSONDecoder().decode(PartialConfig.self, from: data)
 }
 
-func loadConfig() -> Config {
+func decodePartialConfig(at path: String) throws -> PartialConfig? {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let partial = try JSONDecoder().decode(PartialConfig.self, from: data)
+        try validate(partial: partial)
+        return partial
+    } catch let error as NSError
+        where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+        return nil
+    } catch {
+        throw ConfigLoadError(path: path, underlying: error)
+    }
+}
+
+func loadConfig() throws -> Config {
     // Layer the config: built-in defaults, then the bundled config.json, then
     // the user override at ~/.config/sainttorrent/config.json (terminalApp wins).
     var config = loadFallbackConfig()
 
     if let url = Bundle.main.url(forResource: "config", withExtension: "json"),
-       let bundled = decodePartialConfig(at: url.path) {
+       let bundled = try decodePartialConfig(at: url.path) {
         config = overlay(base: config, partial: bundled)
     }
 
     let userConfigPath = "\(NSHomeDirectory())/.config/sainttorrent/config.json"
-    if let userConfig = decodePartialConfig(at: userConfigPath) {
+    if let userConfig = try decodePartialConfig(at: userConfigPath) {
         config = overlay(base: config, partial: userConfig)
     }
 
@@ -57,7 +92,13 @@ func loadFallbackConfig() -> Config {
     let fallbackBinary = "\(homeDir)/go/bin/sainttorrent"
     let fallbackSocket = "\(homeDir)/.config/sainttorrent/sainttorrent.sock"
     let fallbackDownload = "\(homeDir)/Downloads"
-    return Config(binaryPath: fallbackBinary, socketPath: fallbackSocket, defaultDownloadDir: fallbackDownload, terminalApp: "Terminal")
+    return Config(
+        binaryPath: fallbackBinary,
+        socketPath: fallbackSocket,
+        defaultDownloadDir: fallbackDownload,
+        fallbackDownloadDirs: [],
+        terminalApp: "Terminal"
+    )
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -80,13 +121,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func handleURL(_ urlString: String, startingRetry: Int) {
-        let config = loadConfig()
+        let config: Config
+        do {
+            config = try loadConfig()
+        } catch {
+            showNSAlertAndExit(message: error.localizedDescription)
+        }
         
         // Construct the framed JSON message using JSONSerialization for safe escaping
         let messageDict: [String: Any] = [
             "items": [urlString],
             "confirm": true,
-            "download_dir": config.defaultDownloadDir
+            "download_dir": config.defaultDownloadDir,
+            "fallback_download_dirs": config.fallbackDownloadDirs
         ]
         
         guard let jsonData = try? JSONSerialization.data(withJSONObject: messageDict, options: []),
@@ -299,8 +346,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let escapedBinary = escapeForShell(config.binaryPath)
         let escapedDir = escapeForShell(config.defaultDownloadDir)
         let escapedURL = escapeForShell(urlString)
+        let fallbackArgs = config.fallbackDownloadDirs
+            .map { " --fallback-dir \(escapeForShell($0))" }
+            .joined()
 
-        let command = "exec \(escapedBinary) -d \(escapedDir) --confirm \(escapedURL)"
+        let command = "exec \(escapedBinary) -d \(escapedDir)\(fallbackArgs) --confirm \(escapedURL)"
 
         let app = config.terminalApp.trimmingCharacters(in: .whitespacesAndNewlines)
         switch app.lowercased() {

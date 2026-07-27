@@ -341,17 +341,19 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	magnetURI := "magnet:?xt=urn:btih:4cf469d37a3b7f65fbdb6bf8b36e6ab495e5a0fb&dn=TestTorrent"
 	mag, _ := torrent.ParseMagnet(magnetURI)
 	infoHashHex := fmt.Sprintf("%x", mag.InfoHash)
+	fallbackDir := filepath.Join(tempDir, "fallback")
 
 	// Write session.json with a magnet torrent and custom file priorities
 	state := PersistedState{
 		Version: 1,
 		Torrents: []PersistedTorrent{
 			{
-				InfoHashHex:    infoHashHex,
-				MagnetURI:      magnetURI,
-				DownloadDir:    tempDir,
-				Paused:         false,
-				FilePriorities: []FilePriority{PriorityHigh, PrioritySkip},
+				InfoHashHex:          infoHashHex,
+				MagnetURI:            magnetURI,
+				DownloadDir:          tempDir,
+				FallbackDownloadDirs: []string{fallbackDir},
+				Paused:               false,
+				FilePriorities:       []FilePriority{PriorityHigh, PrioritySkip},
 			},
 		},
 	}
@@ -372,11 +374,15 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	// Verify pending file priorities are stored
 	sess.mu.RLock()
 	pending := sess.pendingFilePriorities
+	fallbacks := append([]string(nil), sess.fallbackDownloadDirs...)
 	announceBeforeMetadata := sess.allowsDHTAnnounceLocked()
 	sess.mu.RUnlock()
 
 	if len(pending) != 2 || pending[0] != PriorityHigh || pending[1] != PrioritySkip {
 		t.Errorf("unexpected pending priorities: %v", pending)
+	}
+	if len(fallbacks) != 1 || fallbacks[0] != fallbackDir {
+		t.Fatalf("fallback directories = %v, want %q", fallbacks, fallbackDir)
 	}
 	if announceBeforeMetadata {
 		t.Fatal("restored magnet should suppress DHT announce until metadata is known")

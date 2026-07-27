@@ -118,12 +118,20 @@ const (
 )
 
 type pendingItem struct {
-	rawURL      string
-	displayName string
-	infoHashHex string
-	downloadDir string
-	isDuplicate bool
-	respChan    chan addTorrentResponse
+	rawURL        string
+	displayName   string
+	infoHashHex   string
+	downloadDir   string
+	downloadPaths downloadPathOptions
+	isDuplicate   bool
+	respChan      chan addTorrentResponse
+}
+
+func (p pendingItem) pathOptions() downloadPathOptions {
+	if p.downloadPaths.primary != "" {
+		return p.downloadPaths
+	}
+	return downloadPathOptions{primary: p.downloadDir}
 }
 
 type addTorrentMsg struct {
@@ -141,9 +149,10 @@ type deleteFinishedMsg struct {
 }
 
 type socketMessage struct {
-	Items       []string `json:"items"`
-	Confirm     bool     `json:"confirm"`
-	DownloadDir string   `json:"download_dir"`
+	Items                []string `json:"items"`
+	Confirm              bool     `json:"confirm"`
+	DownloadDir          string   `json:"download_dir"`
+	FallbackDownloadDirs []string `json:"fallback_download_dirs"`
 }
 
 type socketResponse struct {
@@ -161,24 +170,27 @@ type terminalIdentity struct {
 }
 
 type cliOptions struct {
-	downloadDir string
-	configDir   string
-	persist     bool
-	confirm     bool
-	headless    bool
-	theme       string
-	listenPort  int
-	httpAddr    string
-	natEnabled  bool
-	encryption  mse.Policy
-	storage     storage.Backend
-	logPath     string
-	logLevel    logging.Level
-	logLevelSet bool
-	help        bool
-	showVersion bool
-	err         error
-	items       []string
+	downloadDir          string
+	downloadDirSet       bool
+	fallbackDownloadDirs []string
+	fallbackDirsSet      bool
+	configDir            string
+	persist              bool
+	confirm              bool
+	headless             bool
+	theme                string
+	listenPort           int
+	httpAddr             string
+	natEnabled           bool
+	encryption           mse.Policy
+	storage              storage.Backend
+	logPath              string
+	logLevel             logging.Level
+	logLevelSet          bool
+	help                 bool
+	showVersion          bool
+	err                  error
+	items                []string
 }
 
 type inputMode int
@@ -201,6 +213,7 @@ func tickCmd() tea.Cmd {
 type model struct {
 	manager          *downloader.TorrentManager
 	downloadDir      string
+	downloadPaths    downloadPathOptions
 	progress         progress.Model
 	textInput        textinput.Model
 	viewMode         viewMode
@@ -426,6 +439,7 @@ func initialModel(mgr *downloader.TorrentManager, downloadDir string, startupWar
 	m := model{
 		manager:        mgr,
 		downloadDir:    downloadDir,
+		downloadPaths:  downloadPathOptions{primary: downloadDir},
 		progress:       p,
 		textInput:      ti,
 		viewMode:       mode,
@@ -538,13 +552,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				switch m.inputMode {
 				case inputAddTorrent:
-					var sess *downloader.Session
-					var err error
-					if strings.HasPrefix(val, "magnet:?") {
-						sess, err = m.manager.AddMagnet(val, m.downloadDir)
-					} else {
-						sess, err = m.manager.AddTorrentFile(val, m.downloadDir)
-					}
+					sess, err := addTorrentWithDownloadPaths(m.manager, val, m.downloadPaths)
 
 					if err != nil {
 						m.inputErr = fmt.Sprintf("Failed to load torrent: %v", err)
@@ -809,12 +817,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					item := m.pendingItems[m.pendingIdx]
 					var addErr error
 					if !item.isDuplicate {
-						var sess *downloader.Session
-						if strings.HasPrefix(item.rawURL, "magnet:?") {
-							sess, addErr = m.manager.AddMagnet(item.rawURL, item.downloadDir)
-						} else {
-							sess, addErr = m.manager.AddTorrentFile(item.rawURL, item.downloadDir)
-						}
+						sess, err := addTorrentWithDownloadPaths(m.manager, item.rawURL, item.pathOptions())
+						addErr = err
 						if addErr == nil {
 							sess.Start()
 						}
@@ -879,18 +883,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case addTorrentMsg:
 		if !msg.msg.Confirm {
 			var addErr error
-			pDir := m.downloadDir
-			if msg.msg.DownloadDir != "" {
-				pDir = msg.msg.DownloadDir
-			}
+			paths := socketDownloadPaths(msg.msg, m.downloadPaths)
 			for _, item := range msg.msg.Items {
-				var sess *downloader.Session
-				var err error
-				if strings.HasPrefix(item, "magnet:?") {
-					sess, err = m.manager.AddMagnet(item, pDir)
-				} else {
-					sess, err = m.manager.AddTorrentFile(item, pDir)
-				}
+				sess, err := addTorrentWithDownloadPaths(m.manager, item, paths)
 				if err == nil {
 					sess.Start()
 				} else {
@@ -909,9 +904,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Convert msg.msg.Items to pendingItems
 		var newPending []pendingItem
-		pDir := m.downloadDir
-		if msg.msg.DownloadDir != "" {
-			pDir = msg.msg.DownloadDir
+		paths := socketDownloadPaths(msg.msg, m.downloadPaths)
+		pDir := paths.primary
+		if selectedDir, err := selectDownloadPath(paths); err == nil {
+			pDir = selectedDir
 		}
 		for _, item := range msg.msg.Items {
 			name, hashHex, err := parseItem(item)
@@ -928,11 +924,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			displayName = sanitizeText(displayName)
 
 			pItem := pendingItem{
-				rawURL:      item,
-				displayName: displayName,
-				infoHashHex: hashHex,
-				downloadDir: pDir,
-				isDuplicate: isDuplicate,
+				rawURL:        item,
+				displayName:   displayName,
+				infoHashHex:   hashHex,
+				downloadDir:   pDir,
+				downloadPaths: paths,
+				isDuplicate:   isDuplicate,
 			}
 			newPending = append(newPending, pItem)
 		}
@@ -1097,10 +1094,59 @@ func formatSpeed(speed float64) string {
 }
 
 type appConfig struct {
-	BinaryPath         string `json:"binaryPath"`
-	SocketPath         string `json:"socketPath"`
-	DefaultDownloadDir string `json:"defaultDownloadDir"`
-	TerminalApp        string `json:"terminalApp"`
+	BinaryPath           string   `json:"binaryPath"`
+	SocketPath           string   `json:"socketPath"`
+	DefaultDownloadDir   string   `json:"defaultDownloadDir"`
+	FallbackDownloadDirs []string `json:"fallbackDownloadDirs"`
+	TerminalApp          string   `json:"terminalApp"`
+}
+
+func loadUserConfig(configDir string) (appConfig, string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return appConfig{}, "", fmt.Errorf("get user home directory: %w", err)
+	}
+	cfg := appConfig{
+		DefaultDownloadDir:   filepath.Join(home, "Downloads"),
+		FallbackDownloadDirs: []string{},
+	}
+	defaultDownloadDir := cfg.DefaultDownloadDir
+	if configDir == "" {
+		configDir = filepath.Join(home, ".config", "sainttorrent")
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, configPath, nil
+		}
+		return appConfig{}, configPath, err
+	}
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return appConfig{}, configPath, err
+	}
+	if cfg.DefaultDownloadDir == "" {
+		cfg.DefaultDownloadDir = defaultDownloadDir
+	}
+	if cfg.FallbackDownloadDirs == nil {
+		cfg.FallbackDownloadDirs = []string{}
+	}
+	for index, dir := range cfg.FallbackDownloadDirs {
+		if dir == "" {
+			return appConfig{}, configPath, fmt.Errorf("fallbackDownloadDirs[%d] must be a non-empty string", index)
+		}
+	}
+	return cfg, configPath, nil
+}
+
+func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
+	if !opts.downloadDirSet && cfg.DefaultDownloadDir != "" {
+		opts.downloadDir = cfg.DefaultDownloadDir
+	}
+	if !opts.fallbackDirsSet && cfg.FallbackDownloadDirs != nil {
+		opts.fallbackDownloadDirs = append([]string{}, cfg.FallbackDownloadDirs...)
+	}
 }
 
 func sanitizeText(s string) string {
@@ -1163,7 +1209,8 @@ Usage:
   sainttorrent [options] [torrent-file-or-magnet-uri ...]
 
 Options:
-  -d, --dir <path>          Download directory (default ".")
+  -d, --dir <path>          Preferred download directory (default ~/Downloads)
+      --fallback-dir <path> Fallback download directory (repeatable)
   -c, --config <path>       Configuration/IPC directory
   -p, --port <port>         Peer listen port (0 for ephemeral, default 51413)
       --no-nat              Disable automatic UPnP/NAT-PMP port mapping
@@ -1183,6 +1230,7 @@ Options:
 
 Examples:
   sainttorrent -d ~/Downloads
+  sainttorrent -d "/Volumes/External SSD/Downloads" --fallback-dir ~/Downloads
   sainttorrent -d ~/Downloads "magnet:?xt=urn:btih:..."
   sainttorrent --headless --http-addr 127.0.0.1:16666
 `
@@ -1203,12 +1251,25 @@ func parseCLIArgs(args []string) cliOptions {
 		case "-d", "--dir":
 			if i+1 < len(args) {
 				opts.downloadDir = args[i+1]
+				opts.downloadDirSet = true
 				i++
+			} else {
+				opts.err = fmt.Errorf("%s requires a directory path", args[i])
+			}
+		case "--fallback-dir":
+			if i+1 < len(args) {
+				opts.fallbackDownloadDirs = append(opts.fallbackDownloadDirs, args[i+1])
+				opts.fallbackDirsSet = true
+				i++
+			} else {
+				opts.err = fmt.Errorf("%s requires a directory path", args[i])
 			}
 		case "-c", "--config":
 			if i+1 < len(args) {
 				opts.configDir = args[i+1]
 				i++
+			} else {
+				opts.err = fmt.Errorf("%s requires a directory path", args[i])
 			}
 		case "--no-persist":
 			opts.persist = false
@@ -1386,7 +1447,7 @@ func writeFrame(conn net.Conn, payload []byte) error {
 	return nil
 }
 
-func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup, terminal terminalIdentity, headless bool) {
+func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *downloader.TorrentManager, handlersWG *sync.WaitGroup, terminal terminalIdentity, headless bool, defaults downloadPathOptions) {
 	defer handlersWG.Done()
 	defer unregisterConn(conn)
 	defer conn.Close()
@@ -1436,7 +1497,7 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 			sendResponse(conn, "starting", "saintTorrent is starting up", terminal)
 			return
 		}
-		if err := handleHeadlessSocketMessage(msg, mgr); err != nil {
+		if err := handleHeadlessSocketMessage(msg, mgr, defaults); err != nil {
 			sendResponse(conn, "error", err.Error(), terminal)
 		} else {
 			sendResponse(conn, "ok", "torrent request handled", terminal)
@@ -1467,25 +1528,16 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	}
 }
 
-func handleHeadlessSocketMessage(msg socketMessage, mgr *downloader.TorrentManager) error {
+func handleHeadlessSocketMessage(msg socketMessage, mgr *downloader.TorrentManager, defaults downloadPathOptions) error {
 	if msg.Confirm {
 		return fmt.Errorf("confirmation is unavailable in headless mode; retry with --no-confirm")
 	}
 
-	downloadDir := msg.DownloadDir
-	if downloadDir == "" {
-		downloadDir = "."
-	}
+	paths := socketDownloadPaths(msg, defaults)
 
 	var errs []error
 	for _, item := range msg.Items {
-		var sess *downloader.Session
-		var err error
-		if strings.HasPrefix(item, "magnet:?") {
-			sess, err = mgr.AddMagnet(item, downloadDir)
-		} else {
-			sess, err = mgr.AddTorrentFile(item, downloadDir)
-		}
+		sess, err := addTorrentWithDownloadPaths(mgr, item, paths)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -1551,10 +1603,11 @@ func main() {
 				os.Exit(1)
 			}
 			cfg := appConfig{
-				BinaryPath:         execPath,
-				SocketPath:         socketPath,
-				DefaultDownloadDir: filepath.Join(home, "Downloads"),
-				TerminalApp:        "Terminal",
+				BinaryPath:           execPath,
+				SocketPath:           socketPath,
+				DefaultDownloadDir:   filepath.Join(home, "Downloads"),
+				FallbackDownloadDirs: []string{},
+				TerminalApp:          "Terminal",
 			}
 			data, err := json.MarshalIndent(cfg, "", "  ")
 			if err != nil {
@@ -1582,6 +1635,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", opts.err)
 		os.Exit(2)
 	}
+	userConfig, userConfigPath, configErr := loadUserConfig(opts.configDir)
+	if configErr != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config %s: %v\n", userConfigPath, configErr)
+		os.Exit(2)
+	}
+	applyUserDownloadConfig(&opts, userConfig)
 	logConfig, err := logging.ConfigFromEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error configuring debug log: %v\n", err)
@@ -1599,7 +1658,11 @@ func main() {
 	}
 	defer logging.Close()
 
-	downloadDir := opts.downloadDir
+	downloadPaths := downloadPathOptions{
+		primary:   opts.downloadDir,
+		fallbacks: opts.fallbackDownloadDirs,
+	}.normalized()
+	downloadDir := downloadPaths.primary
 	configDir := opts.configDir
 	persist := opts.persist
 	confirmFlag := opts.confirm
@@ -1608,6 +1671,7 @@ func main() {
 	if logging.Enabled() {
 		logging.Info("app_start",
 			logging.String("download_dir", downloadDir),
+			logging.Int("fallback_download_dirs", len(downloadPaths.fallbacks)),
 			logging.Int("listen_port", opts.listenPort),
 			logging.Bool("nat_enabled", opts.natEnabled),
 			logging.String("encryption", opts.encryption.String()),
@@ -1637,15 +1701,6 @@ func main() {
 
 		normalizedItems := normalizeForwardedItems(filesToAdd)
 
-		var absDownloadDir string
-		if downloadDir != "" {
-			var err error
-			absDownloadDir, err = filepath.Abs(downloadDir)
-			if err != nil {
-				absDownloadDir = downloadDir
-			}
-		}
-
 		var conn net.Conn
 		var connErr error
 		var resp socketResponse
@@ -1659,9 +1714,10 @@ func main() {
 			}
 
 			msg := socketMessage{
-				Items:       normalizedItems,
-				Confirm:     confirmFlag,
-				DownloadDir: absDownloadDir,
+				Items:                normalizedItems,
+				Confirm:              confirmFlag,
+				DownloadDir:          downloadPaths.primary,
+				FallbackDownloadDirs: downloadPaths.fallbacks,
 			}
 			data, err := json.Marshal(msg)
 			if err != nil {
@@ -1758,8 +1814,14 @@ func main() {
 	var startupInfos []string
 	var startupWarns []string
 
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		startupWarns = append(startupWarns, fmt.Sprintf("Failed to create download dir %s: %v", downloadDir, err))
+	selectedDownloadDir, pathErr := selectDownloadPath(downloadPaths)
+	if pathErr != nil {
+		startupWarns = append(startupWarns, pathErr.Error())
+	} else {
+		downloadDir = selectedDownloadDir
+		if downloadDir != downloadPaths.primary {
+			startupWarns = append(startupWarns, fmt.Sprintf("Using fallback download directory %s; preferred directory is unavailable", downloadDir))
+		}
 	}
 
 	mgr := downloader.NewTorrentManager()
@@ -1813,7 +1875,7 @@ func main() {
 			}
 			registerConn(conn)
 			handlersWG.Add(1)
-			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG, terminal, opts.headless)
+			go handleSocketConnection(conn, shutdownChan, mgr, &handlersWG, terminal, opts.headless, downloadPaths)
 		}
 	}()
 
@@ -1868,13 +1930,7 @@ func main() {
 	var initialPending []pendingItem
 	for _, item := range filesToAdd {
 		if opts.headless {
-			var sess *downloader.Session
-			var err error
-			if strings.HasPrefix(item, "magnet:?") {
-				sess, err = mgr.AddMagnet(item, downloadDir)
-			} else {
-				sess, err = mgr.AddTorrentFile(item, downloadDir)
-			}
+			sess, err := addTorrentWithDownloadPaths(mgr, item, downloadPaths)
 			if err != nil {
 				startupWarns = append(startupWarns, fmt.Sprintf("Failed to load torrent %s: %v", item, err))
 				continue
@@ -1896,11 +1952,12 @@ func main() {
 		}
 		displayName = sanitizeText(displayName)
 		initialPending = append(initialPending, pendingItem{
-			rawURL:      item,
-			displayName: displayName,
-			infoHashHex: hashHex,
-			downloadDir: downloadDir,
-			isDuplicate: isDuplicate,
+			rawURL:        item,
+			displayName:   displayName,
+			infoHashHex:   hashHex,
+			downloadDir:   downloadDir,
+			downloadPaths: downloadPaths,
+			isDuplicate:   isDuplicate,
 		})
 	}
 
@@ -1912,6 +1969,7 @@ func main() {
 	var p *tea.Program
 	if !opts.headless {
 		startModel := initialModel(mgr, downloadDir, startupWarn, initialPending)
+		startModel.downloadPaths = downloadPaths
 		startModel.theme = selectedTheme
 		startModel.configDir = configDir
 		startModel.persistEnabled = persist

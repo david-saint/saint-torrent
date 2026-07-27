@@ -198,6 +198,11 @@ func (s *MMapStorage) Close() error {
 		file.tryInvalidateReader()
 		file.tryInvalidateWriter()
 	}
+	if s.downloadRoot != nil {
+		if err := s.downloadRoot.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
@@ -258,16 +263,19 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (b
 }
 
 func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {
-	f, err := openNoFollow(layout.absPath, os.O_RDWR, 0644)
+	if err := layout.volumeGuard.validate(); err != nil {
+		return nil, false, err
+	}
+	f, err := rootOpenNoFollow(layout.downloadRoot, layout.path, os.O_RDWR, 0644)
 	repaired := false
 	if os.IsNotExist(err) {
 		if !repair {
 			return nil, false, fmt.Errorf("failed to open file %s for mmap: %w", layout.path, err)
 		}
-		if err := os.MkdirAll(filepath.Dir(layout.absPath), 0755); err != nil {
+		if err := mkdirAllInRoot(layout.downloadRoot, filepath.Dir(layout.path), 0755); err != nil {
 			return nil, false, fmt.Errorf("failed to recreate directories for file %s: %w", layout.path, err)
 		}
-		f, err = openNoFollow(layout.absPath, os.O_CREATE|os.O_RDWR, 0644)
+		f, err = rootOpenNoFollow(layout.downloadRoot, layout.path, os.O_CREATE|os.O_RDWR, 0644)
 		repaired = true
 	}
 	if err != nil {
@@ -348,18 +356,25 @@ func (s *MMapStorage) refreshDirtyStateLocked() error {
 
 func (s *MMapStorage) touchMappedFileLocked(file *fileLayout) error {
 	now := time.Now()
-	if err := os.Chtimes(file.absPath, now, now); err != nil {
-		fi, statErr := os.Stat(file.absPath)
+	h, err := rootOpenNoFollow(file.downloadRoot, file.path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s for mtime refresh: %w", file.path, err)
+	}
+	tv := unix.NsecToTimeval(now.UnixNano())
+	if err := unix.Futimes(int(h.Fd()), []unix.Timeval{tv, tv}); err != nil {
+		fi, statErr := h.Stat()
+		_ = h.Close()
 		if statErr != nil {
 			return fmt.Errorf("failed to refresh mtime for file %s: chtimes: %v; stat: %w", file.path, err, statErr)
 		}
 		s.stateFileMt[file.path] = fi.ModTime().UnixNano()
 		return nil
 	}
-	if fi, err := os.Stat(file.absPath); err == nil {
+	if fi, err := h.Stat(); err == nil {
 		s.stateFileMt[file.path] = fi.ModTime().UnixNano()
-		return nil
+		return h.Close()
 	} else {
+		_ = h.Close()
 		return fmt.Errorf("failed to stat file %s after mtime refresh: %w", file.path, err)
 	}
 }

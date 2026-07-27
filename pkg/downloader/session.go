@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -245,15 +246,16 @@ type Session struct {
 	optimisticTimer *time.Ticker
 
 	// Metadata exchange state
-	metadataSize        int
-	metadataBuf         []byte
-	metadataPieces      []bool
-	metadataCompleted   bool
-	metadataMode        bool
-	metadataCompletedCh chan struct{}
-	DHT                 *dht.DHT
-	downloadDir         string
-	storageFactory      storage.Factory
+	metadataSize         int
+	metadataBuf          []byte
+	metadataPieces       []bool
+	metadataCompleted    bool
+	metadataMode         bool
+	metadataCompletedCh  chan struct{}
+	DHT                  *dht.DHT
+	downloadDir          string
+	fallbackDownloadDirs []string
+	storageFactory       storage.Factory
 }
 
 // NewSession creates a new download session for a torrent.
@@ -992,6 +994,74 @@ func (s *Session) DownloadDir() string {
 	return s.downloadDir
 }
 
+// SetFallbackDownloadDirs configures ordered alternatives for a metadata-only
+// session. They are tried if deferred storage initialization fails after the
+// magnet metadata arrives.
+func (s *Session) SetFallbackDownloadDirs(dirs []string) {
+	s.mu.Lock()
+	s.fallbackDownloadDirs = append([]string(nil), dirs...)
+	onStateChange := s.OnStateChange
+	s.mu.Unlock()
+	if onStateChange != nil {
+		onStateChange()
+	}
+}
+
+// MergeFallbackDownloadDirs adds ordered alternatives without discarding any
+// already persisted for the session. The active directory is never retained as
+// its own fallback.
+func (s *Session) MergeFallbackDownloadDirs(dirs []string) {
+	s.mu.Lock()
+	activeDir := normalizedDirectory(s.downloadDir)
+	merged := make([]string, 0, len(s.fallbackDownloadDirs)+len(dirs))
+	seen := map[string]struct{}{activeDir: {}}
+	for _, dir := range append(append([]string(nil), s.fallbackDownloadDirs...), dirs...) {
+		normalized := normalizedDirectory(dir)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		merged = append(merged, normalized)
+	}
+	changed := len(merged) != len(s.fallbackDownloadDirs)
+	if !changed {
+		for i := range merged {
+			if merged[i] != s.fallbackDownloadDirs[i] {
+				changed = true
+				break
+			}
+		}
+	}
+	if changed {
+		s.fallbackDownloadDirs = merged
+	}
+	onStateChange := s.OnStateChange
+	s.mu.Unlock()
+	if changed && onStateChange != nil {
+		onStateChange()
+	}
+}
+
+// FallbackDownloadDirs returns a copy of the session's ordered alternatives.
+func (s *Session) FallbackDownloadDirs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.fallbackDownloadDirs...)
+}
+
+func normalizedDirectory(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if absDir, err := filepath.Abs(dir); err == nil {
+		dir = absDir
+	}
+	return filepath.Clean(dir)
+}
+
 // ContentPath returns the absolute on-disk path to this torrent's root item:
 // the file itself for single-file torrents, or the top-level folder for
 // multi-file torrents. ok is false when the path is not yet known, e.g. a
@@ -1396,9 +1466,22 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	if factory == nil {
 		factory = storage.NewStorage
 	}
-	st, err := factory(s.downloadDir, fileInfos, s.Torrent.PieceLength)
-	if err != nil {
-		statusErr := fmt.Errorf("failed to initialize storage: %w", err)
+	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
+	var (
+		st            storage.Storage
+		storageErrors []error
+	)
+	for _, downloadDir := range downloadDirs {
+		st, err = factory(downloadDir, fileInfos, s.Torrent.PieceLength)
+		if err == nil {
+			s.downloadDir = st.BaseDir()
+			s.fallbackDownloadDirs = nil
+			break
+		}
+		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, err))
+	}
+	if st == nil {
+		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
 		s.lastErr = statusErr
 		s.statusErr = statusErr
 		s.broadcastPieceWaitersLocked()
