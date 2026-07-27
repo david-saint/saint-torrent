@@ -40,7 +40,7 @@ func TestValidateOpenedRootDevice(t *testing.T) {
 }
 
 func TestExternalVolumeGuardValidatesHandleAndMountPath(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
+	root, err := OpenDownloadRoot(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

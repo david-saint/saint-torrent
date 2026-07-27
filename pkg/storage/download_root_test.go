@@ -27,7 +27,7 @@ func TestOpenDownloadRootCreatesAnchoredDirectory(t *testing.T) {
 }
 
 func TestMkdirAllInRootCreatesNestedPath(t *testing.T) {
-	root, err := os.OpenRoot(t.TempDir())
+	root, err := OpenDownloadRoot(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,12 +12,12 @@ import (
 
 type externalVolumeGuard struct {
 	rootPath      string
-	root          *os.Root
+	root          *DownloadRoot
 	device        uint64
 	mountedDevice func(string) (uint64, error)
 }
 
-func newExternalVolumeGuard(path string, root *os.Root) (*externalVolumeGuard, error) {
+func newExternalVolumeGuard(path string, root *DownloadRoot) (*externalVolumeGuard, error) {
 	cleanPath, err := canonicalDownloadPath(path)
 	if err != nil {
 		return nil, err

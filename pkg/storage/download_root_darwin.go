@@ -61,7 +61,11 @@ func openPlatformDownloadRoot(path string) (*os.Root, error) {
 	return current, nil
 }
 
-func validateOpenedRootDevice(root *os.Root, expectedDevice uint64, volumeName string) error {
+type rootStatter interface {
+	Stat(string) (os.FileInfo, error)
+}
+
+func validateOpenedRootDevice(root rootStatter, expectedDevice uint64, volumeName string) error {
 	openedInfo, err := root.Stat(".")
 	if err != nil {
 		return fmt.Errorf("inspect opened download directory: %w", err)

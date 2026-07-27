@@ -108,7 +108,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 // to downloadRoot, so a later symlink swap cannot redirect payload I/O.
 type fileLayout struct {
 	path         string // relative path (torrent-declared)
-	downloadRoot *os.Root
+	downloadRoot *DownloadRoot
 	volumeGuard  *externalVolumeGuard
 	length       int64
 	startOffset  int64
@@ -270,7 +270,7 @@ type FileStorage struct {
 	mtMu         sync.Mutex
 	stateFileMt  map[string]int64
 	dirty        map[*fileLayout]struct{}
-	downloadRoot *os.Root
+	downloadRoot *DownloadRoot
 	closed       atomic.Bool
 }
 
@@ -437,7 +437,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	}, nil
 }
 
-func openOrCreateRootFile(root *os.Root, path string, perm os.FileMode) (*os.File, bool, error) {
+func openOrCreateRootFile(root *DownloadRoot, path string, perm os.FileMode) (*os.File, bool, error) {
 	f, err := rootOpenNoFollow(root, path, os.O_RDWR, perm)
 	if err == nil {
 		return f, false, nil

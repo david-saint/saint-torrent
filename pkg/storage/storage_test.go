@@ -788,7 +788,7 @@ func TestOpenNoFollowSymlink(t *testing.T) {
 		t.Skipf("symlink creation not supported in this environment: %v", err)
 	}
 
-	root, err := os.OpenRoot(tmpDir)
+	root, err := OpenDownloadRoot(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}

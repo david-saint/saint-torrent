@@ -12,14 +12,21 @@ var errUnsafeRootPath = errors.New("path is a symbolic link or changed while ope
 // symlinks that resolve inside the root; the identity check rejects those too.
 // O_TRUNC is deliberately applied only after validation so a raced symlink can
 // never truncate its target before being rejected.
-func rootOpenNoFollow(root *os.Root, path string, flag int, perm os.FileMode) (*os.File, error) {
+func rootOpenNoFollow(root *DownloadRoot, path string, flag int, perm os.FileMode) (*os.File, error) {
+	rawRoot, release, err := root.acquire()
+	if err != nil {
+		return nil, err
+	}
+	if release {
+		defer rawRoot.Close()
+	}
 	openFlag := flag &^ os.O_TRUNC
-	f, err := root.OpenFile(path, openFlag, perm)
+	f, err := rawRoot.OpenFile(path, openFlag, perm)
 	if err != nil {
 		return nil, err
 	}
 
-	pathInfo, pathErr := root.Lstat(path)
+	pathInfo, pathErr := rawRoot.Lstat(path)
 	openedInfo, openedErr := f.Stat()
 	if pathErr != nil || openedErr != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, openedInfo) {
 		_ = f.Close()
