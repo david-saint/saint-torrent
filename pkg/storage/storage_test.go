@@ -327,6 +327,40 @@ func TestStorageRejectsReservedInternalNames(t *testing.T) {
 	}
 }
 
+func TestStoragePrevalidatesAllPathsBeforeCreatingFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	_, err := NewStorage(tmpDir, []FileInfo{
+		{Path: "would-have-been-created.bin", Length: 1},
+		{Path: ".dht_nodes", Length: 1},
+	}, 1)
+	if err == nil {
+		t.Fatal("expected reserved second path to be rejected")
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "would-have-been-created.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("storage created a file before validating all paths: %v", statErr)
+	}
+}
+
+func TestStorageFailureRemovesOnlyNewlyCreatedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(tmpDir, "existing-directory"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewStorage(tmpDir, []FileInfo{
+		{Path: "new-file.bin", Length: 1},
+		{Path: "existing-directory", Length: 1},
+	}, 1)
+	if err == nil {
+		t.Fatal("expected opening an existing directory as a payload file to fail")
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "new-file.bin")); !os.IsNotExist(statErr) {
+		t.Fatalf("new file from failed construction was not removed: %v", statErr)
+	}
+	if info, statErr := os.Stat(filepath.Join(tmpDir, "existing-directory")); statErr != nil || !info.IsDir() {
+		t.Fatalf("pre-existing directory was changed: info=%v err=%v", info, statErr)
+	}
+}
+
 func TestStorageAllowsNestedReservedNames(t *testing.T) {
 	// The collision only exists at the download-dir root, so a reserved name nested
 	// under a normal top-level directory must remain allowed.
@@ -750,14 +784,20 @@ func TestOpenNoFollowSymlink(t *testing.T) {
 	}
 
 	linkFile := filepath.Join(tmpDir, "link.bin")
-	if err := os.Symlink(targetFile, linkFile); err != nil {
+	if err := os.Symlink(filepath.Base(targetFile), linkFile); err != nil {
 		t.Skipf("symlink creation not supported in this environment: %v", err)
 	}
 
-	f, err := openNoFollow(linkFile, os.O_RDONLY, 0)
+	root, err := OpenDownloadRoot(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	f, err := rootOpenNoFollow(root, filepath.Base(linkFile), os.O_WRONLY|os.O_TRUNC, 0)
 	if err == nil {
 		_ = f.Close()
-		t.Fatal("expected openNoFollow to fail when opening a symlink")
+		t.Fatal("expected rootOpenNoFollow to fail when opening a symlink")
 	}
 
 	content, err := os.ReadFile(targetFile)

@@ -841,12 +841,13 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 }
 
 type PersistedTorrent struct {
-	InfoHashHex    string         `json:"info_hash_hex"`
-	MagnetURI      string         `json:"magnet_uri,omitempty"`
-	DownloadDir    string         `json:"download_dir"`
-	Paused         bool           `json:"paused"`
-	FilePriorities []FilePriority `json:"file_priorities,omitempty"`
-	AddedAt        *time.Time     `json:"added_at,omitempty"`
+	InfoHashHex          string         `json:"info_hash_hex"`
+	MagnetURI            string         `json:"magnet_uri,omitempty"`
+	DownloadDir          string         `json:"download_dir"`
+	FallbackDownloadDirs []string       `json:"fallback_download_dirs,omitempty"`
+	Paused               bool           `json:"paused"`
+	FilePriorities       []FilePriority `json:"file_priorities,omitempty"`
+	AddedAt              *time.Time     `json:"added_at,omitempty"`
 }
 
 type PersistedState struct {
@@ -877,6 +878,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		}
 		magnetURI := sess.MagnetURI
 		downloadDir := sess.downloadDir
+		fallbackDownloadDirs := append([]string(nil), sess.fallbackDownloadDirs...)
 		paused := sess.paused
 		addedAt := sess.AddedAt
 		sess.mu.RUnlock()
@@ -888,12 +890,13 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		}
 
 		state.Torrents = append(state.Torrents, PersistedTorrent{
-			InfoHashHex:    infoHashHex,
-			MagnetURI:      magnetURI,
-			DownloadDir:    downloadDir,
-			Paused:         paused,
-			FilePriorities: priorities,
-			AddedAt:        addedAtPtr,
+			InfoHashHex:          infoHashHex,
+			MagnetURI:            magnetURI,
+			DownloadDir:          downloadDir,
+			FallbackDownloadDirs: fallbackDownloadDirs,
+			Paused:               paused,
+			FilePriorities:       priorities,
+			AddedAt:              addedAtPtr,
 		})
 	}
 
@@ -1178,6 +1181,10 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		}
 
 		if sess != nil {
+			if sess.IsMetadataMode() {
+				sess.MergeFallbackDownloadDirs(entry.FallbackDownloadDirs)
+			}
+
 			// Restore AddedAt
 			if entry.AddedAt != nil && !entry.AddedAt.IsZero() {
 				sess.mu.Lock()
