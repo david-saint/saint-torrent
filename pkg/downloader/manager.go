@@ -1181,11 +1181,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		}
 
 		if sess != nil {
-			sess.mu.Lock()
-			if sess.metadataMode {
-				sess.fallbackDownloadDirs = append([]string(nil), entry.FallbackDownloadDirs...)
+			if sess.IsMetadataMode() {
+				sess.MergeFallbackDownloadDirs(entry.FallbackDownloadDirs)
 			}
-			sess.mu.Unlock()
 
 			// Restore AddedAt
 			if entry.AddedAt != nil && !entry.AddedAt.IsZero() {

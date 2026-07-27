@@ -129,12 +129,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         // Construct the framed JSON message using JSONSerialization for safe escaping
-        let messageDict: [String: Any] = [
+        var messageDict: [String: Any] = [
             "items": [urlString],
             "confirm": true,
-            "download_dir": config.defaultDownloadDir,
-            "fallback_download_dirs": config.fallbackDownloadDirs
+            "download_dir": config.defaultDownloadDir
         ]
+        if !config.fallbackDownloadDirs.isEmpty {
+            messageDict["fallback_download_dirs"] = config.fallbackDownloadDirs
+        }
         
         guard let jsonData = try? JSONSerialization.data(withJSONObject: messageDict, options: []),
               let jsonString = String(data: jsonData, encoding: .utf8) else {

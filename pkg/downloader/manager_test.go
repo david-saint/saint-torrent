@@ -417,6 +417,77 @@ func TestPersistenceMagnetStateTransitions(t *testing.T) {
 	mgr.Close()
 }
 
+func TestPersistenceRetainsFallbackAfterMagnetMetadataCompletes(t *testing.T) {
+	tempDir := t.TempDir()
+	configDir := filepath.Join(tempDir, "config")
+	primaryDir := filepath.Join(tempDir, "primary")
+	fallbackDir := filepath.Join(tempDir, "fallback")
+	info := map[string]interface{}{
+		"name":         "persisted-fallback.bin",
+		"piece length": int64(1),
+		"pieces":       string(make([]byte, 20)),
+		"length":       int64(1),
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoHash := sha1.Sum(infoBytes)
+	infoHashHex := fmt.Sprintf("%x", infoHash)
+	magnetURI := "magnet:?xt=urn:btih:" + infoHashHex + "&dn=PersistedFallback"
+
+	first := NewTorrentManager()
+	first.SetStorageFactory(func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		return storage.NewMemStorage(dir, files, pieceLength)
+	})
+	if _, err := first.EnablePersistence(configDir); err != nil {
+		first.Close()
+		t.Fatalf("enable first persistence: %v", err)
+	}
+	sess, err := first.AddMagnet(magnetURI, primaryDir)
+	if err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	sess.MergeFallbackDownloadDirs([]string{fallbackDir})
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		first.Close()
+		t.Fatalf("complete first metadata: %v", err)
+	}
+	if got := sess.FallbackDownloadDirs(); len(got) != 1 || got[0] != fallbackDir {
+		first.Close()
+		t.Fatalf("fallbacks after metadata = %v, want %q", got, fallbackDir)
+	}
+	first.Close()
+
+	second := NewTorrentManager()
+	defer second.Close()
+	var storageCalls []string
+	second.SetStorageFactory(func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		storageCalls = append(storageCalls, dir)
+		if filepath.Clean(dir) == filepath.Clean(primaryDir) {
+			return nil, fmt.Errorf("primary unavailable")
+		}
+		return storage.NewMemStorage(dir, files, pieceLength)
+	})
+	if _, err := second.EnablePersistence(configDir); err != nil {
+		t.Fatalf("enable second persistence: %v", err)
+	}
+	restored := second.GetSession(infoHashHex)
+	if restored == nil {
+		t.Fatal("persisted magnet was not restored")
+	}
+	if got := restored.FallbackDownloadDirs(); len(got) != 1 || got[0] != fallbackDir {
+		t.Fatalf("restored fallbacks = %v, want %q", got, fallbackDir)
+	}
+	if err := restored.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("complete restored metadata: %v", err)
+	}
+	if got := restored.DownloadDir(); got != fallbackDir {
+		t.Fatalf("restored download directory = %q, want fallback %q (calls: %v)", got, fallbackDir, storageCalls)
+	}
+}
+
 func TestPersistenceRestoreTorrentPrioritiesRebuildNeededBuckets(t *testing.T) {
 	tempDir := t.TempDir()
 	configDir := filepath.Join(tempDir, "config")

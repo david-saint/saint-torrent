@@ -553,8 +553,8 @@ func (m model) viewAddConfirm() string {
 	nameLabel := "Torrent Name: "
 	sb.WriteString(g + st.Header.Render("Torrent Name") + ": " +
 		truncateRight(item.displayName, bw-dispWidth(nameLabel)) + "\n")
-	dirLabel := "Download Dir: "
-	sb.WriteString(g + st.Header.Render("Download Dir") + ": " +
+	dirLabel := "Preferred Download Dir: "
+	sb.WriteString(g + st.Header.Render("Preferred Download Dir") + ": " +
 		truncateMiddle(sanitizeText(item.downloadDir), bw-dispWidth(dirLabel)) + "\n\n")
 
 	if item.isDuplicate {

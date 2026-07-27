@@ -1471,11 +1471,11 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		st            storage.Storage
 		storageErrors []error
 	)
-	for _, downloadDir := range downloadDirs {
+	for index, downloadDir := range downloadDirs {
 		st, err = factory(downloadDir, fileInfos, s.Torrent.PieceLength)
 		if err == nil {
 			s.downloadDir = st.BaseDir()
-			s.fallbackDownloadDirs = nil
+			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
 			break
 		}
 		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, err))

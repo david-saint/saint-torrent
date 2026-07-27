@@ -16,13 +16,16 @@ func mkdirAllInRoot(root *os.Root, path string, perm os.FileMode) error {
 	}
 	current := root
 	for _, component := range splitPathComponents(path) {
-		if err := current.Mkdir(component, perm); err != nil && !os.IsExist(err) {
-			if current != root {
-				_ = current.Close()
-			}
-			return err
-		}
 		next, err := current.OpenRoot(component)
+		if os.IsNotExist(err) {
+			if err := current.Mkdir(component, perm); err != nil && !os.IsExist(err) {
+				if current != root {
+					_ = current.Close()
+				}
+				return err
+			}
+			next, err = current.OpenRoot(component)
+		}
 		if current != root {
 			_ = current.Close()
 		}

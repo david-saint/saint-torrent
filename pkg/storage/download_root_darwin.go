@@ -68,7 +68,7 @@ func validateOpenedRootDevice(root *os.Root, expectedDevice uint64, volumeName s
 	}
 	openedStat, ok := openedInfo.Sys().(*syscall.Stat_t)
 	if !ok || uint64(openedStat.Dev) != expectedDevice {
-		return fmt.Errorf("download directory moved off volume %q while opening", volumeName)
+		return fmt.Errorf("download root is no longer on volume %q", volumeName)
 	}
 	return nil
 }

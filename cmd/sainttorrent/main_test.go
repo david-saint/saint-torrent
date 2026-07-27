@@ -1321,6 +1321,38 @@ func TestForwardedDownloadDir(t *testing.T) {
 	}
 }
 
+func TestConfirmedForwardDoesNotProbePathsOnTUIEventLoop(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+
+	root := t.TempDir()
+	blockingFile := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(blockingFile, []byte("blocked"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	primary := filepath.Join(blockingFile, "primary")
+	fallback := filepath.Join(root, "fallback")
+	m := initialModel(mgr, t.TempDir(), "", nil)
+
+	updated, _ := m.Update(addTorrentMsg{msg: socketMessage{
+		Items:                []string{"magnet:?xt=urn:btih:742e85596f7a0dd05eefdb78b0ac1736496f8626&dn=NoUIProbe"},
+		Confirm:              true,
+		DownloadDir:          primary,
+		FallbackDownloadDirs: []string{fallback},
+	}})
+	m = updated.(model)
+
+	if len(m.pendingItems) != 1 {
+		t.Fatalf("pending items = %d, want 1", len(m.pendingItems))
+	}
+	if got := m.pendingItems[0].downloadDir; got != primary {
+		t.Fatalf("displayed directory = %q, want preferred %q", got, primary)
+	}
+	if _, err := os.Stat(fallback); !os.IsNotExist(err) {
+		t.Fatalf("confirmation handling touched fallback path: %v", err)
+	}
+}
+
 func TestRelativeTorrentPathNormalization(t *testing.T) {
 	files := []string{"magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626", "some/relative/path.torrent"}
 

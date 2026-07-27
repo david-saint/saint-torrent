@@ -905,10 +905,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Convert msg.msg.Items to pendingItems
 		var newPending []pendingItem
 		paths := socketDownloadPaths(msg.msg, m.downloadPaths)
-		pDir := paths.primary
-		if selectedDir, err := selectDownloadPath(paths); err == nil {
-			pDir = selectedDir
-		}
 		for _, item := range msg.msg.Items {
 			name, hashHex, err := parseItem(item)
 			isDuplicate := false
@@ -927,7 +923,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				rawURL:        item,
 				displayName:   displayName,
 				infoHashHex:   hashHex,
-				downloadDir:   pDir,
+				downloadDir:   paths.primary,
 				downloadPaths: paths,
 				isDuplicate:   isDuplicate,
 			}

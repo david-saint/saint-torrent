@@ -297,7 +297,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	if err != nil {
 		return nil, err
 	}
-	volumeGuard, err := newExternalVolumeGuard(resolver.BaseDir())
+	volumeGuard, err := newExternalVolumeGuard(resolver.BaseDir(), downloadRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +305,6 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	var layouts []*fileLayout
 	var currentOffset int64
 	seenPaths := make(map[string]bool)
-	stateFileMt := make(map[string]int64, len(files))
 
 	for _, file := range files {
 		if file.Length < 0 {
@@ -354,9 +353,38 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
+	}
 
-		if err := mkdirAllInRoot(downloadRoot, filepath.Dir(file.Path), 0755); err != nil {
-			return nil, fmt.Errorf("failed to create directories for file %s: %w", file.Path, err)
+	createdDirs := map[string]struct{}{".": {}}
+	type createdFile struct {
+		path string
+		info os.FileInfo
+	}
+	createdFiles := make([]createdFile, 0, len(files))
+	keepCreatedFiles := false
+	defer func() {
+		if keepCreatedFiles {
+			return
+		}
+		for i := len(createdFiles) - 1; i >= 0; i-- {
+			created := createdFiles[i]
+			current, err := downloadRoot.Lstat(created.path)
+			if err == nil && current.Mode()&os.ModeSymlink == 0 && os.SameFile(current, created.info) {
+				_ = downloadRoot.Remove(created.path)
+			}
+		}
+	}()
+	stateFileMt := make(map[string]int64, len(files))
+
+	for _, layout := range layouts {
+		path := layout.path
+
+		parentDir := filepath.Clean(filepath.Dir(path))
+		if _, exists := createdDirs[parentDir]; !exists {
+			if err := mkdirAllInRoot(downloadRoot, parentDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create directories for file %s: %w", path, err)
+			}
+			createdDirs[parentDir] = struct{}{}
 		}
 		if err := volumeGuard.validate(); err != nil {
 			return nil, err
@@ -366,33 +394,36 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		// We do not retain this handle: read handles are cached lazily on first read
 		// (see fileLayout.reader) and writes open on demand, which keeps construction
 		// cheap and lets tests that swap a file for a FIFO still block on first access.
-		f, err := rootOpenNoFollow(downloadRoot, file.Path, os.O_CREATE|os.O_RDWR, 0644)
+		f, created, err := openOrCreateRootFile(downloadRoot, path, 0644)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open/create file %s: %w", file.Path, err)
+			return nil, fmt.Errorf("failed to open/create file %s: %w", path, err)
 		}
-
 		fi, err := f.Stat()
 		if err != nil {
 			f.Close()
-			return nil, fmt.Errorf("failed to stat file %s: %w", file.Path, err)
+			return nil, fmt.Errorf("failed to stat file %s: %w", path, err)
 		}
-		if fi.Size() != file.Length {
-			if err := f.Truncate(file.Length); err != nil {
+		if created {
+			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
+		}
+		if fi.Size() != layout.length {
+			if err := f.Truncate(layout.length); err != nil {
 				f.Close()
-				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", file.Path, err)
+				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", path, err)
 			}
 			fi, err = f.Stat()
 			if err != nil {
 				f.Close()
-				return nil, fmt.Errorf("failed to stat file %s after resize: %w", file.Path, err)
+				return nil, fmt.Errorf("failed to stat file %s after resize: %w", path, err)
 			}
 		}
-		stateFileMt[file.Path] = fi.ModTime().UnixNano()
+		stateFileMt[path] = fi.ModTime().UnixNano()
 		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("failed to close file %s: %w", file.Path, err)
+			return nil, fmt.Errorf("failed to close file %s: %w", path, err)
 		}
 	}
 
+	keepCreatedFiles = true
 	keepDownloadRoot = true
 	return &FileStorage{
 		resolver:     resolver,
@@ -404,6 +435,22 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		dirty:        make(map[*fileLayout]struct{}, len(layouts)),
 		downloadRoot: downloadRoot,
 	}, nil
+}
+
+func openOrCreateRootFile(root *os.Root, path string, perm os.FileMode) (*os.File, bool, error) {
+	f, err := rootOpenNoFollow(root, path, os.O_RDWR, perm)
+	if err == nil {
+		return f, false, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, false, err
+	}
+	f, err = rootOpenNoFollow(root, path, os.O_CREATE|os.O_EXCL|os.O_RDWR, perm)
+	if os.IsExist(err) {
+		f, err = rootOpenNoFollow(root, path, os.O_RDWR, perm)
+		return f, false, err
+	}
+	return f, err == nil, err
 }
 
 // BaseDir returns the base directory of the storage.
@@ -765,17 +812,9 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 	if err != nil {
 		return err
 	}
-	for written := 0; written < len(data); {
-		n, writeErr := stateFile.Write(data[written:])
-		if writeErr != nil {
-			_ = stateFile.Close()
-			return writeErr
-		}
-		if n == 0 {
-			_ = stateFile.Close()
-			return io.ErrNoProgress
-		}
-		written += n
+	if _, err := stateFile.Write(data); err != nil {
+		_ = stateFile.Close()
+		return err
 	}
 	return stateFile.Close()
 }
@@ -828,6 +867,9 @@ func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file path mismatch at index %d", i)
 		}
 
+		// The rooted stat intentionally pays for a secure component walk. LoadState
+		// is a once-per-torrent control path, so avoiding a symlink race matters more
+		// here than matching the syscall count of an absolute-path stat.
 		fi, err := f.downloadRoot.Stat(f.path)
 		if err != nil {
 			return nil, fmt.Errorf("file stat error: %w", err)

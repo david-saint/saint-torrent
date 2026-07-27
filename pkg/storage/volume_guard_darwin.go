@@ -11,11 +11,13 @@ import (
 )
 
 type externalVolumeGuard struct {
-	rootPath string
-	device   uint64
+	rootPath      string
+	root          *os.Root
+	device        uint64
+	mountedDevice func(string) (uint64, error)
 }
 
-func newExternalVolumeGuard(path string) (*externalVolumeGuard, error) {
+func newExternalVolumeGuard(path string, root *os.Root) (*externalVolumeGuard, error) {
 	cleanPath, err := canonicalDownloadPath(path)
 	if err != nil {
 		return nil, err
@@ -33,14 +35,22 @@ func newExternalVolumeGuard(path string) (*externalVolumeGuard, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &externalVolumeGuard{rootPath: rootPath, device: device}, nil
+	return &externalVolumeGuard{
+		rootPath:      rootPath,
+		root:          root,
+		device:        device,
+		mountedDevice: mountedVolumeDevice,
+	}, nil
 }
 
 func (g *externalVolumeGuard) validate() error {
 	if g == nil {
 		return nil
 	}
-	device, err := mountedVolumeDevice(g.rootPath)
+	if err := validateOpenedRootDevice(g.root, g.device, filepath.Base(g.rootPath)); err != nil {
+		return err
+	}
+	device, err := g.mountedDevice(g.rootPath)
 	if err != nil {
 		return err
 	}

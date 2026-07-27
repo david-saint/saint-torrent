@@ -2,9 +2,11 @@
 
 package storage
 
+import "os"
+
 type externalVolumeGuard struct{}
 
-func newExternalVolumeGuard(string) (*externalVolumeGuard, error) {
+func newExternalVolumeGuard(string, *os.Root) (*externalVolumeGuard, error) {
 	return nil, nil
 }
 
