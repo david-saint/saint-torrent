@@ -170,17 +170,45 @@ func (f *fileLayout) invalidateReaderLocked() {
 	}
 }
 
-// writer returns the cached O_RDWR handle, opening it on first use. The open
-// doubles as the repair check: if the file vanished it is recreated, and if its
-// size drifted it is truncated back to the declared length — either case reports
-// repaired=true and drops the now-stale read handle. Once cached, subsequent
-// writes reuse the handle, so the open/stat/close syscall churn is paid once per
-// file rather than once per completed piece. Guarded by wmu.
+func (f *fileLayout) isWriteHandleValidLocked() bool {
+	if f.writeHandle == nil {
+		return false
+	}
+	if err := f.volumeGuard.validate(); err != nil {
+		return false
+	}
+	hInfo, err := f.writeHandle.Stat()
+	if err != nil || hInfo.Size() != f.length {
+		return false
+	}
+	pathInfo, err := f.downloadRoot.Lstat(f.path)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() != f.length {
+		return false
+	}
+	return os.SameFile(pathInfo, hInfo)
+}
+
+// writer returns the cached O_RDWR handle, opening it on first use and
+// re-validating the handle's on-disk identity on reuse. The open doubles as the
+// repair check: if the file vanished it is recreated, and if its size drifted it
+// is truncated back to the declared length — either case reports repaired=true
+// and drops the now-stale read handle. Once cached, subsequent writes reuse the
+// handle after a fast identity check (fstat + lstat against downloadRoot), so the
+// full open/close syscall pair is avoided while still detecting external deletion,
+// moves, truncation, or replacement. Guarded by wmu.
 func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 	f.wmu.Lock()
 	defer f.wmu.Unlock()
 	if f.writeHandle != nil {
-		return f.writeHandle, false, nil
+		if f.isWriteHandleValidLocked() {
+			return f.writeHandle, false, nil
+		}
+		// The cached handle failed validation (file was unlinked, moved,
+		// replaced, or resized externally). Drop the stale write and read
+		// handles and mark this write as a repair.
+		f.invalidateWriterLocked()
+		f.invalidateReader()
+		repaired = true
 	}
 	if err := f.volumeGuard.validate(); err != nil {
 		return nil, false, err

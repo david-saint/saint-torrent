@@ -250,8 +250,23 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 
 func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (bool, error) {
 	layout := mapped.layout
-	if layout.length == 0 || len(mapped.data) > 0 {
+	if layout.length == 0 {
 		return false, nil
+	}
+	wasStale := false
+	if len(mapped.data) > 0 {
+		if !repair {
+			return false, nil
+		}
+		if s.isMappedFileValidLocked(mapped) {
+			return false, nil
+		}
+		// File on disk was unlinked, replaced, or resized; drop the stale mapping.
+		_ = unix.Munmap(mapped.data)
+		mapped.data = nil
+		layout.invalidateWriter()
+		layout.invalidateReader()
+		wasStale = true
 	}
 
 	data, repaired, err := mapOrRepairFile(layout, repair)
@@ -259,7 +274,19 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (b
 		return false, err
 	}
 	mapped.data = data
-	return repaired, nil
+	return repaired || wasStale, nil
+}
+
+func (s *MMapStorage) isMappedFileValidLocked(mapped *mappedFile) bool {
+	layout := mapped.layout
+	if err := layout.volumeGuard.validate(); err != nil {
+		return false
+	}
+	pathInfo, err := layout.downloadRoot.Lstat(layout.path)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || pathInfo.Size() != layout.length {
+		return false
+	}
+	return true
 }
 
 func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {

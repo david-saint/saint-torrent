@@ -118,6 +118,43 @@ func TestMMapStorageWriteBlockRepairsMissingFile(t *testing.T) {
 	}
 }
 
+func TestMMapStorageWriteBlockRepairsUnlinkedMappedFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := NewMMapStorage(tmpDir, []FileInfo{{Path: "unlinked.bin", Length: 64}}, 32)
+	if err != nil {
+		t.Fatalf("NewMMapStorage: %v", err)
+	}
+	defer st.Close()
+
+	filePath := filepath.Join(tmpDir, "unlinked.bin")
+
+	// First write warms and maps the file.
+	p0Data := bytes.Repeat([]byte{'a'}, 32)
+	if err := st.WriteBlock(0, 0, p0Data); err != nil {
+		t.Fatalf("initial write piece 0: %v", err)
+	}
+
+	// Delete file while mapping is active.
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("remove mapped file: %v", err)
+	}
+
+	// Next write must unmap the stale mapping, recreate file on disk, and report ErrFileRepaired.
+	p1Data := bytes.Repeat([]byte{'b'}, 32)
+	err = st.WriteBlock(1, 0, p1Data)
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after unlinking mapped file = %v, want ErrFileRepaired", err)
+	}
+
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("recreated file stat: %v", err)
+	}
+	if fi.Size() != 64 {
+		t.Fatalf("recreated file size = %d, want 64", fi.Size())
+	}
+}
+
 func TestMMapStorageReadBlockDoesNotRepairMissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	st, err := NewMMapStorage(tmpDir, []FileInfo{{Path: "missing-read.bin", Length: 32}}, 32)

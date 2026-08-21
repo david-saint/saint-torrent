@@ -578,8 +578,9 @@ func TestStorageWriteBlockCachesWriteHandle(t *testing.T) {
 }
 
 // TestStorageWriteRepairInvalidatesReadHandle proves that when a mid-session write
-// recreates a vanished file, the cached read handle pointing at the orphaned inode
-// is dropped so subsequent reads observe the freshly written bytes.
+// recreates a vanished file without any manual handle invalidation, the cached write
+// handle detects the unlinked inode, invalidates the cached read handle pointing at
+// the orphaned inode, and drops it so subsequent reads observe the freshly written bytes.
 func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 	tmpDir := t.TempDir()
 	s, err := NewStorage(tmpDir, []FileInfo{{Path: "repair.bin", Length: 16}}, 16)
@@ -597,9 +598,6 @@ func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 		t.Fatalf("initial read: %v", err)
 	}
 
-	// Drop both cached handles so the next write reopens (and repairs) the file.
-	fs := s.(*FileStorage)
-	fs.files[0].invalidateWriter()
 	if err := os.Remove(filepath.Join(tmpDir, "repair.bin")); err != nil {
 		t.Fatalf("remove file: %v", err)
 	}
@@ -615,6 +613,187 @@ func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 	}
 	if !bytes.Equal(got, second) {
 		t.Fatalf("post-repair read returned stale data %q, want %q", got, second)
+	}
+}
+
+// TestStorageWriteBlockRepairsUnlinkedCachedHandle reproduces issue #89:
+// writes after an external file deletion must return ErrFileRepaired, recreate the
+// file on disk, invalidate stale read handles so verification reflects the on-disk
+// state, and allow clean resume persistence.
+func TestStorageWriteBlockRepairsUnlinkedCachedHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	const pieceLen = 32
+	const fileLen = 64
+	filePath := filepath.Join(tmpDir, "payload.bin")
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "payload.bin", Length: fileLen}}, pieceLen)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	p0Data := bytes.Repeat([]byte{'A'}, pieceLen)
+	if err := s.WriteBlock(0, 0, p0Data); err != nil {
+		t.Fatalf("write piece 0: %v", err)
+	}
+	p0Hash := sha1.Sum(p0Data)
+	ok, err := s.VerifyPiece(0, p0Hash)
+	if err != nil || !ok {
+		t.Fatalf("verify piece 0 initial: ok=%v, err=%v", ok, err)
+	}
+
+	// External delete while storage holds open/cached read and write handles.
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+
+	p1Data := bytes.Repeat([]byte{'B'}, pieceLen)
+	p1Hash := sha1.Sum(p1Data)
+
+	// WriteBlock must detect the unlinked file, recreate it, and return ErrFileRepaired.
+	err = s.WriteBlock(1, 0, p1Data)
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after external delete = %v, want ErrFileRepaired", err)
+	}
+
+	// The file must now exist on disk with the declared size.
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("recreated file stat failed: %v", err)
+	}
+	if fi.Size() != fileLen {
+		t.Fatalf("recreated file size = %d, want %d", fi.Size(), fileLen)
+	}
+
+	// Verify piece 1 should pass on the newly created file.
+	ok, err = s.VerifyPiece(1, p1Hash)
+	if err != nil || !ok {
+		t.Fatalf("verify piece 1 on recreated file: ok=%v, err=%v", ok, err)
+	}
+
+	// Verify piece 0 must FAIL because piece 0 was lost when the file was unlinked.
+	ok, err = s.VerifyPiece(0, p0Hash)
+	if err != nil {
+		t.Fatalf("verify piece 0 error: %v", err)
+	}
+	if ok {
+		t.Fatal("verify piece 0 unexpectedly succeeded; stale read handle was not invalidated")
+	}
+
+	// SaveState captures fresh mtime and succeeds.
+	infoHash := "0123456789abcdef0123456789abcdef01234567"
+	if err := s.SaveState(infoHash, []int{1}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	loaded, err := s.LoadState(infoHash)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0] != 1 {
+		t.Fatalf("loaded pieces = %v, want [1]", loaded)
+	}
+}
+
+// TestStorageWriteBlockRepairsMovedCachedHandle proves that when a file is moved
+// away mid-session, WriteBlock detects that the directory entry no longer points
+// to the cached handle, recreates the file at the declared path, and returns ErrFileRepaired.
+func TestStorageWriteBlockRepairsMovedCachedHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "moved.bin")
+	movedPath := filepath.Join(tmpDir, "quarantine.bin")
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "moved.bin", Length: 64}}, 32)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.WriteBlock(0, 0, bytes.Repeat([]byte{'m'}, 32)); err != nil {
+		t.Fatalf("write piece 0: %v", err)
+	}
+
+	if err := os.Rename(filePath, movedPath); err != nil {
+		t.Fatalf("rename file: %v", err)
+	}
+
+	err = s.WriteBlock(1, 0, bytes.Repeat([]byte{'n'}, 32))
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after move = %v, want ErrFileRepaired", err)
+	}
+
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("recreated file stat: %v", err)
+	}
+	if fi.Size() != 64 {
+		t.Fatalf("recreated file size = %d, want 64", fi.Size())
+	}
+}
+
+// TestStorageWriteBlockRepairsReplacedCachedHandle proves that if a file is replaced
+// by a different file at the same path mid-session, WriteBlock detects the identity
+// change, drops stale handles, and returns ErrFileRepaired.
+func TestStorageWriteBlockRepairsReplacedCachedHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "replaced.bin")
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "replaced.bin", Length: 32}}, 32)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.WriteBlock(0, 0, bytes.Repeat([]byte{'a'}, 32)); err != nil {
+		t.Fatalf("write initial: %v", err)
+	}
+
+	// Atomically replace with a new file of the same length but new inode.
+	replacementPath := filepath.Join(tmpDir, "temp_replacement.bin")
+	if err := os.WriteFile(replacementPath, bytes.Repeat([]byte{'b'}, 32), 0644); err != nil {
+		t.Fatalf("write replacement file: %v", err)
+	}
+	if err := os.Rename(replacementPath, filePath); err != nil {
+		t.Fatalf("atomic rename replacement: %v", err)
+	}
+
+	// Next write must detect identity mismatch and report repair.
+	err = s.WriteBlock(0, 0, bytes.Repeat([]byte{'c'}, 32))
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after replacement = %v, want ErrFileRepaired", err)
+	}
+}
+
+// TestStorageWriteBlockRepairsTruncatedCachedHandle proves that if a file is truncated
+// externally mid-session, WriteBlock restores the declared size and returns ErrFileRepaired.
+func TestStorageWriteBlockRepairsTruncatedCachedHandle(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "truncated.bin")
+
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "truncated.bin", Length: 64}}, 32)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.WriteBlock(0, 0, bytes.Repeat([]byte{'t'}, 32)); err != nil {
+		t.Fatalf("write initial: %v", err)
+	}
+
+	if err := os.Truncate(filePath, 10); err != nil {
+		t.Fatalf("truncate file: %v", err)
+	}
+
+	err = s.WriteBlock(1, 0, bytes.Repeat([]byte{'u'}, 32))
+	if !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after truncate = %v, want ErrFileRepaired", err)
+	}
+
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat after truncate repair: %v", err)
+	}
+	if fi.Size() != 64 {
+		t.Fatalf("file size after truncate repair = %d, want 64", fi.Size())
 	}
 }
 
