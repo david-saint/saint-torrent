@@ -239,16 +239,29 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	c := s.conns[key]
 	listener := s.listener
 	closed := s.closed
-	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
-		recvKey := newConnKey(addr, p.connID+1)
-		c = s.conns[recvKey]
-		if c == nil {
-			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-			s.conns[recvKey] = c
+	dropSyn := false
+	if p.typ == packetTypeSyn {
+		if c != nil && !c.inbound {
+			// RESET on this connID would tear down the live outbound stream.
+			c = nil
+			dropSyn = true
+		} else if c == nil && !closed && listener != nil && !listener.isClosed() {
+			recvKey := newConnKey(addr, p.connID+1)
+			existing := s.conns[recvKey]
+			switch {
+			case existing == nil:
+				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
+				s.conns[recvKey] = c
+			case existing.inbound:
+				c = existing
+			}
 		}
 	}
 	s.mu.Unlock()
 
+	if dropSyn {
+		return
+	}
 	if c == nil {
 		if p.typ != packetTypeReset {
 			_ = s.writePacket(packet{
@@ -264,7 +277,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 
 	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
-	if p.typ == packetTypeSyn && !wasAccepted {
+	if p.typ == packetTypeSyn && c.inbound && !wasAccepted {
 		if listener == nil || !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
 		} else {
