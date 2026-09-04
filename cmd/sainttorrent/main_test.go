@@ -671,7 +671,7 @@ func TestSanitizeText(t *testing.T) {
 }
 
 func TestLockHeldAndSocketNotReadyRetry(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "sainttorrent-test-*")
+	tmpDir, err := os.MkdirTemp("", "st-lk-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
@@ -766,7 +766,7 @@ func TestForwardingWithConfirmFalse(t *testing.T) {
 }
 
 func TestWriteConfigSubprocess(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "sainttorrent-config-*")
+	tmpDir, err := os.MkdirTemp("", "st-cfg-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
