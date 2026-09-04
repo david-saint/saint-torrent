@@ -56,6 +56,8 @@ type Conn struct {
 
 	sendID uint16
 	recvID uint16
+	// inbound is set by newInboundConn and never mutated.
+	inbound bool
 
 	mu                sync.Mutex
 	localSeq          uint16
@@ -95,6 +97,7 @@ func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
 
 func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
 	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+	c.inbound = true
 	c.establishedClosed = true
 	close(c.established)
 	return c
@@ -195,13 +198,13 @@ func (c *Conn) handlePacket(p packet) {
 func (c *Conn) handleSyn(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || !c.inbound {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	c.remoteSeq = p.seqNr
-	c.remoteSeqSet = true
 	if !c.stateSent {
+		c.remoteSeq = p.seqNr
+		c.remoteSeqSet = true
 		c.stateSent = true
 		c.localSeq++
 	}
