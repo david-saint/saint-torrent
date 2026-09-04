@@ -234,18 +234,26 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	key := newConnKey(addr, p.connID)
+	var c *Conn
+	var listener *Listener
 	s.mu.Lock()
-	c := s.conns[key]
-	listener := s.listener
 	closed := s.closed
-	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
-		recvKey := newConnKey(addr, p.connID+1)
-		c = s.conns[recvKey]
-		if c == nil {
-			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-			s.conns[recvKey] = c
+	if p.typ == packetTypeSyn {
+		listener = s.listener
+		if !closed {
+			recvKey := newConnKey(addr, p.connID+1)
+			if existing := s.conns[recvKey]; existing != nil {
+				if existing.isInbound() {
+					c = existing
+				}
+			} else if listener != nil && !listener.isClosed() {
+				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
+				s.conns[recvKey] = c
+			}
 		}
+	} else {
+		key := newConnKey(addr, p.connID)
+		c = s.conns[key]
 	}
 	s.mu.Unlock()
 
@@ -264,7 +272,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 
 	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
-	if p.typ == packetTypeSyn && !wasAccepted {
+	if p.typ == packetTypeSyn && c.isInbound() && !wasAccepted {
 		if listener == nil || !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
 		} else {
