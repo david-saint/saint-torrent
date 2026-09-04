@@ -67,6 +67,9 @@ type DHT struct {
 
 	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
 
+	addrMu      sync.Mutex
+	addrChanges map[[20]byte]*addrChangeState
+
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -79,6 +82,22 @@ type DHT struct {
 type transaction struct {
 	ch   chan interface{}
 	addr *net.UDPAddr
+}
+
+const (
+	// nodePingTimeout bounds every routing-table liveness ping.
+	nodePingTimeout = 2 * time.Second
+	// maxPendingAddrChanges caps how many node IDs may have an address change
+	// tracked at once, so a flood of spoofed sightings cannot grow memory.
+	maxPendingAddrChanges = 64
+	// addrChangeCooldown is how long a node ID is ignored for address-change
+	// purposes after a verification attempt finishes.
+	addrChangeCooldown = 5 * time.Minute
+)
+
+type addrChangeState struct {
+	inFlight  bool
+	notBefore time.Time
 }
 
 // NewDHT creates and starts a DHT client.
@@ -112,6 +131,7 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 		peerChan:       make(chan DiscoveredPeer, 256),
 		transactions:   make(map[string]transaction),
 		inFlightProbes: make(map[string]struct{}),
+		addrChanges:    make(map[[20]byte]*addrChangeState),
 		ctx:            ctx,
 		cancel:         cancel,
 		downloadDir:    downloadDir,
@@ -267,10 +287,9 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 	var senderID [20]byte
 	copy(senderID[:], idStr)
 
-	d.addNode(senderID, addr)
-
 	switch q {
 	case "ping":
+		d.addNode(senderID, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
@@ -282,6 +301,8 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		}
 		var targetID [20]byte
 		copy(targetID[:], targetStr)
+
+		d.addNode(senderID, addr)
 
 		closerNodes := d.getCloserNodes(targetID, 8)
 		d.sendResponse(t, map[string]interface{}{
@@ -296,6 +317,8 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		}
 		var infoHash [20]byte
 		copy(infoHash[:], infoHashStr)
+
+		d.addNode(senderID, addr)
 
 		token := d.generateToken(addr)
 		peers := d.getPeersForInfoHash(infoHash)
@@ -345,6 +368,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 			return
 		}
 
+		d.addNode(senderID, addr)
 		d.registerPeer(infoHash, addr.IP, actualPort)
 
 		d.sendResponse(t, map[string]interface{}{
@@ -657,11 +681,15 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	}
 
 	if foundIdx != -1 {
-		n := b.nodes[foundIdx]
-		n.Addr = addr
-		n.LastSeen = time.Now()
-		b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
-		b.nodes = append(b.nodes, n)
+		if sameUDPAddr(b.nodes[foundIdx].Addr, addr) {
+			n := b.nodes[foundIdx]
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
+			b.nodes = append(b.nodes, n)
+			return
+		}
+		// A claimed address change is never trusted on sight; it is only a candidate.
+		d.considerAddressChange(id, b.nodes[foundIdx].Addr, addr)
 	} else {
 		if len(b.nodes) < 8 {
 			b.nodes = append(b.nodes, Node{
@@ -688,7 +716,7 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 				headNode := head
 				newID := id
 				newAddr := addr
-				ctx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
+				ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
 				defer cancel()
 				err := d.pingNode(ctx, headNode.Addr)
 				d.mu.Lock()
@@ -724,6 +752,152 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 			})
 		}
 	}
+}
+
+// considerAddressChange queues a candidate address for a node ID already in the
+// routing table. Called with d.mu held; it only reserves a slot and hands the
+// network work to a tracked goroutine.
+func (d *DHT) considerAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	if oldAddr == nil || newAddr == nil {
+		return
+	}
+	if !d.beginAddressVerification(id) {
+		return
+	}
+	from := cloneUDPAddr(oldAddr)
+	to := cloneUDPAddr(newAddr)
+	d.goTracked(func() {
+		defer d.endAddressVerification(id)
+		d.verifyAddressChange(id, from, to)
+	})
+}
+
+// beginAddressVerification reserves the single verification slot for id,
+// reporting false when one is already in flight, the ID is still in its
+// post-attempt cooldown, or the pending set is full.
+func (d *DHT) beginAddressVerification(id [20]byte) bool {
+	now := time.Now()
+
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+
+	if d.addrChanges == nil {
+		d.addrChanges = make(map[[20]byte]*addrChangeState)
+	}
+	if st, ok := d.addrChanges[id]; ok {
+		if st.inFlight || now.Before(st.notBefore) {
+			return false
+		}
+		st.inFlight = true
+		return true
+	}
+	if len(d.addrChanges) >= maxPendingAddrChanges {
+		for k, st := range d.addrChanges {
+			if !st.inFlight && !now.Before(st.notBefore) {
+				delete(d.addrChanges, k)
+			}
+		}
+		if len(d.addrChanges) >= maxPendingAddrChanges {
+			return false
+		}
+	}
+	d.addrChanges[id] = &addrChangeState{inFlight: true}
+	return true
+}
+
+func (d *DHT) endAddressVerification(id [20]byte) {
+	d.addrMu.Lock()
+	if st, ok := d.addrChanges[id]; ok {
+		st.inFlight = false
+		st.notBefore = time.Now().Add(addrChangeCooldown)
+	}
+	d.addrMu.Unlock()
+}
+
+// verifyAddressChange adopts newAddr for id only when oldAddr stops answering
+// pings and newAddr answers one with that same node ID. It runs off the read
+// loop and never holds d.mu across a network wait.
+func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	select {
+	case <-d.ctx.Done():
+		return
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
+	oldID, err := d.queryNodeID(ctx, oldAddr)
+	cancel()
+	if err == nil {
+		if oldID == id {
+			d.refreshNode(id, oldAddr)
+		}
+		return
+	}
+
+	ctx, cancel = context.WithTimeout(d.ctx, nodePingTimeout)
+	newID, err := d.queryNodeID(ctx, newAddr)
+	cancel()
+	if err != nil || newID != id {
+		return
+	}
+
+	d.repointNode(id, oldAddr, newAddr)
+}
+
+// refreshNode marks a node live and moves it to the tail of its bucket, but only
+// if it is still stored at addr.
+func (d *DHT) refreshNode(id [20]byte, addr *net.UDPAddr) {
+	idx := bucketIndex(d.nodeID, id)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID == id && sameUDPAddr(n.Addr, addr) {
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+			b.nodes = append(b.nodes, n)
+			return
+		}
+	}
+}
+
+// repointNode moves a verified node from oldAddr to newAddr, leaving the entry
+// alone if it no longer points at oldAddr.
+func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	idx := bucketIndex(d.nodeID, id)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID != id {
+			continue
+		}
+		if !sameUDPAddr(n.Addr, oldAddr) {
+			return
+		}
+		n.Addr = newAddr
+		n.LastSeen = time.Now()
+		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+		b.nodes = append(b.nodes, n)
+		return
+	}
+}
+
+func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
+	if a == nil {
+		return nil
+	}
+	return &net.UDPAddr{IP: append(net.IP(nil), a.IP...), Port: a.Port, Zone: a.Zone}
 }
 
 // HasNodeAddress returns true if a node with the given IP and UDP port exists in the routing table.
