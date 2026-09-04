@@ -50,6 +50,38 @@ type PacketConn interface {
 	Close() error
 }
 
+const (
+	maxInFlightVerifications = 64
+	maxFailedCandidates      = 512
+	failedCandidateCooldown  = 1 * time.Minute
+	verifyPingTimeout        = 2 * time.Second
+)
+
+type candidateKey struct {
+	id   [20]byte
+	ip   [16]byte
+	port int
+}
+
+func makeCandidateKey(id [20]byte, addr *net.UDPAddr) candidateKey {
+	var ip16 [16]byte
+	if addr != nil && addr.IP != nil {
+		copy(ip16[:], addr.IP.To16())
+	}
+	port := 0
+	if addr != nil {
+		port = addr.Port
+	}
+	return candidateKey{id: id, ip: ip16, port: port}
+}
+
+func equalUDPAddr(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.IP.Equal(b.IP) && a.Port == b.Port
+}
+
 // DHT implements a BEP 5 Kademlia DHT client.
 type DHT struct {
 	nodeID       [20]byte
@@ -65,7 +97,9 @@ type DHT struct {
 	txMu         sync.Mutex
 	txCounter    uint32
 
-	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
+	inFlightProbes        map[string]struct{} // Track in-flight AddNode queries to endpoints
+	inFlightVerifications map[[20]byte]struct{}
+	failedCandidates      map[candidateKey]time.Time
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -107,14 +141,16 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := &DHT{
-		conn:           conn,
-		peersMap:       make(map[[20]byte]map[string]time.Time),
-		peerChan:       make(chan DiscoveredPeer, 256),
-		transactions:   make(map[string]transaction),
-		inFlightProbes: make(map[string]struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
-		downloadDir:    downloadDir,
+		conn:                  conn,
+		peersMap:              make(map[[20]byte]map[string]time.Time),
+		peerChan:              make(chan DiscoveredPeer, 256),
+		transactions:          make(map[string]transaction),
+		inFlightProbes:        make(map[string]struct{}),
+		inFlightVerifications: make(map[[20]byte]struct{}),
+		failedCandidates:      make(map[candidateKey]time.Time),
+		ctx:                   ctx,
+		cancel:                cancel,
+		downloadDir:           downloadDir,
 	}
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[0][:])
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[1][:])
@@ -660,10 +696,113 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 
 	if foundIdx != -1 {
 		n := b.nodes[foundIdx]
-		n.Addr = addr
-		n.LastSeen = time.Now()
-		b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
-		b.nodes = append(b.nodes, n)
+		if equalUDPAddr(n.Addr, addr) {
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
+			b.nodes = append(b.nodes, n)
+			return
+		}
+
+		if d.inFlightVerifications == nil {
+			d.inFlightVerifications = make(map[[20]byte]struct{})
+		}
+		if d.failedCandidates == nil {
+			d.failedCandidates = make(map[candidateKey]time.Time)
+		}
+
+		if _, inFlight := d.inFlightVerifications[id]; inFlight {
+			return
+		}
+
+		candKey := makeCandidateKey(id, addr)
+		if exp, failed := d.failedCandidates[candKey]; failed {
+			if time.Now().Before(exp) {
+				return
+			}
+			delete(d.failedCandidates, candKey)
+		}
+
+		if len(d.inFlightVerifications) >= maxInFlightVerifications {
+			return
+		}
+
+		d.inFlightVerifications[id] = struct{}{}
+		oldAddr := n.Addr
+		newAddr := &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port}
+
+		d.goTracked(func() {
+			defer func() {
+				d.mu.Lock()
+				delete(d.inFlightVerifications, id)
+				d.mu.Unlock()
+			}()
+
+			select {
+			case <-d.ctx.Done():
+				return
+			default:
+			}
+
+			// Step 1: Ping incumbent address A.
+			ctxA, cancelA := context.WithTimeout(d.ctx, verifyPingTimeout)
+			oldID, errA := d.queryNodeID(ctxA, oldAddr)
+			cancelA()
+
+			if errA == nil && oldID == id {
+				// Incumbent responded with matching node ID: incumbent is alive.
+				d.mu.Lock()
+				d.recordFailedCandidateLocked(id, newAddr)
+				b2 := d.buckets[idx]
+				if b2 != nil {
+					for i, existing := range b2.nodes {
+						if existing.ID == id && equalUDPAddr(existing.Addr, oldAddr) {
+							existing.LastSeen = time.Now()
+							b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
+							b2.nodes = append(b2.nodes, existing)
+							break
+						}
+					}
+				}
+				d.mu.Unlock()
+				return
+			}
+
+			// Step 2: Incumbent did not answer within timeout. Ping candidate B.
+			select {
+			case <-d.ctx.Done():
+				return
+			default:
+			}
+
+			ctxB, cancelB := context.WithTimeout(d.ctx, verifyPingTimeout)
+			newID, errB := d.queryNodeID(ctxB, newAddr)
+			cancelB()
+
+			if errB != nil || newID != id {
+				d.mu.Lock()
+				d.recordFailedCandidateLocked(id, newAddr)
+				d.mu.Unlock()
+				return
+			}
+
+			// Step 3: Candidate verified. Replace incumbent with candidate.
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			b2 := d.buckets[idx]
+			if b2 == nil {
+				return
+			}
+			for i, existing := range b2.nodes {
+				if existing.ID == id && equalUDPAddr(existing.Addr, oldAddr) {
+					existing.Addr = newAddr
+					existing.LastSeen = time.Now()
+					b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
+					b2.nodes = append(b2.nodes, existing)
+					break
+				}
+			}
+		})
+		return
 	} else {
 		if len(b.nodes) < 8 {
 			b.nodes = append(b.nodes, Node{
@@ -726,6 +865,27 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 			})
 		}
 	}
+}
+
+func (d *DHT) recordFailedCandidateLocked(id [20]byte, addr *net.UDPAddr) {
+	if d.failedCandidates == nil {
+		d.failedCandidates = make(map[candidateKey]time.Time)
+	}
+	if len(d.failedCandidates) >= maxFailedCandidates {
+		now := time.Now()
+		for k, exp := range d.failedCandidates {
+			if now.After(exp) {
+				delete(d.failedCandidates, k)
+			}
+		}
+		if len(d.failedCandidates) >= maxFailedCandidates {
+			for k := range d.failedCandidates {
+				delete(d.failedCandidates, k)
+				break
+			}
+		}
+	}
+	d.failedCandidates[makeCandidateKey(id, addr)] = time.Now().Add(failedCandidateCooldown)
 }
 
 // HasNodeAddress returns true if a node with the given IP and UDP port exists in the routing table.
