@@ -234,18 +234,35 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	// A SYN carries the initiator's recv_id, so our side of that connection is
+	// keyed one higher; every other packet is keyed by its own connection id.
 	key := newConnKey(addr, p.connID)
+	isSyn := p.typ == packetTypeSyn
+	if isSyn {
+		key.id++
+	}
+
+	var (
+		c        *Conn
+		listener *Listener
+	)
 	s.mu.Lock()
-	c := s.conns[key]
-	listener := s.listener
-	closed := s.closed
-	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
-		recvKey := newConnKey(addr, p.connID+1)
-		c = s.conns[recvKey]
-		if c == nil {
-			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-			s.conns[recvKey] = c
+	if isSyn {
+		listener = s.listener
+		if !s.closed && listener != nil && !listener.isClosed() {
+			switch existing := s.conns[key]; {
+			case existing == nil:
+				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
+				s.conns[key] = c
+			case existing.inbound:
+				// SYN retransmit for a conn we already created.
+				c = existing
+			}
+			// Any other conn at this key (an outbound conn whose recv_id
+			// collides) is left untouched and the SYN is refused below.
 		}
+	} else {
+		c = s.conns[key]
 	}
 	s.mu.Unlock()
 
@@ -262,10 +279,15 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	if !isSyn {
+		c.handlePacket(p)
+		return
+	}
+
 	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
-	if p.typ == packetTypeSyn && !wasAccepted {
-		if listener == nil || !listener.enqueue(c) {
+	if !wasAccepted {
+		if !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
 		} else {
 			c.markAccepted()

@@ -545,3 +545,309 @@ func TestSocketDemuxesDHTPackets(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
+	rawPeer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("raw peer: %v", err)
+	}
+	defer rawPeer.Close()
+	_ = rawPeer.SetDeadline(time.Now().Add(5 * time.Second))
+
+	client, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("client socket: %v", err)
+	}
+	defer client.Close()
+	ln := client.Listen()
+	defer ln.Close()
+
+	const peerSeq = uint16(900)
+	type handshake struct {
+		syn  packet
+		addr *net.UDPAddr
+		err  error
+	}
+	handshakeCh := make(chan handshake, 1)
+	go func() {
+		buf := make([]byte, 1500)
+		n, addr, err := rawPeer.ReadFromUDP(buf)
+		if err != nil {
+			handshakeCh <- handshake{err: err}
+			return
+		}
+		syn, err := parsePacket(buf[:n])
+		if err != nil {
+			handshakeCh <- handshake{err: err}
+			return
+		}
+		if syn.typ != packetTypeSyn {
+			handshakeCh <- handshake{err: fmt.Errorf("first packet type = %d, want SYN", syn.typ)}
+			return
+		}
+		state := packet{
+			typ:       packetTypeState,
+			connID:    syn.connID,
+			timestamp: uint32(time.Now().UnixMicro()),
+			seqNr:     peerSeq,
+			ackNr:     syn.seqNr,
+		}
+		if _, err := rawPeer.WriteToUDP(state.marshal(), addr); err != nil {
+			handshakeCh <- handshake{err: err}
+			return
+		}
+		handshakeCh <- handshake{syn: syn, addr: addr}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	dialed, err := client.DialContext(ctx, rawPeer.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer dialed.Close()
+	conn := dialed.(*Conn)
+
+	hs := <-handshakeCh
+	if hs.err != nil {
+		t.Fatalf("raw peer handshake: %v", hs.err)
+	}
+
+	conn.mu.Lock()
+	localSeq, remoteSeq := conn.localSeq, conn.remoteSeq
+	accepted := conn.accepted
+	conn.mu.Unlock()
+	if accepted {
+		t.Fatal("outbound conn was marked accepted by the handshake")
+	}
+
+	acceptCh := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			acceptCh <- c
+		}
+	}()
+
+	// A SYN whose connID is the outbound conn's recvID-1 derives the very key
+	// the established outbound conn is registered under.
+	stray := packet{
+		typ:       packetTypeSyn,
+		connID:    conn.recvID - 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     40000,
+	}
+	if _, err := rawPeer.WriteToUDP(stray.marshal(), hs.addr); err != nil {
+		t.Fatalf("send colliding SYN: %v", err)
+	}
+
+	select {
+	case c := <-acceptCh:
+		t.Fatalf("colliding SYN was accepted as an inbound conn (is the dialed conn: %v)", c == net.Conn(conn))
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	buf := make([]byte, 1500)
+	n, _, err := rawPeer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read reply to colliding SYN: %v", err)
+	}
+	reply, err := parsePacket(buf[:n])
+	if err != nil {
+		t.Fatalf("parse reply: %v", err)
+	}
+	if reply.typ != packetTypeReset || reply.connID != stray.connID {
+		t.Fatalf("reply to colliding SYN: type=%d connID=%d, want RESET connID=%d", reply.typ, reply.connID, stray.connID)
+	}
+
+	conn.mu.Lock()
+	gotLocal, gotRemote := conn.localSeq, conn.remoteSeq
+	gotAccepted := conn.accepted
+	conn.mu.Unlock()
+	if gotLocal != localSeq || gotRemote != remoteSeq {
+		t.Fatalf("sequence state after colliding SYN: localSeq %d->%d remoteSeq %d->%d", localSeq, gotLocal, remoteSeq, gotRemote)
+	}
+	if gotAccepted {
+		t.Fatal("colliding SYN marked the outbound conn accepted")
+	}
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		_, err := conn.Write([]byte("ping"))
+		writeErr <- err
+	}()
+
+	n, _, err = rawPeer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read DATA after colliding SYN: %v", err)
+	}
+	data, err := parsePacket(buf[:n])
+	if err != nil {
+		t.Fatalf("parse DATA: %v", err)
+	}
+	if data.typ != packetTypeData || data.connID != hs.syn.connID+1 {
+		t.Fatalf("DATA after colliding SYN: type=%d connID=%d, want DATA connID=%d", data.typ, data.connID, hs.syn.connID+1)
+	}
+	if data.seqNr != localSeq || data.ackNr != remoteSeq {
+		t.Fatalf("DATA seq=%d ack=%d, want seq=%d ack=%d", data.seqNr, data.ackNr, localSeq, remoteSeq)
+	}
+	if string(data.payload) != "ping" {
+		t.Fatalf("DATA payload = %q, want ping", data.payload)
+	}
+	ack := packet{
+		typ:       packetTypeState,
+		connID:    hs.syn.connID,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     peerSeq,
+		ackNr:     data.seqNr,
+	}
+	if _, err := rawPeer.WriteToUDP(ack.marshal(), hs.addr); err != nil {
+		t.Fatalf("send DATA ack: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write after colliding SYN: %v", err)
+	}
+
+	inbound := packet{
+		typ:       packetTypeData,
+		connID:    hs.syn.connID,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     peerSeq + 1,
+		ackNr:     data.seqNr,
+		payload:   []byte("pong"),
+	}
+	if _, err := rawPeer.WriteToUDP(inbound.marshal(), hs.addr); err != nil {
+		t.Fatalf("send inbound DATA: %v", err)
+	}
+	got := make([]byte, len(inbound.payload))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read after colliding SYN: %v", err)
+	}
+	if !bytes.Equal(got, inbound.payload) {
+		t.Fatalf("read %q, want %q", got, inbound.payload)
+	}
+}
+
+func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
+	server, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("server socket: %v", err)
+	}
+	defer server.Close()
+	ln := server.Listen()
+	defer ln.Close()
+
+	rawClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("raw client: %v", err)
+	}
+	defer rawClient.Close()
+	_ = rawClient.SetDeadline(time.Now().Add(5 * time.Second))
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(server.Port())}
+	syn := packet{typ: packetTypeSyn, connID: 4321, timestamp: uint32(time.Now().UnixMicro()), seqNr: 55}
+	buf := make([]byte, 1500)
+	readState := func(what string) packet {
+		t.Helper()
+		n, _, err := rawClient.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("read %s: %v", what, err)
+		}
+		p, err := parsePacket(buf[:n])
+		if err != nil {
+			t.Fatalf("parse %s: %v", what, err)
+		}
+		if p.typ != packetTypeState || p.connID != syn.connID {
+			t.Fatalf("%s: type=%d connID=%d, want STATE connID=%d", what, p.typ, p.connID, syn.connID)
+		}
+		return p
+	}
+
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("send SYN: %v", err)
+	}
+	first := readState("STATE for first SYN")
+	if first.ackNr != syn.seqNr {
+		t.Fatalf("first STATE ack = %d, want %d", first.ackNr, syn.seqNr)
+	}
+	accepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer accepted.Close()
+
+	// A retransmitted SYN must be answered with the same STATE by the same
+	// Conn: no reset, no second accept, no second localSeq increment.
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("resend SYN: %v", err)
+	}
+	second := readState("STATE for SYN retransmit")
+	if second.seqNr != first.seqNr || second.ackNr != first.ackNr {
+		t.Fatalf("STATE for retransmit seq=%d ack=%d, want seq=%d ack=%d", second.seqNr, second.ackNr, first.seqNr, first.ackNr)
+	}
+
+	acceptCh := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			acceptCh <- c
+		}
+	}()
+	select {
+	case <-acceptCh:
+		t.Fatal("SYN retransmit produced a second accepted conn")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	data := packet{
+		typ:       packetTypeData,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     first.seqNr,
+		payload:   []byte("hello"),
+	}
+	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
+		t.Fatalf("send DATA: %v", err)
+	}
+	got := make([]byte, len(data.payload))
+	_ = accepted.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(accepted, got); err != nil {
+		t.Fatalf("read accepted payload: %v", err)
+	}
+	if !bytes.Equal(got, data.payload) {
+		t.Fatalf("accepted payload = %q, want %q", got, data.payload)
+	}
+	if ack := readState("STATE for DATA"); ack.ackNr != data.seqNr {
+		t.Fatalf("DATA ack = %d, want %d", ack.ackNr, data.seqNr)
+	}
+
+	// A late SYN retransmit arriving after data must not rewind remoteSeq.
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("resend SYN after data: %v", err)
+	}
+	third := readState("STATE for late SYN retransmit")
+	if third.seqNr != first.seqNr || third.ackNr != data.seqNr {
+		t.Fatalf("late retransmit STATE seq=%d ack=%d, want seq=%d ack=%d", third.seqNr, third.ackNr, first.seqNr, data.seqNr)
+	}
+
+	more := packet{
+		typ:       packetTypeData,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 2,
+		ackNr:     first.seqNr,
+		payload:   []byte("world"),
+	}
+	if _, err := rawClient.WriteToUDP(more.marshal(), target); err != nil {
+		t.Fatalf("send second DATA: %v", err)
+	}
+	got = make([]byte, len(more.payload))
+	_ = accepted.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(accepted, got); err != nil {
+		t.Fatalf("read second payload: %v", err)
+	}
+	if !bytes.Equal(got, more.payload) {
+		t.Fatalf("second payload = %q, want %q", got, more.payload)
+	}
+}
