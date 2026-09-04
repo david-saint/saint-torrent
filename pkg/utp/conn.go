@@ -66,6 +66,7 @@ type Conn struct {
 	establishedClosed bool
 	establishErr      error
 	accepted          bool
+	inbound           bool // set by newInboundConn; never mutated; SYN retransmit reuse keys off this
 	pending           map[uint16][]byte
 	pendingBytes      int
 	pendingFin        bool
@@ -95,6 +96,7 @@ func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
 
 func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
 	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+	c.inbound = true
 	c.establishedClosed = true
 	close(c.established)
 	return c
@@ -195,12 +197,10 @@ func (c *Conn) handlePacket(p packet) {
 func (c *Conn) handleSyn(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || !c.inbound {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	c.remoteSeq = p.seqNr
-	c.remoteSeqSet = true
 	if !c.stateSent {
 		c.stateSent = true
 		c.localSeq++
