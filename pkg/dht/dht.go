@@ -41,6 +41,13 @@ type bucket struct {
 	pingInProgress bool
 }
 
+const (
+	routingTablePingTimeout = 2 * time.Second
+	maxAddrChangeInFlight   = 32
+	maxAddrChangeFailed     = 128
+	addrChangeFailCooldown  = 30 * time.Second
+)
+
 // PacketConn is the UDP subset DHT needs. It is satisfied by *net.UDPConn and
 // by the uTP/DHT shared packet connection.
 type PacketConn interface {
@@ -66,6 +73,10 @@ type DHT struct {
 	txCounter    uint32
 
 	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
+
+	addrChangeInFlight map[[20]byte]struct{}  // guarded by mu; one verification per node ID
+	addrChangeFailed   map[string]time.Time   // guarded by mu; cooldown after a failed candidate
+	addrChangeCooldown map[[20]byte]time.Time // guarded by mu; per-ID cooldown after a verification
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -107,14 +118,17 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := &DHT{
-		conn:           conn,
-		peersMap:       make(map[[20]byte]map[string]time.Time),
-		peerChan:       make(chan DiscoveredPeer, 256),
-		transactions:   make(map[string]transaction),
-		inFlightProbes: make(map[string]struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
-		downloadDir:    downloadDir,
+		conn:               conn,
+		peersMap:           make(map[[20]byte]map[string]time.Time),
+		peerChan:           make(chan DiscoveredPeer, 256),
+		transactions:       make(map[string]transaction),
+		inFlightProbes:     make(map[string]struct{}),
+		addrChangeInFlight: make(map[[20]byte]struct{}),
+		addrChangeFailed:   make(map[string]time.Time),
+		addrChangeCooldown: make(map[[20]byte]time.Time),
+		ctx:                ctx,
+		cancel:             cancel,
+		downloadDir:        downloadDir,
 	}
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[0][:])
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[1][:])
@@ -267,13 +281,12 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 	var senderID [20]byte
 	copy(senderID[:], idStr)
 
-	d.addNode(senderID, addr)
-
 	switch q {
 	case "ping":
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
+		d.addNode(senderID, addr)
 
 	case "find_node":
 		targetStr, _ := a["target"].(string)
@@ -288,6 +301,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 			"id":    string(d.nodeID[:]),
 			"nodes": compactNodes(closerNodes),
 		}, addr)
+		d.addNode(senderID, addr)
 
 	case "get_peers":
 		infoHashStr, _ := a["info_hash"].(string)
@@ -313,6 +327,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 				"nodes": compactNodes(closerNodes),
 			}, addr)
 		}
+		d.addNode(senderID, addr)
 
 	case "announce_peer":
 		infoHashStr, _ := a["info_hash"].(string)
@@ -350,6 +365,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
+		d.addNode(senderID, addr)
 	}
 }
 
@@ -635,13 +651,12 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	if id == d.nodeID {
 		return
 	}
-	if addr.IP.To4() == nil {
+	if addr == nil || addr.IP.To4() == nil {
 		return
 	}
 
 	idx := bucketIndex(d.nodeID, id)
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	if d.buckets[idx] == nil {
 		d.buckets[idx] = &bucket{}
@@ -658,71 +673,254 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 
 	if foundIdx != -1 {
 		n := b.nodes[foundIdx]
-		n.Addr = addr
-		n.LastSeen = time.Now()
-		b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
-		b.nodes = append(b.nodes, n)
-	} else {
-		if len(b.nodes) < 8 {
-			b.nodes = append(b.nodes, Node{
-				ID:       id,
-				Addr:     addr,
-				LastSeen: time.Now(),
-			})
-		} else {
-			if b.pingInProgress {
-				return
-			}
-			b.pingInProgress = true
-			// Asynchronously ping the head node and replace if offline
-			head := b.nodes[0]
-			d.goTracked(func() {
-				defer func() {
-					d.mu.Lock()
-					b2 := d.buckets[idx]
-					if b2 != nil {
-						b2.pingInProgress = false
-					}
-					d.mu.Unlock()
-				}()
-				headNode := head
-				newID := id
-				newAddr := addr
-				ctx, cancel := context.WithTimeout(d.ctx, 2*time.Second)
-				defer cancel()
-				err := d.pingNode(ctx, headNode.Addr)
-				d.mu.Lock()
-				defer d.mu.Unlock()
-				b2 := d.buckets[idx]
-				if b2 == nil {
-					return
-				}
-				if err != nil {
-					// Evict head and add new
-					for i, n := range b2.nodes {
-						if n.ID == headNode.ID {
-							b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
-							b2.nodes = append(b2.nodes, Node{
-								ID:       newID,
-								Addr:     newAddr,
-								LastSeen: time.Now(),
-							})
-							break
-						}
-					}
-				} else {
-					// Respond, update mtime
-					for i, n := range b2.nodes {
-						if n.ID == headNode.ID {
-							b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
-							headNode.LastSeen = time.Now()
-							b2.nodes = append(b2.nodes, headNode)
-							break
-						}
-					}
-				}
-			})
+		if sameUDPAddr(n.Addr, addr) {
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
+			b.nodes = append(b.nodes, n)
+			d.mu.Unlock()
+			return
 		}
+		oldAddr := n.Addr
+		start := d.tryBeginAddrChangeLocked(id, addr)
+		d.mu.Unlock()
+		if !start {
+			return
+		}
+		oldCopy := cloneUDPAddr(oldAddr)
+		newCopy := cloneUDPAddr(addr)
+		d.goTracked(func() {
+			defer d.finishAddrChange(id)
+			d.verifyAddressChange(id, oldCopy, newCopy)
+		})
+		return
+	}
+
+	if len(b.nodes) < 8 {
+		b.nodes = append(b.nodes, Node{
+			ID:       id,
+			Addr:     addr,
+			LastSeen: time.Now(),
+		})
+		d.mu.Unlock()
+		return
+	}
+
+	if b.pingInProgress {
+		d.mu.Unlock()
+		return
+	}
+	b.pingInProgress = true
+	head := b.nodes[0]
+	d.goTracked(func() {
+		defer func() {
+			d.mu.Lock()
+			b2 := d.buckets[idx]
+			if b2 != nil {
+				b2.pingInProgress = false
+			}
+			d.mu.Unlock()
+		}()
+		headNode := head
+		newID := id
+		newAddr := addr
+		ctx, cancel := context.WithTimeout(d.ctx, routingTablePingTimeout)
+		defer cancel()
+		err := d.pingNode(ctx, headNode.Addr)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		b2 := d.buckets[idx]
+		if b2 == nil {
+			return
+		}
+		if err != nil {
+			for i, n := range b2.nodes {
+				if n.ID == headNode.ID {
+					b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
+					b2.nodes = append(b2.nodes, Node{
+						ID:       newID,
+						Addr:     newAddr,
+						LastSeen: time.Now(),
+					})
+					break
+				}
+			}
+		} else {
+			for i, n := range b2.nodes {
+				if n.ID == headNode.ID {
+					b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
+					headNode.LastSeen = time.Now()
+					b2.nodes = append(b2.nodes, headNode)
+					break
+				}
+			}
+		}
+	})
+	d.mu.Unlock()
+}
+
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	ip := append(net.IP(nil), addr.IP...)
+	return &net.UDPAddr{IP: ip, Port: addr.Port, Zone: addr.Zone}
+}
+
+func addrChangeFailKey(id [20]byte, addr *net.UDPAddr) string {
+	if addr == nil {
+		return string(id[:])
+	}
+	return string(id[:]) + addr.String()
+}
+
+func (d *DHT) pruneAddrChangeFailedLocked(now time.Time) {
+	for k, t := range d.addrChangeFailed {
+		if now.Sub(t) >= addrChangeFailCooldown {
+			delete(d.addrChangeFailed, k)
+		}
+	}
+	for id, t := range d.addrChangeCooldown {
+		if now.Sub(t) >= addrChangeFailCooldown {
+			delete(d.addrChangeCooldown, id)
+		}
+	}
+}
+
+func (d *DHT) tryBeginAddrChangeLocked(id [20]byte, newAddr *net.UDPAddr) bool {
+	now := time.Now()
+	if d.addrChangeFailed == nil {
+		d.addrChangeFailed = make(map[string]time.Time)
+	}
+	if d.addrChangeInFlight == nil {
+		d.addrChangeInFlight = make(map[[20]byte]struct{})
+	}
+	if d.addrChangeCooldown == nil {
+		d.addrChangeCooldown = make(map[[20]byte]time.Time)
+	}
+	d.pruneAddrChangeFailedLocked(now)
+	if t, ok := d.addrChangeCooldown[id]; ok {
+		if now.Sub(t) < addrChangeFailCooldown {
+			return false
+		}
+		delete(d.addrChangeCooldown, id)
+	}
+	if t, ok := d.addrChangeFailed[addrChangeFailKey(id, newAddr)]; ok && now.Sub(t) < addrChangeFailCooldown {
+		return false
+	}
+	if _, ok := d.addrChangeInFlight[id]; ok {
+		return false
+	}
+	if len(d.addrChangeInFlight) >= maxAddrChangeInFlight {
+		return false
+	}
+	if len(d.addrChangeFailed) >= maxAddrChangeFailed {
+		return false
+	}
+	if len(d.addrChangeCooldown) >= maxAddrChangeFailed {
+		return false
+	}
+	d.addrChangeInFlight[id] = struct{}{}
+	return true
+}
+
+func (d *DHT) finishAddrChange(id [20]byte) {
+	d.mu.Lock()
+	delete(d.addrChangeInFlight, id)
+	if d.addrChangeCooldown == nil {
+		d.addrChangeCooldown = make(map[[20]byte]time.Time)
+	}
+	if len(d.addrChangeCooldown) >= maxAddrChangeFailed {
+		for k := range d.addrChangeCooldown {
+			delete(d.addrChangeCooldown, k)
+			break
+		}
+	}
+	d.addrChangeCooldown[id] = time.Now()
+	d.mu.Unlock()
+}
+
+func (d *DHT) markAddrChangeFailed(id [20]byte, addr *net.UDPAddr) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.addrChangeFailed == nil {
+		d.addrChangeFailed = make(map[string]time.Time)
+	}
+	d.pruneAddrChangeFailedLocked(time.Now())
+	if len(d.addrChangeFailed) >= maxAddrChangeFailed {
+		for k := range d.addrChangeFailed {
+			delete(d.addrChangeFailed, k)
+			break
+		}
+	}
+	d.addrChangeFailed[addrChangeFailKey(id, addr)] = time.Now()
+}
+
+func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	select {
+	case <-d.ctx.Done():
+		return
+	default:
+	}
+
+	ctx, cancel := context.WithTimeout(d.ctx, routingTablePingTimeout)
+	oldID, err := d.queryNodeID(ctx, oldAddr)
+	cancel()
+	if err == nil {
+		if oldID == id {
+			d.refreshNodeLastSeen(id, oldAddr)
+		}
+		d.markAddrChangeFailed(id, newAddr)
+		return
+	}
+
+	ctx, cancel = context.WithTimeout(d.ctx, routingTablePingTimeout)
+	newID, err := d.queryNodeID(ctx, newAddr)
+	cancel()
+	if err != nil || newID != id {
+		d.markAddrChangeFailed(id, newAddr)
+		return
+	}
+
+	d.adoptNodeAddress(id, oldAddr, newAddr)
+}
+
+func (d *DHT) refreshNodeLastSeen(id [20]byte, addr *net.UDPAddr) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	idx := bucketIndex(d.nodeID, id)
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID == id && sameUDPAddr(n.Addr, addr) {
+			n.LastSeen = time.Now()
+			b.nodes[i] = n
+			return
+		}
+	}
+}
+
+func (d *DHT) adoptNodeAddress(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	idx := bucketIndex(d.nodeID, id)
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID != id {
+			continue
+		}
+		if !sameUDPAddr(n.Addr, oldAddr) {
+			return
+		}
+		n.Addr = cloneUDPAddr(newAddr)
+		n.LastSeen = time.Now()
+		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+		b.nodes = append(b.nodes, n)
+		return
 	}
 }
 
