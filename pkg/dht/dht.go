@@ -67,6 +67,10 @@ type DHT struct {
 
 	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
 
+	addrVerMu       sync.Mutex
+	addrVerifying   map[[20]byte]struct{}
+	addrVerFailNext map[addrVerKey]time.Time
+
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -107,14 +111,16 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	d := &DHT{
-		conn:           conn,
-		peersMap:       make(map[[20]byte]map[string]time.Time),
-		peerChan:       make(chan DiscoveredPeer, 256),
-		transactions:   make(map[string]transaction),
-		inFlightProbes: make(map[string]struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
-		downloadDir:    downloadDir,
+		conn:            conn,
+		peersMap:        make(map[[20]byte]map[string]time.Time),
+		peerChan:        make(chan DiscoveredPeer, 256),
+		transactions:    make(map[string]transaction),
+		inFlightProbes:  make(map[string]struct{}),
+		addrVerifying:   make(map[[20]byte]struct{}),
+		addrVerFailNext: make(map[addrVerKey]time.Time),
+		ctx:             ctx,
+		cancel:          cancel,
+		downloadDir:     downloadDir,
 	}
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[0][:])
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[1][:])
@@ -267,10 +273,9 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 	var senderID [20]byte
 	copy(senderID[:], idStr)
 
-	d.addNode(senderID, addr)
-
 	switch q {
 	case "ping":
+		d.addNode(senderID, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
@@ -283,6 +288,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		var targetID [20]byte
 		copy(targetID[:], targetStr)
 
+		d.addNode(senderID, addr)
 		closerNodes := d.getCloserNodes(targetID, 8)
 		d.sendResponse(t, map[string]interface{}{
 			"id":    string(d.nodeID[:]),
@@ -297,6 +303,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		var infoHash [20]byte
 		copy(infoHash[:], infoHashStr)
 
+		d.addNode(senderID, addr)
 		token := d.generateToken(addr)
 		peers := d.getPeersForInfoHash(infoHash)
 		if len(peers) > 0 {
@@ -347,6 +354,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 
 		d.registerPeer(infoHash, addr.IP, actualPort)
 
+		d.addNode(senderID, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
@@ -631,6 +639,140 @@ func lessXor(a, b [20]byte) bool {
 	return false
 }
 
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	cp := *addr
+	if addr.IP != nil {
+		cp.IP = append(net.IP(nil), addr.IP...)
+	}
+	return &cp
+}
+
+const (
+	maxAddrVerifications = 64
+	maxAddrVerFailures   = 1024
+	addrVerCooldown      = 5 * time.Minute
+	addrVerPingTimeout   = 2 * time.Second
+)
+
+type addrVerKey struct {
+	id   [20]byte
+	addr string
+}
+
+func (d *DHT) queueAddrVerification(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	if oldAddr == nil || newAddr == nil {
+		return
+	}
+	key := addrVerKey{id: id, addr: newAddr.String()}
+	d.addrVerMu.Lock()
+	if d.addrVerifying == nil {
+		d.addrVerifying = make(map[[20]byte]struct{})
+	}
+	if d.addrVerFailNext == nil {
+		d.addrVerFailNext = make(map[addrVerKey]time.Time)
+	}
+	if _, ok := d.addrVerifying[id]; ok {
+		d.addrVerMu.Unlock()
+		return
+	}
+	if len(d.addrVerifying) >= maxAddrVerifications {
+		d.addrVerMu.Unlock()
+		return
+	}
+	if until, ok := d.addrVerFailNext[key]; ok {
+		if time.Now().Before(until) {
+			d.addrVerMu.Unlock()
+			return
+		}
+		delete(d.addrVerFailNext, key)
+	}
+	d.addrVerifying[id] = struct{}{}
+	d.addrVerMu.Unlock()
+
+	d.goTracked(func() {
+		d.verifyNodeAddr(id, oldAddr, newAddr)
+	})
+}
+
+func (d *DHT) verifyNodeAddr(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+	defer func() {
+		d.addrVerMu.Lock()
+		delete(d.addrVerifying, id)
+		d.addrVerMu.Unlock()
+	}()
+
+	ctxOld, cancelOld := context.WithTimeout(d.ctx, addrVerPingTimeout)
+	_, oldErr := d.queryNodeID(ctxOld, oldAddr)
+	cancelOld()
+	if oldErr == nil {
+		d.refreshNodeAddr(id, oldAddr)
+		return
+	}
+
+	ctxNew, cancelNew := context.WithTimeout(d.ctx, addrVerPingTimeout)
+	newID, newErr := d.queryNodeID(ctxNew, newAddr)
+	cancelNew()
+	if newErr != nil || newID != id {
+		d.addrVerMu.Lock()
+		if d.addrVerFailNext == nil {
+			d.addrVerFailNext = make(map[addrVerKey]time.Time)
+		}
+		if len(d.addrVerFailNext) >= maxAddrVerFailures {
+			for k, v := range d.addrVerFailNext {
+				if time.Now().After(v) {
+					delete(d.addrVerFailNext, k)
+				}
+			}
+			if len(d.addrVerFailNext) >= maxAddrVerFailures {
+				for k := range d.addrVerFailNext {
+					delete(d.addrVerFailNext, k)
+					break
+				}
+			}
+		}
+		d.addrVerFailNext[addrVerKey{id: id, addr: newAddr.String()}] = time.Now().Add(addrVerCooldown)
+		d.addrVerMu.Unlock()
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	idx := bucketIndex(d.nodeID, id)
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID == id && sameUDPAddr(n.Addr, oldAddr) {
+			b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+			n.Addr = newAddr
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes, n)
+			return
+		}
+	}
+}
+
+func (d *DHT) refreshNodeAddr(id [20]byte, addr *net.UDPAddr) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	idx := bucketIndex(d.nodeID, id)
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID == id && sameUDPAddr(n.Addr, addr) {
+			b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes, n)
+			return
+		}
+	}
+}
 func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	if id == d.nodeID {
 		return
@@ -657,11 +799,18 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	}
 
 	if foundIdx != -1 {
-		n := b.nodes[foundIdx]
-		n.Addr = addr
-		n.LastSeen = time.Now()
-		b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
-		b.nodes = append(b.nodes, n)
+		existing := b.nodes[foundIdx]
+		if sameUDPAddr(existing.Addr, addr) {
+			n := existing
+			n.LastSeen = time.Now()
+			b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
+			b.nodes = append(b.nodes, n)
+			return
+		}
+		oldAddr := cloneUDPAddr(existing.Addr)
+		newAddr := cloneUDPAddr(addr)
+		d.queueAddrVerification(id, oldAddr, newAddr)
+		return
 	} else {
 		if len(b.nodes) < 8 {
 			b.nodes = append(b.nodes, Node{
