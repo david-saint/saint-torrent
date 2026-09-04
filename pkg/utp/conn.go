@@ -66,6 +66,8 @@ type Conn struct {
 	establishedClosed bool
 	establishErr      error
 	accepted          bool
+	inbound           bool
+	dataReceived      bool
 	pending           map[uint16][]byte
 	pendingBytes      int
 	pendingFin        bool
@@ -95,6 +97,7 @@ func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
 
 func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
 	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+	c.inbound = true
 	c.establishedClosed = true
 	close(c.established)
 	return c
@@ -195,12 +198,14 @@ func (c *Conn) handlePacket(p packet) {
 func (c *Conn) handleSyn(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || !c.inbound {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	c.remoteSeq = p.seqNr
-	c.remoteSeqSet = true
+	if !c.dataReceived {
+		c.remoteSeq = p.seqNr
+		c.remoteSeqSet = true
+	}
 	if !c.stateSent {
 		c.stateSent = true
 		c.localSeq++
@@ -230,6 +235,7 @@ func (c *Conn) handleData(p packet) ackDisposition {
 	if c.closed {
 		return ackNone
 	}
+	c.dataReceived = true
 	c.updateTimestampDiffLocked(p)
 	if !c.remoteSeqSet {
 		c.remoteSeq = p.seqNr - 1
@@ -285,6 +291,7 @@ func (c *Conn) handleFin(p packet) bool {
 	if c.closed {
 		return false
 	}
+	c.dataReceived = true
 	c.updateTimestampDiffLocked(p)
 	if !c.remoteSeqSet || p.seqNr == c.remoteSeq+1 || seqLTE(p.seqNr, c.remoteSeq) {
 		if !c.remoteSeqSet || p.seqNr == c.remoteSeq+1 {
@@ -816,6 +823,10 @@ func (c *Conn) isAccepted() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.accepted
+}
+
+func (c *Conn) isInbound() bool {
+	return c.inbound
 }
 
 func (c *Conn) markAccepted() {
