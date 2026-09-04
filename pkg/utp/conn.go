@@ -57,6 +57,9 @@ type Conn struct {
 	sendID uint16
 	recvID uint16
 
+	// inbound marks conns created by newInboundConn; it never changes after construction.
+	inbound bool
+
 	mu                sync.Mutex
 	localSeq          uint16
 	remoteSeq         uint16
@@ -95,6 +98,7 @@ func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
 
 func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
 	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+	c.inbound = true
 	c.establishedClosed = true
 	close(c.established)
 	return c
@@ -199,9 +203,17 @@ func (c *Conn) handleSyn(p packet) bool {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	c.remoteSeq = p.seqNr
-	c.remoteSeqSet = true
+	// A SYN is only meaningful on an inbound conn. On any other conn it is
+	// ignored: no sequence state changes and no ack, so a stray SYN can
+	// neither rewind remoteSeq nor punch a hole in localSeq.
+	if !c.inbound {
+		return false
+	}
+	// A repeated SYN only re-sends the STATE ack below; remoteSeq and
+	// localSeq are set once so a retransmit never rewinds received data.
 	if !c.stateSent {
+		c.remoteSeq = p.seqNr
+		c.remoteSeqSet = true
 		c.stateSent = true
 		c.localSeq++
 	}

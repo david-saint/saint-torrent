@@ -241,8 +241,14 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	closed := s.closed
 	if c == nil && !closed && p.typ == packetTypeSyn && listener != nil && !listener.isClosed() {
 		recvKey := newConnKey(addr, p.connID+1)
-		c = s.conns[recvKey]
-		if c == nil {
+		if existing := s.conns[recvKey]; existing != nil {
+			// Only dedupe SYN retransmits for pending inbound conns. A live
+			// conn of another kind at this key is left alone and the SYN
+			// falls through to the reset path below without registering.
+			if existing.inbound {
+				c = existing
+			}
+		} else {
 			c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
 			s.conns[recvKey] = c
 		}
@@ -264,7 +270,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 
 	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
-	if p.typ == packetTypeSyn && !wasAccepted {
+	if p.typ == packetTypeSyn && c.inbound && !wasAccepted {
 		if listener == nil || !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
 		} else {
