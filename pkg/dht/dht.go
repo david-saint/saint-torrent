@@ -267,10 +267,9 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 	var senderID [20]byte
 	copy(senderID[:], idStr)
 
-	d.addNode(senderID, addr)
-
 	switch q {
 	case "ping":
+		d.addNode(senderID, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
@@ -282,6 +281,8 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		}
 		var targetID [20]byte
 		copy(targetID[:], targetStr)
+
+		d.addNode(senderID, addr)
 
 		closerNodes := d.getCloserNodes(targetID, 8)
 		d.sendResponse(t, map[string]interface{}{
@@ -296,6 +297,8 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		}
 		var infoHash [20]byte
 		copy(infoHash[:], infoHashStr)
+
+		d.addNode(senderID, addr)
 
 		token := d.generateToken(addr)
 		peers := d.getPeersForInfoHash(infoHash)
@@ -345,6 +348,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 			return
 		}
 
+		d.addNode(senderID, addr)
 		d.registerPeer(infoHash, addr.IP, actualPort)
 
 		d.sendResponse(t, map[string]interface{}{
