@@ -8,14 +8,40 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const resumeMetadataReadFlags = os.O_RDONLY
+const (
+	resumeMetadataReadFlags = os.O_RDONLY
+	// FlushFileBuffers needs write access, so a checkpoint opens read/write for the
+	// payload files it has to flush.
+	resumeSyncOpenFlags = os.O_RDWR
+)
+
+// fileBasicInfo mirrors FILE_BASIC_INFO. Only ChangeTime is read: it is the
+// Windows equivalent of the Unix change timestamp and is what catches an in-place
+// edit whose author restored the modification time.
+type fileBasicInfo struct {
+	CreationTime   int64
+	LastAccessTime int64
+	LastWriteTime  int64
+	ChangeTime     int64
+	FileAttributes uint32
+	_              uint32
+}
 
 func fileIdentity(f *os.File, _ os.FileInfo) string {
+	if f == nil {
+		return ""
+	}
 	var info windows.ByHandleFileInformation
 	if windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info) != nil {
 		return ""
 	}
-	return fmt.Sprintf("%d:%d:%d", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow)
+	var basic fileBasicInfo
+	if windows.GetFileInformationByHandleEx(windows.Handle(f.Fd()), windows.FileBasicInfo, (*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic))) != nil {
+		// Without a change timestamp the identity cannot prove the content is
+		// unchanged, so report none and let the pieces be rechecked.
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime)
 }
 
 func replaceResumeFile(root *DownloadRoot, oldName, newName string, _ bool) error {
@@ -60,5 +86,3 @@ func replaceResumeFile(root *DownloadRoot, oldName, newName string, _ bool) erro
 func sameFileVersion(a, b os.FileInfo) bool {
 	return b != nil && os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime())
 }
-
-func fileObjectIdentity(f *os.File, info os.FileInfo) string { return fileIdentity(f, info) }

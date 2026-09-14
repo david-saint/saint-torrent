@@ -5,13 +5,17 @@ package storage
 import (
 	"fmt"
 	"os"
-	"reflect"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-const resumeMetadataReadFlags = os.O_RDONLY | unix.O_NONBLOCK
+const (
+	resumeMetadataReadFlags = os.O_RDONLY | unix.O_NONBLOCK
+	// fsync works on a read-only descriptor here, so a checkpoint never needs write
+	// access to a payload file it only flushes.
+	resumeSyncOpenFlags = os.O_RDONLY | unix.O_NONBLOCK
+)
 
 func fileIdentity(_ *os.File, info os.FileInfo) string {
 	st, ok := info.Sys().(*syscall.Stat_t)
@@ -19,16 +23,11 @@ func fileIdentity(_ *os.File, info os.FileInfo) string {
 		return ""
 	}
 	// The change timestamp catches in-place edits even if a tool restores mtime.
-	// Stat_t names this field Ctim on Linux and Ctimespec on BSD/macOS.
-	value := reflect.ValueOf(st).Elem()
-	change := value.FieldByName("Ctim")
-	if !change.IsValid() {
-		change = value.FieldByName("Ctimespec")
-	}
-	if !change.IsValid() {
+	seconds, nanoseconds, ok := statChangeTime(st)
+	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("%d:%d:%v", st.Dev, st.Ino, change.Interface())
+	return fmt.Sprintf("%d:%d:%d.%09d", st.Dev, st.Ino, seconds, nanoseconds)
 }
 
 func replaceResumeFile(root *DownloadRoot, oldName, newName string, durable bool) error {
@@ -48,12 +47,4 @@ func replaceResumeFile(root *DownloadRoot, oldName, newName string, durable bool
 
 func sameFileVersion(a, b os.FileInfo) bool {
 	return b != nil && os.SameFile(a, b) && a.Size() == b.Size() && a.ModTime().Equal(b.ModTime()) && fileIdentity(nil, a) == fileIdentity(nil, b)
-}
-
-func fileObjectIdentity(_ *os.File, info os.FileInfo) string {
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ""
-	}
-	return fmt.Sprintf("%d:%d", st.Dev, st.Ino)
 }

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -184,5 +185,169 @@ func TestAtomicResumeReplacement(t *testing.T) {
 	}
 	if got, err := st.LoadResumeState(hash); err != nil || !reflect.DeepEqual(got.Verified, []int{0, 1}) {
 		t.Fatalf("new checkpoint invalid: %+v %v", got, err)
+	}
+}
+
+func TestCheckpointOmitsUnclaimedPiecesFromRecheck(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	// Only the pieces inside "a" are claimed; "b" and "c" hold nothing yet.
+	if err := st.SaveResumeState(hash, []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	root := st.BaseDir()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "c")); err != nil {
+		t.Fatal(err)
+	}
+	files := []FileInfo{{Path: "a", Length: 6}, {Path: "b", Length: 4}, {Path: "c", Length: 6}}
+	next, err := NewFileStorage(root, files, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	got, err := next.LoadResumeState(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Recreating "c" must not make its never-downloaded pieces wait for a hash.
+	want := ResumeState{Verified: []int{0}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v; want %+v", got, want)
+	}
+}
+
+func TestCheckpointSurvivesUnreadablePayloadFile(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := os.Remove(filepath.Join(st.BaseDir(), "c")); err != nil {
+		t.Fatal(err)
+	}
+	// A payload that vanished at runtime must not fail the whole checkpoint, or the
+	// caller retries a full flush sweep every second and reports a permanent error.
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatalf("checkpoint aborted on missing payload: %v", err)
+	}
+	got, err := st.LoadResumeState(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pieces 2 and 3 overlap the missing file; piece 0 lies entirely inside "a".
+	want := ResumeState{Verified: []int{0, 1}, Recheck: []int{2, 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v; want %+v", got, want)
+	}
+}
+
+func TestResumeHintPreservesDurableCheckpoint(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	// A hint written while a recheck is running (or at shutdown) must not replace
+	// the checkpoint with a version-less guess that rehashes everything.
+	if err := st.SaveResumeState(hash, []int{0, 1}, []int{2, 3}, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LoadResumeState(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ResumeState{Verified: []int{0, 1}, Recheck: []int{2, 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v; want %+v", got, want)
+	}
+	// A piece the recheck rejected drops out of the claim and stays out.
+	if err = st.SaveResumeState(hash, []int{0}, []int{2, 3}, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = st.LoadResumeState(hash); err != nil {
+		t.Fatal(err)
+	}
+	want = ResumeState{Verified: []int{0}, Recheck: []int{2, 3}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v; want %+v", got, want)
+	}
+}
+
+func TestCheckpointSkipsRepeatedFlushOfCleanFiles(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(st.BaseDir(), "."+hash+".state")
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An unchanged checkpoint is not rewritten, so quitting a stack of idle
+	// torrents costs no per-file sweep at all.
+	if !os.SameFile(first, second) {
+		t.Fatal("identical checkpoint was rewritten")
+	}
+	if err = st.WriteBlock(0, 0, []byte{5, 6, 7, 8}); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	third, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(second, third) {
+		t.Fatal("checkpoint not refreshed after a write")
+	}
+}
+
+func TestCheckpointTrustsRepairedFileOnceRewritten(t *testing.T) {
+	root := t.TempDir()
+	files := []FileInfo{{Path: "a", Length: 4}, {Path: "b", Length: 4}}
+	st, err := NewFileStorage(root, files, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i := int64(0); i < 2; i++ {
+		if err = st.WriteBlock(i, 0, []byte{1, 2, 3, 4}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Drop the cached handle so the next write reopens (and recreates) the file.
+	st.files[1].invalidateWriter()
+	if err = os.Remove(filepath.Join(root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.WriteBlock(1, 0, []byte{1, 2, 3, 4}); !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock = %v, want ErrFileRepaired", err)
+	}
+	// The checkpoint taken right after a repair distrusts the recreated file.
+	if err = st.SaveResumeState("repair", []int{0, 1}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.LoadResumeState("repair")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, ResumeState{Verified: []int{0}, Recheck: []int{1}}) {
+		t.Fatalf("repair was blessed immediately: %+v", got)
+	}
+	// A session that keeps running re-anchors the file instead of rehashing it on
+	// every launch for the rest of its life.
+	if err = st.SaveResumeState("repair", []int{0, 1}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = st.LoadResumeState("repair"); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, ResumeState{Verified: []int{0, 1}}) {
+		t.Fatalf("repaired file never regained trust: %+v", got)
 	}
 }

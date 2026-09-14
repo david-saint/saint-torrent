@@ -5,6 +5,7 @@ package storage
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -301,5 +302,143 @@ func TestMMapDurableResume(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("piece %d: %v %v", i, ok, err)
 		}
+	}
+}
+
+// mmapPayload writes size bytes through a mapping and returns the storage.
+func mmapPayload(t *testing.T, root string, size int64) *MMapStorage {
+	t.Helper()
+	st, err := NewMMapStorage(root, []FileInfo{{Path: "payload", Length: size}}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make([]byte, size)
+	for i := range block {
+		block[i] = byte(i)
+	}
+	if err = st.WriteBlock(0, 0, block); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// A mapped write is flushed by the page cache long after the write itself, and on
+// Darwin that page-out bumps the modification time during the checkpoint's own
+// flush for any payload past a few megabytes. A checkpoint that captured metadata
+// around that flush distrusted every large file and rehashed the whole torrent on
+// the next launch.
+func TestMMapDurableResumeLargeFile(t *testing.T) {
+	const size = 32 << 20
+	root := t.TempDir()
+	st := mmapPayload(t, root, size)
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, ".mapped.state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state FastResumeState
+	if err = json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != 2 || len(state.Identities) != 1 || state.Identities[0] == "" {
+		t.Fatalf("large mapped file was distrusted: %+v", state)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewMMapStorage(root, []FileInfo{{Path: "payload", Length: size}}, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	got, err := next.LoadResumeState("mapped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.Verified, []int{0}) || len(got.Recheck) != 0 {
+		t.Fatalf("resume %+v", got)
+	}
+}
+
+// A durable checkpoint must replace the previous one in a single atomic step. When
+// it published a cheap hint first, a crash during the payload flush left the next
+// launch with a version-less state and a full rehash of data that had just been
+// checkpointed.
+func TestMMapDurableCheckpointNeverPublishesHint(t *testing.T) {
+	const size = 32 << 20
+	root := t.TempDir()
+	st := mmapPayload(t, root, size)
+	defer st.Close()
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WriteBlock(0, 0, make([]byte, size)); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	done := make(chan int)
+	go func() {
+		lowest := 2
+		for {
+			select {
+			case <-stop:
+				done <- lowest
+				return
+			default:
+			}
+			if data, err := os.ReadFile(filepath.Join(root, ".mapped.state")); err == nil {
+				var observed FastResumeState
+				if json.Unmarshal(data, &observed) == nil && observed.Version < lowest {
+					lowest = observed.Version
+				}
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	if lowest := <-done; lowest < 2 {
+		t.Fatalf("durable checkpoint published a version-%d state mid-flight", lowest)
+	}
+}
+
+// Size, modification time and file identity alone cannot see an in-place edit whose
+// author restored the modification time, so the checkpoint must record the change
+// timestamp for mapped files too.
+func TestMMapCheckpointRejectsExternalEditWithRestoredMtime(t *testing.T) {
+	root := t.TempDir()
+	st := mmapPayload(t, root, 8)
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "payload")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte("nonsense"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewMMapStorage(root, []FileInfo{{Path: "payload", Length: 8}}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	got, err := next.LoadResumeState("mapped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Verified) != 0 || !slices.Equal(got.Recheck, []int{0}) {
+		t.Fatalf("edited payload was restored as verified: %+v", got)
 	}
 }

@@ -33,9 +33,6 @@ func NewMMapStorage(baseDir string, files []FileInfo, pieceLength int64) (*MMapS
 		return nil, err
 	}
 
-	// Unmapping a writable mapping can change ctime even after a data flush.
-	// Use file identity and mtime for these checkpoints, as on Windows.
-	fs.resumeIdentityMode = "file"
 	st := &MMapStorage{
 		FileStorage: fs,
 		dirty:       make(map[*fileLayout]struct{}),
@@ -328,6 +325,16 @@ func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {
 // SaveState refreshes mmap-backed file mtimes once per resume persist rather
 // than on every block write, then reuses FileStorage's state serialization.
 func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error {
+	if err := s.refreshMappedMtimes(); err != nil {
+		return err
+	}
+	return s.FileStorage.SaveState(infoHashHex, completedPieces)
+}
+
+// refreshMappedMtimes stamps the files written through a mapping since the last
+// persist. Mapped writes do not bump the mtime promptly, so the cheap hint path
+// sets it explicitly instead of paying a syscall on every completed piece.
+func (s *MMapStorage) refreshMappedMtimes() error {
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
@@ -344,10 +351,9 @@ func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return ErrStorageClosed
 	}
 
-	mtimes := make(map[*fileLayout]int64, len(dirty))
+	touched := make([]*fileLayout, 0, len(dirty))
 	for file := range dirty {
-		mtime, err := touchMappedFile(file)
-		if err != nil {
+		if err := touchMappedFile(file); err != nil {
 			s.mu.Lock()
 			for pending := range dirty {
 				s.dirty[pending] = struct{}{}
@@ -355,49 +361,98 @@ func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error
 			s.mu.Unlock()
 			return err
 		}
-		mtimes[file] = mtime
+		touched = append(touched, file)
+	}
+	s.markFileStorageDirty(touched, dirtyMeta|dirtySync)
+	return nil
+}
+
+// unmapForCheckpoint releases every mapping before a durable checkpoint reads the
+// files back. Tearing the mapping down is what settles a mapped write: it flushes
+// the dirty pages and applies their timestamp bump, so the checkpoint sees stable
+// metadata instead of racing a page-out that happens during (or after) its own
+// flush. Mappings are re-established lazily on the next read or write.
+func (s *MMapStorage) unmapForCheckpoint() error {
+	if s.closed.Load() {
+		return ErrStorageClosed
+	}
+	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		return ErrStorageClosed
+	}
+	var unmapped, flushed []*fileLayout
+	var firstErr error
+	for _, mapped := range s.maps {
+		if len(mapped.data) == 0 {
+			continue
+		}
+		if err := unix.Munmap(mapped.data); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to flush mapping for file %s: %w", mapped.layout.path, err)
+			}
+			continue
+		}
+		mapped.data = nil
+		unmapped = append(unmapped, mapped.layout)
+		if _, ok := s.dirty[mapped.layout]; ok {
+			flushed = append(flushed, mapped.layout)
+			delete(s.dirty, mapped.layout)
+		}
+	}
+	s.mu.Unlock()
+	if firstErr != nil {
+		return firstErr
+	}
+	// Unmapping moved every mapped file's timestamps, so none of them can be
+	// compared against the previous metadata snapshot; only the ones carrying
+	// mapped writes still owe a flush to disk.
+	s.markFileStorageDirty(unmapped, dirtyMeta)
+	s.markFileStorageDirty(flushed, dirtySync)
+	return nil
+}
+
+func (s *MMapStorage) markFileStorageDirty(files []*fileLayout, flags dirtyState) {
+	if len(files) == 0 {
+		return
 	}
 	s.mtMu.Lock()
-	for file, mtime := range mtimes {
-		s.stateFileMt[file.path] = mtime
-		s.FileStorage.dirty[file] = struct{}{}
+	for _, file := range files {
+		s.FileStorage.dirty[file] |= flags
 	}
 	s.mtMu.Unlock()
-
-	return s.FileStorage.SaveState(infoHashHex, completedPieces)
 }
 
-func touchMappedFile(file *fileLayout) (int64, error) {
-	now := time.Now()
+func touchMappedFile(file *fileLayout) error {
 	h, err := rootOpenNoFollow(file.downloadRoot, file.path, os.O_RDONLY, 0)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open file %s for mtime refresh: %w", file.path, err)
+		return fmt.Errorf("failed to open file %s for mtime refresh: %w", file.path, err)
 	}
-	tv := unix.NsecToTimeval(now.UnixNano())
+	tv := unix.NsecToTimeval(time.Now().UnixNano())
 	touchErr := unix.Futimes(int(h.Fd()), []unix.Timeval{tv, tv})
-	fi, statErr := h.Stat()
 	closeErr := h.Close()
-	if statErr != nil {
-		if touchErr != nil {
-			return 0, fmt.Errorf("failed to refresh mtime for file %s: futimes: %v; stat: %w", file.path, touchErr, statErr)
-		}
-		return 0, fmt.Errorf("failed to stat file %s after mtime refresh: %w", file.path, statErr)
+	if touchErr != nil {
+		return fmt.Errorf("failed to refresh mtime for file %s: %w", file.path, touchErr)
 	}
 	if closeErr != nil {
-		return 0, fmt.Errorf("failed to close file %s after mtime refresh: %w", file.path, closeErr)
-	}
-	return fi.ModTime().UnixNano(), nil
-}
-
-// SaveResumeState refreshes timestamps for mapped writes before the ordinary
-// durable checkpoint. File.Sync flushes the same file-backed pages without holding
-// the mapping lock across disk I/O. Active transfers only persist lightweight hints.
-func (s *MMapStorage) SaveResumeState(hash string, verified, unverified []int, durable bool) error {
-	if err := s.SaveState(hash, append(append([]int(nil), verified...), unverified...)); err != nil {
-		return err
-	}
-	if durable {
-		return s.FileStorage.SaveResumeState(hash, verified, unverified, true)
+		return fmt.Errorf("failed to close file %s after mtime refresh: %w", file.path, closeErr)
 	}
 	return nil
+}
+
+// SaveResumeState settles mapped writes before the ordinary checkpoint. Active
+// transfers only stamp timestamps and persist a lightweight hint; a durable
+// checkpoint releases the mappings first so its flush and metadata capture see a
+// file no page-out can move underneath them.
+func (s *MMapStorage) SaveResumeState(hash string, verified, unverified []int, durable bool) error {
+	if durable {
+		if err := s.unmapForCheckpoint(); err != nil {
+			return err
+		}
+		return s.FileStorage.SaveResumeState(hash, verified, unverified, true)
+	}
+	if err := s.refreshMappedMtimes(); err != nil {
+		return err
+	}
+	return s.FileStorage.SaveResumeState(hash, verified, unverified, false)
 }
