@@ -546,11 +546,26 @@ func (s *Session) flushState() {
 		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
 		s.lastErr = stateErr
 		s.statusErr = stateErr
+		s.statePersistErr = stateErr
 		// Wake any blocked readers so they observe the new statusErr rather than
 		// sleeping until the next unrelated state change.
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
+		return
 	}
+	// A persist failure that has since resolved must not leave the torrent showing
+	// Error forever; an unrelated failure recorded meanwhile still stands.
+	s.mu.Lock()
+	if s.statePersistErr != nil {
+		if s.statusErr == s.statePersistErr {
+			s.statusErr = nil
+		}
+		if s.lastErr == s.statePersistErr {
+			s.lastErr = nil
+		}
+		s.statePersistErr = nil
+	}
+	s.mu.Unlock()
 }
 
 type byteRange struct {

@@ -372,3 +372,37 @@ func TestForcedRecheckAppliesOnlyToRestoredTorrents(t *testing.T) {
 		t.Fatal("a torrent added after startup inherited the forced recheck")
 	}
 }
+
+// A payload that disappears at runtime must not park the torrent in Error: the
+// checkpoint degrades that file to untrusted, and a persist failure that later
+// resolves has to clear the status it set.
+func TestPersistFailureClearsOnceItRecovers(t *testing.T) {
+	tor, st := resumeSessionFixture(t, 16)
+	sess, err := NewSession(tor, st, [20]byte{}, 0, st.BaseDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.mu.Lock()
+	for idx := range sess.PieceStates {
+		sess.setPieceStateLocked(idx, PieceCompleted)
+	}
+	sess.verifying = false
+	sess.verifyDone = nil
+	sess.stateDirty = true
+	failure := fmt.Errorf("failed to save fast-resume state: disk full")
+	sess.statusErr = failure
+	sess.lastErr = failure
+	sess.statePersistErr = failure
+	sess.mu.Unlock()
+
+	if err = os.Remove(filepath.Join(st.BaseDir(), "b")); err != nil {
+		t.Fatal(err)
+	}
+	sess.flushState()
+	if got := sess.Status(); got != "Seeding" {
+		t.Fatalf("status = %q, want Seeding after a recovered persist", got)
+	}
+	if got := sess.LastError(); got != nil {
+		t.Fatalf("last error = %v, want nil", got)
+	}
+}

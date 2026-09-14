@@ -198,6 +198,7 @@ type Session struct {
 	trackerCompleted    int
 	lastErr             error
 	statusErr           error // current blocking failure; drives Error status
+	statePersistErr     error // last resume-persist failure, cleared once it recovers
 	lastTrackerErr      error
 	paused              bool
 	pauseEpoch          uint64 // increments when active connections are closed for pause
