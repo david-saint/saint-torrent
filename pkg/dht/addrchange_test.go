@@ -460,9 +460,17 @@ func TestAddressChangeRejectsCandidateWithDifferentID(t *testing.T) {
 	// The stored address never answers, so the candidate is probed next.
 	tid := awaitQueryTo(t, conn, attackerAddr, "ping")
 	impostor := idInBucket(d.nodeID, bucket, 2)
+	answered := time.Now()
 	conn.injectPingReply(t, tid, impostor, attackerAddr)
 
 	awaitNoPendingAddrChange(t, d)
+
+	// A reply that never matched the transaction would reach the same end state
+	// by simply letting the candidate query expire, so this branch is only
+	// exercised if the answer ended the verification well inside that timeout.
+	if elapsed := time.Since(answered); elapsed > nodePingTimeout/2 {
+		t.Fatalf("verification took %v, so the wrong-ID reply is not what ended it", elapsed)
+	}
 
 	nodes := bucketNodes(d, bucket)
 	if len(nodes) != 1 {
