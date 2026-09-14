@@ -10,12 +10,47 @@ import (
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/storage"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // verifyGate bounds how many piece hash checks run concurrently across all sessions,
 // so background verification saturates available cores without thrashing the disk.
 var verifyGate = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
+
+// pausedVerifyGate serialises the rechecks of paused sessions. Nobody is waiting on
+// a paused torrent's pieces, so its recheck is background work: running them one at
+// a time keeps a slow disk from being split between streams the user is not
+// watching, and keeps them off the gate that active sessions share.
+var pausedVerifyGate = make(chan struct{}, 1)
+
+// pausedQueuePoll is how often a recheck waiting for the paused slot re-checks
+// whether its session has been resumed, which moves it to the active gate.
+const pausedQueuePoll = 250 * time.Millisecond
+
+// liveTransfers counts the sessions currently receiving payload at or above
+// liveTransferThreshold. A paused session's recheck yields to them between pieces
+// so a disk shared between the recheck and a live download serves the download
+// first; with no live transfer the recheck runs flat out.
+var liveTransfers atomic.Int32
+
+const liveTransferThreshold = 512 * 1024 // bytes per second
+
+// pausedRecheckYield waits between two pieces of a paused recheck while a live
+// transfer is running. The wait is twice the time the piece just took to read and
+// hash, so the recheck takes at most a third of the disk and the share scales with
+// the disk rather than with a fixed rate. Tests replace it.
+var pausedRecheckYield = func(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+}
 
 func (s *Session) logSessionEvent(level logging.Level, event string, fields ...logging.Field) {
 	if !logging.EnabledFor(level) {
@@ -272,6 +307,48 @@ func (s *Session) maybeStartVerification() {
 	go s.verifyResume(ctx)
 }
 
+// acquireVerifySlot takes a verification slot for this session and returns the
+// function that gives it back. Active sessions share the core-bounded gate. A
+// paused session's recheck is background work and waits for the single paused slot
+// instead; if the session is resumed while it waits, it moves to the active gate.
+// ok is false when ctx ended first.
+func (s *Session) acquireVerifySlot(ctx context.Context) (release func(), ok bool) {
+	s.mu.Lock()
+	paused := s.paused
+	s.verifyQueued = paused
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.verifyQueued = false
+		s.mu.Unlock()
+	}()
+	if paused {
+		ticker := time.NewTicker(pausedQueuePoll)
+		defer ticker.Stop()
+		for release == nil && paused {
+			select {
+			case pausedVerifyGate <- struct{}{}:
+				release = func() { <-pausedVerifyGate }
+			case <-ticker.C:
+				s.mu.RLock()
+				paused = s.paused
+				s.mu.RUnlock()
+			case <-ctx.Done():
+				return nil, false
+			}
+		}
+	}
+	if release == nil {
+		select {
+		case verifyGate <- struct{}{}:
+			release = func() { <-verifyGate }
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+	return release, true
+}
+
 // verifyResume hash-checks the pieces flagged by loadResumeState. On success a piece
 // becomes PieceCompleted (now advertisable and seedable); on failure it returns to
 // PieceEmpty so the downloader re-fetches it.
@@ -320,13 +397,12 @@ func (s *Session) runVerification(ctx context.Context) bool {
 	// sessions. Acquisition is cancellable, and the slot is reclaimed by Close() even if a
 	// VerifyPiece read is wedged on slow I/O — so a closed session can never permanently
 	// consume verification capacity.
-	select {
-	case verifyGate <- struct{}{}:
-	case <-ctx.Done():
+	slot, ok := s.acquireVerifySlot(ctx)
+	if !ok {
 		return false
 	}
 	var relOnce sync.Once
-	release := func() { relOnce.Do(func() { <-verifyGate }) }
+	release := func() { relOnce.Do(slot) }
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -350,13 +426,16 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		default:
 		}
 
+		pieceStart := time.Now()
 		ok, verifyErr := st.VerifyPiece(int64(idx), pieceHashes[idx])
+		pieceTime := time.Since(pieceStart)
 
 		s.mu.Lock()
 		if s.closed || s.Storage != st || idx >= len(s.PieceStates) {
 			s.mu.Unlock()
 			return false
 		}
+		paused := s.paused
 		s.verifyCheckedBytes += st.PieceLength(int64(idx))
 		var nowCompleted bool
 		if fullScan {
@@ -391,6 +470,9 @@ func (s *Session) runVerification(ctx context.Context) bool {
 				logging.Bool("hash_ok", ok),
 				logging.Err(verifyErr),
 			)
+		}
+		if paused && liveTransfers.Load() > 0 {
+			pausedRecheckYield(ctx, 2*pieceTime)
 		}
 	}
 	s.logSessionEvent(logging.LevelInfo, "resume_verification_finished",

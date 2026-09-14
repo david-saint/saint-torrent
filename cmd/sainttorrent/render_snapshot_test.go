@@ -179,6 +179,30 @@ func TestCheckingShowsDiskProgressWhilePaused(t *testing.T) {
 			t.Fatalf("checking row: %s", plain)
 		}
 	}
+	queued := downloader.SessionSnapshot{
+		Name: "Queued torrent", Status: "Queued", Paused: true, TotalSize: 8 << 30,
+		Verification: downloader.VerificationSnapshot{Active: true, Queued: true, TotalBytes: 8 << 30},
+	}
+	qrow := rowFromSnapshot(nil, queued)
+	if qrow.speedText() != "queued" {
+		t.Fatalf("queued speed %q", qrow.speedText())
+	}
+	if !strings.HasPrefix(qrow.checkingText(), "Queued for checking") {
+		t.Fatalf("queued detail %q", qrow.checkingText())
+	}
+	for _, theme := range []*theme{monoTheme, draculaTheme} {
+		m := &model{width: 120, theme: theme}
+		var view string
+		if theme == monoTheme {
+			view = monoRow(m, theme.styles, listColumns(120), false, qrow)
+		} else {
+			view = dracRow(theme.styles, listColumns(120), false, qrow)
+		}
+		plain := ansi.Strip(view)
+		if !strings.Contains(plain, "QUEUED") || strings.Contains(plain, "DOWNLOADING") {
+			t.Fatalf("queued row: %s", plain)
+		}
+	}
 	if !parseCLIArgs([]string{"--recheck"}).verifyOnStartup {
 		t.Fatal("--recheck did not enable startup verification")
 	}

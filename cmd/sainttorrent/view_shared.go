@@ -311,6 +311,8 @@ func statusLabelStyle(st styles, status string) (string, lipgloss.Style) {
 		return "METADATA", st.StatusMetadata
 	case "Checking":
 		return "CHECKING", st.StatusMetadata
+	case "Queued":
+		return "QUEUED", st.StatusMetadata
 	case "Error":
 		return "ERROR", st.StatusError
 	default:
