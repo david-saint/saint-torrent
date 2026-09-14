@@ -118,6 +118,9 @@ func (row sessionRow) checkingPercent() float64 {
 }
 
 func (row sessionRow) speedText() string {
+	if row.verification.Queued {
+		return "queued"
+	}
 	if row.verification.Active {
 		return formatSpeed(row.verification.BytesPerSecond)
 	}
@@ -127,6 +130,9 @@ func (row sessionRow) speedText() string {
 func (row sessionRow) checkingText() string {
 	if !row.verification.Active {
 		return ""
+	}
+	if row.verification.Queued {
+		return fmt.Sprintf("Queued for checking · %s · waits for the recheck in progress", formatBytes(row.verification.TotalBytes))
 	}
 	return fmt.Sprintf("Checking %.1f%% · %s / %s · %s · ETA %s", row.checkingPercent(), formatBytes(row.verification.CheckedBytes), formatBytes(row.verification.TotalBytes), formatSpeed(row.verification.BytesPerSecond), row.eta)
 }

@@ -193,6 +193,7 @@ type Session struct {
 	globalInboundSlots  chan struct{} // manager-wide inbound cap shared across sessions (nil if standalone)
 	currentSpeed        float64
 	currentUploadSpeed  float64
+	liveTransfer        bool // counted in liveTransfers
 	trackerSeeders      int
 	trackerLeechers     int
 	trackerCompleted    int
@@ -222,6 +223,7 @@ type Session struct {
 	verifyStartTime    time.Time
 	verifying          bool
 	verifyStarted      bool
+	verifyQueued       bool // paused recheck waiting for the paused slot
 	verifyFullScan     bool
 	verifyDone         chan struct{}
 	verifyGateRelease  func() // releases this session's global verification slot (once)
@@ -701,6 +703,7 @@ func (s *Session) speedMonitorLoop() {
 			if s.paused {
 				s.currentSpeed = 0
 				s.currentUploadSpeed = 0
+				s.setLiveTransferLocked(false)
 				lastGlobalDownloaded = s.Downloaded.Load()
 				lastGlobalUploaded = s.Uploaded.Load()
 				for _, pState := range s.Peers {
@@ -714,6 +717,7 @@ func (s *Session) speedMonitorLoop() {
 			curDownloaded := s.Downloaded.Load()
 			globalDiff := curDownloaded - lastGlobalDownloaded
 			s.currentSpeed = float64(globalDiff)
+			s.setLiveTransferLocked(globalDiff >= liveTransferThreshold)
 			lastGlobalDownloaded = curDownloaded
 			curUploaded := s.Uploaded.Load()
 			globalUploadDiff := curUploaded - lastGlobalUploaded
@@ -759,6 +763,7 @@ func (s *Session) speedMonitorLoop() {
 			s.mu.Lock()
 			s.currentSpeed = 0
 			s.currentUploadSpeed = 0
+			s.setLiveTransferLocked(false)
 			for _, pState := range s.Peers {
 				pState.DownloadSpeed = 0
 				pState.UploadSpeed = 0
@@ -766,6 +771,20 @@ func (s *Session) speedMonitorLoop() {
 			s.mu.Unlock()
 			return
 		}
+	}
+}
+
+// setLiveTransferLocked records whether this session counts as a live transfer in
+// the process-wide gauge that paused rechecks yield to. The caller holds s.mu.
+func (s *Session) setLiveTransferLocked(live bool) {
+	if live == s.liveTransfer {
+		return
+	}
+	s.liveTransfer = live
+	if live {
+		liveTransfers.Add(1)
+	} else {
+		liveTransfers.Add(-1)
 	}
 }
 
@@ -868,6 +887,9 @@ func (s *Session) IsCompleted() bool {
 
 func (s *Session) statusLocked() string {
 	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
+		if s.verifyQueued {
+			return "Queued"
+		}
 		return "Checking"
 	}
 	isCompleted := s.isCompletedLocked()
@@ -917,7 +939,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	// recheck it is displaying progress for.
 	case s.paused:
 		statusScore = 2
-	case status == "Downloading" || status == "Metadata" || status == "Checking":
+	case status == "Downloading" || status == "Metadata" || status == "Checking" || status == "Queued":
 		statusScore = 0
 	case status == "Seeding":
 		statusScore = 1
@@ -945,6 +967,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 // VerificationSnapshot reports disk checking separately from network transfer.
 type VerificationSnapshot struct {
 	Active         bool
+	Queued         bool // waiting for the paused-recheck slot; nothing has been hashed yet
 	CheckedBytes   int64
 	TotalBytes     int64
 	BytesPerSecond float64
@@ -994,7 +1017,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	// added torrent runs alongside a normal download, so surfacing it would replace
 	// real transfer progress with disk-scan progress for the length of the scan.
 	checking := s.verifying && !s.verifyFullScan
-	snap.Verification = VerificationSnapshot{Active: checking, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
+	snap.Verification = VerificationSnapshot{Active: checking, Queued: checking && s.verifyQueued, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
 	if checking && !s.verifyStartTime.IsZero() {
 		elapsed := time.Since(s.verifyStartTime).Seconds()
 		if elapsed > 0 {
@@ -1159,6 +1182,10 @@ func (s *Session) Pause() {
 	}
 	s.paused = true
 	s.pauseEpoch++
+	// A paused session receives no payload, so drop it from the gauge here rather
+	// than leaving a stale sample for the next speed-monitor tick to clear: a paused
+	// recheck must not keep yielding to a transfer that has already stopped.
+	s.setLiveTransferLocked(false)
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("stopped")
 	for _, client := range s.activePeers {
