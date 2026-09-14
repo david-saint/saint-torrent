@@ -51,6 +51,36 @@ func expireIDCooldown(t *testing.T, d *DHT, id [20]byte) {
 	d.addrCooldowns[key] = time.Now().Add(-time.Second)
 }
 
+// awaitNoPendingAddrChange waits for every in-flight verification to finish.
+func awaitNoPendingAddrChange(t *testing.T, d *DHT) {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for pendingAddrChangeCount(d) != 0 {
+		select {
+		case <-deadline:
+			t.Fatal("address-change verification never finished")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// awaitQueryTo waits for an outbound query of type q to addr and returns its
+// transaction ID.
+func awaitQueryTo(t *testing.T, c *fakeConn, addr *net.UDPAddr, q string) string {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for {
+		if tid, ok := c.lastQueryTo(addr, q); ok {
+			return tid
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no %s query to %s was ever sent", q, addr)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // TestHandleQueryDoesNotRepointNodeOnUnverifiedAddressChange is the reported
 // reproduction: a node seeded at 10.0.0.1:6881 must survive an inbound query
 // that claims its ID from 203.0.113.9:1, for every query type.
@@ -342,6 +372,36 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 			t.Fatal("the same spoofed candidate was retried inside its long cooldown")
 		}
 	})
+}
+
+// TestAddressChangeRejectsCandidateWithDifferentID covers the branch where the
+// candidate answers the verification ping with a node ID other than the one it
+// claimed: the stored entry must be left exactly where it was.
+func TestAddressChangeRejectsCandidateWithDifferentID(t *testing.T) {
+	const bucket = 16
+	d, conn := newFakeDHT(t)
+
+	honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+	honest := idInBucket(d.nodeID, bucket, 1)
+	d.addNode(honest, honestAddr)
+
+	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(honest[:])}, attackerAddr)
+
+	// The stored address never answers, so the candidate is probed next.
+	tid := awaitQueryTo(t, conn, attackerAddr, "ping")
+	impostor := idInBucket(d.nodeID, bucket, 2)
+	conn.injectPingReply(t, tid, impostor, attackerAddr)
+
+	awaitNoPendingAddrChange(t, d)
+
+	nodes := bucketNodes(d, bucket)
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node in bucket %d, got %d", bucket, len(nodes))
+	}
+	if nodes[0].ID != honest || !sameUDPAddr(nodes[0].Addr, honestAddr) {
+		t.Fatalf("entry was disturbed: %x at %s", nodes[0].ID, nodes[0].Addr)
+	}
 }
 
 // unusedLoopbackAddr returns a loopback UDP address with nothing bound to it.

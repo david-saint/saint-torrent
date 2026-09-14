@@ -4,6 +4,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -88,6 +89,56 @@ func (c *fakeConn) queriesTo(addr *net.UDPAddr, q string) int {
 		}
 	}
 	return count
+}
+
+// lastQueryTo returns the transaction ID of the most recent outbound query of
+// the given type sent to addr.
+func (c *fakeConn) lastQueryTo(addr *net.UDPAddr, q string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i := len(c.sent) - 1; i >= 0; i-- {
+		p := c.sent[i]
+		if !sameUDPAddr(p.addr, addr) {
+			continue
+		}
+		parsed, err := bencode.Unmarshal(p.data)
+		if err != nil {
+			continue
+		}
+		dict, ok := parsed.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if y, _ := dict["y"].(string); y != "q" {
+			continue
+		}
+		if got, _ := dict["q"].(string); got != q {
+			continue
+		}
+		tid, _ := dict["t"].(string)
+		return tid, true
+	}
+	return "", false
+}
+
+// injectPingReply feeds a bencoded ping response into the read loop as if it
+// had arrived from addr, resolving the transaction tid.
+func (c *fakeConn) injectPingReply(t *testing.T, tid string, id [20]byte, addr *net.UDPAddr) {
+	t.Helper()
+	payload, err := bencode.Marshal(map[string]interface{}{
+		"t": tid,
+		"y": "r",
+		"r": map[string]interface{}{"id": string(id[:])},
+	})
+	if err != nil {
+		t.Fatalf("failed to encode ping reply: %v", err)
+	}
+	select {
+	case c.in <- fakePacket{data: payload, addr: &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port}}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read loop never consumed the injected reply")
+	}
 }
 
 func newFakeDHT(t *testing.T) (*DHT, *fakeConn) {
