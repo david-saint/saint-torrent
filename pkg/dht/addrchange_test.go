@@ -31,6 +31,26 @@ func pendingAddrChangeCount(d *DHT) int {
 	return len(d.addrChanges)
 }
 
+func addrCooldownCount(d *DHT) int {
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	return len(d.addrCooldowns)
+}
+
+// expireIDCooldown rewinds the short per-ID cooldown so the window elapsing can
+// be observed without waiting on the clock. The long per-candidate cooldowns are
+// left untouched.
+func expireIDCooldown(t *testing.T, d *DHT, id [20]byte) {
+	t.Helper()
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	key := addrChangeKey{id: id}
+	if _, ok := d.addrCooldowns[key]; !ok {
+		t.Fatalf("no short cooldown recorded for %x", id)
+	}
+	d.addrCooldowns[key] = time.Now().Add(-time.Second)
+}
+
 // TestHandleQueryDoesNotRepointNodeOnUnverifiedAddressChange is the reported
 // reproduction: a node seeded at 10.0.0.1:6881 must survive an inbound query
 // that claims its ID from 203.0.113.9:1, for every query type.
@@ -225,8 +245,8 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 			d.handleQuery("tx", "ping", map[string]interface{}{"id": string(id[:])}, addr)
 		}
 
-		if got := pendingAddrChangeCount(d); got > maxPendingAddrChanges {
-			t.Fatalf("pending candidate set grew to %d, cap is %d", got, maxPendingAddrChanges)
+		if got := pendingAddrChangeCount(d); got != maxPendingAddrChanges {
+			t.Fatalf("pending candidate set holds %d verifications, want exactly the cap %d", got, maxPendingAddrChanges)
 		}
 	})
 
@@ -237,106 +257,89 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 		honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
 		honest := idInBucket(d.nodeID, bucket, 1)
 		d.addNode(honest, honestAddr)
+		candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
 
-		if !d.beginAddressVerification(honest) {
+		if !d.beginAddressVerification(honest, candidate) {
 			t.Fatal("first verification should have been admitted")
 		}
-		d.endAddressVerification(honest)
-		if d.beginAddressVerification(honest) {
+		d.endAddressVerification(honest, candidate, addrChangeFailed)
+		if d.beginAddressVerification(honest, candidate) {
 			t.Fatal("a candidate was retried during its cooldown")
 		}
 	})
-}
 
-// TestAddressChangeAdoptedOnlyAfterVerification exercises the full verification
-// path against live DHT instances over loopback: a stored address that has gone
-// silent is replaced by a candidate that answers a ping with the same node ID,
-// while a stored address that still answers keeps its slot.
-func TestAddressChangeAdoptedOnlyAfterVerification(t *testing.T) {
-	t.Run("adopted when old address is silent", func(t *testing.T) {
-		victim, err := NewDHT(t.TempDir(), 0)
-		if err != nil {
-			t.Fatalf("failed to start victim DHT: %v", err)
+	// Completed attempts sit in the cooldown map, not the in-flight set, so a
+	// full round of recent checks cannot starve an unrelated genuine move.
+	t.Run("cooling attempts do not starve a fresh id", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		for i := 0; i < maxPendingAddrChanges; i++ {
+			id := idInBucket(d.nodeID, i, 1)
+			candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1 + i}
+			if !d.beginAddressVerification(id, candidate) {
+				t.Fatalf("verification %d should have been admitted", i)
+			}
+			d.endAddressVerification(id, candidate, addrChangeFailed)
 		}
-		defer victim.Close()
-
-		mover, err := NewDHT(t.TempDir(), 0)
-		if err != nil {
-			t.Fatalf("failed to start mover DHT: %v", err)
-		}
-		defer mover.Close()
-
-		oldAddr := unusedLoopbackAddr(t)
-		newAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(mover.Port())}
-		if newAddr.Port == 0 {
-			t.Fatal("mover DHT has no listen port")
+		if got := pendingAddrChangeCount(d); got != 0 {
+			t.Fatalf("completed verifications still hold %d in-flight slots", got)
 		}
 
-		victim.addNode(mover.nodeID, oldAddr)
-		victim.handleQuery("tx", "ping", map[string]interface{}{"id": string(mover.nodeID[:])}, newAddr)
-
-		deadline := time.After(15 * time.Second)
-		for {
-			addr := storedAddrFor(victim, mover.nodeID)
-			if addr == nil {
-				t.Fatal("node vanished from the routing table")
-			}
-			if sameUDPAddr(addr, newAddr) {
-				return
-			}
-			select {
-			case <-deadline:
-				t.Fatalf("address change was never adopted; entry still at %s", addr)
-			case <-time.After(20 * time.Millisecond):
-			}
+		fresh := idInBucket(d.nodeID, 130, 1)
+		freshCandidate := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 4242}
+		if !d.beginAddressVerification(fresh, freshCandidate) {
+			t.Fatalf("%d cooling attempts blocked an unrelated address change", maxPendingAddrChanges)
 		}
 	})
 
-	t.Run("rejected when old address still answers", func(t *testing.T) {
-		victim, err := NewDHT(t.TempDir(), 0)
-		if err != nil {
-			t.Fatalf("failed to start victim DHT: %v", err)
+	// A verified adoption leaves no cooldown, so a node that legitimately moves
+	// again straight away is still followed.
+	t.Run("adoption leaves no cooldown", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		id := idInBucket(d.nodeID, 14, 1)
+		candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		if !d.beginAddressVerification(id, candidate) {
+			t.Fatal("first verification should have been admitted")
 		}
-		defer victim.Close()
+		d.endAddressVerification(id, candidate, addrChangeAdopted)
 
-		incumbent, err := NewDHT(t.TempDir(), 0)
-		if err != nil {
-			t.Fatalf("failed to start incumbent DHT: %v", err)
+		if got := addrCooldownCount(d); got != 0 {
+			t.Fatalf("a verified adoption left %d cooldown entries behind", got)
 		}
-		defer incumbent.Close()
-
-		oldAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(incumbent.Port())}
-		if oldAddr.Port == 0 {
-			t.Fatal("incumbent DHT has no listen port")
+		next := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
+		if !d.beginAddressVerification(id, next) {
+			t.Fatal("a second genuine move was blocked right after a verified adoption")
 		}
-		attackerAddr := unusedLoopbackAddr(t)
+	})
 
-		victim.addNode(incumbent.nodeID, oldAddr)
-		bucket := bucketIndex(victim.nodeID, incumbent.nodeID)
-		past := time.Now().Add(-time.Hour)
-		backdateNode(t, victim, bucket, incumbent.nodeID, past)
+	// The cooldown is two-tier: a short per-ID window bounds probing, while the
+	// exact spoofed candidate stays barred for the long window.
+	t.Run("short id window releases a new candidate but not the old one", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
 
-		victim.handleQuery("tx", "ping", map[string]interface{}{"id": string(incumbent.nodeID[:])}, attackerAddr)
+		id := idInBucket(d.nodeID, 15, 1)
+		spoofed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		genuine := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
 
-		// The incumbent's real ping reply is what ends the verification, so wait
-		// for the refreshed LastSeen rather than a fixed delay.
-		deadline := time.After(15 * time.Second)
-		for {
-			nodes := bucketNodes(victim, bucket)
-			if len(nodes) != 1 {
-				t.Fatalf("expected 1 node in bucket %d, got %d", bucket, len(nodes))
-			}
-			if !sameUDPAddr(nodes[0].Addr, oldAddr) {
-				t.Fatalf("entry was re-pointed to %s despite the old address answering", nodes[0].Addr)
-			}
-			if nodes[0].LastSeen.After(past) {
-				return
-			}
-			select {
-			case <-deadline:
-				t.Fatal("incumbent was never re-confirmed by its ping reply")
-			case <-time.After(20 * time.Millisecond):
-			}
+		if !d.beginAddressVerification(id, spoofed) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, spoofed, addrChangeFailed)
+
+		if d.beginAddressVerification(id, genuine) {
+			t.Fatal("the short per-ID window did not bound repeat probing")
+		}
+
+		expireIDCooldown(t, d, id)
+		if !d.beginAddressVerification(id, genuine) {
+			t.Fatal("a genuine move from a new address stayed blocked past the short window")
+		}
+		d.endAddressVerification(id, genuine, addrChangeFailed)
+
+		expireIDCooldown(t, d, id)
+		if d.beginAddressVerification(id, spoofed) {
+			t.Fatal("the same spoofed candidate was retried inside its long cooldown")
 		}
 	})
 }
