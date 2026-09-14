@@ -619,11 +619,18 @@ func (s *Session) Close() {
 		if s.stats.completedTotalBytes > 0 {
 			s.stateDirty = true
 		}
-		s.mu.Unlock()
-		s.flushState()
-
-		s.mu.Lock()
 		wasStarted := s.started
+		// Stop serving before the shutdown checkpoint runs. A peer read re-maps a
+		// file the checkpoint released, and releasing that mapping again when the
+		// storage closes moves the timestamps the checkpoint just recorded — which
+		// would rehash on the next launch a torrent this one had already proved.
+		if s.listener != nil {
+			s.listener.Close()
+			s.listener = nil
+		}
+		for _, client := range s.activePeers {
+			_ = client.Conn.Close()
+		}
 		s.mu.Unlock()
 		if wasStarted {
 			s.announceStopped()
@@ -631,6 +638,9 @@ func (s *Session) Close() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// The peer loops are cancelled and their connections gone, so nothing can
+		// touch the files behind the checkpoint.
+		s.flushState()
 
 		s.mu.Lock()
 		s.closed = true
@@ -642,13 +652,6 @@ func (s *Session) Close() {
 		gateRelease = s.verifyGateRelease
 		s.verifyGateRelease = nil
 		storageToClose = s.Storage
-		if s.listener != nil {
-			s.listener.Close()
-			s.listener = nil
-		}
-		for _, client := range s.activePeers {
-			_ = client.Conn.Close()
-		}
 		s.broadcastPieceWaitersLocked()
 		if s.chokeTimer != nil {
 			s.chokeTimer.Stop()

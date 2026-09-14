@@ -3,13 +3,16 @@ package downloader
 import (
 	"crypto/sha1"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 )
@@ -18,8 +21,9 @@ type countedVerificationStorage struct {
 	*storage.FileStorage
 	checks []int64
 
-	mu    sync.Mutex
-	saves []bool
+	mu        sync.Mutex
+	saves     []bool
+	onDurable func()
 }
 
 func (s *countedVerificationStorage) VerifyPiece(idx int64, hash [20]byte) (bool, error) {
@@ -30,7 +34,11 @@ func (s *countedVerificationStorage) VerifyPiece(idx int64, hash [20]byte) (bool
 func (s *countedVerificationStorage) SaveResumeState(hash string, verified, unverified []int, durable bool) error {
 	s.mu.Lock()
 	s.saves = append(s.saves, durable)
+	observe := s.onDurable
 	s.mu.Unlock()
+	if durable && observe != nil {
+		observe()
+	}
 	return s.FileStorage.SaveResumeState(hash, verified, unverified, durable)
 }
 
@@ -404,5 +412,51 @@ func TestPersistFailureClearsOnceItRecovers(t *testing.T) {
 	}
 	if got := sess.LastError(); got != nil {
 		t.Fatalf("last error = %v, want nil", got)
+	}
+}
+
+// closeTrackingConn reports whether the session has already dropped the peer.
+type closeTrackingConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeTrackingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// A peer still reading when the shutdown checkpoint runs re-maps a file the
+// checkpoint released, and releasing that mapping again at storage close moves the
+// timestamps it just recorded, costing a full rehash on the next launch. Close
+// stops serving first.
+func TestCloseStopsServingBeforeCheckpoint(t *testing.T) {
+	tor, st := resumeSessionFixture(t, 16)
+	sess, err := NewSession(tor, st, [20]byte{}, 0, st.BaseDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, remote := net.Pipe()
+	defer remote.Close()
+	tracked := &closeTrackingConn{Conn: local}
+	var serving atomic.Bool
+	st.mu.Lock()
+	st.onDurable = func() { serving.Store(!tracked.closed.Load()) }
+	st.mu.Unlock()
+
+	sess.mu.Lock()
+	sess.setPieceStateLocked(0, PieceCompleted)
+	sess.verifying = false
+	sess.verifyDone = nil
+	sess.stateDirty = true
+	sess.activePeers["127.0.0.1:6881"] = peer.NewClient(tracked, tor.InfoHash, [20]byte{})
+	sess.mu.Unlock()
+
+	sess.Close()
+	if saves := st.savedStates(); len(saves) == 0 || !saves[len(saves)-1] {
+		t.Fatalf("close wrote %v, want a durable checkpoint", saves)
+	}
+	if serving.Load() {
+		t.Fatal("the shutdown checkpoint ran while a peer could still read through a mapping")
 	}
 }

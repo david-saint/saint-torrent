@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -22,6 +23,11 @@ type MMapStorage struct {
 	*FileStorage
 	maps  []*mappedFile
 	dirty map[*fileLayout]struct{}
+	// checkpointing is set while a durable checkpoint holds the files released and
+	// captures their metadata. Re-establishing a mapping during that window would
+	// move the change timestamp the checkpoint just recorded, so reads fall back to
+	// the file handles instead of remapping.
+	checkpointing atomic.Bool
 }
 
 var _ Storage = (*MMapStorage)(nil)
@@ -65,13 +71,31 @@ func (s *MMapStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 	if err := s.ensureMappedRange(globalStart, globalEnd); err != nil {
 		return 0, err
 	}
+	served, err := s.copyMapped(globalStart, globalEnd, buf)
+	if err != nil {
+		return 0, err
+	}
+	if !served {
+		// A durable checkpoint released the mappings while this read was starting.
+		// Serve it from the file handles rather than re-establishing a mapping the
+		// checkpoint would then have to distrust.
+		return s.FileStorage.ReadBlock(pieceIndex, offset, buf)
+	}
+	return len(buf), nil
+}
 
+// copyMapped copies the range out of the mappings, reporting false when a file it
+// needs is no longer mapped. Checking and copying share one read lock: a checkpoint
+// releasing the mappings in between would leave nothing to copy from.
+func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed.Load() {
-		return 0, ErrStorageClosed
+		return false, ErrStorageClosed
 	}
-
+	if !s.rangeMappedLocked(globalStart, globalEnd) {
+		return false, nil
+	}
 	for _, mapped := range s.maps {
 		file := mapped.layout
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
@@ -83,7 +107,7 @@ func (s *MMapStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 			copy(buf[bufOffset:bufOffset+nBytes], mapped.data[fileOffset:fileOffset+nBytes])
 		}
 	}
-	return len(buf), nil
+	return true, nil
 }
 
 // WriteBlock writes a block of data into mapped files.
@@ -148,13 +172,30 @@ func (s *MMapStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	if err := s.ensureMappedRange(globalStart, globalEnd); err != nil {
 		return false, err
 	}
+	served, actualHash, err := s.hashMapped(globalStart, globalEnd)
+	if err != nil {
+		return false, err
+	}
+	if !served {
+		// The mappings went away with a durable checkpoint; hash through the file
+		// handles instead of remapping behind its metadata capture.
+		return s.FileStorage.VerifyPiece(pieceIndex, expectedHash)
+	}
+	return actualHash == expectedHash, nil
+}
 
+// hashMapped hashes the range from the mappings, reporting false when a file it
+// needs is no longer mapped. Checking and hashing share one read lock.
+func (s *MMapStorage) hashMapped(globalStart, globalEnd int64) (bool, [20]byte, error) {
+	var actualHash [20]byte
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed.Load() {
-		return false, ErrStorageClosed
+		return false, actualHash, ErrStorageClosed
 	}
-
+	if !s.rangeMappedLocked(globalStart, globalEnd) {
+		return false, actualHash, nil
+	}
 	h := sha1.New()
 	for _, mapped := range s.maps {
 		file := mapped.layout
@@ -164,13 +205,12 @@ func (s *MMapStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 			fileOffset := overlapStart - file.startOffset
 			nBytes := overlapEnd - overlapStart
 			if _, err := h.Write(mapped.data[fileOffset : fileOffset+nBytes]); err != nil {
-				return false, err
+				return false, actualHash, err
 			}
 		}
 	}
-	var actualHash [20]byte
 	copy(actualHash[:], h.Sum(nil))
-	return actualHash == expectedHash, nil
+	return true, actualHash, nil
 }
 
 // Close flushes and releases mappings. It is idempotent.
@@ -216,18 +256,16 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 		s.mu.RUnlock()
 		return ErrStorageClosed
 	}
-	allMapped := true
-	for _, mapped := range s.maps {
-		file := mapped.layout
-		if globalStart < file.endOffset && globalEnd > file.startOffset {
-			if file.length != 0 && len(mapped.data) == 0 {
-				allMapped = false
-				break
-			}
-		}
-	}
+	allMapped := s.rangeMappedLocked(globalStart, globalEnd)
 	s.mu.RUnlock()
 	if allMapped {
+		return nil
+	}
+	if s.checkpointing.Load() {
+		// A durable checkpoint is capturing this file's metadata. Mapping it now
+		// would move the change timestamp the checkpoint records and cost a rehash
+		// on the next launch, so the caller reads through the file handles until the
+		// checkpoint is done — without ever waiting on the exclusive mapping lock.
 		return nil
 	}
 
@@ -246,6 +284,20 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 		}
 	}
 	return nil
+}
+
+// rangeMappedLocked reports whether every non-empty file overlapping the range is
+// mapped. The caller holds s.mu.
+func (s *MMapStorage) rangeMappedLocked(globalStart, globalEnd int64) bool {
+	for _, mapped := range s.maps {
+		file := mapped.layout
+		if globalStart < file.endOffset && globalEnd > file.startOffset {
+			if file.length != 0 && len(mapped.data) == 0 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (bool, error) {
@@ -371,7 +423,7 @@ func (s *MMapStorage) refreshMappedMtimes() error {
 // files back. Tearing the mapping down is what settles a mapped write: it flushes
 // the dirty pages and applies their timestamp bump, so the checkpoint sees stable
 // metadata instead of racing a page-out that happens during (or after) its own
-// flush. Mappings are re-established lazily on the next read or write.
+// flush. Mappings are re-established lazily once the checkpoint is done.
 func (s *MMapStorage) unmapForCheckpoint() error {
 	if s.closed.Load() {
 		return ErrStorageClosed
@@ -381,34 +433,49 @@ func (s *MMapStorage) unmapForCheckpoint() error {
 		s.mu.Unlock()
 		return ErrStorageClosed
 	}
-	var unmapped, flushed []*fileLayout
+	// Writes hold this lock exclusively, so the set of files this client has written
+	// to cannot change while the mappings are classified.
+	unflushed := s.pendingFlush()
+	var written []*fileLayout
+	var released []releasedMapping
 	var firstErr error
 	for _, mapped := range s.maps {
 		if len(mapped.data) == 0 {
 			continue
 		}
+		layout := mapped.layout
+		_, mappedWrite := s.dirty[layout]
+		wrote := mappedWrite || unflushed[layout]
+		// A mapping this client only ever read through still has its change timestamp
+		// moved by the release, so record the identity the file carries while the
+		// mapping is up: only a file that still matches what the last checkpoint
+		// trusted may adopt the metadata the release leaves behind.
+		var before os.FileInfo
+		if !wrote {
+			before, _ = layout.downloadRoot.Stat(layout.path)
+		}
 		if err := unix.Munmap(mapped.data); err != nil {
 			if firstErr == nil {
-				firstErr = fmt.Errorf("failed to flush mapping for file %s: %w", mapped.layout.path, err)
+				firstErr = fmt.Errorf("failed to flush mapping for file %s: %w", layout.path, err)
 			}
 			continue
 		}
 		mapped.data = nil
-		unmapped = append(unmapped, mapped.layout)
-		if _, ok := s.dirty[mapped.layout]; ok {
-			flushed = append(flushed, mapped.layout)
-			delete(s.dirty, mapped.layout)
+		if wrote {
+			written = append(written, layout)
+			delete(s.dirty, layout)
+			continue
 		}
+		released = append(released, releasedMapping{file: layout, before: before})
 	}
 	s.mu.Unlock()
 	if firstErr != nil {
 		return firstErr
 	}
-	// Unmapping moved every mapped file's timestamps, so none of them can be
-	// compared against the previous metadata snapshot; only the ones carrying
-	// mapped writes still owe a flush to disk.
-	s.markFileStorageDirty(unmapped, dirtyMeta)
-	s.markFileStorageDirty(flushed, dirtySync)
+	// Our own writes moved these files' timestamps and they still owe a flush; the
+	// rest are trusted only if they were unchanged when their mapping went away.
+	s.markFileStorageDirty(written, dirtyMeta|dirtySync)
+	s.markReleasedMappings(released)
 	return nil
 }
 
@@ -446,6 +513,12 @@ func touchMappedFile(file *fileLayout) error {
 // file no page-out can move underneath them.
 func (s *MMapStorage) SaveResumeState(hash string, verified, unverified []int, durable bool) error {
 	if durable {
+		// Keep the files unmapped for the whole checkpoint: a mapping re-established
+		// between the release and the metadata capture would move the change
+		// timestamp again right after it was recorded, and the next launch would
+		// rehash a torrent this checkpoint had just proved.
+		s.checkpointing.Store(true)
+		defer s.checkpointing.Store(false)
 		if err := s.unmapForCheckpoint(); err != nil {
 			return err
 		}
