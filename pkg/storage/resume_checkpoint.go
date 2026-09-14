@@ -96,6 +96,7 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		}
 		verified[idx] = state.Version == 2
 	}
+	intact := true
 	for i, file := range s.files {
 		saved := state.Files[i]
 		if saved.Path != file.path || saved.Size != file.length {
@@ -109,8 +110,9 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 			}
 			_ = h.Close()
 		}
-		if !matches && file.length > 0 {
-			for piece := file.startOffset / s.pieceLength; piece <= (file.endOffset-1)/s.pieceLength; piece++ {
+		if !matches {
+			intact = false
+			for piece := file.startOffset / s.pieceLength; file.length > 0 && piece <= (file.endOffset-1)/s.pieceLength; piece++ {
 				recheck[piece] = true
 			}
 		}
@@ -126,7 +128,7 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		}
 	}
 	if state.Version == 2 {
-		s.adoptCheckpoint(state)
+		s.adoptCheckpoint(state, intact)
 	}
 	return result, nil
 }
@@ -152,13 +154,16 @@ func (s *FileStorage) openPayloadMetadata(file *fileLayout, flag int) (os.FileIn
 
 // adoptCheckpoint records a loaded checkpoint so later hint writes replay its
 // verified pieces instead of downgrading them to unhashed completion guesses.
-func (s *FileStorage) adoptCheckpoint(state FastResumeState) {
+// A checkpoint every file still matched is adopted as complete, so pausing or
+// quitting a restored torrent nothing has touched costs no sweep at all.
+func (s *FileStorage) adoptCheckpoint(state FastResumeState, intact bool) {
 	checkpoint := resumeCheckpoint{
 		identities: append([]string(nil), state.Identities...),
 		mtimes:     make([]int64, len(state.Files)),
 		verified:   append([]int(nil), state.VerifiedPieces...),
 		completed:  append([]int(nil), state.CompletedPieces...),
 		valid:      true,
+		complete:   intact,
 	}
 	for i, saved := range state.Files {
 		checkpoint.mtimes[i] = saved.Mtime
@@ -254,6 +259,10 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 	for path, info := range s.initialInfo {
 		initial[path] = info
 	}
+	trusted := make(map[string]string, len(s.trustedIdentity))
+	for path, identity := range s.trustedIdentity {
+		trusted[path] = identity
+	}
 	s.mtMu.Unlock()
 	saved := false
 	pending := make(map[*fileLayout]dirtyState, len(dirty))
@@ -272,10 +281,11 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 
 	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, VerifiedPieces: verified, CompletedPieces: completed}
 	checkpoint := resumeCheckpoint{identities: make([]string, len(s.files)), mtimes: make([]int64, len(s.files)), valid: true, complete: true}
-	current := make(map[string]os.FileInfo, len(s.files))
+	current := make(map[string]int64, len(s.files))
+	proven := make(map[string]checkpointRecord, len(s.files))
 	for i, file := range s.files {
 		flags := dirty[file]
-		info, identity := s.checkpointFile(file, flags, expected[file.path], initial[file.path])
+		info, identity := s.checkpointFile(file, flags, expected[file.path], initial[file.path], trusted[file.path])
 		if identity == "" {
 			// Keep the file queued for the next checkpoint: its data may still be
 			// unflushed and its recorded identity is deliberately untrusted.
@@ -285,7 +295,10 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		mtime := int64(0)
 		if info != nil {
 			mtime = info.ModTime().UnixNano()
-			current[file.path] = info
+			current[file.path] = mtime
+			if identity != "" {
+				proven[file.path] = checkpointRecord{info: info, identity: identity}
+			}
 		}
 		checkpoint.identities[i] = identity
 		checkpoint.mtimes[i] = mtime
@@ -303,13 +316,69 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 	checkpoint.verified = append([]int(nil), verified...)
 	checkpoint.completed = append([]int(nil), completed...)
 	s.mtMu.Lock()
-	for path, info := range current {
-		s.stateFileMt[path] = info.ModTime().UnixNano()
-		s.stateFileInfo[path] = info
+	for path, mtime := range current {
+		s.stateFileMt[path] = mtime
+	}
+	// Only a file this checkpoint proved becomes the baseline the next one compares
+	// against. Adopting the metadata of a file it distrusted would let the very next
+	// checkpoint declare that same file unchanged and bless its pieces.
+	for path, record := range proven {
+		s.stateFileInfo[path] = record.info
+		s.trustedIdentity[path] = record.identity
 	}
 	s.checkpoint = checkpoint
 	s.mtMu.Unlock()
 	return nil
+}
+
+// checkpointRecord is the metadata a proven file leaves behind as the baseline the
+// next checkpoint compares it against.
+type checkpointRecord struct {
+	info     os.FileInfo
+	identity string
+}
+
+// releasedMapping is what a file looked like at the moment this client released a
+// mapping it had only read through.
+type releasedMapping struct {
+	file   *fileLayout
+	before os.FileInfo
+}
+
+// markReleasedMappings accounts for the change timestamp that releasing a mapping
+// moves. A file still carrying the identity it was trusted under when its mapping
+// went away is the file the checkpoint already trusts, so it may adopt the metadata
+// the release leaves behind; anything else keeps the stale baseline and stays
+// distrusted until its contents have been proven again.
+func (s *FileStorage) markReleasedMappings(released []releasedMapping) {
+	if len(released) == 0 {
+		return
+	}
+	s.mtMu.Lock()
+	defer s.mtMu.Unlock()
+	for _, entry := range released {
+		if entry.before == nil {
+			continue
+		}
+		identity := fileIdentity(nil, entry.before)
+		if identity != "" && identity == s.trustedIdentity[entry.file.path] {
+			s.dirty[entry.file] |= dirtyMeta
+		}
+	}
+}
+
+// pendingFlush reports which files this client has written to since the last
+// durable checkpoint flushed them.
+func (s *FileStorage) pendingFlush() map[*fileLayout]bool {
+	s.mtMu.Lock()
+	defer s.mtMu.Unlock()
+	pending := make(map[*fileLayout]bool, len(s.dirty))
+	for file, flags := range s.dirty {
+		if flags&dirtySync != 0 {
+			pending[file] = true
+		}
+	}
+	return pending
 }
 
 // checkpointCurrentLocked reports whether the on-disk checkpoint already describes
@@ -344,7 +413,7 @@ func sameIndices(a, b []int) bool {
 // checkpointFile flushes one payload file if it has unsynced writes and returns the
 // metadata to record. An empty identity marks the file untrusted, which forces its
 // pieces to be rechecked on the next launch.
-func (s *FileStorage) checkpointFile(file *fileLayout, flags dirtyState, expected, initial os.FileInfo) (os.FileInfo, string) {
+func (s *FileStorage) checkpointFile(file *fileLayout, flags dirtyState, expected, initial os.FileInfo, trusted string) (os.FileInfo, string) {
 	openFlags := resumeMetadataReadFlags
 	if flags&dirtySync != 0 {
 		openFlags = resumeSyncOpenFlags
@@ -354,11 +423,19 @@ func (s *FileStorage) checkpointFile(file *fileLayout, flags dirtyState, expecte
 		return nil, ""
 	}
 	repaired := file.repaired.Load()
-	// A file written since the last metadata snapshot cannot be compared against it:
-	// our own writes moved its timestamps. See the fast-resume trust model in README.
-	trustworthy := !repaired && before.Size() == file.length && initial != nil && os.SameFile(before, initial) &&
-		(flags&dirtyMeta != 0 || sameFileVersion(before, expected))
 	identity := fileIdentity(f, before)
+	// A file must still carry the identity it was last trusted under. Only a file no
+	// capture has recorded an identity for falls back to comparing the metadata
+	// snapshot, which is all such a file is known by.
+	unchanged := trusted != "" && identity == trusted
+	if trusted == "" {
+		unchanged = sameFileVersion(before, expected)
+	}
+	// A file whose metadata this client moved itself cannot be compared against
+	// either: our own writes (and a mapping release checked against the trusted
+	// identity first) moved its timestamps. See the trust model in README.
+	trustworthy := !repaired && before.Size() == file.length && initial != nil && os.SameFile(before, initial) &&
+		(flags&dirtyMeta != 0 || unchanged)
 	if flags&dirtySync != 0 {
 		if err := f.Sync(); err != nil {
 			_ = f.Close()
@@ -370,17 +447,22 @@ func (s *FileStorage) checkpointFile(file *fileLayout, flags dirtyState, expecte
 		_ = f.Close()
 		return nil, ""
 	}
+	// The settled identity must be read while the handle is still open: Windows
+	// reads the change timestamp from the handle, and a closed one yields nothing.
+	settled := fileIdentity(f, after)
 	if err = f.Close(); err != nil {
 		return nil, ""
 	}
 	// A concurrent external modification between the two stats invalidates the file.
-	trustworthy = trustworthy && identity == fileIdentity(f, after) && before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size()
+	trustworthy = trustworthy && identity != "" && identity == settled && before.ModTime().Equal(after.ModTime()) && before.Size() == after.Size()
 	if repaired {
 		// The repair is now recorded as untrusted, so re-anchor the file: a session
 		// that keeps running (the downloader re-fetches every piece after a repair)
 		// can be trusted again by the next checkpoint instead of rehashing forever.
 		s.mtMu.Lock()
 		s.initialInfo[file.path] = after
+		s.stateFileInfo[file.path] = after
+		s.trustedIdentity[file.path] = settled
 		s.mtMu.Unlock()
 		file.repaired.Store(false)
 	}

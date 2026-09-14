@@ -274,16 +274,24 @@ type FileStorage struct {
 	stateFileMt   map[string]int64
 	stateFileInfo map[string]os.FileInfo
 	initialInfo   map[string]os.FileInfo
-	dirty         map[*fileLayout]dirtyState
-	checkpoint    resumeCheckpoint
-	downloadRoot  *DownloadRoot
-	closed        atomic.Bool
+	// trustedIdentity is the identity each file carried the last time this client
+	// had reason to believe it held content it trusts: when the storage was opened,
+	// when a checkpoint proved it, or when its own write moved the metadata. A
+	// checkpoint trusts a file it did not write only if the file still carries it.
+	// An empty entry means no identity is known, which on Windows is the case until
+	// a checkpoint records one, and the checkpoint falls back to the snapshot.
+	trustedIdentity map[string]string
+	dirty           map[*fileLayout]dirtyState
+	checkpoint      resumeCheckpoint
+	downloadRoot    *DownloadRoot
+	closed          atomic.Bool
 }
 
-// dirtyState records the bookkeeping a written file still owes. dirtyMeta is
-// cleared whenever its metadata snapshot is refreshed; dirtySync survives cheap
-// hint writes and is cleared only by a durable checkpoint that flushed the file,
-// so a checkpoint never re-syncs payload files nothing has written to.
+// dirtyState records the bookkeeping a file still owes. dirtyMeta means this
+// client's own action moved the file's metadata, so the recorded snapshot is
+// stale; it is cleared whenever that snapshot is refreshed. dirtySync survives
+// cheap hint writes and is cleared only by a durable checkpoint that flushed the
+// file, so a checkpoint never re-syncs payload files nothing has written to.
 type dirtyState uint8
 
 const (
@@ -394,6 +402,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	stateFileMt := make(map[string]int64, len(files))
 	stateFileInfo := make(map[string]os.FileInfo, len(files))
 	initialInfo := make(map[string]os.FileInfo, len(files))
+	trustedIdentity := make(map[string]string, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -439,6 +448,10 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		stateFileInfo[path] = fi
 		initialInfo[path] = fi
 		stateFileMt[path] = fi.ModTime().UnixNano()
+		// Capture the identity while the handle is open: Windows reads the change
+		// timestamp from the handle, so this is the only chance to anchor a file the
+		// session never writes to without paying a second open.
+		trustedIdentity[path] = fileIdentity(f, fi)
 		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close file %s: %w", path, err)
 		}
@@ -447,16 +460,17 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	keepCreatedFiles = true
 	keepDownloadRoot = true
 	return &FileStorage{
-		resolver:      resolver,
-		baseDir:       resolver.BaseDir(),
-		files:         layouts,
-		pieceLength:   pieceLength,
-		totalSize:     currentOffset,
-		stateFileMt:   stateFileMt,
-		stateFileInfo: stateFileInfo,
-		initialInfo:   initialInfo,
-		dirty:         make(map[*fileLayout]dirtyState, len(layouts)),
-		downloadRoot:  downloadRoot,
+		resolver:        resolver,
+		baseDir:         resolver.BaseDir(),
+		files:           layouts,
+		pieceLength:     pieceLength,
+		totalSize:       currentOffset,
+		stateFileMt:     stateFileMt,
+		stateFileInfo:   stateFileInfo,
+		initialInfo:     initialInfo,
+		trustedIdentity: trustedIdentity,
+		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
+		downloadRoot:    downloadRoot,
 	}, nil
 }
 
@@ -784,6 +798,12 @@ func (s *FileStorage) refreshDirtyLocked() {
 		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
 			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
 			s.stateFileInfo[file.path] = fi
+			// The snapshot now describes a file this client moved itself, so the
+			// identity it was trusted under no longer applies. Where a stat carries
+			// the change timestamp this re-anchors it immediately, keeping the
+			// window in which a written file cannot be cross-checked down to one
+			// persist; elsewhere it clears, and the snapshot comparison takes over.
+			s.trustedIdentity[file.path] = fileIdentity(nil, fi)
 		}
 		flags &^= dirtyMeta
 		if flags == 0 {

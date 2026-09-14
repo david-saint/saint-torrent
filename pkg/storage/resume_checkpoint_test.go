@@ -351,3 +351,103 @@ func TestCheckpointTrustsRepairedFileOnceRewritten(t *testing.T) {
 		t.Fatalf("repaired file never regained trust: %+v", got)
 	}
 }
+
+// Every payload must be checkpointed with an identity. Reading it after the file
+// was closed leaves it empty on the platforms that take the change timestamp from
+// the handle, which silently turns fast resume into a full rehash there.
+func TestCheckpointRecordsIdentityForEveryFile(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(st.BaseDir(), "."+hash+".state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state FastResumeState
+	if err = json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != 2 || len(state.Identities) != 3 {
+		t.Fatalf("checkpoint layout: %+v", state)
+	}
+	for i, identity := range state.Identities {
+		if identity == "" {
+			t.Fatalf("file %d was checkpointed without an identity: %+v", i, state)
+		}
+	}
+}
+
+// A file the checkpoint distrusted must not become the baseline the next one
+// compares against, or the second checkpoint of an ordinary pause-then-quit
+// declares the edited file unchanged and restores its pieces as verified.
+func TestCheckpointNeverBlessesAnEditItAlreadyDistrusted(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(st.BaseDir(), "b")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, []byte{9, 9, 9, 9}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		// Writing to another file keeps the checkpoint from reusing the previous one,
+		// so every attempt re-examines the edited file.
+		if err = st.WriteBlock(0, 0, []byte{1, 2, 3, 4}); err != nil {
+			t.Fatal(err)
+		}
+		if err = st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.LoadResumeState(hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, ResumeState{Verified: []int{0, 3}, Recheck: []int{1, 2}}) {
+			t.Fatalf("edit was blessed on attempt %d: %+v", attempt, got)
+		}
+	}
+}
+
+// A checkpoint restored from disk with every file intact is as current as one this
+// process wrote, so pausing or quitting an untouched torrent costs no sweep.
+func TestRestoredCheckpointSkipsRedundantFlush(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	root := st.BaseDir()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewFileStorage(root, []FileInfo{{Path: "a", Length: 6}, {Path: "b", Length: 4}, {Path: "c", Length: 6}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	if _, err = next.LoadResumeState(hash); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(root, "."+hash+".state")
+	first, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = next.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(first, second) {
+		t.Fatal("a restored checkpoint nothing had touched was rewritten")
+	}
+}
