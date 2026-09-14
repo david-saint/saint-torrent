@@ -792,11 +792,14 @@ func (d *DHT) considerAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) 
 	if oldAddr == nil || newAddr == nil {
 		return
 	}
-	from := cloneUDPAddr(oldAddr)
-	to := cloneUDPAddr(newAddr)
-	if !d.beginAddressVerification(id, to) {
+	// Admission is decided straight from the stored addresses; only the
+	// goroutine that outlives d.mu needs copies, so a rejected sighting costs
+	// no allocation on the receive path.
+	if !d.beginAddressVerification(id, newAddr) {
 		return
 	}
+	from := cloneUDPAddr(oldAddr)
+	to := cloneUDPAddr(newAddr)
 	d.goTracked(func() {
 		outcome := d.verifyAddressChange(id, from, to)
 		d.endAddressVerification(id, to, outcome)
