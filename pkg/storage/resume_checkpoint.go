@@ -319,8 +319,10 @@ func (s *FileStorage) checkpointCurrentLocked(verified, completed []int, dirty m
 	if !s.checkpoint.valid || !s.checkpoint.complete || !sameIndices(s.checkpoint.verified, verified) || !sameIndices(s.checkpoint.completed, completed) {
 		return false
 	}
+	// Any pending bookkeeping means a file's recorded metadata is stale: it either
+	// still owes a flush or its timestamps have moved since the snapshot.
 	for _, flags := range dirty {
-		if flags&dirtySync != 0 {
+		if flags != 0 {
 			return false
 		}
 	}

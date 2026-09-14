@@ -442,3 +442,37 @@ func TestMMapCheckpointRejectsExternalEditWithRestoredMtime(t *testing.T) {
 		t.Fatalf("edited payload was restored as verified: %+v", got)
 	}
 }
+
+// Reading remaps a file, and tearing that mapping down at the next checkpoint
+// moves its change timestamp. A checkpoint that reused the previous one because
+// the piece set had not changed would leave that stale timestamp on disk and
+// rehash the torrent on the next launch.
+func TestMMapCheckpointRefreshesAfterRemap(t *testing.T) {
+	root := t.TempDir()
+	files := []FileInfo{{Path: "payload", Length: 8}}
+	st := mmapPayload(t, root, 8)
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReadBlock(0, 0, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewMMapStorage(root, files, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	got, err := next.LoadResumeState("mapped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.Verified, []int{0}) || len(got.Recheck) != 0 {
+		t.Fatalf("resume %+v", got)
+	}
+}
