@@ -1218,7 +1218,7 @@ Options:
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
       --no-persist          Do not persist fast-resume state
-      --recheck             Fully hash-check all torrents on this launch
+      --recheck             Fully hash-check restored torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
       --log <path>          Write JSON-lines debug logs to a rotating file
       --log-level <level>   Log level: debug, info, warn, or error

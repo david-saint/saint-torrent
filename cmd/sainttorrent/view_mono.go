@@ -15,7 +15,12 @@ import (
 
 var brailleRamp = []rune{' ', '⡀', '⣀', '⣄', '⣆', '⣇', '⣧', '⣷', '⣿'}
 
-func monoStatusIcon(st styles, status string) (string, lipgloss.Style) {
+func monoStatusIcon(st styles, status string, paused bool) (string, lipgloss.Style) {
+	// A paused torrent keeps the paused glyph even while its status reports the
+	// recheck whose progress the row is showing.
+	if paused {
+		return "‖", st.Faint
+	}
 	switch status {
 	case "Seeding":
 		return "▲", st.Dim
@@ -141,7 +146,7 @@ func monoHeaderRow(col listLayout) string {
 func monoRow(m *model, st styles, col listLayout, selected bool, row sessionRow) string {
 	cell := func(v string, w int) string { return padTo(truncateRight(v, w), w) }
 
-	icon, iconSt := monoStatusIcon(st, row.status)
+	icon, iconSt := monoStatusIcon(st, row.status, row.paused)
 	name := row.name
 	sizeStr := formatBytes(row.totalSize)
 	if row.metadataMode {
@@ -210,7 +215,7 @@ func monoRow(m *model, st styles, col listLayout, selected bool, row sessionRow)
 	switch {
 	case row.metadataMode:
 		bar = st.Track.Render(strings.Repeat("─", meterW))
-	case row.status == "Downloading" || row.status == "Checking":
+	case !row.paused && (row.status == "Downloading" || row.status == "Checking"):
 		bar = hairBar(percent, meterW, st.Accent, st.Track)
 	default:
 		bar = hairBar(percent, meterW, st.Muted, st.Track)

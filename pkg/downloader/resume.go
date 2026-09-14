@@ -226,10 +226,17 @@ func (s *Session) loadResumeState() {
 			}
 		}
 	}
-	if s.verifyOnStartup {
+	// A forced recheck re-hashes what the checkpoint claims. Without a checkpoint
+	// there is nothing to distrust, so the opportunistic full scan still adopts
+	// whatever is on disk while leaving every piece downloadable — marking a fresh
+	// torrent's pieces unverified would hide them from the picker until the hasher
+	// has rejected each one.
+	if s.verifyOnStartup && err == nil {
 		s.verifyFullScan = false
-		for idx := range s.PieceStates {
-			s.PieceStates[idx] = PieceUnverified
+		for idx, state := range s.PieceStates {
+			if state == PieceCompleted {
+				s.PieceStates[idx] = PieceUnverified
+			}
 		}
 	}
 	for idx, state := range s.PieceStates {
@@ -473,9 +480,21 @@ func (s *Session) statePersistLoop() {
 		case <-s.ctx.Done():
 			s.flushState()
 			return
+		case <-s.stateFlushCh:
+			s.flushState()
 		case <-ticker.C:
 			s.flushState()
 		}
+	}
+}
+
+// requestStateFlush asks the persistence goroutine to flush now. It never blocks
+// and never performs I/O, so a caller on the UI goroutine (pause) cannot stall
+// behind a file sync.
+func (s *Session) requestStateFlush() {
+	select {
+	case s.stateFlushCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -501,7 +520,11 @@ func (s *Session) flushState() {
 			unverified = append(unverified, i)
 		}
 	}
-	durable := !s.verifying && (s.isCompletedLocked() || s.paused)
+	// A durable checkpoint costs a flush of every file written since the last one,
+	// so it is taken only when the session is quiescent: completed, paused, or
+	// shutting down. Verification is still in flight until it finishes, and the
+	// hint it would replace already carries the previous checkpoint forward.
+	durable := !s.verifying && (s.isCompletedLocked() || s.paused || s.closing)
 
 	s.stateDirty = false
 	closed := s.closed

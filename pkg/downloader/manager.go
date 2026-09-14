@@ -60,8 +60,11 @@ type TorrentManager struct {
 	failedTorrents []PersistedTorrent
 }
 
-// SetVerifyOnStartup forces full hashing for future sessions, including restored torrents.
-// Call before EnablePersistence or adding torrents.
+// SetVerifyOnStartup forces full hashing of the torrents restored on this launch,
+// distrusting their resume checkpoints. Torrents added later in the same run are
+// unaffected: they have nothing restored to distrust, and marking their pieces
+// unverified would hide them from the picker until each had been hashed.
+// Call before EnablePersistence.
 func (m *TorrentManager) SetVerifyOnStartup(force bool) {
 	m.mu.Lock()
 	m.verifyOnStartup = force
@@ -735,7 +738,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 		m.mu.Unlock()
 		return s, nil
 	}
-	verifyOnStartup := m.verifyOnStartup
+	verifyOnStartup := m.verifyOnStartup && m.restoring
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -795,7 +798,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		m.mu.Unlock()
 		return s, nil
 	}
-	verifyOnStartup := m.verifyOnStartup
+	verifyOnStartup := m.verifyOnStartup && m.restoring
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage

@@ -172,8 +172,12 @@ type Session struct {
 	uploadBlockPool sync.Pool
 
 	stateDirty bool
+	closing    bool
 	stats      completionStats
 	flushMu    sync.Mutex
+	// stateFlushCh wakes the persistence goroutine so a pause checkpoints promptly
+	// without running the flush (and its file syncs) on the caller's goroutine.
+	stateFlushCh chan struct{}
 
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
@@ -304,6 +308,7 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		ctx:                 ctx,
 		cancel:              cancel,
 		resumeCh:            make(chan struct{}, 1),
+		stateFlushCh:        make(chan struct{}, 1),
 		pauseStateCh:        make(chan struct{}),
 		filePriorities:      priorities,
 		DownloadLimiter:     NewRateLimiter(0), // unlimited by default
@@ -605,6 +610,15 @@ func (s *Session) Close() {
 	var verifyDone chan struct{}
 	var storageToClose storage.Storage
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		// Shutdown is the last chance to record what has been downloaded. The
+		// periodic hint flush clears stateDirty, so re-arm it when there is
+		// anything to checkpoint.
+		if s.stats.completedTotalBytes > 0 {
+			s.stateDirty = true
+		}
+		s.mu.Unlock()
 		s.flushState()
 
 		s.mu.Lock()
@@ -894,14 +908,16 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 
 	status := s.statusLocked()
 	var statusScore int
-	switch status {
-	case "Downloading", "Metadata", "Checking":
-		statusScore = 0
-	case "Seeding":
-		statusScore = 1
-	case "Paused", "Stopped":
+	switch {
+	// A paused torrent sorts with the paused ones even while its status reports the
+	// recheck it is displaying progress for.
+	case s.paused:
 		statusScore = 2
-	case "Error":
+	case status == "Downloading" || status == "Metadata" || status == "Checking":
+		statusScore = 0
+	case status == "Seeding":
+		statusScore = 1
+	case status == "Error":
 		statusScore = 3
 	default:
 		statusScore = 4
@@ -969,8 +985,13 @@ func (s *Session) Snapshot() SessionSnapshot {
 		Status:        s.statusLocked(),
 		Completed:     s.isCompletedLocked(),
 	}
-	snap.Verification = VerificationSnapshot{Active: s.verifying, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
-	if s.verifying && !s.verifyStartTime.IsZero() {
+	// Only a recheck of data the session already claims is reported as checking, the
+	// same condition statusLocked uses. The opportunistic full scan of a freshly
+	// added torrent runs alongside a normal download, so surfacing it would replace
+	// real transfer progress with disk-scan progress for the length of the scan.
+	checking := s.verifying && !s.verifyFullScan
+	snap.Verification = VerificationSnapshot{Active: checking, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
+	if checking && !s.verifyStartTime.IsZero() {
 		elapsed := time.Since(s.verifyStartTime).Seconds()
 		if elapsed > 0 {
 			snap.Verification.BytesPerSecond = float64(s.verifyCheckedBytes) / elapsed
@@ -1141,9 +1162,13 @@ func (s *Session) Pause() {
 			_ = client.Conn.Close()
 		}
 	}
+	// Pausing makes the session quiescent, which is when a durable checkpoint is
+	// worth taking. Hand it to the persistence goroutine: running the per-file
+	// flush here would freeze the caller (the TUI update loop) for the length of a
+	// full writeback.
+	s.stateDirty = true
 	s.mu.Unlock()
-
-	s.flushState()
+	s.requestStateFlush()
 
 	if logging.Enabled() {
 		s.mu.RLock()
