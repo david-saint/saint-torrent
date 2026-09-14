@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,6 +108,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 // cached read handle. Paths are validated once and every operation is anchored
 // to downloadRoot, so a later symlink swap cannot redirect payload I/O.
 type fileLayout struct {
+	repaired     atomic.Bool
 	path         string // relative path (torrent-declared)
 	downloadRoot *DownloadRoot
 	volumeGuard  *externalVolumeGuard
@@ -263,16 +265,39 @@ type FileStorage struct {
 	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
-	// mtMu guards stateFileMt and dirty, which the shared-read-lock WriteBlock and
-	// SaveState paths mutate concurrently. dirty records files written since the last
-	// persist; their mtimes are captured lazily in SaveState instead of via a stat
-	// syscall on every completed piece (mirrors the mmap backend).
-	mtMu         sync.Mutex
-	stateFileMt  map[string]int64
-	dirty        map[*fileLayout]struct{}
-	downloadRoot *DownloadRoot
-	closed       atomic.Bool
+	// mtMu guards stateFileMt, stateFileInfo, initialInfo, dirty and checkpoint,
+	// which the shared-read-lock WriteBlock and persistence paths mutate
+	// concurrently. dirty records what each file still owes: a metadata snapshot
+	// (captured lazily when state is persisted instead of via a stat syscall on
+	// every completed piece) and a flush before the next durable checkpoint.
+	mtMu          sync.Mutex
+	stateFileMt   map[string]int64
+	stateFileInfo map[string]os.FileInfo
+	initialInfo   map[string]os.FileInfo
+	// trustedIdentity is the identity each file carried the last time this client
+	// had reason to believe it held content it trusts: when the storage was opened,
+	// when a checkpoint proved it, or when its own write moved the metadata. A
+	// checkpoint trusts a file it did not write only if the file still carries it.
+	// An empty entry means no identity is known, which on Windows is the case until
+	// a checkpoint records one, and the checkpoint falls back to the snapshot.
+	trustedIdentity map[string]string
+	dirty           map[*fileLayout]dirtyState
+	checkpoint      resumeCheckpoint
+	downloadRoot    *DownloadRoot
+	closed          atomic.Bool
 }
+
+// dirtyState records the bookkeeping a file still owes. dirtyMeta means this
+// client's own action moved the file's metadata, so the recorded snapshot is
+// stale; it is cleared whenever that snapshot is refreshed. dirtySync survives
+// cheap hint writes and is cleared only by a durable checkpoint that flushed the
+// file, so a checkpoint never re-syncs payload files nothing has written to.
+type dirtyState uint8
+
+const (
+	dirtyMeta dirtyState = 1 << iota
+	dirtySync
+)
 
 // NewFileStorage creates the target directories and pre-allocates files to their
 // respective sizes.
@@ -375,6 +400,9 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 	}()
 	stateFileMt := make(map[string]int64, len(files))
+	stateFileInfo := make(map[string]os.FileInfo, len(files))
+	initialInfo := make(map[string]os.FileInfo, len(files))
+	trustedIdentity := make(map[string]string, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -417,7 +445,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 				return nil, fmt.Errorf("failed to stat file %s after resize: %w", path, err)
 			}
 		}
+		stateFileInfo[path] = fi
+		initialInfo[path] = fi
 		stateFileMt[path] = fi.ModTime().UnixNano()
+		// Capture the identity while the handle is open: Windows reads the change
+		// timestamp from the handle, so this is the only chance to anchor a file the
+		// session never writes to without paying a second open.
+		trustedIdentity[path] = fileIdentity(f, fi)
 		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close file %s: %w", path, err)
 		}
@@ -426,14 +460,17 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	keepCreatedFiles = true
 	keepDownloadRoot = true
 	return &FileStorage{
-		resolver:     resolver,
-		baseDir:      resolver.BaseDir(),
-		files:        layouts,
-		pieceLength:  pieceLength,
-		totalSize:    currentOffset,
-		stateFileMt:  stateFileMt,
-		dirty:        make(map[*fileLayout]struct{}, len(layouts)),
-		downloadRoot: downloadRoot,
+		resolver:        resolver,
+		baseDir:         resolver.BaseDir(),
+		files:           layouts,
+		pieceLength:     pieceLength,
+		totalSize:       currentOffset,
+		stateFileMt:     stateFileMt,
+		stateFileInfo:   stateFileInfo,
+		initialInfo:     initialInfo,
+		trustedIdentity: trustedIdentity,
+		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
+		downloadRoot:    downloadRoot,
 	}, nil
 }
 
@@ -592,6 +629,7 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 				return fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
 			}
 			if fileRepaired {
+				file.repaired.Store(true)
 				repaired = true
 			}
 			if s.closed.Load() {
@@ -607,11 +645,11 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 				return fmt.Errorf("short write on file %s: expected %d bytes, got %d", file.path, nBytes, n)
 			}
 
-			// Defer the mtime refresh to SaveState: mark the file dirty rather than
-			// paying a stat syscall on every completed piece. SaveState is infrequent
-			// (~once per second) and off the block path.
+			// Defer the mtime refresh and the flush to the persistence paths: mark the
+			// file dirty rather than paying a stat or fsync syscall on every completed
+			// piece. Both paths are infrequent and off the block path.
 			s.mtMu.Lock()
-			s.dirty[file] = struct{}{}
+			s.dirty[file] |= dirtyMeta | dirtySync
 			s.mtMu.Unlock()
 		}
 	}
@@ -627,6 +665,11 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 // is amortized) while staying small enough that re-checking a multi-GB torrent on
 // resume no longer allocates a full piece — potentially many MB — per call.
 const verifyChunkSize = 1 << 18 // 256 KiB
+
+var verifyBuffers = sync.Pool{New: func() any {
+	buffer := make([]byte, verifyChunkSize)
+	return &buffer
+}}
 
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
 func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
@@ -650,11 +693,17 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	if chunkLen > verifyChunkSize {
 		chunkLen = verifyChunkSize
 	}
-	chunk := make([]byte, chunkLen)
+	buffer := verifyBuffers.Get().(*[]byte)
+	defer verifyBuffers.Put(buffer)
+	chunk := (*buffer)[:chunkLen]
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
-	for _, file := range s.files {
+	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
+	for _, file := range s.files[first:] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
@@ -718,26 +767,50 @@ func (s *FileStorage) Close() error {
 
 // FastResumeState defines the structure for saving completed pieces metadata
 type FastResumeState struct {
-	InfoHashHex string `json:"info_hash_hex"`
-	Files       []struct {
-		Path  string `json:"path"`
-		Size  int64  `json:"size"`
-		Mtime int64  `json:"mtime"`
-	} `json:"files"`
-	CompletedPieces []int `json:"completed_pieces"`
+	Version         int               `json:"version,omitempty"`
+	PieceLength     int64             `json:"piece_length,omitempty"`
+	VerifiedPieces  []int             `json:"verified_pieces,omitempty"`
+	Identities      []string          `json:"identities,omitempty"`
+	IdentityMode    string            `json:"identity_mode,omitempty"`
+	InfoHashHex     string            `json:"info_hash_hex"`
+	Files           []resumeFileEntry `json:"files"`
+	CompletedPieces []int             `json:"completed_pieces"`
+}
+
+// resumeFileEntry is the per-file metadata a resume state records.
+type resumeFileEntry struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"size"`
+	Mtime int64  `json:"mtime"`
 }
 
 // refreshDirtyLocked captures the on-disk mtime of every file written since the
-// last persist and clears the dirty set. WriteAt already bumps the mtime, so a
-// plain stat suffices; failures are ignored (mirroring the previous per-write
+// last persist and clears their metadata debt. WriteAt already bumps the mtime, so
+// a plain stat suffices; failures are ignored (mirroring the previous per-write
 // behavior) since a stale mtime only costs an extra re-verify on the next resume.
+// The pending-flush bit survives: only a durable checkpoint clears that.
 // The caller must hold mtMu.
 func (s *FileStorage) refreshDirtyLocked() {
-	for file := range s.dirty {
+	for file, flags := range s.dirty {
+		if flags&dirtyMeta == 0 {
+			continue
+		}
 		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
 			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+			s.stateFileInfo[file.path] = fi
+			// The snapshot now describes a file this client moved itself, so the
+			// identity it was trusted under no longer applies. Where a stat carries
+			// the change timestamp this re-anchors it immediately, keeping the
+			// window in which a written file cannot be cross-checked down to one
+			// persist; elsewhere it clears, and the snapshot comparison takes over.
+			s.trustedIdentity[file.path] = fileIdentity(nil, fi)
 		}
-		delete(s.dirty, file)
+		flags &^= dirtyMeta
+		if flags == 0 {
+			delete(s.dirty, file)
+		} else {
+			s.dirty[file] = flags
+		}
 	}
 }
 
@@ -792,15 +865,7 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 	}
 
 	for _, fm := range filesMeta {
-		state.Files = append(state.Files, struct {
-			Path  string `json:"path"`
-			Size  int64  `json:"size"`
-			Mtime int64  `json:"mtime"`
-		}{
-			Path:  fm.path,
-			Size:  fm.size,
-			Mtime: fm.mtime,
-		})
+		state.Files = append(state.Files, resumeFileEntry{Path: fm.path, Size: fm.size, Mtime: fm.mtime})
 	}
 
 	data, err := json.Marshal(state)
@@ -808,18 +873,13 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return err
 	}
 
-	stateFile, err := rootOpenNoFollow(s.downloadRoot, stateName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	if _, err := stateFile.Write(data); err != nil {
-		_ = stateFile.Close()
-		return err
-	}
-	return stateFile.Close()
+	return s.writeResumeAtomically(stateName, data, false)
 }
 
-// LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.
+// LoadState reads and validates the fast-resume state file, returning completed
+// piece indices if valid. It is the conservative Storage-interface fallback used by
+// backends without a durable checkpoint: every index it returns is a hint that the
+// caller must still hash. Backends implementing ResumeStorage use LoadResumeState.
 func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 	if s.closed.Load() {
 		return nil, ErrStorageClosed

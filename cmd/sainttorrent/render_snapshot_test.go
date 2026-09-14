@@ -150,3 +150,39 @@ func TestAnimStaysIdleWithoutDownloads(t *testing.T) {
 		t.Fatal("animMsg should not reschedule when nothing animates")
 	}
 }
+
+func TestCheckingShowsDiskProgressWhilePaused(t *testing.T) {
+	snap := downloader.SessionSnapshot{
+		Name: "Completed torrent", Status: "Checking", Paused: true, TotalSize: 8 << 30, Percent: 25,
+		Verification: downloader.VerificationSnapshot{Active: true, CheckedBytes: 2 << 30, TotalBytes: 8 << 30, BytesPerSecond: 32 << 20},
+	}
+	row := rowFromSnapshot(nil, snap)
+	if row.eta != "~3m 12s" {
+		t.Fatalf("checking ETA %q", row.eta)
+	}
+	if row.speedText() == "paused" || !strings.Contains(row.speedText(), "32") {
+		t.Fatalf("checking speed %q", row.speedText())
+	}
+	if row.checkingPercent() != 25 {
+		t.Fatalf("checking percent %v", row.checkingPercent())
+	}
+	for _, theme := range []*theme{monoTheme, draculaTheme} {
+		m := &model{width: 120, theme: theme}
+		var view string
+		if theme == monoTheme {
+			view = monoRow(m, theme.styles, listColumns(120), false, row)
+		} else {
+			view = dracRow(theme.styles, listColumns(120), false, row)
+		}
+		plain := ansi.Strip(view)
+		if !strings.Contains(plain, "CHECKING") || strings.Contains(plain, "paused") {
+			t.Fatalf("checking row: %s", plain)
+		}
+	}
+	if !parseCLIArgs([]string{"--recheck"}).verifyOnStartup {
+		t.Fatal("--recheck did not enable startup verification")
+	}
+	if parseCLIArgs(nil).verifyOnStartup {
+		t.Fatal("full verification should be opt-in")
+	}
+}

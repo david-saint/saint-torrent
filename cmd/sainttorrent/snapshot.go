@@ -28,6 +28,7 @@ type sessionRow struct {
 	// open-folder). It is never queried on the per-frame render path.
 	session *downloader.Session
 
+	verification  downloader.VerificationSnapshot
 	infoHashHex   string
 	name          string // sanitized once per tick, not per row per frame
 	totalSize     int64
@@ -84,6 +85,7 @@ type filesSnapshot struct {
 // computing the derived display fields once.
 func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) sessionRow {
 	row := sessionRow{
+		verification:  snap.Verification,
 		session:       s,
 		infoHashHex:   fmt.Sprintf("%x", snap.InfoHash),
 		name:          sanitizeText(snap.Name),
@@ -108,9 +110,33 @@ func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) ses
 	return row
 }
 
+func (row sessionRow) checkingPercent() float64 {
+	if row.verification.TotalBytes <= 0 {
+		return 0
+	}
+	return 100 * float64(row.verification.CheckedBytes) / float64(row.verification.TotalBytes)
+}
+
+func (row sessionRow) speedText() string {
+	if row.verification.Active {
+		return formatSpeed(row.verification.BytesPerSecond)
+	}
+	return getSpeedStr(row.paused, row.completed, row.transferSpeed)
+}
+
+func (row sessionRow) checkingText() string {
+	if !row.verification.Active {
+		return ""
+	}
+	return fmt.Sprintf("Checking %.1f%% · %s / %s · %s · ETA %s", row.checkingPercent(), formatBytes(row.verification.CheckedBytes), formatBytes(row.verification.TotalBytes), formatSpeed(row.verification.BytesPerSecond), row.eta)
+}
+
 // rowETA mirrors the former sessionETA helper but reads the pre-snapshotted
 // fields instead of re-locking the session.
 func rowETA(row sessionRow) string {
+	if row.verification.Active {
+		return remainingETA(row.verification.TotalBytes-row.verification.CheckedBytes, row.verification.BytesPerSecond)
+	}
 	if row.completed {
 		return "—"
 	}
@@ -120,7 +146,11 @@ func rowETA(row sessionRow) string {
 	}
 	downloaded := int64(row.percent / 100.0 * float64(row.totalSize))
 	remaining := row.totalSize - downloaded
-	if remaining <= 0 {
+	return remainingETA(remaining, speed)
+}
+
+func remainingETA(remaining int64, speed float64) string {
+	if remaining <= 0 || speed <= 0 {
 		return "—"
 	}
 	d := time.Duration(float64(remaining)/speed) * time.Second

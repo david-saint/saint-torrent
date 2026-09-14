@@ -285,3 +285,42 @@ go test -bench='BenchmarkColdStartup|BenchmarkShutdown' -benchmem ./pkg/download
 ## License
 
 saintTorrent is released under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+### Startup checking and fast resume
+
+The file and mmap backends restore completed downloads from a durable resume
+checkpoint after validating each file's size, modification time, and identity.
+Identity always includes the change timestamp, which moves even when a tool
+restores the modification time after an in-place edit; the mmap backend releases
+its mappings before taking a checkpoint so that timestamp is settled before it is
+recorded. Unchanged files need no content reads. Files that changed are rechecked
+along with any torrent pieces crossing their boundaries; unaffected files retain
+their verified state, and pieces the checkpoint never claimed stay immediately
+downloadable instead of queueing behind a hash.
+
+Older state files contain completion hints, so the first launch after upgrading
+performs one verification pass before saving the new checkpoint. Interrupted
+checks never promote unverified hints, and the cheap hints written while a check
+is running replay the previous checkpoint rather than replacing it. Completed,
+paused and closing sessions flush the files they wrote and atomically replace
+resume state from background persistence work, outside peer and piece locks; a
+file nothing has written to since the last checkpoint is never re-flushed.
+
+Two trade-offs are deliberate. Changing a file's metadata without changing its
+contents — a `chmod`, a new extended attribute, a hardlink, or remounting the
+volume — moves the change timestamp, so those files are hashed once on the next
+launch. And a file the client is itself writing cannot be compared against its own
+previous metadata, so an external in-place edit of an already-completed region of
+a file that is still downloading is not detected until the next full check.
+
+Use `sainttorrent --recheck` to force full hashing of the torrents restored on a
+launch, including their unchanged files. Metadata validation is a fast-resume
+policy, not a replacement for a full integrity check when silent corruption is
+suspected. Checking progress, disk read speed, and ETA appear separately from
+network transfer statistics; paused torrents still display their checking status.
+
+Run `go test -run '^$' -bench BenchmarkResumeVerification -benchmem ./pkg/downloader`
+to compare completed-torrent startup with a full verification pass. This benchmark
+includes verification and completion persistence, unlike `BenchmarkColdStartup`.
+Its small fixture is normally cached; use real cold files on the target disk when
+measuring physical checking throughput.

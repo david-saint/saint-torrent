@@ -244,11 +244,7 @@ func (s *MemStorage) SaveState(infoHashHex string, completedPieces []int) error 
 		CompletedPieces: append([]int(nil), completedPieces...),
 	}
 	for _, fm := range filesMeta {
-		state.Files = append(state.Files, struct {
-			Path  string `json:"path"`
-			Size  int64  `json:"size"`
-			Mtime int64  `json:"mtime"`
-		}{
+		state.Files = append(state.Files, resumeFileEntry{
 			Path:  fm.path,
 			Size:  fm.size,
 			Mtime: fm.mtime,

@@ -15,7 +15,12 @@ import (
 
 var brailleRamp = []rune{' ', '⡀', '⣀', '⣄', '⣆', '⣇', '⣧', '⣷', '⣿'}
 
-func monoStatusIcon(st styles, status string) (string, lipgloss.Style) {
+func monoStatusIcon(st styles, status string, paused bool) (string, lipgloss.Style) {
+	// A paused torrent keeps the paused glyph even while its status reports the
+	// recheck whose progress the row is showing.
+	if paused {
+		return "‖", st.Faint
+	}
 	switch status {
 	case "Seeding":
 		return "▲", st.Dim
@@ -141,19 +146,22 @@ func monoHeaderRow(col listLayout) string {
 func monoRow(m *model, st styles, col listLayout, selected bool, row sessionRow) string {
 	cell := func(v string, w int) string { return padTo(truncateRight(v, w), w) }
 
-	icon, iconSt := monoStatusIcon(st, row.status)
+	icon, iconSt := monoStatusIcon(st, row.status, row.paused)
 	name := row.name
 	sizeStr := formatBytes(row.totalSize)
 	if row.metadataMode {
 		sizeStr = "unknown"
 	}
 	pctStr := fmt.Sprintf("%.1f%%", row.percent)
+	if row.verification.Active {
+		pctStr = "—"
+	}
 	if row.metadataMode {
 		pctStr = "0.0%"
 	}
 	statusLabel, statusSt := statusLabelStyle(st, row.status)
-	speedStr := getSpeedStr(row.paused, row.completed, row.transferSpeed)
-	spdSt := speedStyle(st, row.status == "Downloading")
+	speedStr := row.speedText()
+	spdSt := speedStyle(st, row.status == "Downloading" || row.verification.Active)
 
 	g := gutterStr(m.width)
 	if selected && effGutter(m.width) >= 2 {
@@ -199,14 +207,18 @@ func monoRow(m *model, st styles, col listLayout, selected bool, row sessionRow)
 			meterSuffix = ""
 		}
 	}
+	percent := row.percent
+	if row.verification.Active {
+		percent = row.checkingPercent()
+	}
 	var bar string
 	switch {
 	case row.metadataMode:
 		bar = st.Track.Render(strings.Repeat("─", meterW))
-	case row.status == "Downloading" || row.status == "Checking":
-		bar = hairBar(row.percent, meterW, st.Accent, st.Track)
+	case !row.paused && (row.status == "Downloading" || row.status == "Checking"):
+		bar = hairBar(percent, meterW, st.Accent, st.Track)
 	default:
-		bar = hairBar(row.percent, meterW, st.Muted, st.Track)
+		bar = hairBar(percent, meterW, st.Muted, st.Track)
 	}
 	if meterSuffix != "" {
 		bar += " " + spdSt.Render(meterSuffix)
@@ -255,8 +267,15 @@ func renderDetailsMono(m *model) string {
 		st.Muted.Render(fmt.Sprintf("%d seeds / %d leechers / %d completed", d.seeders, d.leechers, d.completed)) + "\n")
 	sb.WriteString(g + st.Dim.Render("PORT") + " " + st.Muted.Render(peerPortStatus(m.manager)) + "\n\n")
 
+	if row.verification.Active {
+		sb.WriteString(g + st.Accent.Render(row.checkingText()) + "\n\n")
+	}
+	completeLabel := "COMPLETE"
+	if row.verification.Active {
+		completeLabel = "VERIFIED"
+	}
 	pct := row.percent
-	sb.WriteString(g + st.Dim.Render("COMPLETE") + "  " + st.Bold.Render(fmt.Sprintf("%.1f%%", pct)) + "\n")
+	sb.WriteString(g + st.Dim.Render(completeLabel) + "  " + st.Bold.Render(fmt.Sprintf("%.1f%%", pct)) + "\n")
 	sb.WriteString(g + hairBar(pct, bw, st.Accent, st.Track) + "\n\n")
 
 	transferSpeed := row.transferSpeed

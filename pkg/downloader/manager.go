@@ -46,6 +46,7 @@ type TorrentManager struct {
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
 	encryptionPolicy      mse.Policy
+	verifyOnStartup       bool
 	storageFactory        storage.Factory
 	secretKeys            [][20]byte
 	ctx                   context.Context
@@ -57,6 +58,17 @@ type TorrentManager struct {
 	restoring      bool
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+}
+
+// SetVerifyOnStartup forces full hashing of the torrents restored on this launch,
+// distrusting their resume checkpoints. Torrents added later in the same run are
+// unaffected: they have nothing restored to distrust, and marking their pieces
+// unverified would hide them from the picker until each had been hashed.
+// Call before EnablePersistence.
+func (m *TorrentManager) SetVerifyOnStartup(force bool) {
+	m.mu.Lock()
+	m.verifyOnStartup = force
+	m.mu.Unlock()
 }
 
 // SetEncryptionPolicy configures MSE/PE behavior for all existing and future
@@ -726,6 +738,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 		m.mu.Unlock()
 		return s, nil
 	}
+	verifyOnStartup := m.verifyOnStartup && m.restoring
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -745,7 +758,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 	copy(peerID[:8], "-ST0001-")
 	_, _ = rand.Read(peerID[8:])
 
-	sess, err := NewSession(tor, nil, peerID, m.AdvertisedPeerPort(), downloadDir)
+	sess, err := newSession(tor, nil, peerID, m.AdvertisedPeerPort(), downloadDir, verifyOnStartup)
 	if err != nil {
 		return nil, err
 	}
@@ -785,6 +798,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		m.mu.Unlock()
 		return s, nil
 	}
+	verifyOnStartup := m.verifyOnStartup && m.restoring
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -809,7 +823,7 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 	copy(peerID[:8], "-ST0001-")
 	_, _ = rand.Read(peerID[8:])
 
-	sess, err := NewSession(tor, st, peerID, m.AdvertisedPeerPort(), downloadDir)
+	sess, err := newSession(tor, st, peerID, m.AdvertisedPeerPort(), downloadDir, verifyOnStartup)
 	if err != nil {
 		st.Close()
 		return nil, err

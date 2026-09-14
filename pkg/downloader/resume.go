@@ -190,14 +190,8 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	}
 }
 
-// loadResumeState reads the fast-resume hint and marks the pieces it claims complete
-// as PieceUnverified (or schedules a full scan when there is no hint). It does no disk
-// hashing, so it is cheap enough for the startup path; the actual hash verification is
-// deferred to verifyResume, which Start() launches in the background.
-//
-// Invariant preserved from the original synchronous verifier ("never trust resume data
-// blindly"): a PieceUnverified piece is never advertised in a bitfield, served to a
-// peer, or counted toward seeding/completion until it has been hash-verified here.
+// loadResumeState restores durable verified pieces immediately. Legacy hints and
+// pieces overlapping changed files remain unavailable until background hashing.
 func (s *Session) loadResumeState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,24 +199,59 @@ func (s *Session) loadResumeState() {
 		return
 	}
 	s.PieceStates = make([]PieceState, len(s.Torrent.PieceHashes))
-
-	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	completedIndices, err := s.Storage.LoadState(infoHashHex)
-	if err == nil {
-		for _, idx := range completedIndices {
+	s.verifyFullScan = false
+	s.verifyStarted = false
+	s.verifyCheckedBytes = 0
+	s.verifyTotalBytes = 0
+	s.verifyStartTime = time.Time{}
+	hash := fmt.Sprintf("%x", s.Torrent.InfoHash)
+	var resume storage.ResumeState
+	var err error
+	if checkpoint, ok := s.Storage.(storage.ResumeStorage); ok {
+		resume, err = checkpoint.LoadResumeState(hash)
+	} else {
+		resume.Recheck, err = s.Storage.LoadState(hash)
+	}
+	if err != nil {
+		s.verifyFullScan = true
+	} else {
+		for _, idx := range resume.Verified {
+			if idx >= 0 && idx < len(s.PieceStates) {
+				s.PieceStates[idx] = PieceCompleted
+			}
+		}
+		for _, idx := range resume.Recheck {
 			if idx >= 0 && idx < len(s.PieceStates) {
 				s.PieceStates[idx] = PieceUnverified
 			}
 		}
-	} else {
-		// No valid hint: leave pieces empty (a fresh torrent downloads immediately) and
-		// let the background pass scan for any already-present data on disk.
-		s.verifyFullScan = true
+	}
+	// A forced recheck re-hashes what the checkpoint claims. Without a checkpoint
+	// there is nothing to distrust, so the opportunistic full scan still adopts
+	// whatever is on disk while leaving every piece downloadable — marking a fresh
+	// torrent's pieces unverified would hide them from the picker until the hasher
+	// has rejected each one.
+	if s.verifyOnStartup && err == nil {
+		s.verifyFullScan = false
+		for idx, state := range s.PieceStates {
+			if state == PieceCompleted {
+				s.PieceStates[idx] = PieceUnverified
+			}
+		}
+	}
+	for idx, state := range s.PieceStates {
+		if s.verifyFullScan || state == PieceUnverified {
+			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
+		}
 	}
 	s.recomputeNeededLocked()
 	s.recomputeStatsLocked()
-	s.verifying = true
-	s.verifyDone = make(chan struct{})
+	s.verifying = s.verifyTotalBytes > 0
+	if s.verifying {
+		s.verifyDone = make(chan struct{})
+	} else {
+		s.verifyDone = nil
+	}
 }
 
 // maybeStartVerification launches the background verification goroutine exactly once.
@@ -305,6 +334,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		return false
 	}
 	s.verifyGateRelease = release
+	s.verifyStartTime = time.Now()
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -327,6 +357,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 			s.mu.Unlock()
 			return false
 		}
+		s.verifyCheckedBytes += st.PieceLength(int64(idx))
 		var nowCompleted bool
 		if fullScan {
 			// Adopt only positively-verified pieces, and only if the downloader has not
@@ -348,6 +379,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		if nowCompleted {
 			s.signalPieceWaitersLocked(int64(idx))
 			verified++
+			s.stateDirty = true
 		}
 		s.mu.Unlock()
 
@@ -448,9 +480,21 @@ func (s *Session) statePersistLoop() {
 		case <-s.ctx.Done():
 			s.flushState()
 			return
+		case <-s.stateFlushCh:
+			s.flushState()
 		case <-ticker.C:
 			s.flushState()
 		}
+	}
+}
+
+// requestStateFlush asks the persistence goroutine to flush now. It never blocks
+// and never performs I/O, so a caller on the UI goroutine (pause) cannot stall
+// behind a file sync.
+func (s *Session) requestStateFlush() {
+	select {
+	case s.stateFlushCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -467,20 +511,33 @@ func (s *Session) flushState() {
 		return
 	}
 	infoHashHex := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	var completed []int
+	var completed, unverified []int
 	for i, state := range s.PieceStates {
-		// Include PieceUnverified so a quit mid-verification keeps the resume hint;
-		// those pieces are re-checked (not re-downloaded) on the next start.
-		if state == PieceCompleted || state == PieceUnverified {
+		if state == PieceCompleted {
 			completed = append(completed, i)
 		}
+		if state == PieceUnverified {
+			unverified = append(unverified, i)
+		}
 	}
+	// A durable checkpoint costs a flush of every file written since the last one,
+	// so it is taken only when the session is quiescent: completed, paused, or
+	// shutting down. Verification is still in flight until it finishes, and the
+	// hint it would replace already carries the previous checkpoint forward.
+	durable := !s.verifying && (s.isCompletedLocked() || s.paused || s.closing)
+
 	s.stateDirty = false
 	closed := s.closed
 	st := s.Storage
 	s.mu.Unlock()
 
-	if err := st.SaveState(infoHashHex, completed); err != nil {
+	var err error
+	if checkpoint, ok := st.(storage.ResumeStorage); ok {
+		err = checkpoint.SaveResumeState(infoHashHex, completed, unverified, durable)
+	} else {
+		err = st.SaveState(infoHashHex, append(completed, unverified...))
+	}
+	if err != nil {
 		if err == storage.ErrStorageClosed && closed {
 			return
 		}
@@ -489,11 +546,26 @@ func (s *Session) flushState() {
 		stateErr := fmt.Errorf("failed to save fast-resume state: %w", err)
 		s.lastErr = stateErr
 		s.statusErr = stateErr
+		s.statePersistErr = stateErr
 		// Wake any blocked readers so they observe the new statusErr rather than
 		// sleeping until the next unrelated state change.
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
+		return
 	}
+	// A persist failure that has since resolved must not leave the torrent showing
+	// Error forever; an unrelated failure recorded meanwhile still stands.
+	s.mu.Lock()
+	if s.statePersistErr != nil {
+		if s.statusErr == s.statePersistErr {
+			s.statusErr = nil
+		}
+		if s.lastErr == s.statePersistErr {
+			s.lastErr = nil
+		}
+		s.statePersistErr = nil
+	}
+	s.mu.Unlock()
 }
 
 type byteRange struct {

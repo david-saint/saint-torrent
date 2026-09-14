@@ -226,3 +226,77 @@ func TestSeedFixture(t *testing.T) {
 	lib := seedStateInto(t, dir, seedConfig{numTorrents: 5, bytesPerTorrent: 16 << 20, pieceLength: 1 << 18})
 	t.Logf("seeded few-large library: config=%s downloads=%s", lib.stateDir, lib.downloadDir)
 }
+
+// BenchmarkResumeVerification includes file opening, restoring, hashing (when
+// requested), and the durable completion checkpoint. The fixture fits in cache;
+// use large real files on each target volume for cold-disk throughput measurements.
+func BenchmarkResumeVerification(b *testing.B) {
+	const size = 64 << 20
+	for _, force := range []bool{false, true} {
+		name := "fast_resume"
+		if force {
+			name = "full_check"
+		}
+		b.Run(name, func(b *testing.B) {
+			lib := seedState(b, seedConfig{numTorrents: 1, bytesPerTorrent: size, pieceLength: 8 << 20})
+			cached, err := filepath.Glob(filepath.Join(lib.stateDir, "torrents", "*.torrent"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			raw, err := os.ReadFile(cached[0])
+			if err != nil {
+				b.Fatal(err)
+			}
+			tor, err := torrent.Parse(raw)
+			if err != nil {
+				b.Fatal(err)
+			}
+			files := []storage.FileInfo{{Path: tor.Files[0].Path[0], Length: size}}
+			seed, err := storage.NewFileStorage(lib.downloadDir, files, tor.PieceLength)
+			if err != nil {
+				b.Fatal(err)
+			}
+			complete := make([]int, len(tor.PieceHashes))
+			for i := range complete {
+				complete[i] = i
+			}
+			if err = seed.SaveResumeState(fmt.Sprintf("%x", tor.InfoHash), complete, nil, true); err != nil {
+				b.Fatal(err)
+			}
+			if err = seed.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			if force {
+				b.SetBytes(size)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				fs, err := storage.NewFileStorage(lib.downloadDir, files, tor.PieceLength)
+				if err != nil {
+					b.Fatal(err)
+				}
+				st := &countedVerificationStorage{FileStorage: fs}
+				sess, err := newSession(tor, st, [20]byte{}, 0, lib.downloadDir, force)
+				if err != nil {
+					b.Fatal(err)
+				}
+				sess.verifyResume(sess.ctx)
+				if !sess.IsCompleted() {
+					b.Fatal("verification did not finish")
+				}
+				want := 0
+				if force {
+					want = len(tor.PieceHashes)
+				}
+				if len(st.checks) != want {
+					b.Fatalf("hashed %d pieces, want %d", len(st.checks), want)
+				}
+				sess.cancel()
+				if err = st.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

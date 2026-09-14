@@ -172,8 +172,12 @@ type Session struct {
 	uploadBlockPool sync.Pool
 
 	stateDirty bool
+	closing    bool
 	stats      completionStats
 	flushMu    sync.Mutex
+	// stateFlushCh wakes the persistence goroutine so a pause checkpoints promptly
+	// without running the flush (and its file syncs) on the caller's goroutine.
+	stateFlushCh chan struct{}
 
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
@@ -194,6 +198,7 @@ type Session struct {
 	trackerCompleted    int
 	lastErr             error
 	statusErr           error // current blocking failure; drives Error status
+	statePersistErr     error // last resume-persist failure, cleared once it recovers
 	lastTrackerErr      error
 	paused              bool
 	pauseEpoch          uint64 // increments when active connections are closed for pause
@@ -209,14 +214,18 @@ type Session struct {
 	completedAnnounced bool
 	stoppedAnnounced   bool
 
-	// Background fast-resume verification. Pieces claimed by resume data start as
-	// PieceUnverified and are hash-checked off the startup path (kicked off by Start).
-	verifying         bool
-	verifyStarted     bool
-	verifyFullScan    bool
-	verifyDone        chan struct{}
-	verifyGateRelease func() // releases this session's global verification slot (once)
-	pieceWaiters      map[int64]*pieceWaiter
+	// Background verification of legacy hints and changed files. Durable pieces
+	// whose metadata still matches are restored immediately.
+	verifyOnStartup    bool
+	verifyCheckedBytes int64
+	verifyTotalBytes   int64
+	verifyStartTime    time.Time
+	verifying          bool
+	verifyStarted      bool
+	verifyFullScan     bool
+	verifyDone         chan struct{}
+	verifyGateRelease  func() // releases this session's global verification slot (once)
+	pieceWaiters       map[int64]*pieceWaiter
 
 	// Sequential mode biases piece selection toward one or more read cursors plus
 	// readahead windows. SetSequentialMode owns the session-wide window; live
@@ -260,6 +269,10 @@ type Session struct {
 
 // NewSession creates a new download session for a torrent.
 func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port uint16, downloadDir string) (*Session, error) {
+	return newSession(tor, st, peerID, port, downloadDir, false)
+}
+
+func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port uint16, downloadDir string, verifyOnStartup bool) (*Session, error) {
 	numPieces := len(tor.PieceHashes)
 	states := make([]PieceState, numPieces)
 
@@ -279,6 +292,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 	}
 
 	sess := &Session{
+		verifyOnStartup:     verifyOnStartup,
 		Torrent:             tor,
 		Storage:             st,
 		PeerID:              peerID,
@@ -295,6 +309,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		ctx:                 ctx,
 		cancel:              cancel,
 		resumeCh:            make(chan struct{}, 1),
+		stateFlushCh:        make(chan struct{}, 1),
 		pauseStateCh:        make(chan struct{}),
 		filePriorities:      priorities,
 		DownloadLimiter:     NewRateLimiter(0), // unlimited by default
@@ -596,10 +611,26 @@ func (s *Session) Close() {
 	var verifyDone chan struct{}
 	var storageToClose storage.Storage
 	s.closeOnce.Do(func() {
-		s.flushState()
-
 		s.mu.Lock()
+		s.closing = true
+		// Shutdown is the last chance to record what has been downloaded. The
+		// periodic hint flush clears stateDirty, so re-arm it when there is
+		// anything to checkpoint.
+		if s.stats.completedTotalBytes > 0 {
+			s.stateDirty = true
+		}
 		wasStarted := s.started
+		// Stop serving before the shutdown checkpoint runs. A peer read re-maps a
+		// file the checkpoint released, and releasing that mapping again when the
+		// storage closes moves the timestamps the checkpoint just recorded — which
+		// would rehash on the next launch a torrent this one had already proved.
+		if s.listener != nil {
+			s.listener.Close()
+			s.listener = nil
+		}
+		for _, client := range s.activePeers {
+			_ = client.Conn.Close()
+		}
 		s.mu.Unlock()
 		if wasStarted {
 			s.announceStopped()
@@ -607,6 +638,9 @@ func (s *Session) Close() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// The peer loops are cancelled and their connections gone, so nothing can
+		// touch the files behind the checkpoint.
+		s.flushState()
 
 		s.mu.Lock()
 		s.closed = true
@@ -618,13 +652,6 @@ func (s *Session) Close() {
 		gateRelease = s.verifyGateRelease
 		s.verifyGateRelease = nil
 		storageToClose = s.Storage
-		if s.listener != nil {
-			s.listener.Close()
-			s.listener = nil
-		}
-		for _, client := range s.activePeers {
-			_ = client.Conn.Close()
-		}
 		s.broadcastPieceWaitersLocked()
 		if s.chokeTimer != nil {
 			s.chokeTimer.Stop()
@@ -840,6 +867,9 @@ func (s *Session) IsCompleted() bool {
 }
 
 func (s *Session) statusLocked() string {
+	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
+		return "Checking"
+	}
 	isCompleted := s.isCompletedLocked()
 	if s.paused {
 		if isCompleted {
@@ -852,11 +882,6 @@ func (s *Session) statusLocked() string {
 	}
 	if s.metadataMode {
 		return "Metadata"
-	}
-	// Only resume-hint verification shows "Checking"; a no-hint background scan runs
-	// opportunistically and the torrent shows its normal (downloading/seeding) status.
-	if s.verifying && !s.verifyFullScan {
-		return "Checking"
 	}
 
 	if isCompleted {
@@ -887,14 +912,16 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 
 	status := s.statusLocked()
 	var statusScore int
-	switch status {
-	case "Downloading", "Metadata", "Checking":
-		statusScore = 0
-	case "Seeding":
-		statusScore = 1
-	case "Paused", "Stopped":
+	switch {
+	// A paused torrent sorts with the paused ones even while its status reports the
+	// recheck it is displaying progress for.
+	case s.paused:
 		statusScore = 2
-	case "Error":
+	case status == "Downloading" || status == "Metadata" || status == "Checking":
+		statusScore = 0
+	case status == "Seeding":
+		statusScore = 1
+	case status == "Error":
 		statusScore = 3
 	default:
 		statusScore = 4
@@ -915,6 +942,14 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	}
 }
 
+// VerificationSnapshot reports disk checking separately from network transfer.
+type VerificationSnapshot struct {
+	Active         bool
+	CheckedBytes   int64
+	TotalBytes     int64
+	BytesPerSecond float64
+}
+
 // SessionSnapshot is a point-in-time copy of the display-facing fields the TUI
 // needs for one session, gathered under a single read lock. The TUI takes one
 // snapshot per data tick and renders every animation frame from it, so the
@@ -922,6 +957,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 // completion takes s.mu for writes). All fields are read O(1): completion stats
 // come from the incrementally-maintained cache, never a fresh piece scan.
 type SessionSnapshot struct {
+	Verification  VerificationSnapshot
 	Name          string
 	InfoHash      [20]byte
 	TotalSize     int64
@@ -952,6 +988,18 @@ func (s *Session) Snapshot() SessionSnapshot {
 		UploadedBytes: s.Uploaded.Load(),
 		Status:        s.statusLocked(),
 		Completed:     s.isCompletedLocked(),
+	}
+	// Only a recheck of data the session already claims is reported as checking, the
+	// same condition statusLocked uses. The opportunistic full scan of a freshly
+	// added torrent runs alongside a normal download, so surfacing it would replace
+	// real transfer progress with disk-scan progress for the length of the scan.
+	checking := s.verifying && !s.verifyFullScan
+	snap.Verification = VerificationSnapshot{Active: checking, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
+	if checking && !s.verifyStartTime.IsZero() {
+		elapsed := time.Since(s.verifyStartTime).Seconds()
+		if elapsed > 0 {
+			snap.Verification.BytesPerSecond = float64(s.verifyCheckedBytes) / elapsed
+		}
 	}
 	if s.Torrent != nil {
 		snap.Name = s.Torrent.Name
@@ -1118,9 +1166,13 @@ func (s *Session) Pause() {
 			_ = client.Conn.Close()
 		}
 	}
+	// Pausing makes the session quiescent, which is when a durable checkpoint is
+	// worth taking. Hand it to the persistence goroutine: running the per-file
+	// flush here would freeze the caller (the TUI update loop) for the length of a
+	// full writeback.
+	s.stateDirty = true
 	s.mu.Unlock()
-
-	s.flushState()
+	s.requestStateFlush()
 
 	if logging.Enabled() {
 		s.mu.RLock()
