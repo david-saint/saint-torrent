@@ -52,7 +52,7 @@ jobs:
         run: go test -v -race ./...
 
       - name: Run benchmark smoke tests
-        run: go test -run '^$' -bench 'BenchmarkColdStartup|BenchmarkShutdown' -benchtime=1x -benchmem ./pkg/downloader
+        run: go test -run '^$' -bench 'BenchmarkColdStartup|BenchmarkShutdown|BenchmarkResumeVerification' -benchtime=1x -benchmem ./pkg/downloader
 
   lint:
     name: golangci-lint

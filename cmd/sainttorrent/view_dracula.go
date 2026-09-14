@@ -99,12 +99,15 @@ func dracRow(st styles, col listLayout, selected bool, row sessionRow) string {
 		sizeStr = "unknown"
 	}
 	pctStr := fmt.Sprintf("%.1f%%", row.percent)
+	if row.verification.Active {
+		pctStr = "—"
+	}
 	if row.metadataMode {
 		pctStr = "0.0%"
 	}
 	statusLabel, statusSt := statusLabelStyle(st, row.status)
-	speedStr := getSpeedStr(row.paused, row.completed, row.transferSpeed)
-	spdSt := speedStyle(st, row.status == "Downloading")
+	speedStr := row.speedText()
+	spdSt := speedStyle(st, row.status == "Downloading" || row.verification.Active)
 
 	if selected {
 		// Solid highlight across the whole row (single style).
@@ -207,9 +210,13 @@ func renderDetailsDracula(m *model) string {
 	card := cardWidth(st.Card, m.width)
 	uploadPeers := d.uploadPeers
 
+	completeLabel := "Complete"
+	if row.verification.Active {
+		completeLabel = "Verified"
+	}
 	cardContent := st.Header.Render("Hash") + ": " + row.infoHashHex + "\n" +
 		st.Header.Render("Total Size") + ": " + formatBytes(row.totalSize) + "\n" +
-		st.Header.Render("Complete") + ": " + fmt.Sprintf("%.2f%%", row.percent) + "\n" +
+		st.Header.Render(completeLabel) + ": " + fmt.Sprintf("%.2f%%", row.percent) + "\n" +
 		st.Header.Render("Status") + ": " + statusSt.Render(statusLabel) + "\n" +
 		st.Header.Render("Speed") + ": ↓ " + formatSpeed(row.downloadSpeed) +
 		" / ↑ " + formatSpeed(row.uploadSpeed) + "\n" +
@@ -219,6 +226,9 @@ func renderDetailsDracula(m *model) string {
 		fmt.Sprintf("%d seeds / %d leechers / %d completed", d.seeders, d.leechers, d.completed) + "\n" +
 		st.Header.Render("Peer Port") + ": " + peerPortStatus(m.manager) + "\n\n" +
 		m.progress.ViewAs(pct)
+	if row.verification.Active {
+		cardContent += "\n" + st.Info.Render(row.checkingText())
+	}
 	if row.lastErrText != "" {
 		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + sanitizeText(row.lastErrText)
 	}

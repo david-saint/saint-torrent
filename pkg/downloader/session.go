@@ -209,14 +209,18 @@ type Session struct {
 	completedAnnounced bool
 	stoppedAnnounced   bool
 
-	// Background fast-resume verification. Pieces claimed by resume data start as
-	// PieceUnverified and are hash-checked off the startup path (kicked off by Start).
-	verifying         bool
-	verifyStarted     bool
-	verifyFullScan    bool
-	verifyDone        chan struct{}
-	verifyGateRelease func() // releases this session's global verification slot (once)
-	pieceWaiters      map[int64]*pieceWaiter
+	// Background verification of legacy hints and changed files. Durable pieces
+	// whose metadata still matches are restored immediately.
+	verifyOnStartup    bool
+	verifyCheckedBytes int64
+	verifyTotalBytes   int64
+	verifyStartTime    time.Time
+	verifying          bool
+	verifyStarted      bool
+	verifyFullScan     bool
+	verifyDone         chan struct{}
+	verifyGateRelease  func() // releases this session's global verification slot (once)
+	pieceWaiters       map[int64]*pieceWaiter
 
 	// Sequential mode biases piece selection toward one or more read cursors plus
 	// readahead windows. SetSequentialMode owns the session-wide window; live
@@ -260,6 +264,10 @@ type Session struct {
 
 // NewSession creates a new download session for a torrent.
 func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port uint16, downloadDir string) (*Session, error) {
+	return newSession(tor, st, peerID, port, downloadDir, false)
+}
+
+func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port uint16, downloadDir string, verifyOnStartup bool) (*Session, error) {
 	numPieces := len(tor.PieceHashes)
 	states := make([]PieceState, numPieces)
 
@@ -279,6 +287,7 @@ func NewSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 	}
 
 	sess := &Session{
+		verifyOnStartup:     verifyOnStartup,
 		Torrent:             tor,
 		Storage:             st,
 		PeerID:              peerID,
@@ -840,6 +849,9 @@ func (s *Session) IsCompleted() bool {
 }
 
 func (s *Session) statusLocked() string {
+	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
+		return "Checking"
+	}
 	isCompleted := s.isCompletedLocked()
 	if s.paused {
 		if isCompleted {
@@ -852,11 +864,6 @@ func (s *Session) statusLocked() string {
 	}
 	if s.metadataMode {
 		return "Metadata"
-	}
-	// Only resume-hint verification shows "Checking"; a no-hint background scan runs
-	// opportunistically and the torrent shows its normal (downloading/seeding) status.
-	if s.verifying && !s.verifyFullScan {
-		return "Checking"
 	}
 
 	if isCompleted {
@@ -915,6 +922,14 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	}
 }
 
+// VerificationSnapshot reports disk checking separately from network transfer.
+type VerificationSnapshot struct {
+	Active         bool
+	CheckedBytes   int64
+	TotalBytes     int64
+	BytesPerSecond float64
+}
+
 // SessionSnapshot is a point-in-time copy of the display-facing fields the TUI
 // needs for one session, gathered under a single read lock. The TUI takes one
 // snapshot per data tick and renders every animation frame from it, so the
@@ -922,6 +937,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 // completion takes s.mu for writes). All fields are read O(1): completion stats
 // come from the incrementally-maintained cache, never a fresh piece scan.
 type SessionSnapshot struct {
+	Verification  VerificationSnapshot
 	Name          string
 	InfoHash      [20]byte
 	TotalSize     int64
@@ -952,6 +968,13 @@ func (s *Session) Snapshot() SessionSnapshot {
 		UploadedBytes: s.Uploaded.Load(),
 		Status:        s.statusLocked(),
 		Completed:     s.isCompletedLocked(),
+	}
+	snap.Verification = VerificationSnapshot{Active: s.verifying, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
+	if s.verifying && !s.verifyStartTime.IsZero() {
+		elapsed := time.Since(s.verifyStartTime).Seconds()
+		if elapsed > 0 {
+			snap.Verification.BytesPerSecond = float64(s.verifyCheckedBytes) / elapsed
+		}
 	}
 	if s.Torrent != nil {
 		snap.Name = s.Torrent.Name

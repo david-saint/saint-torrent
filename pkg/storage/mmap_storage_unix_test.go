@@ -264,3 +264,42 @@ func TestMMapStorageCloseWaitsForActiveReaders(t *testing.T) {
 		t.Fatal("Close did not finish after reader released lock")
 	}
 }
+
+func TestMMapDurableResume(t *testing.T) {
+	root := t.TempDir()
+	files := []FileInfo{{Path: "payload", Length: 8}}
+	st, err := NewMMapStorage(root, files, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.WriteBlock(0, 0, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.WriteBlock(1, 0, []byte("efgh")); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.SaveResumeState("mapped", []int{0, 1}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := NewMMapStorage(root, files, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	got, err := next.LoadResumeState("mapped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Verified) != 2 || len(got.Recheck) != 0 {
+		t.Fatalf("resume %+v", got)
+	}
+	for i, data := range []string{"abcd", "efgh"} {
+		ok, err := next.VerifyPiece(int64(i), sha1.Sum([]byte(data)))
+		if err != nil || !ok {
+			t.Fatalf("piece %d: %v %v", i, ok, err)
+		}
+	}
+}

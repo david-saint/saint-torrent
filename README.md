@@ -285,3 +285,30 @@ go test -bench='BenchmarkColdStartup|BenchmarkShutdown' -benchmem ./pkg/download
 ## License
 
 saintTorrent is released under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+### Startup checking and fast resume
+
+The file and mmap backends restore completed downloads from a durable resume
+checkpoint after validating each file's size, modification time, and identity.
+For the file backend on Unix, identity validation also includes the change timestamp
+(mmap can update that timestamp when unmapping, so it uses file identity and mtime). Unchanged files
+need no content reads. Files that changed are rechecked along with any torrent
+pieces crossing their boundaries; unaffected files retain their verified state.
+
+Older state files contain completion hints, so the first launch after upgrading
+performs one verification pass before saving the new checkpoint. Interrupted
+checks never promote unverified hints. Active downloads continue to save cheap
+hints; completed or paused sessions can flush their data and atomically replace
+resume state from background persistence work, outside peer and piece locks.
+
+Use `sainttorrent --recheck` to force full hashing on a launch, including for
+unchanged files. Metadata validation is a fast-resume policy, not a replacement
+for a full integrity check when silent corruption is suspected. Checking progress,
+disk read speed, and ETA appear separately from network transfer statistics;
+paused torrents still display their checking status.
+
+Run `go test -run '^$' -bench BenchmarkResumeVerification -benchmem ./pkg/downloader`
+to compare completed-torrent startup with a full verification pass. This benchmark
+includes verification and completion persistence, unlike `BenchmarkColdStartup`.
+Its small fixture is normally cached; use real cold files on the target disk when
+measuring physical checking throughput.

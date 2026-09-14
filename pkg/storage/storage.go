@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,6 +108,8 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 // cached read handle. Paths are validated once and every operation is anchored
 // to downloadRoot, so a later symlink swap cannot redirect payload I/O.
 type fileLayout struct {
+	initialInfo  os.FileInfo
+	repaired     atomic.Bool
 	path         string // relative path (torrent-declared)
 	downloadRoot *DownloadRoot
 	volumeGuard  *externalVolumeGuard
@@ -267,11 +270,13 @@ type FileStorage struct {
 	// SaveState paths mutate concurrently. dirty records files written since the last
 	// persist; their mtimes are captured lazily in SaveState instead of via a stat
 	// syscall on every completed piece (mirrors the mmap backend).
-	mtMu         sync.Mutex
-	stateFileMt  map[string]int64
-	dirty        map[*fileLayout]struct{}
-	downloadRoot *DownloadRoot
-	closed       atomic.Bool
+	mtMu               sync.Mutex
+	stateFileMt        map[string]int64
+	stateFileInfo      map[string]os.FileInfo
+	resumeIdentityMode string
+	dirty              map[*fileLayout]struct{}
+	downloadRoot       *DownloadRoot
+	closed             atomic.Bool
 }
 
 // NewFileStorage creates the target directories and pre-allocates files to their
@@ -375,6 +380,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 	}()
 	stateFileMt := make(map[string]int64, len(files))
+	stateFileInfo := make(map[string]os.FileInfo, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -417,6 +423,8 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 				return nil, fmt.Errorf("failed to stat file %s after resize: %w", path, err)
 			}
 		}
+		stateFileInfo[path] = fi
+		layout.initialInfo = fi
 		stateFileMt[path] = fi.ModTime().UnixNano()
 		if err := f.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close file %s: %w", path, err)
@@ -426,14 +434,15 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	keepCreatedFiles = true
 	keepDownloadRoot = true
 	return &FileStorage{
-		resolver:     resolver,
-		baseDir:      resolver.BaseDir(),
-		files:        layouts,
-		pieceLength:  pieceLength,
-		totalSize:    currentOffset,
-		stateFileMt:  stateFileMt,
-		dirty:        make(map[*fileLayout]struct{}, len(layouts)),
-		downloadRoot: downloadRoot,
+		resolver:      resolver,
+		baseDir:       resolver.BaseDir(),
+		files:         layouts,
+		pieceLength:   pieceLength,
+		totalSize:     currentOffset,
+		stateFileMt:   stateFileMt,
+		stateFileInfo: stateFileInfo,
+		dirty:         make(map[*fileLayout]struct{}, len(layouts)),
+		downloadRoot:  downloadRoot,
 	}, nil
 }
 
@@ -592,6 +601,7 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 				return fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
 			}
 			if fileRepaired {
+				file.repaired.Store(true)
 				repaired = true
 			}
 			if s.closed.Load() {
@@ -628,6 +638,11 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 // resume no longer allocates a full piece — potentially many MB — per call.
 const verifyChunkSize = 1 << 18 // 256 KiB
 
+var verifyBuffers = sync.Pool{New: func() any {
+	buffer := make([]byte, verifyChunkSize)
+	return &buffer
+}}
+
 // VerifyPiece computes the SHA-1 hash of the piece and compares it with expectedHash.
 func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool, error) {
 	pieceLen := s.PieceLength(pieceIndex)
@@ -650,11 +665,17 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	if chunkLen > verifyChunkSize {
 		chunkLen = verifyChunkSize
 	}
-	chunk := make([]byte, chunkLen)
+	buffer := verifyBuffers.Get().(*[]byte)
+	defer verifyBuffers.Put(buffer)
+	chunk := (*buffer)[:chunkLen]
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
-	for _, file := range s.files {
+	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
+	for _, file := range s.files[first:] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
@@ -718,8 +739,13 @@ func (s *FileStorage) Close() error {
 
 // FastResumeState defines the structure for saving completed pieces metadata
 type FastResumeState struct {
-	InfoHashHex string `json:"info_hash_hex"`
-	Files       []struct {
+	Version        int      `json:"version,omitempty"`
+	PieceLength    int64    `json:"piece_length,omitempty"`
+	VerifiedPieces []int    `json:"verified_pieces,omitempty"`
+	Identities     []string `json:"identities,omitempty"`
+	IdentityMode   string   `json:"identity_mode,omitempty"`
+	InfoHashHex    string   `json:"info_hash_hex"`
+	Files          []struct {
 		Path  string `json:"path"`
 		Size  int64  `json:"size"`
 		Mtime int64  `json:"mtime"`
@@ -736,6 +762,7 @@ func (s *FileStorage) refreshDirtyLocked() {
 	for file := range s.dirty {
 		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
 			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+			s.stateFileInfo[file.path] = fi
 		}
 		delete(s.dirty, file)
 	}
@@ -808,15 +835,7 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		return err
 	}
 
-	stateFile, err := rootOpenNoFollow(s.downloadRoot, stateName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	if _, err := stateFile.Write(data); err != nil {
-		_ = stateFile.Close()
-		return err
-	}
-	return stateFile.Close()
+	return s.writeResumeAtomically(stateName, data, false)
 }
 
 // LoadState reads and validates the fast-resume state file, returning completed piece indices if valid.

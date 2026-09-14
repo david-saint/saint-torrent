@@ -33,6 +33,9 @@ func NewMMapStorage(baseDir string, files []FileInfo, pieceLength int64) (*MMapS
 		return nil, err
 	}
 
+	// Unmapping a writable mapping can change ctime even after a data flush.
+	// Use file identity and mtime for these checkpoints, as on Windows.
+	fs.resumeIdentityMode = "file"
 	st := &MMapStorage{
 		FileStorage: fs,
 		dirty:       make(map[*fileLayout]struct{}),
@@ -259,6 +262,9 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (b
 		return false, err
 	}
 	mapped.data = data
+	if repaired {
+		layout.repaired.Store(true)
+	}
 	return repaired, nil
 }
 
@@ -354,6 +360,7 @@ func (s *MMapStorage) SaveState(infoHashHex string, completedPieces []int) error
 	s.mtMu.Lock()
 	for file, mtime := range mtimes {
 		s.stateFileMt[file.path] = mtime
+		s.FileStorage.dirty[file] = struct{}{}
 	}
 	s.mtMu.Unlock()
 
@@ -380,4 +387,17 @@ func touchMappedFile(file *fileLayout) (int64, error) {
 		return 0, fmt.Errorf("failed to close file %s after mtime refresh: %w", file.path, closeErr)
 	}
 	return fi.ModTime().UnixNano(), nil
+}
+
+// SaveResumeState refreshes timestamps for mapped writes before the ordinary
+// durable checkpoint. File.Sync flushes the same file-backed pages without holding
+// the mapping lock across disk I/O. Active transfers only persist lightweight hints.
+func (s *MMapStorage) SaveResumeState(hash string, verified, unverified []int, durable bool) error {
+	if err := s.SaveState(hash, append(append([]int(nil), verified...), unverified...)); err != nil {
+		return err
+	}
+	if durable {
+		return s.FileStorage.SaveResumeState(hash, verified, unverified, true)
+	}
+	return nil
 }

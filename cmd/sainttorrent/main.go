@@ -175,6 +175,7 @@ type cliOptions struct {
 	fallbackDownloadDirs []string
 	fallbackDirsSet      bool
 	configDir            string
+	verifyOnStartup      bool
 	persist              bool
 	confirm              bool
 	headless             bool
@@ -1217,6 +1218,7 @@ Options:
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
       --no-persist          Do not persist fast-resume state
+      --recheck             Fully hash-check all torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
       --log <path>          Write JSON-lines debug logs to a rotating file
       --log-level <level>   Log level: debug, info, warn, or error
@@ -1267,6 +1269,8 @@ func parseCLIArgs(args []string) cliOptions {
 			} else {
 				opts.err = fmt.Errorf("%s requires a directory path", args[i])
 			}
+		case "--recheck":
+			opts.verifyOnStartup = true
 		case "--no-persist":
 			opts.persist = false
 		case "--confirm":
@@ -1822,6 +1826,7 @@ func main() {
 
 	mgr := downloader.NewTorrentManager()
 	mgr.SetEncryptionPolicy(opts.encryption)
+	mgr.SetVerifyOnStartup(opts.verifyOnStartup)
 	if err := mgr.SetStorageBackend(opts.storage); err != nil {
 		fmt.Fprintf(os.Stderr, "Error configuring storage backend: %v\n", err)
 		mgr.Close()
