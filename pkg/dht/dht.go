@@ -926,6 +926,10 @@ func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) ad
 		// Any answer from the stored address discards the candidate unprobed.
 		if oldID == id {
 			d.refreshNode(id, oldAddr)
+		} else {
+			// Something else owns that address now, so the stored contact is
+			// proven wrong and must not linger in the bucket.
+			d.dropNode(id, oldAddr)
 		}
 		return addrChangeIncumbentAnswered
 	}
@@ -962,6 +966,30 @@ func (d *DHT) refreshNode(id [20]byte, addr *net.UDPAddr) {
 			b.nodes = append(b.nodes, n)
 			return
 		}
+	}
+}
+
+// dropNode removes a node that has been proven wrong, but only if it is still
+// stored at addr, so a concurrent re-point is never undone.
+func (d *DHT) dropNode(id [20]byte, addr *net.UDPAddr) {
+	idx := bucketIndex(d.nodeID, id)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	for i, n := range b.nodes {
+		if n.ID != id {
+			continue
+		}
+		if !sameUDPAddr(n.Addr, addr) {
+			return
+		}
+		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+		return
 	}
 }
 

@@ -404,6 +404,127 @@ func TestAddressChangeRejectsCandidateWithDifferentID(t *testing.T) {
 	}
 }
 
+// TestStaleIncumbentIsRemovedWhenAddressAnswersWithDifferentID covers the case
+// where the stored address is answered by some other node: the contact is proven
+// wrong and must leave the bucket, and the candidate is still never adopted.
+func TestStaleIncumbentIsRemovedWhenAddressAnswersWithDifferentID(t *testing.T) {
+	const bucket = 17
+	d, conn := newFakeDHT(t)
+
+	honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+	honest := idInBucket(d.nodeID, bucket, 1)
+	d.addNode(honest, honestAddr)
+
+	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(honest[:])}, attackerAddr)
+
+	tid := awaitQueryTo(t, conn, honestAddr, "ping")
+	squatter := idInBucket(d.nodeID, bucket, 3)
+	conn.injectPingReply(t, tid, squatter, honestAddr)
+
+	awaitNoPendingAddrChange(t, d)
+
+	if nodes := bucketNodes(d, bucket); len(nodes) != 0 {
+		t.Fatalf("proven-wrong contact stayed in the bucket: %x at %s", nodes[0].ID, nodes[0].Addr)
+	}
+	if got := conn.queriesTo(attackerAddr, "ping"); got != 0 {
+		t.Fatalf("candidate was probed %d times after the stored address answered", got)
+	}
+}
+
+// TestAddressChangeAdoptedOnlyAfterVerification exercises the full verification
+// path against live DHT instances over loopback: a stored address that has gone
+// silent is replaced by a candidate that answers a ping with the same node ID,
+// while a stored address that still answers keeps its slot.
+func TestAddressChangeAdoptedOnlyAfterVerification(t *testing.T) {
+	t.Run("adopted when old address is silent", func(t *testing.T) {
+		victim, err := NewDHT(t.TempDir(), 0)
+		if err != nil {
+			t.Fatalf("failed to start victim DHT: %v", err)
+		}
+		defer victim.Close()
+
+		mover, err := NewDHT(t.TempDir(), 0)
+		if err != nil {
+			t.Fatalf("failed to start mover DHT: %v", err)
+		}
+		defer mover.Close()
+
+		oldAddr := unusedLoopbackAddr(t)
+		newAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(mover.Port())}
+		if newAddr.Port == 0 {
+			t.Fatal("mover DHT has no listen port")
+		}
+
+		victim.addNode(mover.nodeID, oldAddr)
+		victim.handleQuery("tx", "ping", map[string]interface{}{"id": string(mover.nodeID[:])}, newAddr)
+
+		deadline := time.After(15 * time.Second)
+		for {
+			addr := storedAddrFor(victim, mover.nodeID)
+			if addr == nil {
+				t.Fatal("node vanished from the routing table")
+			}
+			if sameUDPAddr(addr, newAddr) {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("address change was never adopted; entry still at %s", addr)
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
+
+	t.Run("rejected when old address still answers", func(t *testing.T) {
+		victim, err := NewDHT(t.TempDir(), 0)
+		if err != nil {
+			t.Fatalf("failed to start victim DHT: %v", err)
+		}
+		defer victim.Close()
+
+		incumbent, err := NewDHT(t.TempDir(), 0)
+		if err != nil {
+			t.Fatalf("failed to start incumbent DHT: %v", err)
+		}
+		defer incumbent.Close()
+
+		oldAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(incumbent.Port())}
+		if oldAddr.Port == 0 {
+			t.Fatal("incumbent DHT has no listen port")
+		}
+		attackerAddr := unusedLoopbackAddr(t)
+
+		victim.addNode(incumbent.nodeID, oldAddr)
+		bucket := bucketIndex(victim.nodeID, incumbent.nodeID)
+		past := time.Now().Add(-time.Hour)
+		backdateNode(t, victim, bucket, incumbent.nodeID, past)
+
+		victim.handleQuery("tx", "ping", map[string]interface{}{"id": string(incumbent.nodeID[:])}, attackerAddr)
+
+		// The incumbent's real ping reply is what ends the verification, so wait
+		// for the refreshed LastSeen rather than a fixed delay.
+		deadline := time.After(15 * time.Second)
+		for {
+			nodes := bucketNodes(victim, bucket)
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 node in bucket %d, got %d", bucket, len(nodes))
+			}
+			if !sameUDPAddr(nodes[0].Addr, oldAddr) {
+				t.Fatalf("entry was re-pointed to %s despite the old address answering", nodes[0].Addr)
+			}
+			if nodes[0].LastSeen.After(past) {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatal("incumbent was never re-confirmed by its ping reply")
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
+}
+
 // unusedLoopbackAddr returns a loopback UDP address with nothing bound to it.
 func unusedLoopbackAddr(t *testing.T) *net.UDPAddr {
 	t.Helper()
