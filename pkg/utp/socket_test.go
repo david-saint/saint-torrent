@@ -851,3 +851,104 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 		t.Fatalf("second payload = %q, want %q", got, more.payload)
 	}
 }
+
+func TestSynRetransmitAfterListenerCloseKeepsInboundConn(t *testing.T) {
+	server, err := NewSocket(0)
+	if err != nil {
+		t.Fatalf("server socket: %v", err)
+	}
+	defer server.Close()
+	ln := server.Listen()
+	defer ln.Close()
+
+	rawClient, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("raw client: %v", err)
+	}
+	defer rawClient.Close()
+	_ = rawClient.SetDeadline(time.Now().Add(5 * time.Second))
+
+	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(server.Port())}
+	syn := packet{typ: packetTypeSyn, connID: 6543, timestamp: uint32(time.Now().UnixMicro()), seqNr: 21}
+	buf := make([]byte, 1500)
+	readPacket := func(what string) packet {
+		t.Helper()
+		n, _, err := rawClient.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("read %s: %v", what, err)
+		}
+		p, err := parsePacket(buf[:n])
+		if err != nil {
+			t.Fatalf("parse %s: %v", what, err)
+		}
+		return p
+	}
+
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("send SYN: %v", err)
+	}
+	first := readPacket("STATE for first SYN")
+	if first.typ != packetTypeState || first.connID != syn.connID || first.ackNr != syn.seqNr {
+		t.Fatalf("first reply: type=%d connID=%d ack=%d, want STATE connID=%d ack=%d", first.typ, first.connID, first.ackNr, syn.connID, syn.seqNr)
+	}
+
+	accepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer accepted.Close()
+
+	// markAccepted runs in the read loop just after the conn is queued, so
+	// Accept can return before the flag is set. Wait for it so the retransmit
+	// below exercises the routing change and not that race.
+	inbound := accepted.(*Conn)
+	deadline := time.Now().Add(2 * time.Second)
+	for !inbound.isAccepted() {
+		if time.Now().After(deadline) {
+			t.Fatal("accepted conn was never marked accepted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// TorrentManager.Close closes the uTP listener while sessions still hold
+	// the conns it handed out. A SYN retransmit arriving after that must still
+	// be routed to the inbound conn: a RESET carries the initiator's connID,
+	// so at the peer it keys to the connection it opened and kills a live
+	// stream.
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
+		t.Fatalf("resend SYN after listener close: %v", err)
+	}
+	second := readPacket("reply to SYN retransmit after listener close")
+	if second.typ == packetTypeReset {
+		t.Fatal("SYN retransmit after listener close was answered with a RESET")
+	}
+	if second.typ != packetTypeState || second.connID != syn.connID {
+		t.Fatalf("retransmit reply: type=%d connID=%d, want STATE connID=%d", second.typ, second.connID, syn.connID)
+	}
+	if second.seqNr != first.seqNr || second.ackNr != first.ackNr {
+		t.Fatalf("retransmit STATE seq=%d ack=%d, want seq=%d ack=%d", second.seqNr, second.ackNr, first.seqNr, first.ackNr)
+	}
+
+	data := packet{
+		typ:       packetTypeData,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     first.seqNr,
+		payload:   []byte("after-close"),
+	}
+	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
+		t.Fatalf("send DATA after listener close: %v", err)
+	}
+	got := make([]byte, len(data.payload))
+	_ = accepted.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(accepted, got); err != nil {
+		t.Fatalf("read accepted payload after listener close: %v", err)
+	}
+	if !bytes.Equal(got, data.payload) {
+		t.Fatalf("accepted payload = %q, want %q", got, data.payload)
+	}
+}

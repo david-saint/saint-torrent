@@ -249,14 +249,22 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	s.mu.Lock()
 	if isSyn {
 		listener = s.listener
-		if !s.closed && listener != nil && !listener.isClosed() {
+		if !s.closed {
+			// The existing conn is consulted before the listener: an inbound
+			// conn parked at this key owns the connection the SYN belongs to
+			// whether or not the listener is still open. TorrentManager.Close
+			// closes the listener ahead of the sessions still using conns it
+			// handed out, and Listener.Close clears Socket.listener without
+			// unregistering accepted conns, so answering a retransmit with a
+			// RESET here would carry the initiator's connID and tear down a
+			// live inbound stream.
 			switch existing := s.conns[key]; {
-			case existing == nil:
-				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-				s.conns[key] = c
-			case existing.inbound:
+			case existing != nil && existing.inbound:
 				// SYN retransmit for a conn we already created.
 				c = existing
+			case existing == nil && listener != nil && !listener.isClosed():
+				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
+				s.conns[key] = c
 			}
 			// Any other conn at this key (an outbound conn whose recv_id
 			// collides) is left untouched and the SYN is refused below.
@@ -287,7 +295,9 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
 	if !wasAccepted {
-		if !listener.enqueue(c) {
+		// listener can be nil here: a reused inbound conn is routed without
+		// consulting the listener, so it may already have been cleared.
+		if listener == nil || !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
 		} else {
 			c.markAccepted()
