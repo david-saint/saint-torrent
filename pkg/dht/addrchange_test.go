@@ -31,6 +31,73 @@ func pendingAddrChangeCount(d *DHT) int {
 	return len(d.addrChanges)
 }
 
+func addrCooldownCount(d *DHT) int {
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	return len(d.addrCooldowns)
+}
+
+// expireIDCooldown rewinds the short per-ID cooldown so the window elapsing can
+// be observed without waiting on the clock. The long per-candidate cooldowns are
+// left untouched.
+func expireIDCooldown(t *testing.T, d *DHT, id [20]byte) {
+	t.Helper()
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	key := addrChangeKey{id: id}
+	if _, ok := d.addrCooldowns[key]; !ok {
+		t.Fatalf("no short cooldown recorded for %x", id)
+	}
+	d.addrCooldowns[key] = time.Now().Add(-time.Second)
+}
+
+// saturateAddrCooldowns fills the bounded cooldown map with live per-candidate
+// entries so behaviour at the bound can be observed.
+func saturateAddrCooldowns(t *testing.T, d *DHT) {
+	t.Helper()
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	until := time.Now().Add(addrChangeCooldown)
+	for i := 0; i < maxAddrChangeCooldowns; i++ {
+		id := idInBucket(d.nodeID, 100, uint16(i))
+		addr := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1 + i}
+		d.addrCooldowns[addrChangeKey{id: id, addr: udpAddrKey(addr)}] = until
+	}
+	if len(d.addrCooldowns) != maxAddrChangeCooldowns {
+		t.Fatalf("cooldown map holds %d entries, want %d", len(d.addrCooldowns), maxAddrChangeCooldowns)
+	}
+}
+
+// awaitNoPendingAddrChange waits for every in-flight verification to finish.
+func awaitNoPendingAddrChange(t *testing.T, d *DHT) {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for pendingAddrChangeCount(d) != 0 {
+		select {
+		case <-deadline:
+			t.Fatal("address-change verification never finished")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// awaitQueryTo waits for an outbound query of type q to addr and returns its
+// transaction ID.
+func awaitQueryTo(t *testing.T, c *fakeConn, addr *net.UDPAddr, q string) string {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for {
+		if tid, ok := c.lastQueryTo(addr, q); ok {
+			return tid
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("no %s query to %s was ever sent", q, addr)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // TestHandleQueryDoesNotRepointNodeOnUnverifiedAddressChange is the reported
 // reproduction: a node seeded at 10.0.0.1:6881 must survive an inbound query
 // that claims its ID from 203.0.113.9:1, for every query type.
@@ -225,8 +292,8 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 			d.handleQuery("tx", "ping", map[string]interface{}{"id": string(id[:])}, addr)
 		}
 
-		if got := pendingAddrChangeCount(d); got > maxPendingAddrChanges {
-			t.Fatalf("pending candidate set grew to %d, cap is %d", got, maxPendingAddrChanges)
+		if got := pendingAddrChangeCount(d); got != maxPendingAddrChanges {
+			t.Fatalf("pending candidate set holds %d verifications, want exactly the cap %d", got, maxPendingAddrChanges)
 		}
 	})
 
@@ -237,15 +304,209 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 		honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
 		honest := idInBucket(d.nodeID, bucket, 1)
 		d.addNode(honest, honestAddr)
+		candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
 
-		if !d.beginAddressVerification(honest) {
+		if !d.beginAddressVerification(honest, candidate) {
 			t.Fatal("first verification should have been admitted")
 		}
-		d.endAddressVerification(honest)
-		if d.beginAddressVerification(honest) {
+		d.endAddressVerification(honest, candidate, addrChangeFailed)
+		if d.beginAddressVerification(honest, candidate) {
 			t.Fatal("a candidate was retried during its cooldown")
 		}
 	})
+
+	// Completed attempts sit in the cooldown map, not the in-flight set, so a
+	// full round of recent checks cannot starve an unrelated genuine move.
+	t.Run("cooling attempts do not starve a fresh id", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		for i := 0; i < maxPendingAddrChanges; i++ {
+			id := idInBucket(d.nodeID, i, 1)
+			candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1 + i}
+			if !d.beginAddressVerification(id, candidate) {
+				t.Fatalf("verification %d should have been admitted", i)
+			}
+			d.endAddressVerification(id, candidate, addrChangeFailed)
+		}
+		if got := pendingAddrChangeCount(d); got != 0 {
+			t.Fatalf("completed verifications still hold %d in-flight slots", got)
+		}
+
+		fresh := idInBucket(d.nodeID, 130, 1)
+		freshCandidate := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 4242}
+		if !d.beginAddressVerification(fresh, freshCandidate) {
+			t.Fatalf("%d cooling attempts blocked an unrelated address change", maxPendingAddrChanges)
+		}
+	})
+
+	// A verified adoption leaves no cooldown, so a node that legitimately moves
+	// again straight away is still followed.
+	t.Run("adoption leaves no cooldown", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		id := idInBucket(d.nodeID, 14, 1)
+		candidate := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		if !d.beginAddressVerification(id, candidate) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, candidate, addrChangeAdopted)
+
+		if got := addrCooldownCount(d); got != 0 {
+			t.Fatalf("a verified adoption left %d cooldown entries behind", got)
+		}
+		next := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
+		if !d.beginAddressVerification(id, next) {
+			t.Fatal("a second genuine move was blocked right after a verified adoption")
+		}
+	})
+
+	// The cooldown is two-tier: a short per-ID window bounds probing, while the
+	// exact spoofed candidate stays barred for the long window.
+	t.Run("short id window releases a new candidate but not the old one", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		id := idInBucket(d.nodeID, 15, 1)
+		spoofed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		genuine := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
+
+		if !d.beginAddressVerification(id, spoofed) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, spoofed, addrChangeFailed)
+
+		if d.beginAddressVerification(id, genuine) {
+			t.Fatal("the short per-ID window did not bound repeat probing")
+		}
+
+		expireIDCooldown(t, d, id)
+		if !d.beginAddressVerification(id, genuine) {
+			t.Fatal("a genuine move from a new address stayed blocked past the short window")
+		}
+		d.endAddressVerification(id, genuine, addrChangeFailed)
+
+		expireIDCooldown(t, d, id)
+		if d.beginAddressVerification(id, spoofed) {
+			t.Fatal("the same spoofed candidate was retried inside its long cooldown")
+		}
+	})
+
+	// Adoption proves the node is live at its new address, so it has to clear
+	// the long cooldowns earlier candidates for that ID left behind too.
+	t.Run("adoption clears earlier candidates for the id", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		id := idInBucket(d.nodeID, 19, 1)
+		first := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		second := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
+
+		if !d.beginAddressVerification(id, first) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, first, addrChangeFailed)
+
+		expireIDCooldown(t, d, id)
+		if !d.beginAddressVerification(id, second) {
+			t.Fatal("a second candidate stayed blocked past the short window")
+		}
+		d.endAddressVerification(id, second, addrChangeAdopted)
+
+		if got := addrCooldownCount(d); got != 0 {
+			t.Fatalf("a verified adoption left %d cooldown entries behind", got)
+		}
+		if !d.beginAddressVerification(id, first) {
+			t.Fatal("a move back to an earlier address stayed blocked after a verified adoption")
+		}
+	})
+
+	// The short per-ID window is what bounds probing, so a saturated cooldown
+	// map must not evict it - least of all when recording the entry armed
+	// alongside it.
+	t.Run("a full cooldown map keeps the short id window", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+		saturateAddrCooldowns(t, d)
+
+		id := idInBucket(d.nodeID, 20, 1)
+		spoofed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		rotated := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 2}
+
+		if !d.beginAddressVerification(id, spoofed) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, spoofed, addrChangeFailed)
+
+		if d.beginAddressVerification(id, rotated) {
+			t.Fatal("a full cooldown map let a rotating source re-probe the stored address")
+		}
+		if got := addrCooldownCount(d); got > maxAddrChangeCooldowns {
+			t.Fatalf("cooldown map grew to %d entries, past its bound of %d", got, maxAddrChangeCooldowns)
+		}
+	})
+}
+
+// TestAddressChangeRejectsCandidateWithDifferentID covers the branch where the
+// candidate answers the verification ping with a node ID other than the one it
+// claimed: the stored entry must be left exactly where it was.
+func TestAddressChangeRejectsCandidateWithDifferentID(t *testing.T) {
+	const bucket = 16
+	d, conn := newFakeDHT(t)
+
+	honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+	honest := idInBucket(d.nodeID, bucket, 1)
+	d.addNode(honest, honestAddr)
+
+	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(honest[:])}, attackerAddr)
+
+	// The stored address never answers, so the candidate is probed next.
+	tid := awaitQueryTo(t, conn, attackerAddr, "ping")
+	impostor := idInBucket(d.nodeID, bucket, 2)
+	answered := time.Now()
+	conn.injectPingReply(t, tid, impostor, attackerAddr)
+
+	awaitNoPendingAddrChange(t, d)
+
+	// A reply that never matched the transaction would reach the same end state
+	// by simply letting the candidate query expire, so this branch is only
+	// exercised if the answer ended the verification well inside that timeout.
+	if elapsed := time.Since(answered); elapsed > nodePingTimeout/2 {
+		t.Fatalf("verification took %v, so the wrong-ID reply is not what ended it", elapsed)
+	}
+
+	nodes := bucketNodes(d, bucket)
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node in bucket %d, got %d", bucket, len(nodes))
+	}
+	if nodes[0].ID != honest || !sameUDPAddr(nodes[0].Addr, honestAddr) {
+		t.Fatalf("entry was disturbed: %x at %s", nodes[0].ID, nodes[0].Addr)
+	}
+}
+
+// TestStaleIncumbentIsRemovedWhenAddressAnswersWithDifferentID covers the case
+// where the stored address is answered by some other node: the contact is proven
+// wrong and must leave the bucket, and the candidate is still never adopted.
+func TestStaleIncumbentIsRemovedWhenAddressAnswersWithDifferentID(t *testing.T) {
+	const bucket = 17
+	d, conn := newFakeDHT(t)
+
+	honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+	honest := idInBucket(d.nodeID, bucket, 1)
+	d.addNode(honest, honestAddr)
+
+	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(honest[:])}, attackerAddr)
+
+	tid := awaitQueryTo(t, conn, honestAddr, "ping")
+	squatter := idInBucket(d.nodeID, bucket, 3)
+	conn.injectPingReply(t, tid, squatter, honestAddr)
+
+	awaitNoPendingAddrChange(t, d)
+
+	if nodes := bucketNodes(d, bucket); len(nodes) != 0 {
+		t.Fatalf("proven-wrong contact stayed in the bucket: %x at %s", nodes[0].ID, nodes[0].Addr)
+	}
+	if got := conn.queriesTo(attackerAddr, "ping"); got != 0 {
+		t.Fatalf("candidate was probed %d times after the stored address answered", got)
+	}
 }
 
 // TestAddressChangeAdoptedOnlyAfterVerification exercises the full verification

@@ -67,8 +67,13 @@ type DHT struct {
 
 	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
 
-	addrMu      sync.Mutex
-	addrChanges map[[20]byte]*addrChangeState
+	addrMu sync.Mutex
+	// addrChanges holds only the node IDs with a verification in flight, so a
+	// completed attempt sitting in cooldown never consumes a pending slot.
+	addrChanges map[[20]byte]struct{}
+	// addrCooldowns holds post-attempt cooldowns: one short entry per node ID
+	// and one long entry per (node ID, candidate address) pair.
+	addrCooldowns map[addrChangeKey]time.Time
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -88,17 +93,42 @@ const (
 	// nodePingTimeout bounds every routing-table liveness ping.
 	nodePingTimeout = 2 * time.Second
 	// maxPendingAddrChanges caps how many node IDs may have an address change
-	// tracked at once, so a flood of spoofed sightings cannot grow memory.
+	// verification in flight at once, so a flood of spoofed sightings cannot
+	// grow memory or the number of probes we emit.
 	maxPendingAddrChanges = 64
-	// addrChangeCooldown is how long a node ID is ignored for address-change
-	// purposes after a verification attempt finishes.
+	// maxAddrChangeCooldowns bounds the cooldown map. It is deliberately much
+	// larger than the in-flight cap: a full cooldown map is never a reason to
+	// refuse a verification, only a reason to evict an older cooldown.
+	maxAddrChangeCooldowns = 512
+	// addrChangeCooldown is how long one (node ID, candidate address) pair is
+	// ignored after a verification attempt that did not adopt it, so the same
+	// spoofed candidate cannot be retried.
 	addrChangeCooldown = 5 * time.Minute
+	// addrChangeIDCooldown is the short per-ID window that bounds how often any
+	// burst of sightings can make us probe a node's stored address. A genuine
+	// move claimed from a new address waits at most this long.
+	addrChangeIDCooldown = 45 * time.Second
 )
 
-type addrChangeState struct {
-	inFlight  bool
-	notBefore time.Time
+// addrChangeKey identifies a cooldown entry. An empty addr is the short per-ID
+// tier; a non-empty addr is the long per-candidate tier.
+type addrChangeKey struct {
+	id   [20]byte
+	addr string
 }
+
+// addrChangeOutcome reports how an address-change verification ended.
+type addrChangeOutcome int
+
+const (
+	// addrChangeFailed means the candidate never proved itself.
+	addrChangeFailed addrChangeOutcome = iota
+	// addrChangeIncumbentAnswered means the stored address replied, so the
+	// candidate was discarded without ever being probed.
+	addrChangeIncumbentAnswered
+	// addrChangeAdopted means the candidate proved itself and now holds the entry.
+	addrChangeAdopted
+)
 
 // NewDHT creates and starts a DHT client.
 func NewDHT(downloadDir string, listenPort int) (*DHT, error) {
@@ -131,7 +161,8 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 		peerChan:       make(chan DiscoveredPeer, 256),
 		transactions:   make(map[string]transaction),
 		inFlightProbes: make(map[string]struct{}),
-		addrChanges:    make(map[[20]byte]*addrChangeState),
+		addrChanges:    make(map[[20]byte]struct{}),
+		addrCooldowns:  make(map[addrChangeKey]time.Time),
 		ctx:            ctx,
 		cancel:         cancel,
 		downloadDir:    downloadDir,
@@ -761,66 +792,155 @@ func (d *DHT) considerAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) 
 	if oldAddr == nil || newAddr == nil {
 		return
 	}
-	if !d.beginAddressVerification(id) {
+	// Admission is decided straight from the stored addresses; only the
+	// goroutine that outlives d.mu needs copies, so a rejected sighting costs
+	// no allocation on the receive path.
+	if !d.beginAddressVerification(id, newAddr) {
 		return
 	}
 	from := cloneUDPAddr(oldAddr)
 	to := cloneUDPAddr(newAddr)
 	d.goTracked(func() {
-		defer d.endAddressVerification(id)
-		d.verifyAddressChange(id, from, to)
+		outcome := d.verifyAddressChange(id, from, to)
+		d.endAddressVerification(id, to, outcome)
 	})
 }
 
 // beginAddressVerification reserves the single verification slot for id,
-// reporting false when one is already in flight, the ID is still in its
-// post-attempt cooldown, or the pending set is full.
-func (d *DHT) beginAddressVerification(id [20]byte) bool {
+// reporting false when this exact candidate is still in its long cooldown, the
+// ID is still in its short cooldown, a verification is already in flight for it,
+// or the in-flight set is full.
+func (d *DHT) beginAddressVerification(id [20]byte, candidate *net.UDPAddr) bool {
 	now := time.Now()
+	candKey := addrChangeKey{id: id, addr: udpAddrKey(candidate)}
+	idKey := addrChangeKey{id: id}
 
 	d.addrMu.Lock()
 	defer d.addrMu.Unlock()
 
 	if d.addrChanges == nil {
-		d.addrChanges = make(map[[20]byte]*addrChangeState)
+		d.addrChanges = make(map[[20]byte]struct{})
 	}
-	if st, ok := d.addrChanges[id]; ok {
-		if st.inFlight || now.Before(st.notBefore) {
-			return false
-		}
-		st.inFlight = true
-		return true
+	if d.addrCooldowns == nil {
+		d.addrCooldowns = make(map[addrChangeKey]time.Time)
+	}
+
+	// This exact claim was already checked and rejected recently.
+	if until, ok := d.addrCooldowns[candKey]; ok && now.Before(until) {
+		return false
+	}
+	// The short per-ID window bounds how often any burst of sightings, spoofed
+	// or not, can make us probe this node's stored address.
+	if until, ok := d.addrCooldowns[idKey]; ok && now.Before(until) {
+		return false
+	}
+	if _, ok := d.addrChanges[id]; ok {
+		return false
 	}
 	if len(d.addrChanges) >= maxPendingAddrChanges {
-		for k, st := range d.addrChanges {
-			if !st.inFlight && !now.Before(st.notBefore) {
-				delete(d.addrChanges, k)
-			}
-		}
-		if len(d.addrChanges) >= maxPendingAddrChanges {
-			return false
-		}
+		return false
 	}
-	d.addrChanges[id] = &addrChangeState{inFlight: true}
+	d.addrChanges[id] = struct{}{}
 	return true
 }
 
-func (d *DHT) endAddressVerification(id [20]byte) {
+// endAddressVerification releases the in-flight slot for id. A verified
+// adoption clears every cooldown held for that ID, so a node that legitimately
+// moves again straight away - even back to an address that once failed - is not
+// ignored; every other outcome arms both cooldowns.
+func (d *DHT) endAddressVerification(id [20]byte, candidate *net.UDPAddr, outcome addrChangeOutcome) {
+	candKey := addrChangeKey{id: id, addr: udpAddrKey(candidate)}
+	idKey := addrChangeKey{id: id}
+
 	d.addrMu.Lock()
-	if st, ok := d.addrChanges[id]; ok {
-		st.inFlight = false
-		st.notBefore = time.Now().Add(addrChangeCooldown)
+	defer d.addrMu.Unlock()
+
+	delete(d.addrChanges, id)
+	if d.addrCooldowns == nil {
+		d.addrCooldowns = make(map[addrChangeKey]time.Time)
 	}
-	d.addrMu.Unlock()
+	if outcome == addrChangeAdopted {
+		for k := range d.addrCooldowns {
+			if k.id == id {
+				delete(d.addrCooldowns, k)
+			}
+		}
+		return
+	}
+
+	wanted := 0
+	if _, ok := d.addrCooldowns[idKey]; !ok {
+		wanted++
+	}
+	if _, ok := d.addrCooldowns[candKey]; !ok {
+		wanted++
+	}
+	d.makeAddrCooldownRoomLocked(wanted)
+
+	now := time.Now()
+	d.addrCooldowns[idKey] = now.Add(addrChangeIDCooldown)
+	d.addrCooldowns[candKey] = now.Add(addrChangeCooldown)
+}
+
+// makeAddrCooldownRoomLocked frees room for wanted new entries, dropping
+// expired cooldowns first. Both tiers of one attempt are recorded together, so
+// room is made for them in one pass; otherwise recording the long entry could
+// evict the short one that was just armed beside it. Callers must hold addrMu.
+func (d *DHT) makeAddrCooldownRoomLocked(wanted int) {
+	if len(d.addrCooldowns)+wanted <= maxAddrChangeCooldowns {
+		return
+	}
+
+	now := time.Now()
+	for k, until := range d.addrCooldowns {
+		if !now.Before(until) {
+			delete(d.addrCooldowns, k)
+		}
+	}
+
+	for len(d.addrCooldowns)+wanted > maxAddrChangeCooldowns {
+		var victim addrChangeKey
+		var victimUntil time.Time
+		found := false
+		for k, until := range d.addrCooldowns {
+			if !found || evictBefore(k, until, victim, victimUntil) {
+				victim, victimUntil, found = k, until, true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(d.addrCooldowns, victim)
+	}
+}
+
+// evictBefore reports whether cooldown a should be dropped ahead of b. The long
+// per-candidate tier goes first because the short per-ID tier is what bounds how
+// often we probe a stored address; within a tier the entry nearest to expiring
+// loses the least protection.
+func evictBefore(a addrChangeKey, aUntil time.Time, b addrChangeKey, bUntil time.Time) bool {
+	if (a.addr != "") != (b.addr != "") {
+		return a.addr != ""
+	}
+	return aUntil.Before(bUntil)
+}
+
+// udpAddrKey renders an address as a map key using the same identity
+// sameUDPAddr compares on: IP and port, ignoring the zone.
+func udpAddrKey(a *net.UDPAddr) string {
+	if a == nil {
+		return ""
+	}
+	return net.JoinHostPort(a.IP.String(), strconv.Itoa(a.Port))
 }
 
 // verifyAddressChange adopts newAddr for id only when oldAddr stops answering
 // pings and newAddr answers one with that same node ID. It runs off the read
 // loop and never holds d.mu across a network wait.
-func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) addrChangeOutcome {
 	select {
 	case <-d.ctx.Done():
-		return
+		return addrChangeFailed
 	default:
 	}
 
@@ -828,20 +948,28 @@ func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
 	oldID, err := d.queryNodeID(ctx, oldAddr)
 	cancel()
 	if err == nil {
+		// Any answer from the stored address discards the candidate unprobed.
 		if oldID == id {
 			d.refreshNode(id, oldAddr)
+		} else {
+			// Something else owns that address now, so the stored contact is
+			// proven wrong and must not linger in the bucket.
+			d.dropNode(id, oldAddr)
 		}
-		return
+		return addrChangeIncumbentAnswered
 	}
 
 	ctx, cancel = context.WithTimeout(d.ctx, nodePingTimeout)
 	newID, err := d.queryNodeID(ctx, newAddr)
 	cancel()
 	if err != nil || newID != id {
-		return
+		return addrChangeFailed
 	}
 
-	d.repointNode(id, oldAddr, newAddr)
+	if !d.repointNode(id, oldAddr, newAddr) {
+		return addrChangeFailed
+	}
+	return addrChangeAdopted
 }
 
 // refreshNode marks a node live and moves it to the tail of its bucket, but only
@@ -866,9 +994,9 @@ func (d *DHT) refreshNode(id [20]byte, addr *net.UDPAddr) {
 	}
 }
 
-// repointNode moves a verified node from oldAddr to newAddr, leaving the entry
-// alone if it no longer points at oldAddr.
-func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
+// dropNode removes a node that has been proven wrong, but only if it is still
+// stored at addr, so a concurrent re-point is never undone.
+func (d *DHT) dropNode(id [20]byte, addr *net.UDPAddr) {
 	idx := bucketIndex(d.nodeID, id)
 
 	d.mu.Lock()
@@ -882,15 +1010,40 @@ func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
 		if n.ID != id {
 			continue
 		}
-		if !sameUDPAddr(n.Addr, oldAddr) {
+		if !sameUDPAddr(n.Addr, addr) {
 			return
+		}
+		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+		return
+	}
+}
+
+// repointNode moves a verified node from oldAddr to newAddr, leaving the entry
+// alone if it no longer points at oldAddr. It reports whether the move applied.
+func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
+	idx := bucketIndex(d.nodeID, id)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.buckets[idx]
+	if b == nil {
+		return false
+	}
+	for i, n := range b.nodes {
+		if n.ID != id {
+			continue
+		}
+		if !sameUDPAddr(n.Addr, oldAddr) {
+			return false
 		}
 		n.Addr = newAddr
 		n.LastSeen = time.Now()
 		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
 		b.nodes = append(b.nodes, n)
-		return
+		return true
 	}
+	return false
 }
 
 func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
