@@ -118,6 +118,64 @@ func assertNoEntry(t *testing.T, entered <-chan string, wait time.Duration) {
 	}
 }
 
+// awaitCondition polls cond until it holds, failing with msg if it never does.
+func awaitCondition(t *testing.T, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// awaitQueued waits until the session reports it is waiting for the paused slot.
+func awaitQueued(t *testing.T, s *Session) {
+	t.Helper()
+	awaitCondition(t, fmt.Sprintf("%s never reported that it was queued for checking", s.Torrent.Name), func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.verifyQueued
+	})
+}
+
+// setPaused flips the paused flag the way Pause and Resume do, waking everything
+// blocked on the session's pause-state channel.
+func setPaused(s *Session, paused bool) {
+	s.mu.Lock()
+	s.paused = paused
+	s.renewPauseStateChLocked()
+	s.mu.Unlock()
+}
+
+// fillVerifyGate takes every slot on the gate active checks share, so a recheck
+// that wants one has to queue for it. The returned function frees a single slot;
+// the rest are handed back when the test ends.
+func fillVerifyGate(t *testing.T) func() {
+	t.Helper()
+	held := 0
+	t.Cleanup(func() {
+		for ; held > 0; held-- {
+			<-verifyGate
+		}
+	})
+	for held < cap(verifyGate) {
+		select {
+		case verifyGate <- struct{}{}:
+			held++
+		case <-time.After(3 * time.Second):
+			t.Fatalf("could not take every active verification slot (%d of %d)", held, cap(verifyGate))
+		}
+	}
+	return func() {
+		if held > 0 {
+			<-verifyGate
+			held--
+		}
+	}
+}
+
 func TestPausedRechecksRunOneAtATimeBesideActiveOnes(t *testing.T) {
 	entered := make(chan string)
 	release := make(chan struct{})
@@ -199,17 +257,119 @@ func TestResumedSessionLeavesThePausedQueue(t *testing.T) {
 	go func() { defer wg.Done(); holder.runVerification(ctx) }()
 	awaitEntry(t, entered, "holder")
 	go func() { defer wg.Done(); waiter.runVerification(ctx) }()
-	assertNoEntry(t, entered, 400*time.Millisecond)
+	awaitQueued(t, waiter)
+	assertNoEntry(t, entered, 200*time.Millisecond)
 
 	// Resuming the queued session moves it onto the active gate without waiting
-	// for the paused slot to free up.
+	// for the paused slot to free up: the holder still has it.
+	setPaused(waiter, false)
+	awaitEntry(t, entered, "waiter")
+	waiter.mu.RLock()
+	queued, status := waiter.verifyQueued, waiter.statusLocked()
+	waiter.mu.RUnlock()
+	if queued || status != "Checking" {
+		t.Fatalf("resumed session status = %q (queued=%v), want Checking", status, queued)
+	}
+	release <- struct{}{}
+	release <- struct{}{}
+	wg.Wait()
+}
+
+func TestResumedWaiterDoesNotTakeThePausedSlot(t *testing.T) {
+	entered := make(chan string)
+	release := make(chan struct{})
+	holder := recheckSession(t, "holder", 1, &gatedVerifyStorage{name: "holder", entered: entered, release: release}, true)
+	waiter := recheckSession(t, "waiter", 1, &gatedVerifyStorage{name: "waiter", entered: entered, release: release}, true)
+
+	ctx := t.Context()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); holder.runVerification(ctx) }()
+	awaitEntry(t, entered, "holder")
+	go func() { defer wg.Done(); waiter.runVerification(ctx) }()
+	awaitQueued(t, waiter)
+
+	// Resume the waiter without waking it, then let the slot it queued for go free:
+	// it is still blocked on the paused gate under the state it queued with, so it
+	// can be handed a slot it no longer belongs on. Taking it would park an active
+	// torrent's recheck in the single-slot queue every other paused one waits for.
 	waiter.mu.Lock()
 	waiter.paused = false
 	waiter.mu.Unlock()
+	release <- struct{}{} // the holder finishes its only piece and frees the slot
+	awaitEntry(t, entered, "waiter")
+	if n := len(pausedVerifyGate); n != 0 {
+		t.Fatalf("resumed recheck holds %d of %d paused slots while hashing", n, cap(pausedVerifyGate))
+	}
+	release <- struct{}{}
+	wg.Wait()
+}
+
+func TestResumedRecheckWaitingForAnActiveSlotIsNotQueued(t *testing.T) {
+	entered := make(chan string)
+	release := make(chan struct{})
+	holder := recheckSession(t, "holder", 1, &gatedVerifyStorage{name: "holder", entered: entered, release: release}, true)
+	waiter := recheckSession(t, "waiter", 1, &gatedVerifyStorage{name: "waiter", entered: entered, release: release}, true)
+	freeSlot := fillVerifyGate(t)
+
+	ctx := t.Context()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); holder.runVerification(ctx) }()
+	awaitEntry(t, entered, "holder")
+	go func() { defer wg.Done(); waiter.runVerification(ctx) }()
+	awaitQueued(t, waiter)
+
+	// Once resumed it queues for an active slot like any other startup recheck, so
+	// it must stop reporting the paused queue even though nothing is hashing yet.
+	setPaused(waiter, false)
+	awaitCondition(t, "resumed session kept reporting Queued while waiting for an active slot", func() bool {
+		waiter.mu.RLock()
+		defer waiter.mu.RUnlock()
+		return !waiter.verifyQueued
+	})
+	waiter.mu.RLock()
+	status := waiter.statusLocked()
+	waiter.mu.RUnlock()
+	if status != "Checking" {
+		t.Fatalf("resumed session status = %q, want Checking", status)
+	}
+	if snap := waiter.Snapshot(); snap.Verification.Queued {
+		t.Fatalf("snapshot = %+v, want Queued cleared", snap.Verification)
+	}
+	assertNoEntry(t, entered, 200*time.Millisecond)
+
+	freeSlot()
 	awaitEntry(t, entered, "waiter")
 	release <- struct{}{}
 	release <- struct{}{}
 	wg.Wait()
+}
+
+func TestPausingAQueuedRecheckMovesItOffTheActiveGate(t *testing.T) {
+	entered := make(chan string)
+	release := make(chan struct{})
+	sess := recheckSession(t, "active", 1, &gatedVerifyStorage{name: "active", entered: entered, release: release}, false)
+	fillVerifyGate(t)
+
+	ctx := t.Context()
+	done := make(chan struct{})
+	go func() { defer close(done); sess.runVerification(ctx) }()
+	assertNoEntry(t, entered, 200*time.Millisecond)
+	sess.mu.RLock()
+	queued, status := sess.verifyQueued, sess.statusLocked()
+	sess.mu.RUnlock()
+	if queued || status != "Checking" {
+		t.Fatalf("session waiting for an active slot reports %q (queued=%v), want Checking", status, queued)
+	}
+
+	// Pausing it while it waits must move it onto the paused slot: a paused recheck
+	// keeping its place in the queue for the shared gate is exactly what active
+	// checks must never have to wait behind.
+	setPaused(sess, true)
+	awaitEntry(t, entered, "active")
+	release <- struct{}{}
+	<-done
 }
 
 func TestPausedRecheckYieldsOnlyToLiveTransfers(t *testing.T) {

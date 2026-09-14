@@ -24,8 +24,10 @@ var verifyGate = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
 // watching, and keeps them off the gate that active sessions share.
 var pausedVerifyGate = make(chan struct{}, 1)
 
-// pausedQueuePoll is how often a recheck waiting for the paused slot re-checks
-// whether its session has been resumed, which moves it to the active gate.
+// pausedQueuePoll is how often a recheck waiting for a verification slot re-reads
+// its session's paused flag. The pause-state channel wakes the wait on the
+// transition itself, so this is only the fallback for a flag that changed without
+// closing that channel.
 const pausedQueuePoll = 250 * time.Millisecond
 
 // liveTransfers counts the sessions currently receiving payload at or above
@@ -310,43 +312,47 @@ func (s *Session) maybeStartVerification() {
 // acquireVerifySlot takes a verification slot for this session and returns the
 // function that gives it back. Active sessions share the core-bounded gate. A
 // paused session's recheck is background work and waits for the single paused slot
-// instead; if the session is resumed while it waits, it moves to the active gate.
+// instead. A pause or resume that lands while the recheck is still queued moves it
+// to the other gate, including one that lands between offering a slot and being
+// handed it — so a resumed torrent never holds the paused slot other rechecks are
+// queued for, and a paused one never holds a slot an active check needs.
 // ok is false when ctx ended first.
 func (s *Session) acquireVerifySlot(ctx context.Context) (release func(), ok bool) {
-	s.mu.Lock()
-	paused := s.paused
-	s.verifyQueued = paused
-	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.verifyQueued = false
 		s.mu.Unlock()
 	}()
-	if paused {
-		ticker := time.NewTicker(pausedQueuePoll)
-		defer ticker.Stop()
-		for release == nil && paused {
-			select {
-			case pausedVerifyGate <- struct{}{}:
-				release = func() { <-pausedVerifyGate }
-			case <-ticker.C:
-				s.mu.RLock()
-				paused = s.paused
-				s.mu.RUnlock()
-			case <-ctx.Done():
-				return nil, false
-			}
+	ticker := time.NewTicker(pausedQueuePoll)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		paused := s.paused
+		pauseChanged := s.pauseStateCh
+		s.verifyQueued = paused
+		s.mu.Unlock()
+
+		gate := verifyGate
+		if paused {
+			gate = pausedVerifyGate
 		}
-	}
-	if release == nil {
 		select {
-		case verifyGate <- struct{}{}:
-			release = func() { <-verifyGate }
+		case gate <- struct{}{}:
+			s.mu.RLock()
+			stillPaused := s.paused
+			s.mu.RUnlock()
+			if stillPaused == paused {
+				return func() { <-gate }, true
+			}
+			// The state this slot was taken for is gone: hand it back and wait on
+			// the gate the session now belongs to.
+			<-gate
+		case <-pauseChanged:
+		case <-ticker.C:
 		case <-ctx.Done():
 			return nil, false
 		}
 	}
-	return release, true
 }
 
 // verifyResume hash-checks the pieces flagged by loadResumeState. On success a piece

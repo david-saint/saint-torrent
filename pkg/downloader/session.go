@@ -939,7 +939,7 @@ func (s *Session) GetSortSnapshot() SessionSortSnapshot {
 	// recheck it is displaying progress for.
 	case s.paused:
 		statusScore = 2
-	case status == "Downloading" || status == "Metadata" || status == "Checking":
+	case status == "Downloading" || status == "Metadata" || status == "Checking" || status == "Queued":
 		statusScore = 0
 	case status == "Seeding":
 		statusScore = 1
