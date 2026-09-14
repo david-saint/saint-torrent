@@ -248,3 +248,52 @@ func TestMalformedQueryDoesNotAddSender(t *testing.T) {
 		})
 	}
 }
+
+// TestAnnouncePeerWithInvalidTokenDoesNotDisturbExistingNode verifies a
+// token-less announce_peer claiming a known node ID from a foreign address
+// leaves that node's bucket position, address and LastSeen untouched, and never
+// starts an address-change verification.
+func TestAnnouncePeerWithInvalidTokenDoesNotDisturbExistingNode(t *testing.T) {
+	const bucket = 18
+	d, conn := newFakeDHT(t)
+
+	victimAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.2"), Port: 6881}
+	attackerAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+	victim := idInBucket(d.nodeID, bucket, 2)
+
+	d.addNode(idInBucket(d.nodeID, bucket, 1), &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881})
+	d.addNode(victim, victimAddr)
+	d.addNode(idInBucket(d.nodeID, bucket, 3), &net.UDPAddr{IP: net.ParseIP("10.0.0.3"), Port: 6881})
+
+	past := time.Now().Add(-time.Hour)
+	backdateNode(t, d, bucket, victim, past)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "info-hash-for-test--")
+	d.handleQuery("tx", "announce_peer", map[string]interface{}{
+		"id":        string(victim[:]),
+		"info_hash": string(infoHash[:]),
+		"token":     "not-a-valid-token",
+		"port":      int64(51413),
+	}, attackerAddr)
+
+	nodes := bucketNodes(d, bucket)
+	if len(nodes) != 3 {
+		t.Fatalf("expected 3 nodes in bucket %d, got %d", bucket, len(nodes))
+	}
+	if nodes[1].ID != victim {
+		t.Fatalf("victim moved within the bucket: index 1 holds %x", nodes[1].ID)
+	}
+	if !sameUDPAddr(nodes[1].Addr, victimAddr) {
+		t.Fatalf("victim was re-pointed to %s, want %s", nodes[1].Addr, victimAddr)
+	}
+	if !nodes[1].LastSeen.Equal(past) {
+		t.Fatalf("victim LastSeen was refreshed by an unauthenticated announce: %v", nodes[1].LastSeen)
+	}
+	if got := pendingAddrChangeCount(d); got != 0 {
+		t.Fatalf("an unauthenticated announce started %d address-change verifications", got)
+	}
+	if got := conn.queriesTo(victimAddr, "ping"); got != 0 {
+		t.Fatalf("an unauthenticated announce emitted %d probes to the stored address", got)
+	}
+}
