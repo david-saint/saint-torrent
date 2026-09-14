@@ -845,8 +845,9 @@ func (d *DHT) beginAddressVerification(id [20]byte, candidate *net.UDPAddr) bool
 }
 
 // endAddressVerification releases the in-flight slot for id. A verified
-// adoption clears the ID's state outright, so a node that legitimately moves
-// again straight away is not ignored; every other outcome arms both cooldowns.
+// adoption clears every cooldown held for that ID, so a node that legitimately
+// moves again straight away - even back to an address that once failed - is not
+// ignored; every other outcome arms both cooldowns.
 func (d *DHT) endAddressVerification(id [20]byte, candidate *net.UDPAddr, outcome addrChangeOutcome) {
 	candKey := addrChangeKey{id: id, addr: udpAddrKey(candidate)}
 	idKey := addrChangeKey{id: id}
@@ -859,48 +860,69 @@ func (d *DHT) endAddressVerification(id [20]byte, candidate *net.UDPAddr, outcom
 		d.addrCooldowns = make(map[addrChangeKey]time.Time)
 	}
 	if outcome == addrChangeAdopted {
-		delete(d.addrCooldowns, idKey)
-		delete(d.addrCooldowns, candKey)
+		for k := range d.addrCooldowns {
+			if k.id == id {
+				delete(d.addrCooldowns, k)
+			}
+		}
 		return
 	}
 
-	now := time.Now()
-	d.setAddrCooldownLocked(idKey, now.Add(addrChangeIDCooldown))
-	d.setAddrCooldownLocked(candKey, now.Add(addrChangeCooldown))
-}
-
-// setAddrCooldownLocked records a cooldown, making room first if the map is at
-// its bound. Callers must hold addrMu.
-func (d *DHT) setAddrCooldownLocked(key addrChangeKey, until time.Time) {
-	if _, ok := d.addrCooldowns[key]; !ok && len(d.addrCooldowns) >= maxAddrChangeCooldowns {
-		d.evictAddrCooldownsLocked()
+	wanted := 0
+	if _, ok := d.addrCooldowns[idKey]; !ok {
+		wanted++
 	}
-	d.addrCooldowns[key] = until
+	if _, ok := d.addrCooldowns[candKey]; !ok {
+		wanted++
+	}
+	d.makeAddrCooldownRoomLocked(wanted)
+
+	now := time.Now()
+	d.addrCooldowns[idKey] = now.Add(addrChangeIDCooldown)
+	d.addrCooldowns[candKey] = now.Add(addrChangeCooldown)
 }
 
-// evictAddrCooldownsLocked drops expired cooldowns and, if that frees nothing,
-// the entries closest to expiring. Callers must hold addrMu.
-func (d *DHT) evictAddrCooldownsLocked() {
+// makeAddrCooldownRoomLocked frees room for wanted new entries, dropping
+// expired cooldowns first. Both tiers of one attempt are recorded together, so
+// room is made for them in one pass; otherwise recording the long entry could
+// evict the short one that was just armed beside it. Callers must hold addrMu.
+func (d *DHT) makeAddrCooldownRoomLocked(wanted int) {
+	if len(d.addrCooldowns)+wanted <= maxAddrChangeCooldowns {
+		return
+	}
+
 	now := time.Now()
 	for k, until := range d.addrCooldowns {
 		if !now.Before(until) {
 			delete(d.addrCooldowns, k)
 		}
 	}
-	for len(d.addrCooldowns) >= maxAddrChangeCooldowns {
-		var oldestKey addrChangeKey
-		var oldest time.Time
+
+	for len(d.addrCooldowns)+wanted > maxAddrChangeCooldowns {
+		var victim addrChangeKey
+		var victimUntil time.Time
 		found := false
 		for k, until := range d.addrCooldowns {
-			if !found || until.Before(oldest) {
-				oldestKey, oldest, found = k, until, true
+			if !found || evictBefore(k, until, victim, victimUntil) {
+				victim, victimUntil, found = k, until, true
 			}
 		}
 		if !found {
 			return
 		}
-		delete(d.addrCooldowns, oldestKey)
+		delete(d.addrCooldowns, victim)
 	}
+}
+
+// evictBefore reports whether cooldown a should be dropped ahead of b. The long
+// per-candidate tier goes first because the short per-ID tier is what bounds how
+// often we probe a stored address; within a tier the entry nearest to expiring
+// loses the least protection.
+func evictBefore(a addrChangeKey, aUntil time.Time, b addrChangeKey, bUntil time.Time) bool {
+	if (a.addr != "") != (b.addr != "") {
+		return a.addr != ""
+	}
+	return aUntil.Before(bUntil)
 }
 
 // udpAddrKey renders an address as a map key using the same identity

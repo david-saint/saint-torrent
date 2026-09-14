@@ -51,6 +51,23 @@ func expireIDCooldown(t *testing.T, d *DHT, id [20]byte) {
 	d.addrCooldowns[key] = time.Now().Add(-time.Second)
 }
 
+// saturateAddrCooldowns fills the bounded cooldown map with live per-candidate
+// entries so behaviour at the bound can be observed.
+func saturateAddrCooldowns(t *testing.T, d *DHT) {
+	t.Helper()
+	d.addrMu.Lock()
+	defer d.addrMu.Unlock()
+	until := time.Now().Add(addrChangeCooldown)
+	for i := 0; i < maxAddrChangeCooldowns; i++ {
+		id := idInBucket(d.nodeID, 100, uint16(i))
+		addr := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1 + i}
+		d.addrCooldowns[addrChangeKey{id: id, addr: udpAddrKey(addr)}] = until
+	}
+	if len(d.addrCooldowns) != maxAddrChangeCooldowns {
+		t.Fatalf("cooldown map holds %d entries, want %d", len(d.addrCooldowns), maxAddrChangeCooldowns)
+	}
+}
+
 // awaitNoPendingAddrChange waits for every in-flight verification to finish.
 func awaitNoPendingAddrChange(t *testing.T, d *DHT) {
 	t.Helper()
@@ -370,6 +387,58 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 		expireIDCooldown(t, d, id)
 		if d.beginAddressVerification(id, spoofed) {
 			t.Fatal("the same spoofed candidate was retried inside its long cooldown")
+		}
+	})
+
+	// Adoption proves the node is live at its new address, so it has to clear
+	// the long cooldowns earlier candidates for that ID left behind too.
+	t.Run("adoption clears earlier candidates for the id", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+
+		id := idInBucket(d.nodeID, 19, 1)
+		first := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		second := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 2}
+
+		if !d.beginAddressVerification(id, first) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, first, addrChangeFailed)
+
+		expireIDCooldown(t, d, id)
+		if !d.beginAddressVerification(id, second) {
+			t.Fatal("a second candidate stayed blocked past the short window")
+		}
+		d.endAddressVerification(id, second, addrChangeAdopted)
+
+		if got := addrCooldownCount(d); got != 0 {
+			t.Fatalf("a verified adoption left %d cooldown entries behind", got)
+		}
+		if !d.beginAddressVerification(id, first) {
+			t.Fatal("a move back to an earlier address stayed blocked after a verified adoption")
+		}
+	})
+
+	// The short per-ID window is what bounds probing, so a saturated cooldown
+	// map must not evict it - least of all when recording the entry armed
+	// alongside it.
+	t.Run("a full cooldown map keeps the short id window", func(t *testing.T) {
+		d, _ := newFakeDHT(t)
+		saturateAddrCooldowns(t, d)
+
+		id := idInBucket(d.nodeID, 20, 1)
+		spoofed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}
+		rotated := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 2}
+
+		if !d.beginAddressVerification(id, spoofed) {
+			t.Fatal("first verification should have been admitted")
+		}
+		d.endAddressVerification(id, spoofed, addrChangeFailed)
+
+		if d.beginAddressVerification(id, rotated) {
+			t.Fatal("a full cooldown map let a rotating source re-probe the stored address")
+		}
+		if got := addrCooldownCount(d); got > maxAddrChangeCooldowns {
+			t.Fatalf("cooldown map grew to %d entries, past its bound of %d", got, maxAddrChangeCooldowns)
 		}
 	})
 }
