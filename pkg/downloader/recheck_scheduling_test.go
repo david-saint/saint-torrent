@@ -436,3 +436,64 @@ func TestLiveTransferGaugeFollowsSessionSpeed(t *testing.T) {
 		t.Fatalf("gauge = %d after clearing, want %d", got, before)
 	}
 }
+
+func TestPausedRecheckYieldEndsWithTheLiveTransfer(t *testing.T) {
+	liveTransfers.Add(1)
+	live := true
+	endTransfer := func() {
+		if live {
+			live = false
+			liveTransfers.Add(-1)
+		}
+	}
+	defer endTransfer()
+
+	done := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		pausedRecheckYield(context.Background(), time.Minute)
+		done <- time.Since(start)
+	}()
+	select {
+	case d := <-done:
+		t.Fatalf("yield ended after %v while a transfer was still live", d)
+	case <-time.After(2 * liveTransferPoll):
+	}
+
+	// The wait is sized for the transfer it makes room for; once that transfer is
+	// gone the disk is free and the recheck must go back to hashing rather than
+	// sitting out the rest of a wait for a download that has already stopped.
+	endTransfer()
+	select {
+	case d := <-done:
+		if d > time.Minute/2 {
+			t.Fatalf("yield ran %v, want it to end shortly after the last live transfer", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("yield outlasted the live transfer it was making room for")
+	}
+}
+
+func TestPauseClearsTheLiveTransferGauge(t *testing.T) {
+	tor := &torrent.Torrent{Name: "live", PieceLength: 1, PieceHashes: [][20]byte{sha1.Sum([]byte("live"))}}
+	sess, err := NewSession(tor, nil, [20]byte{}, 0, t.TempDir())
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	t.Cleanup(sess.Close)
+	before := liveTransfers.Load()
+	sess.wg.Add(1)
+	go sess.speedMonitorLoop()
+	sess.Downloaded.Store(4 * liveTransferThreshold)
+	awaitCondition(t, "speed monitor never counted the session as a live transfer", func() bool {
+		return liveTransfers.Load() == before+1
+	})
+
+	// Pausing stops payload immediately, so the gauge has to drop with it instead of
+	// on the next monitor tick: a recheck yielding to this transfer would otherwise
+	// keep yielding to a download that is already stopped.
+	sess.Pause()
+	if got := liveTransfers.Load(); got != before {
+		t.Fatalf("gauge = %d right after Pause, want %d", got, before)
+	}
+}

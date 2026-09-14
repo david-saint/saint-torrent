@@ -38,19 +38,35 @@ var liveTransfers atomic.Int32
 
 const liveTransferThreshold = 512 * 1024 // bytes per second
 
+// liveTransferPoll is how often a yielding recheck re-reads the live-transfer
+// gauge, so it resumes hashing shortly after the last live transfer stops instead
+// of sitting out a wait sized for a transfer that is already over.
+const liveTransferPoll = 250 * time.Millisecond
+
 // pausedRecheckYield waits between two pieces of a paused recheck while a live
 // transfer is running. The wait is twice the time the piece just took to read and
 // hash, so the recheck takes at most a third of the disk and the share scales with
-// the disk rather than with a fixed rate. Tests replace it.
+// the disk rather than with a fixed rate. It ends early once the gauge reaches zero,
+// because the disk it was making room for is free again. Tests replace it.
 var pausedRecheckYield = func(ctx context.Context, d time.Duration) {
 	if d <= 0 {
 		return
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
+	poll := time.NewTicker(liveTransferPoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return
+		case <-poll.C:
+			if liveTransfers.Load() == 0 {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

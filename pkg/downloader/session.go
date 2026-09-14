@@ -1182,6 +1182,10 @@ func (s *Session) Pause() {
 	}
 	s.paused = true
 	s.pauseEpoch++
+	// A paused session receives no payload, so drop it from the gauge here rather
+	// than leaving a stale sample for the next speed-monitor tick to clear: a paused
+	// recheck must not keep yielding to a transfer that has already stopped.
+	s.setLiveTransferLocked(false)
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("stopped")
 	for _, client := range s.activePeers {
