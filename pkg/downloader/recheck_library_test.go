@@ -42,11 +42,15 @@ func defaultLibraryConfigDir(t *testing.T) string {
 	if dir := os.Getenv("ST_LIB_CONFIG"); dir != "" {
 		return dir
 	}
-	home, err := os.UserHomeDir()
+	// Match how the app picks its state directory (see cmd/sainttorrent/main.go):
+	// os.UserConfigDir, which is ~/Library/Application Support on macOS and
+	// ~/.config on Linux. The ~/.config/sainttorrent path holds config.json and UI
+	// preferences, which is a different directory on macOS.
+	base, err := os.UserConfigDir()
 	if err != nil {
-		t.Skipf("cannot resolve home directory: %v", err)
+		t.Skipf("cannot resolve user config directory: %v", err)
 	}
-	return filepath.Join(home, ".config", "sainttorrent")
+	return filepath.Join(base, "sainttorrent")
 }
 
 // loadLibrary reads the persisted session and returns the torrents whose payload
