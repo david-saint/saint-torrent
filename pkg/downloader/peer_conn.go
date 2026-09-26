@@ -100,6 +100,15 @@ const (
 // with every 7-byte message.
 const maxPeerDHTPortUpdates = 4
 
+// pickRetryInterval bounds how long a peer loop trusts an empty pick (see noPick
+// in runPeerMessageLoop) when nothing it tracks has changed: a backstop for any
+// way a piece becomes pickable that does not advance Session.pickGen.
+const pickRetryInterval = 5 * time.Second
+
+// selectNeededPiece is the peer loop's picker scan. A var so tests can count the
+// scans.
+var selectNeededPiece = (*Session).selectNeededPieceLocked
+
 // addDHTNode feeds a peer-advertised DHT endpoint to the routing table. A var so
 // tests can observe the calls.
 var addDHTNode = (*dht.DHT).AddNode
@@ -1033,6 +1042,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 	var activeDownloads []*activeDownload
 	pipeline := newPeerPipelineController(defaultPeerPipelineConfig())
+	// noPick records that the last pick for this peer found nothing it can serve,
+	// at session pickGen noPickGen and time noPickAt. pump then skips the picker,
+	// whose scan of the needed pieces under the session write lock costs O(needed)
+	// when the peer has none of them, until pickGen moves, the peer's side changes
+	// (a new piece, an unchoke, an allowed_fast grant, one of our pieces closing;
+	// each clears noPick), or pickRetryInterval passes as a backstop. Without it a
+	// peer that unchoked us but has nothing we need paid that scan for every
+	// message it sent, keep-alives and its own block requests included.
+	noPick := false
+	var noPickGen uint64
+	var noPickAt time.Time
 
 	type requestFinishReason int
 	const (
@@ -1063,6 +1083,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 	}
 	removeDownload := func(index int64) {
+		noPick = false // a freed piece slot or endgame copy may allow a new pick
 		for i, dl := range activeDownloads {
 			if dl.pieceIndex == index {
 				releaseDownloadBuffers(dl)
@@ -1237,6 +1258,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// delta into swarm availability. Shared by the bitfield, have_all, and have_none
 	// handlers so the one on-the-wire bookkeeping lives in a single place.
 	setPeerBitfield := func(newBF []byte) {
+		noPick = false
 		oldBF := append([]byte(nil), peerBitfield...)
 		peerBitfield = newBF
 		s.applyBitfieldAvailability(oldBF, peerBitfield)
@@ -1250,6 +1272,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		peerBitfield = fullPieceBitfield(numPieces)
 		peerIsSeed = true
+		noPick = false
 	}
 	// applyAnnouncedBitfield installs a length-checked bitfield announcement.
 	applyAnnouncedBitfield := func(payload []byte, numPieces int) {
@@ -1308,7 +1331,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 		endgame := false
-		bestIdx := s.selectNeededPieceLocked(canRequestPiece)
+		bestIdx := selectNeededPiece(s, canRequestPiece)
 		if bestIdx == -1 {
 			if s.endgameActiveLocked() {
 				owned := make(map[int64]bool, len(activeDownloads))
@@ -1325,6 +1348,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				}
 			}
 			if bestIdx == -1 {
+				noPick, noPickGen, noPickAt = true, s.pickGen.Load(), time.Now()
 				return nil
 			}
 		}
@@ -1661,6 +1685,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				if len(activeDownloads) >= pieceCap || !roomForPiece() {
 					pipeline.OnPieceCapLimited(now)
 					break
+				}
+				if noPick && s.pickGen.Load() == noPickGen && now.Sub(noPickAt) < pickRetryInterval {
+					break // nothing this peer can serve has appeared since the last pick
 				}
 				newDL := openNewPiece(canRequestPiece)
 				if newDL == nil {
@@ -2377,6 +2404,7 @@ peerLoop:
 					peerAllowedFast[idx] = struct{}{}
 				}
 			}
+			noPick = false
 			pendingAllowedFast = nil
 			pendingAllowedFastSet = nil
 		}
@@ -2431,6 +2459,7 @@ peerLoop:
 			// a permanent refusal. Without this a single (often transient) reject
 			// would bar the piece from this peer for the whole connection.
 			clear(peerRejectedPieces)
+			noPick = false
 			pipeline.OnUnchoke(now)
 			publishPipelineSnapshot(now, true)
 
@@ -2485,6 +2514,7 @@ peerLoop:
 				if !bitfieldHas(peerBitfield, i) {
 					setBit(peerBitfield, i)
 					s.addPieceAvailability(i)
+					noPick = false
 				}
 			}
 
@@ -2569,6 +2599,7 @@ peerLoop:
 			// grow to the piece count.
 			if index >= 0 && index < int64(numPiecesNow) && len(peerAllowedFast) < pendingAllowedFastCap {
 				peerAllowedFast[index] = struct{}{}
+				noPick = false
 			}
 
 		case peer.MsgRejectRequest:

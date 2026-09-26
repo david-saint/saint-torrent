@@ -295,6 +295,7 @@ func (b *neededPieceBuckets) firstMatch(match func(int) neededBucketMatch) (int,
 // state changes (resume load, metadata arrival, storage repair, priority changes).
 // Caller holds s.mu.
 func (s *Session) recomputeNeededLocked() {
+	s.pickGen.Add(1)
 	if s.neededPieces == nil {
 		s.neededPieces = make(map[int]struct{}, len(s.PieceStates))
 	} else {
@@ -337,6 +338,7 @@ func (s *Session) addNeededLocked(idx int) {
 	}
 	s.neededPieces[idx] = struct{}{}
 	s.neededBuckets.add(s.piecePriority(int64(idx)), s.pieceAvailabilityAt(idx), idx)
+	s.pickGen.Add(1)
 }
 
 // removeNeededLocked drops a piece from the needed set when it leaves PieceEmpty.
@@ -350,6 +352,16 @@ func (s *Session) removeNeededLocked(idx int) {
 	}
 	delete(s.neededPieces, idx)
 	s.neededBuckets.remove(idx)
+	s.noteNeededShrunkLocked()
+}
+
+// noteNeededShrunkLocked advances pickGen when the needed set has just emptied:
+// endgame begins, so pieces in flight elsewhere become pickable as endgame
+// copies. Caller holds s.mu.
+func (s *Session) noteNeededShrunkLocked() {
+	if len(s.neededPieces) == 0 {
+		s.pickGen.Add(1)
+	}
 }
 
 // neededBucketsFreshLocked checks if the needed-piece bucket structures are fresh.
@@ -402,6 +414,9 @@ func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) 
 	})
 	for _, idx := range dropped {
 		delete(s.neededPieces, idx)
+	}
+	if len(dropped) > 0 {
+		s.noteNeededShrunkLocked()
 	}
 	return bestIdx
 }
@@ -646,6 +661,9 @@ func (s *Session) hasSelectableNeededPieceLocked(hasPiece func(pieceIndex int64)
 	})
 	for _, idx := range dropped {
 		delete(s.neededPieces, idx)
+	}
+	if len(dropped) > 0 {
+		s.noteNeededShrunkLocked()
 	}
 	return bestIdx != -1
 }

@@ -149,6 +149,11 @@ type Session struct {
 	// every lookup. Guarded by s.mu.
 	fileStartOffsets  []int64
 	downloadingPieces map[int]struct{}
+	// pickGen advances (under s.mu) whenever a piece may have become pickable: it
+	// joined the needed set, the set was rebuilt, or the set emptied (endgame
+	// begins). A peer loop whose last pick found nothing skips the picker until it
+	// moves (see pump); it is read without s.mu.
+	pickGen atomic.Uint64
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length
