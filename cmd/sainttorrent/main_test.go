@@ -1648,6 +1648,21 @@ func TestLockErrors(t *testing.T) {
 	}
 }
 
+// TestParseCLIArgsStartPaused: --start-paused restores every torrent paused
+// after a crash loop; it is off by default and listed in --help.
+func TestParseCLIArgsStartPaused(t *testing.T) {
+	if parseCLIArgs(nil).startPaused {
+		t.Fatal("startPaused set by default")
+	}
+	opts := parseCLIArgs([]string{"--start-paused", "-d", "/tmp/x"})
+	if !opts.startPaused || opts.err != nil || opts.downloadDir != "/tmp/x" {
+		t.Fatalf("parseCLIArgs(--start-paused) = %+v, want startPaused and the other flags intact", opts)
+	}
+	if !strings.Contains(usageText(), "--start-paused") {
+		t.Fatal("usage text does not list --start-paused")
+	}
+}
+
 // TestDeleteKeepingCrossSeedFilesIsNotAnError: a removal that kept files a
 // cross-seed still uses went through, so the TUI shows it as a note and
 // returns to the list instead of showing a deletion error.

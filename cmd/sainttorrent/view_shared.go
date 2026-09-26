@@ -305,6 +305,9 @@ func statusLabelStyle(st styles, status string) (string, lipgloss.Style) {
 		return "PAUSED", st.StatusPaused
 	case "Stopped":
 		return "STOPPED", st.StatusPaused
+	case "Paused after crash":
+		// Quarantined after a crash: paused, and flagged like an error.
+		return "CRASHED", st.StatusError
 	case "Seeding":
 		return "SEEDING", st.StatusSeeding
 	case "Metadata":
