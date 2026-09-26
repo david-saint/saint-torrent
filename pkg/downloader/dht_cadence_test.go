@@ -76,38 +76,75 @@ func TestDHTIntervalJitterA2(t *testing.T) {
 
 // TestDHTFirstLookupSpreadA2 covers the startup burst: every restored torrent
 // looked up exactly 1 s after start. A magnet fetching metadata still does;
-// other sessions spread their first lookup over up to dhtStartupSpreadStep per
-// running DHT loop, at most dhtStartupSpreadMax.
+// sessions that start together take consecutive dhtStartupSpreadStep slots,
+// and past dhtStartupSpreadMax a random point in that window.
 func TestDHTFirstLookupSpreadA2(t *testing.T) {
-	if got := dhtFirstLookupAfter(true, 500); got != dhtFirstLookupDelay {
+	resetDHTFirstLookupSlotsA3R(t)
+	now := time.Now()
+
+	if got := dhtFirstLookupAfter(true, now); got != dhtFirstLookupDelay {
 		t.Fatalf("a metadata fetch waits %v for its first lookup, want %v", got, dhtFirstLookupDelay)
 	}
-	for _, c := range []struct {
-		running int32
-		spread  time.Duration
-	}{
-		{1, dhtStartupSpreadStep},
-		{40, 40 * dhtStartupSpreadStep},
-		{100000, dhtStartupSpreadMax},
-	} {
-		lo, hi := time.Duration(1<<62), time.Duration(0)
-		for i := 0; i < 500; i++ {
-			got := dhtFirstLookupAfter(false, c.running)
-			if got < dhtFirstLookupDelay || got >= dhtFirstLookupDelay+c.spread {
-				t.Fatalf("%d loops: first lookup after %v, want in [%v, %v)", c.running, got, dhtFirstLookupDelay, dhtFirstLookupDelay+c.spread)
-			}
-			lo, hi = min(lo, got), max(hi, got)
-		}
-		if hi-lo < c.spread/2 {
-			t.Fatalf("%d loops: first lookups span only %v of %v", c.running, hi-lo, c.spread)
+	burst := int(dhtStartupSpreadMax / dhtStartupSpreadStep)
+	for i := 0; i < burst; i++ {
+		got := dhtFirstLookupAfter(false, now)
+		lo := dhtFirstLookupDelay + time.Duration(i)*dhtStartupSpreadStep
+		if got < lo || got >= lo+dhtStartupSpreadStep {
+			t.Fatalf("session %d of a burst: first lookup after %v, want in [%v, %v)", i, got, lo, lo+dhtStartupSpreadStep)
 		}
 	}
+	lo, hi := time.Duration(1<<62), time.Duration(0)
+	for i := 0; i < 500; i++ {
+		got := dhtFirstLookupAfter(false, now)
+		if got < dhtFirstLookupDelay || got >= dhtFirstLookupDelay+dhtStartupSpreadMax {
+			t.Fatalf("past the spread: first lookup after %v, want in [%v, %v)", got, dhtFirstLookupDelay, dhtFirstLookupDelay+dhtStartupSpreadMax)
+		}
+		lo, hi = min(lo, got), max(hi, got)
+	}
+	if hi-lo < dhtStartupSpreadMax/2 {
+		t.Fatalf("past the spread: first lookups span only %v of %v", hi-lo, dhtStartupSpreadMax)
+	}
+}
+
+// A torrent added once the startup burst has drained looks up at once, however
+// many sessions run: the spread used to grow with every running DHT loop, so a
+// new download in a library of a few hundred torrents waited up to a minute for
+// its first DHT peers.
+func TestDHTFirstLookupOfALaterSessionIsNotDelayedA3R(t *testing.T) {
+	resetDHTFirstLookupSlotsA3R(t)
+	start := time.Now()
+	for i := 0; i < 400; i++ { // a large library restored at startup
+		dhtFirstLookupAfter(false, start)
+	}
+	later := start.Add(10 * time.Minute)
+	for i := 0; i < 3; i++ {
+		got := dhtFirstLookupAfter(false, later)
+		lo := dhtFirstLookupDelay + time.Duration(i)*dhtStartupSpreadStep
+		if got < lo || got >= lo+dhtStartupSpreadStep {
+			t.Fatalf("session %d added later: first lookup after %v, want in [%v, %v)", i, got, lo, lo+dhtStartupSpreadStep)
+		}
+	}
+}
+
+// resetDHTFirstLookupSlotsA3R frees every first-lookup slot for the test and
+// again after it, so slots other tests' sessions took (or this test's own)
+// do not delay another test's first lookup.
+func resetDHTFirstLookupSlotsA3R(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		dhtFirstLookupSlots.mu.Lock()
+		dhtFirstLookupSlots.next = time.Time{}
+		dhtFirstLookupSlots.mu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
 }
 
 // TestDHTLookupAfterResumeA2 checks a resume brings the next lookup forward:
 // lookups are skipped while paused, and with 15-minute intervals a resumed
 // session would otherwise wait up to that long to find peers again.
 func TestDHTLookupAfterResumeA2(t *testing.T) {
+	resetDHTFirstLookupSlotsA3R(t)
 	defer swapDuration(&dhtFirstLookupDelay, 10*time.Millisecond)()
 	defer swapDuration(&dhtDownloadLookupInterval, time.Hour)()
 	defer swapDuration(&dhtMetadataLookupInterval, time.Hour)()

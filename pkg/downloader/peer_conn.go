@@ -16,6 +16,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -3444,9 +3445,10 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 // can shorten them; treat them as constants.
 var (
 	// dhtFirstLookupDelay is how soon a session first looks up its torrent. A
-	// magnet fetching metadata does so right then; any other session adds a
-	// random spread of up to dhtStartupSpreadStep per running DHT loop (at most
-	// dhtStartupSpreadMax), so restored torrents start, and stay, out of phase.
+	// magnet fetching metadata does so right then; any other session takes the
+	// next free first-lookup slot, dhtStartupSpreadStep after the one before,
+	// at most dhtStartupSpreadMax away (see dhtFirstLookupAfter), so restored
+	// torrents start, and stay, out of phase.
 	dhtFirstLookupDelay  = time.Second
 	dhtStartupSpreadStep = 250 * time.Millisecond
 	dhtStartupSpreadMax  = time.Minute
@@ -3466,9 +3468,12 @@ var (
 // session looks up as rarely as a seed.
 const dhtWellConnectedPeers = 50
 
-// dhtLoopsRunning counts the running dhtLoops of every session; it sizes the
-// spread of first lookups.
-var dhtLoopsRunning atomic.Int32
+// dhtFirstLookupSlots hands out first-lookup times (see dhtFirstLookupAfter):
+// next is the earliest time the next session may take.
+var dhtFirstLookupSlots struct {
+	mu   sync.Mutex
+	next time.Time
+}
 
 // startDHTLookup starts a get_peers lookup for infoHash, announcing peerPort
 // when announce is set. A var so tests can observe lookups.
@@ -3481,13 +3486,11 @@ var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, announ
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
 	defer s.crashGuard("dht")()
-	running := dhtLoopsRunning.Add(1)
-	defer dhtLoopsRunning.Add(-1)
 
 	s.mu.RLock()
 	metadataMode := s.metadataMode
 	s.mu.RUnlock()
-	timer := time.NewTimer(dhtFirstLookupAfter(metadataMode, running))
+	timer := time.NewTimer(dhtFirstLookupAfter(metadataMode, time.Now()))
 	defer timer.Stop()
 	for {
 		_, pauseChanged := s.pauseStateSignal()
@@ -3544,14 +3547,31 @@ func (s *Session) dhtLookupIntervalLocked() (interval time.Duration, skip bool) 
 	}
 }
 
-// dhtFirstLookupAfter is the delay before a session's first DHT lookup, with
-// running DHT loops in the process (this one included).
-func dhtFirstLookupAfter(metadataMode bool, running int32) time.Duration {
+// dhtFirstLookupAfter is the delay from now before a session's first DHT
+// lookup. Sessions that start together (a restore) take consecutive slots
+// dhtStartupSpreadStep apart, each at a random point within its slot, so their
+// first lookups spread over dhtStartupSpreadStep per session; past
+// dhtStartupSpreadMax a session picks a random point in that window instead. A
+// session started on its own (a torrent added later) finds the slots drained
+// and looks up after dhtFirstLookupDelay, however many sessions run: sizing
+// the spread by the running sessions made a new download in a large library
+// wait up to a minute for its first DHT peers.
+func dhtFirstLookupAfter(metadataMode bool, now time.Time) time.Duration {
 	if metadataMode {
 		return dhtFirstLookupDelay
 	}
-	spread := min(time.Duration(max(running, 1))*dhtStartupSpreadStep, dhtStartupSpreadMax)
-	return dhtFirstLookupDelay + randDuration(spread)
+	first := now.Add(dhtFirstLookupDelay)
+	dhtFirstLookupSlots.mu.Lock()
+	defer dhtFirstLookupSlots.mu.Unlock()
+	slot := first
+	if dhtFirstLookupSlots.next.After(slot) {
+		slot = dhtFirstLookupSlots.next
+	}
+	if slot.Sub(first) >= dhtStartupSpreadMax {
+		return dhtFirstLookupDelay + randDuration(dhtStartupSpreadMax)
+	}
+	dhtFirstLookupSlots.next = slot.Add(dhtStartupSpreadStep)
+	return slot.Sub(now) + randDuration(dhtStartupSpreadStep)
 }
 
 // jitterDHTInterval spreads d uniformly over ±20%, so sessions that started
