@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // TestStorageRejectsFoldedDuplicatePaths: on APFS and NTFS two layouts whose
@@ -64,5 +68,40 @@ func TestNewFileStorageRejectsPieceCountOverflow(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Fatalf("rejected layout still created %d entries", len(entries))
+	}
+}
+
+// TestPathKeyASCIIShortcutMatchesUnicodeFold: the ASCII shortcut must give
+// exactly the key NFC over full case folding gives. A mismatch would let a
+// restore, or the downloader's path claims, disagree with the add.
+func TestPathKeyASCIIShortcutMatchesUnicodeFold(t *testing.T) {
+	reference := func(p string) string {
+		return norm.NFC.String(cases.Fold().String(norm.NFD.String(filepath.Clean(p))))
+	}
+	inputs := []string{"Some.Show.S01/E01.MKV", "../A/./b//C/", "café/A", "K.txt", "ß"}
+	for c := 0; c < utf8.RuneSelf; c++ {
+		s := string(rune(c))
+		inputs = append(inputs, s, "Dir/"+s+"x.MKV", "a"+s+"Z")
+	}
+	for _, p := range inputs {
+		if got, want := pathKey(p), reference(p); got != want {
+			t.Errorf("pathKey(%q) = %q, want %q", p, got, want)
+		}
+	}
+}
+
+// BenchmarkPathKey measures the key computed per file at every add, restore
+// and path claim.
+func BenchmarkPathKey(b *testing.B) {
+	for name, p := range map[string]string{
+		"ascii":   "/home/user/Downloads/Some.Show.S01.1080p.WEB-DL/Some.Show.S01E01.1080p.WEB-DL.mkv",
+		"unicode": "/home/user/Downloads/Café Tacvba/Re/01 - El Ciclón.flac",
+	} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = PathKey(p)
+			}
+		})
 	}
 }

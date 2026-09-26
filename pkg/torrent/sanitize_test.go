@@ -1,9 +1,13 @@
 package torrent
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 func TestSanitizeComponent(t *testing.T) {
@@ -185,5 +189,24 @@ func TestParseMagnetSanitizesName(t *testing.T) {
 	}
 	if ml.Name != "clipvaw.scr_[2J" {
 		t.Fatalf("Name = %q, want the override removed and ESC replaced", ml.Name)
+	}
+}
+
+// TestPathKeyASCIIShortcutMatchesUnicodeFold: the ASCII shortcut must give
+// exactly the key NFC over full case folding gives, or Parse would miss (or
+// invent) duplicates that storage.PathKey sees.
+func TestPathKeyASCIIShortcutMatchesUnicodeFold(t *testing.T) {
+	reference := func(p string) string {
+		return norm.NFC.String(cases.Fold().String(norm.NFD.String(filepath.Clean(p))))
+	}
+	inputs := []string{"Some.Show.S01/E01.MKV", "../A/./b//C/", "café/A", "K.txt", "ß"}
+	for c := 0; c < utf8.RuneSelf; c++ {
+		s := string(rune(c))
+		inputs = append(inputs, s, "Dir/"+s+"x.MKV", "a"+s+"Z")
+	}
+	for _, p := range inputs {
+		if got, want := pathKey(p), reference(p); got != want {
+			t.Errorf("pathKey(%q) = %q, want %q", p, got, want)
+		}
 	}
 }

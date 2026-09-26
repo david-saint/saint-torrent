@@ -180,5 +180,14 @@ func isWindowsDeviceName(p string) bool {
 // full case folding, so two names a case- or normalization-insensitive
 // filesystem (APFS, NTFS) stores as one file are caught as duplicates.
 func pathKey(p string) string {
-	return norm.NFC.String(pathFolder.String(norm.NFD.String(filepath.Clean(p))))
+	p = filepath.Clean(p)
+	for i := 0; i < len(p); i++ {
+		if p[i] >= utf8.RuneSelf {
+			return norm.NFC.String(pathFolder.String(norm.NFD.String(p)))
+		}
+	}
+	// ASCII, as nearly every payload path is: both normalization forms leave
+	// it unchanged and full case folding maps only A-Z, so skip the Unicode
+	// tables, which cost about a microsecond per file.
+	return strings.ToLower(p)
 }
