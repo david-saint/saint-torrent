@@ -2201,8 +2201,8 @@ func writeNodesFile(path string, data []byte) error {
 }
 
 // readNodesFile reads path only if it is a regular file of sane size, so a
-// symlink or device planted in a shared download directory is ignored rather
-// than followed.
+// symlink, FIFO or device planted in a shared download directory is ignored
+// rather than followed or waited on.
 func readNodesFile(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -2211,17 +2211,19 @@ func readNodesFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Size() > maxNodesFileSize {
 		return nil, errNodesFileNotRegular
 	}
-	f, err := os.Open(path)
+	// The name may be swapped between Lstat and the open: openNodesFile
+	// neither follows a symlink nor blocks on a FIFO, and what it opened must
+	// be the regular file Lstat saw.
+	f, err := openNodesFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	// The name may have been swapped between Lstat and Open.
 	opened, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, opened) {
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() > maxNodesFileSize {
 		return nil, errNodesFileNotRegular
 	}
 	return io.ReadAll(io.LimitReader(f, maxNodesFileSize))
