@@ -2029,6 +2029,13 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 				}
 				seenPeers[value] = struct{}{}
 				pk := nodeAddrKey{ip: [4]byte(value[:4]), port: binary.BigEndian.Uint16(value[4:])}
+				// Some buggy DHT implementation hands out peers on port 1,
+				// where nothing listens, so a dial would only waste an
+				// outbound slot. Transmission drops these too (remove_bad_pex;
+				// transmission issues #527 and #5218).
+				if pk.port == 1 {
+					continue
+				}
 				// We dial these, so a responder may only hand out peers no
 				// more local than itself: a public node cannot aim our
 				// connections at loopback or LAN services.

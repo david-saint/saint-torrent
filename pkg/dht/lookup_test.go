@@ -699,6 +699,34 @@ func TestLookupDoesNotEchoOversizedToken(t *testing.T) {
 	}
 }
 
+// TestLookupDropsPortOneValues verifies a get_peers value on port 1, the mark
+// of a buggy DHT implementation, never reaches the dialer.
+func TestLookupDropsPortOneValues(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "port-one-values-hash")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0x80, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q == "get_peers" && sameUDPAddr(to, seed) {
+			return map[string]interface{}{"id": idString(seedID), "values": []interface{}{
+				compactPeer(net.ParseIP("198.51.100.80"), 1),
+				compactPeer(net.ParseIP("198.51.100.81"), 6881),
+			}}
+		}
+		return nil
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	peers := drainDiscovered(d)
+	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("198.51.100.81")) || peers[0].Port != 6881 {
+		t.Fatalf("published %v, want only 198.51.100.81:6881", peers)
+	}
+}
+
 // TestLookupSetOneCandidatePerSlash24 verifies a lookup keeps one public
 // candidate per /24 (libtorrent's dht_restrict_search_ips), while LAN
 // addresses keep one per IP and loopback one per port.
