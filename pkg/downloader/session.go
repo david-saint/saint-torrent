@@ -187,7 +187,14 @@ type Session struct {
 	stateDirty bool
 	closing    bool
 	stats      completionStats
-	flushMu    sync.Mutex
+	// statsRanges caches wantedStatsRangesLocked (sorted, non-overlapping) so a
+	// piece completion finds its wanted bytes with a binary search instead of
+	// rebuilding every file's range under s.mu. statsRangesValid is cleared by
+	// every change to the file priorities, the file list or the storage (see
+	// invalidateStatsRangesLocked); statsRangesLocked rebuilds it on next use.
+	statsRanges      []byteRange
+	statsRangesValid bool
+	flushMu          sync.Mutex
 	// stateFlushCh wakes the persistence goroutine so a pause checkpoints promptly
 	// without running the flush (and its file syncs) on the caller's goroutine.
 	stateFlushCh chan struct{}
@@ -1363,6 +1370,7 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 		return false
 	}
 	s.filePriorities[fileIndex] = priority
+	s.invalidateStatsRangesLocked()
 	s.onFilePriorityChangedLocked()
 	return true
 }
@@ -1379,6 +1387,9 @@ func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
 				changed = true
 			}
 		}
+	}
+	if changed {
+		s.invalidateStatsRangesLocked()
 	}
 	return changed
 }
@@ -1408,6 +1419,7 @@ func newFilePriorities(numFiles int) []FilePriority {
 // the pending slice. Caller holds s.mu.
 func (s *Session) installFilePrioritiesLocked(priorities []FilePriority) {
 	s.filePriorities = priorities
+	s.invalidateStatsRangesLocked()
 	if len(s.pendingFilePriorities) > 0 {
 		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
@@ -1740,6 +1752,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.PieceStates = pieceStates
 	s.pieceAvailability = pieceAvailability
 	s.Storage = st
+	s.invalidateStatsRangesLocked() // new file list and storage
 	s.releaseClaims = releaseClaims
 	s.statusErr = nil
 	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and

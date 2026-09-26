@@ -707,7 +707,10 @@ func (s *Session) completionStatsLocked() completionStats {
 	return s.stats
 }
 
-// recomputeStatsLocked fully recalculates completion stats from scratch and caches them.
+// recomputeStatsLocked fully recalculates completion stats from scratch and caches
+// them. It rebuilds the cached wanted ranges too, and walks the pieces and the
+// ranges together (both are in offset order), so it costs O(files + pieces) where
+// a per-piece scan of every range cost O(files x pieces).
 func (s *Session) recomputeStatsLocked() {
 	if s.Storage == nil || s.Torrent == nil {
 		s.stats = completionStats{}
@@ -715,21 +718,26 @@ func (s *Session) recomputeStatsLocked() {
 	}
 	var stats completionStats
 	stats.totalBytes = s.Storage.TotalSize()
-	ranges := s.wantedStatsRangesLocked()
+	s.invalidateStatsRangesLocked()
+	ranges := s.statsRangesLocked()
 
 	for _, r := range ranges {
-		if r.end > r.start {
-			stats.wantedBytes += r.end - r.start
-		}
+		stats.wantedBytes += r.end - r.start
 	}
 
+	pieceLenValue := s.Storage.PieceLengthValue()
+	first := 0 // the first range that ends after the current piece starts
 	for i, state := range s.PieceStates {
 		pieceLen := s.Storage.PieceLength(int64(i))
 		if state == PieceCompleted {
 			stats.completedTotalBytes += pieceLen
 		}
 
-		wantedOverlap := s.pieceWantedOverlapLocked(i, ranges)
+		pieceStart := int64(i) * pieceLenValue
+		for first < len(ranges) && ranges[first].end <= pieceStart {
+			first++
+		}
+		wantedOverlap := overlapFrom(ranges, first, pieceStart, pieceStart+pieceLen)
 		if wantedOverlap > 0 {
 			stats.wantedPieces++
 			if state == PieceCompleted {
@@ -743,7 +751,8 @@ func (s *Session) recomputeStatsLocked() {
 
 // wantedStatsRangesLocked returns the wanted byte ranges used for completion stats,
 // synthesizing a whole-storage range for legacy single-file torrents whose metadata
-// carries no file list. Caller holds s.mu.
+// carries no file list. The ranges are sorted by offset and do not overlap. Caller
+// holds s.mu.
 func (s *Session) wantedStatsRangesLocked() []byteRange {
 	if s.Storage == nil || s.Torrent == nil {
 		return nil
@@ -755,32 +764,70 @@ func (s *Session) wantedStatsRangesLocked() []byteRange {
 	return ranges
 }
 
+// statsRangesLocked returns the cached wanted ranges (see wantedStatsRangesLocked),
+// rebuilding them if a change invalidated them. Caller holds s.mu for writing.
+func (s *Session) statsRangesLocked() []byteRange {
+	if !s.statsRangesValid {
+		s.statsRanges = s.wantedStatsRangesLocked()
+		s.statsRangesValid = true
+	}
+	return s.statsRanges
+}
+
+// invalidateStatsRangesLocked drops the cached wanted ranges. Call it on every
+// change to the file priorities, the file list or the storage. Caller holds s.mu
+// for writing.
+func (s *Session) invalidateStatsRangesLocked() {
+	s.statsRanges = nil
+	s.statsRangesValid = false
+}
+
 // pieceWantedOverlapLocked returns the number of bytes the given piece overlaps with the
-// wanted ranges. Ranges are passed in (see wantedStatsRangesLocked) so bulk recomputes
-// build them once instead of per piece. Caller holds s.mu.
+// wanted ranges, which must be sorted and non-overlapping (see wantedStatsRangesLocked):
+// a binary search finds the first range that can overlap the piece, so the cost is
+// O(log files) plus the ranges the piece actually overlaps. Caller holds s.mu.
 func (s *Session) pieceWantedOverlapLocked(idx int, ranges []byteRange) int64 {
 	pieceStart := int64(idx) * s.Storage.PieceLengthValue()
 	pieceEnd := pieceStart + s.Storage.PieceLength(int64(idx))
-	wantedOverlap := int64(0)
-	for _, r := range ranges {
-		overlapStart := maxInt64(pieceStart, r.start)
-		overlapEnd := minInt64(pieceEnd, r.end)
-		if overlapEnd > overlapStart {
-			wantedOverlap += overlapEnd - overlapStart
+	// Ranges do not overlap, so their ends are sorted too: find the first one
+	// that ends after the piece starts.
+	lo, hi := 0, len(ranges)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if ranges[mid].end <= pieceStart {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return wantedOverlap
+	return overlapFrom(ranges, lo, pieceStart, pieceEnd)
+}
+
+// overlapFrom sums the overlap of [start, end) with ranges[first:], stopping at the
+// first range that starts at or after end. ranges must be sorted and non-overlapping.
+func overlapFrom(ranges []byteRange, first int, start, end int64) int64 {
+	var overlap int64
+	for i := first; i < len(ranges) && ranges[i].start < end; i++ {
+		overlapStart := maxInt64(start, ranges[i].start)
+		overlapEnd := minInt64(end, ranges[i].end)
+		if overlapEnd > overlapStart {
+			overlap += overlapEnd - overlapStart
+		}
+	}
+	return overlap
 }
 
 // updateStatsOnPieceCompleteLocked incrementally updates the cached completion stats when
-// a single piece transitions to PieceCompleted. Caller holds s.mu.
+// a single piece transitions to PieceCompleted. It runs under the session write lock
+// on every piece completion, so it uses the cached wanted ranges and allocates
+// nothing. Caller holds s.mu.
 func (s *Session) updateStatsOnPieceCompleteLocked(idx int) {
 	if s.Storage == nil {
 		return
 	}
 	pieceLen := s.Storage.PieceLength(int64(idx))
 	s.stats.completedTotalBytes += pieceLen
-	wantedOverlap := s.pieceWantedOverlapLocked(idx, s.wantedStatsRangesLocked())
+	wantedOverlap := s.pieceWantedOverlapLocked(idx, s.statsRangesLocked())
 	if wantedOverlap > 0 {
 		s.stats.completedWantedBytes += wantedOverlap
 		s.stats.completedWantedPieces++
