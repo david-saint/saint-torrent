@@ -31,7 +31,7 @@ func renderListDracula(m *model) string {
 	var head strings.Builder
 	head.WriteString("\n")
 	if m.startupWarn != "" {
-		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.startupWarn), bw)) + "\n\n")
+		head.WriteString(g + st.Warn.Render(truncateRight(displayText(m.startupWarn), bw)) + "\n\n")
 	}
 
 	head.WriteString(dividerLine(st, m.width) + "\n")
@@ -230,7 +230,7 @@ func renderDetailsDracula(m *model) string {
 		cardContent += "\n" + st.Info.Render(row.checkingText())
 	}
 	if row.lastErrText != "" {
-		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + sanitizeText(row.lastErrText)
+		cardContent += "\n" + st.Header.Render("Last Issue") + ": " + row.lastErrText
 	}
 	sb.WriteString(card.Render(cardContent))
 	sb.WriteString("\n")

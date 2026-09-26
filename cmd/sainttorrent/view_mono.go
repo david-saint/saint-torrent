@@ -89,7 +89,7 @@ func renderListMono(m *model) string {
 	head.WriteString(g + footer + "\n\n")
 
 	if m.startupWarn != "" {
-		head.WriteString(g + st.Warn.Render(truncateRight(sanitizeText(m.startupWarn), bw)) + "\n\n")
+		head.WriteString(g + st.Warn.Render(truncateRight(displayText(m.startupWarn), bw)) + "\n\n")
 	}
 
 	spaceActionHelp := "Pause/Resume"

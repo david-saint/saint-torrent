@@ -420,7 +420,7 @@ func (m *model) startDelete(withFiles bool, origin viewMode) {
 	m.deleteWithFiles = withFiles
 	m.deleteErr = nil
 	m.deleteOriginView = origin
-	m.deleteTargetName = sanitizeText(s.Name())
+	m.deleteTargetName = displayText(s.Name())
 	m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 }
 
@@ -919,7 +919,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err == nil && name != "" {
 				displayName = name
 			}
-			displayName = sanitizeText(displayName)
+			displayName = displayText(displayName)
 
 			pItem := pendingItem{
 				rawURL:        item,
@@ -1145,22 +1145,6 @@ func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
 	if !opts.fallbackDirsSet && cfg.FallbackDownloadDirs != nil {
 		opts.fallbackDownloadDirs = append([]string{}, cfg.FallbackDownloadDirs...)
 	}
-}
-
-func sanitizeText(s string) string {
-	var sb strings.Builder
-	for _, r := range s {
-		if r < 32 || r == 127 || (r >= 0x80 && r <= 0x9F) {
-			sb.WriteRune(' ')
-		} else {
-			sb.WriteRune(r)
-		}
-	}
-	res := sb.String()
-	for strings.Contains(res, "  ") {
-		res = strings.ReplaceAll(res, "  ", " ")
-	}
-	return strings.TrimSpace(res)
 }
 
 func parseItem(item string) (name string, hashHex string, err error) {
@@ -1789,7 +1773,7 @@ func main() {
 
 			if resp.Status != "ok" {
 				conn.Close()
-				fmt.Fprintf(os.Stderr, "Error from running instance: %s\n", resp.Message)
+				fmt.Fprintf(os.Stderr, "Error from running instance: %s\n", escapeForTerminal(resp.Message))
 				os.Exit(1)
 			}
 
@@ -1914,7 +1898,8 @@ func main() {
 		}
 		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
 		if !statsServer.Loopback() {
-			startupWarns = append(startupWarns, fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr()))
+			// First, so the TUI's one-line startup message cannot cut it off.
+			startupWarns = append([]string{fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())}, startupWarns...)
 		}
 	}
 	perfMarkf("http-stats")
@@ -1963,7 +1948,7 @@ func main() {
 		if err == nil && name != "" {
 			displayName = name
 		}
-		displayName = sanitizeText(displayName)
+		displayName = displayText(displayName)
 		initialPending = append(initialPending, pendingItem{
 			rawURL:        item,
 			displayName:   displayName,
@@ -2068,18 +2053,22 @@ func waitForShutdownSignal() {
 	signal.Stop(sigCh)
 }
 
-// tuiStartupLine joins startup infos and warnings into the TUI's single
+// tuiStartupLine joins startup warnings and infos into the TUI's single
 // startup line, so a TUI user also sees where the stats API is listening.
-// Headless mode prints them separately via writeHeadlessStartupMessages.
+// Warnings come first because the line is cut to the terminal width. Headless
+// mode prints them separately via writeHeadlessStartupMessages.
 func tuiStartupLine(infos, warns []string) string {
-	return strings.Join(append(append([]string(nil), infos...), warns...), "; ")
+	return strings.Join(append(append([]string(nil), warns...), infos...), "; ")
 }
 
+// writeHeadlessStartupMessages prints startup infos and warnings. Warnings can
+// embed torrent-controlled text (failed-add errors quote file paths), so each
+// line is escaped before it reaches the terminal.
 func writeHeadlessStartupMessages(w io.Writer, infos []string, warns []string) {
 	for _, info := range infos {
-		fmt.Fprintln(w, info)
+		fmt.Fprintln(w, escapeForTerminal(info))
 	}
 	for _, warn := range warns {
-		fmt.Fprintf(w, "Warning: %s\n", warn)
+		fmt.Fprintf(w, "Warning: %s\n", escapeForTerminal(warn))
 	}
 }

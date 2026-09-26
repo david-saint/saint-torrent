@@ -292,7 +292,7 @@ func TestTUIStartupLineIncludesInfos(t *testing.T) {
 	const endpoint = "HTTP stats endpoint: http://0.0.0.0:16666/stats"
 	const warning = "HTTP stats API on 0.0.0.0:16666 is reachable from the network without authentication"
 	got := tuiStartupLine([]string{endpoint}, []string{warning})
-	if got != endpoint+"; "+warning {
+	if got != warning+"; "+endpoint {
 		t.Fatalf("startup line = %q", got)
 	}
 	if got := tuiStartupLine(nil, nil); got != "" {

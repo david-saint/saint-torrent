@@ -482,7 +482,7 @@ func (m model) viewFileExplorer() string {
 			if i < len(priorities) {
 				prio = priorities[i]
 			}
-			path := truncateMiddle(sanitizeText(filepath.Join(f.Path...)), pathW)
+			path := truncateMiddle(displayText(filepath.Join(f.Path...)), pathW)
 			row := padTo(path, pathW) + " " + padTo(formatBytes(f.Length), sizeW) + " " + priorityBadge(st, prio)
 			if i == m.selectedFileIdx {
 				sb.WriteString(g + st.SelectedRow.Render(row) + "\n")
@@ -521,7 +521,7 @@ func (m model) viewInputBox() string {
 	sb.WriteString(dividerLine(st, m.width) + "\n\n")
 	sb.WriteString(g + m.textInput.View() + "\n\n")
 	if m.inputErr != "" {
-		sb.WriteString(g + st.Error.Render(truncateRight(sanitizeText(m.inputErr), bw)) + "\n\n")
+		sb.WriteString(g + st.Error.Render(truncateRight(displayText(m.inputErr), bw)) + "\n\n")
 	}
 	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
@@ -546,7 +546,7 @@ func (m model) viewAddConfirm() string {
 	if m.addConfirmErr != nil {
 		label := "Error adding torrent: "
 		sb.WriteString(g + st.Error.Render("Error adding torrent") + ": " +
-			truncateRight(sanitizeText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
+			truncateRight(displayText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
 		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
@@ -579,7 +579,7 @@ func (m model) viewDeleteConfirm() string {
 
 	header := func(label, name string) string {
 		return g + st.Header.Render(label) + " " +
-			truncateRight(sanitizeText(name), bw-dispWidth(label+" ")) + "\n\n"
+			truncateRight(displayText(name), bw-dispWidth(label+" ")) + "\n\n"
 	}
 
 	if m.deleteInProgress {
@@ -598,7 +598,7 @@ func (m model) viewDeleteConfirm() string {
 	if m.deleteErr != nil {
 		var sb strings.Builder
 		sb.WriteString(header("Deletion Failure:", m.deleteTargetName))
-		sb.WriteString(card.Render(st.Error.Render(sanitizeText(m.deleteErr.Error()))))
+		sb.WriteString(card.Render(st.Error.Render(displayText(m.deleteErr.Error()))))
 		sb.WriteString("\n\n")
 		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")

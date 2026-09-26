@@ -30,7 +30,7 @@ type sessionRow struct {
 
 	verification  downloader.VerificationSnapshot
 	infoHashHex   string
-	name          string // sanitized once per tick, not per row per frame
+	name          string // bounded and sanitized once per tick, not per row per frame
 	totalSize     int64
 	percent       float64
 	status        string
@@ -42,7 +42,7 @@ type sessionRow struct {
 	transferSpeed float64
 	eta           string
 	uploadedBytes int64
-	lastErrText   string
+	lastErrText   string // bounded and sanitized once per tick, like name
 }
 
 // detailSnapshot is the snapshot backing the detail view for the selected
@@ -88,7 +88,7 @@ func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) ses
 		verification:  snap.Verification,
 		session:       s,
 		infoHashHex:   fmt.Sprintf("%x", snap.InfoHash),
-		name:          sanitizeText(snap.Name),
+		name:          displayText(snap.Name),
 		totalSize:     snap.TotalSize,
 		percent:       snap.Percent,
 		status:        snap.Status,
@@ -105,7 +105,7 @@ func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) ses
 	}
 	row.eta = rowETA(row)
 	if snap.LastError != nil {
-		row.lastErrText = snap.LastError.Error()
+		row.lastErrText = displayText(snap.LastError.Error())
 	}
 	return row
 }
@@ -234,7 +234,7 @@ func (m *model) buildFilesSnapshot() {
 	}
 	m.files = filesSnapshot{
 		valid:      true,
-		name:       sanitizeText(s.Name()),
+		name:       displayText(s.Name()),
 		files:      s.Files(),
 		priorities: s.GetFilePriorities(),
 	}
@@ -253,7 +253,7 @@ func (m *model) filesData() filesSnapshot {
 	}
 	return filesSnapshot{
 		valid:      true,
-		name:       sanitizeText(s.Name()),
+		name:       displayText(s.Name()),
 		files:      s.Files(),
 		priorities: s.GetFilePriorities(),
 	}
