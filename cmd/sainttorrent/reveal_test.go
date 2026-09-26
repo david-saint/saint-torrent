@@ -38,7 +38,9 @@ func TestExplorerCmdLineQuotesTorrentControlledPath(t *testing.T) {
 }
 
 func TestRevealInFileManagerRejectsRelativePath(t *testing.T) {
-	if err := revealInFileManager("-R"); err == nil {
-		t.Fatal("relative path accepted; it could be read as an option")
+	// Check the reason: without the check the helper would be launched, and
+	// a missing xdg-open (as on CI) would also produce an error.
+	if err := revealInFileManager("-R"); err == nil || !strings.Contains(err.Error(), "not an absolute path") {
+		t.Fatalf("relative path: err = %v; want refusal before launching anything", err)
 	}
 }
