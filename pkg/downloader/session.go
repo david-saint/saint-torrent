@@ -262,6 +262,7 @@ type Session struct {
 	metadataPieces       []bool
 	metadataCompleted    bool
 	metadataMode         bool
+	metadataEpoch        uint64 // advances whenever the accumulator is discarded; peers re-request
 	metadataCompletedCh  chan struct{}
 	DHT                  *dht.DHT
 	downloadDir          string
@@ -1493,6 +1494,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			s.metadataSize = 0
 			s.metadataBuf = nil
 			s.metadataPieces = nil
+			s.metadataEpoch++
 			s.mu.Unlock()
 		}
 	}()

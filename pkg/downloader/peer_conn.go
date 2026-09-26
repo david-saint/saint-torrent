@@ -60,6 +60,12 @@ const maxOutboundPeers = 200
 // It is a SEPARATE budget from outbound, so an inbound flood can never starve downloads.
 const maxInboundPeers = 100
 
+// metadataRetryInterval is how often a metadata-phase connection whose peer
+// offers ut_metadata checks whether a failed assembly started a new fetch round
+// and, if so, re-asks the peer for the missing blocks. A var so tests can shorten
+// it; treat it as a constant in production.
+var metadataRetryInterval = 2 * time.Second
+
 // maxExtHandshakesPerConn bounds how many BEP 10 extension handshakes one
 // connection may have decoded and acted on. Real clients send one, occasionally a
 // second to update it; later ones are ignored.
@@ -1582,6 +1588,210 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		publishPipelineSnapshot(now, true)
 	}
 
+	// ut_metadata fetch state (BEP 9) for this connection. peerMetadataSize is the
+	// size this peer advertised. metadataRequested marks the blocks asked of this
+	// peer in fetch round metadataRound (the session's metadataEpoch, which moves on
+	// whenever a failed assembly discards the accumulator). A block is accepted from
+	// this peer only if it was asked for in the current round, so a peer cannot slip
+	// unsolicited blocks into an assembly other peers are feeding.
+	peerMetadataSize := 0
+	var metadataRequested []bool
+	var metadataRound uint64
+	var metadataRetryTicker *time.Ticker
+	var metadataRetryTick <-chan time.Time
+	defer func() {
+		if metadataRetryTicker != nil {
+			metadataRetryTicker.Stop()
+		}
+	}()
+
+	// requestMetadataBlocks asks this peer for every block the shared accumulator
+	// still lacks and that it has not been asked for this round. The session state
+	// is read in a single locked pass that re-checks the fetch is still running and
+	// sized as this peer advertised, and the requests go out after unlocking, so a
+	// concurrent reset can never leave us indexing a stale block list.
+	requestMetadataBlocks := func() {
+		if peerUtMetadataID == -1 || peerMetadataSize <= 0 {
+			return
+		}
+		var missing []int
+		s.mu.Lock()
+		if !s.metadataMode || s.metadataCompleted {
+			s.mu.Unlock()
+			return
+		}
+		if s.metadataSize == 0 {
+			// The first sized peer (or the first after a reset) sizes the accumulator.
+			s.metadataSize = peerMetadataSize
+			s.metadataBuf = make([]byte, peerMetadataSize)
+			s.metadataPieces = make([]bool, (peerMetadataSize+peer.MetadataBlockSize-1)/peer.MetadataBlockSize)
+		}
+		if s.metadataEpoch != metadataRound || len(metadataRequested) != len(s.metadataPieces) {
+			metadataRound = s.metadataEpoch
+			metadataRequested = make([]bool, len(s.metadataPieces))
+		}
+		if s.metadataSize == peerMetadataSize {
+			for i, have := range s.metadataPieces {
+				if !have && !metadataRequested[i] {
+					metadataRequested[i] = true
+					missing = append(missing, i)
+				}
+			}
+		}
+		s.mu.Unlock()
+		for _, i := range missing {
+			if err := client.SendMetadataRequest(byte(peerUtMetadataID), i); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+
+	// acceptMetadataBlock stores a ut_metadata data block this peer was asked for
+	// and, once every block is in, hands the assembled info dict to
+	// onMetadataDownloaded (which discards the accumulator and advances
+	// metadataEpoch if it fails the infohash check).
+	acceptMetadataBlock := func(metaMsg *peer.MetadataMessage) {
+		piece := metaMsg.Piece
+		if piece < 0 || piece >= len(metadataRequested) || !metadataRequested[piece] {
+			return // unsolicited, or asked for in an earlier round
+		}
+		metadataRequested[piece] = false
+		s.mu.Lock()
+		if s.metadataEpoch != metadataRound || !s.metadataMode || s.metadataCompleted ||
+			s.metadataSize == 0 || piece >= len(s.metadataPieces) || s.metadataPieces[piece] ||
+			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) {
+			s.mu.Unlock()
+			return
+		}
+		offset := piece * peer.MetadataBlockSize
+		expectedLen := min(peer.MetadataBlockSize, s.metadataSize-offset)
+		if expectedLen <= 0 || len(metaMsg.Data) != expectedLen || offset+expectedLen > len(s.metadataBuf) {
+			s.mu.Unlock()
+			return
+		}
+		copy(s.metadataBuf[offset:], metaMsg.Data)
+		s.metadataPieces[piece] = true
+		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
+		for _, done := range s.metadataPieces {
+			if !done {
+				s.mu.Unlock()
+				return
+			}
+		}
+		bufCopy := append([]byte(nil), s.metadataBuf...)
+		s.mu.Unlock()
+		if err := s.onMetadataDownloaded(bufCopy); err != nil {
+			s.mu.Lock()
+			s.lastErr = err
+			s.mu.Unlock()
+		}
+	}
+
+	// serveMetadataRequest answers a peer's ut_metadata request from our info dict.
+	serveMetadataRequest := func(metaMsg *peer.MetadataMessage) {
+		if peerUtMetadataID == -1 {
+			return // the peer never told us which id to answer on
+		}
+		s.mu.RLock()
+		inMetaMode := s.metadataMode
+		infoBytes := s.Torrent.InfoBytes
+		s.mu.RUnlock()
+
+		offset := int64(metaMsg.Piece) * peer.MetadataBlockSize
+		if inMetaMode || len(infoBytes) == 0 || offset < 0 || offset >= int64(len(infoBytes)) {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		blockLen := min(int64(peer.MetadataBlockSize), int64(len(infoBytes))-offset)
+		_ = client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), infoBytes[offset:offset+blockLen])
+	}
+
+	// handleExtendedMessage processes one BEP 10 message and returns a non-empty
+	// disconnect reason when the peer must be dropped.
+	handleExtendedMessage := func(payload []byte) string {
+		if len(payload) < 2 {
+			return ""
+		}
+		extMsgID := payload[0]
+		payloadBytes := payload[1:]
+
+		switch {
+		case extMsgID == peer.ExtHandshake:
+			// Size gates run before any bencode decode: see the caps in pkg/peer.
+			if len(payloadBytes) > peer.MaxExtHandshakeSize {
+				return "oversized_extension"
+			}
+			// BEP 10 lets a peer re-send its handshake to update it, but each one
+			// is decoded and can restart the metadata requests, so only the first
+			// few per connection are honoured.
+			extHandshakes++
+			if extHandshakes > maxExtHandshakesPerConn {
+				return ""
+			}
+			hs, err := peer.ParseExtensionHandshake(payloadBytes)
+			if err != nil {
+				return ""
+			}
+			if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
+				peerUtPexID = utPexID
+				startPEX()
+			}
+			utID, ok := hs.Extensions[peer.ExtNameMetadata]
+			if !ok {
+				return ""
+			}
+			peerUtMetadataID = utID
+			s.mu.RLock()
+			fetching := s.metadataMode && !s.metadataCompleted
+			s.mu.RUnlock()
+			if !fetching {
+				return ""
+			}
+			if hs.MetadataSize <= 0 || hs.MetadataSize > peer.MaxMetadataSize {
+				s.mu.Lock()
+				s.lastErr = fmt.Errorf("invalid metadata size from peer: %d", hs.MetadataSize)
+				s.mu.Unlock()
+				return ""
+			}
+			peerMetadataSize = hs.MetadataSize
+			requestMetadataBlocks()
+			// Keep checking for a new fetch round while this peer idles, so an
+			// assembly reset re-asks it instead of waiting for fresh connections.
+			if metadataRetryTicker == nil && metadataRetryInterval > 0 {
+				metadataRetryTicker = time.NewTicker(metadataRetryInterval)
+				metadataRetryTick = metadataRetryTicker.C
+			}
+
+		case extMsgID == peer.LocalMetadataExtID:
+			if len(payloadBytes) > peer.MaxMetadataMessageSize {
+				return "oversized_extension"
+			}
+			metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
+			if err != nil {
+				return ""
+			}
+			switch metaMsg.MsgType {
+			case peer.MetadataRequest:
+				serveMetadataRequest(metaMsg)
+			case peer.MetadataData:
+				acceptMetadataBlock(metaMsg)
+			case peer.MetadataReject:
+				// The block stays marked as asked of this peer, so it is not re-asked
+				// this round; other peers can still supply it.
+			}
+
+		case extMsgID == peer.LocalPEXExtID && s.pexEnabled():
+			if len(payloadBytes) > peer.MaxPEXMessageSize {
+				return "oversized_extension"
+			}
+			if pexMsg, err := peer.ParsePEXMessage(payloadBytes); err == nil {
+				s.handlePEXMessage(peerAddr, pexMsg)
+			}
+		}
+		return ""
+	}
+
 	type peerReadResult struct {
 		msg *peer.Message
 		err error
@@ -1711,6 +1921,20 @@ peerLoop:
 		case <-pexTick:
 			sendPEXDelta()
 			continue
+		case <-metadataRetryTick:
+			s.mu.RLock()
+			fetching := s.metadataMode && !s.metadataCompleted
+			epoch := s.metadataEpoch
+			s.mu.RUnlock()
+			switch {
+			case !fetching:
+				metadataRetryTicker.Stop()
+				metadataRetryTicker = nil
+				metadataRetryTick = nil
+			case epoch != metadataRound:
+				requestMetadataBlocks()
+			}
+			continue
 		case <-rateRetry:
 			rateRetry = nil
 			// The timer covers whichever pump was waiting on bandwidth: re-run both the
@@ -1735,7 +1959,14 @@ peerLoop:
 		s.mu.RLock()
 		inMetaNow := s.metadataMode
 		numPiecesNow := len(s.PieceStates)
+		metadataEpochNow := s.metadataEpoch
 		s.mu.RUnlock()
+
+		// A failed metadata assembly started a new fetch round: re-ask this peer
+		// for the blocks that are still missing.
+		if inMetaNow && peerMetadataSize > 0 && metadataEpochNow != metadataRound {
+			requestMetadataBlocks()
+		}
 
 		if !inMetaNow && !initializedPeersAndBitfield {
 			// Initialize now that metadata is downloaded!
@@ -1775,170 +2006,9 @@ peerLoop:
 
 		switch msg.ID {
 		case peer.MsgExtended:
-			if len(msg.Payload) < 2 {
-				continue
-			}
-			extMsgID := msg.Payload[0]
-			payloadBytes := msg.Payload[1:]
-
-			if extMsgID == peer.ExtHandshake {
-				// Size gates run before any bencode decode: see the caps in pkg/peer.
-				if len(payloadBytes) > peer.MaxExtHandshakeSize {
-					disconnectReason = "oversized_extension"
-					break peerLoop
-				}
-				// BEP 10 lets a peer re-send its handshake to update it, but each one
-				// is decoded and can restart the metadata requests, so only the first
-				// few per connection are honoured.
-				extHandshakes++
-				if extHandshakes > maxExtHandshakesPerConn {
-					break
-				}
-				hs, err := peer.ParseExtensionHandshake(payloadBytes)
-				if err == nil {
-					if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
-						peerUtPexID = utPexID
-						startPEX()
-					}
-					if utID, ok := hs.Extensions[peer.ExtNameMetadata]; ok {
-						peerUtMetadataID = utID
-
-						// If we are in metadata mode, request the metadata blocks
-						s.mu.Lock()
-						inMetaMode := s.metadataMode
-						metadataComp := s.metadataCompleted
-						sz := s.metadataSize
-						s.mu.Unlock()
-
-						if inMetaMode && !metadataComp {
-							if hs.MetadataSize <= 0 || hs.MetadataSize > peer.MaxMetadataSize {
-								s.mu.Lock()
-								s.lastErr = fmt.Errorf("invalid metadata size from peer: %d", hs.MetadataSize)
-								s.mu.Unlock()
-								continue
-							}
-							s.mu.Lock()
-							if s.metadataSize == 0 {
-								s.metadataSize = hs.MetadataSize
-								s.metadataBuf = make([]byte, hs.MetadataSize)
-								numBlocks := (hs.MetadataSize + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
-								s.metadataPieces = make([]bool, numBlocks)
-								sz = hs.MetadataSize
-							} else if s.metadataSize != hs.MetadataSize {
-								s.mu.Unlock()
-								continue
-							}
-							s.mu.Unlock()
-
-							if sz > 0 {
-								numBlocks := (sz + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
-								for i := 0; i < numBlocks; i++ {
-									s.mu.Lock()
-									alreadyGot := s.metadataPieces[i]
-									s.mu.Unlock()
-									if !alreadyGot {
-										_ = client.SendMetadataRequest(byte(peerUtMetadataID), i)
-									}
-								}
-							}
-						}
-					}
-				}
-			} else if extMsgID == peer.LocalMetadataExtID {
-				if len(payloadBytes) > peer.MaxMetadataMessageSize {
-					disconnectReason = "oversized_extension"
-					break peerLoop
-				}
-				metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
-				if err == nil {
-					switch metaMsg.MsgType {
-					case peer.MetadataRequest:
-						s.mu.Lock()
-						inMetaMode := s.metadataMode
-						infoBytes := s.Torrent.InfoBytes
-						s.mu.Unlock()
-
-						if !inMetaMode && len(infoBytes) > 0 {
-							offset := int64(metaMsg.Piece) * peer.MetadataBlockSize
-							if offset >= 0 && offset < int64(len(infoBytes)) {
-								blockLen := int64(peer.MetadataBlockSize)
-								if offset+blockLen > int64(len(infoBytes)) {
-									blockLen = int64(len(infoBytes)) - offset
-								}
-								blockData := infoBytes[offset : offset+blockLen]
-								if peerUtMetadataID != -1 {
-									_ = client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), blockData)
-								}
-							} else {
-								if peerUtMetadataID != -1 {
-									_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
-								}
-							}
-						} else {
-							if peerUtMetadataID != -1 {
-								_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
-							}
-						}
-
-					case peer.MetadataData:
-						s.mu.Lock()
-						if s.metadataMode && !s.metadataCompleted && s.metadataSize > 0 && metaMsg.Piece >= 0 && metaMsg.Piece < len(s.metadataPieces) && !s.metadataPieces[metaMsg.Piece] {
-							if metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize {
-								s.mu.Unlock()
-								continue
-							}
-							offset := metaMsg.Piece * peer.MetadataBlockSize
-							expectedLen := peer.MetadataBlockSize
-							if offset+expectedLen > s.metadataSize {
-								expectedLen = s.metadataSize - offset
-							}
-							if expectedLen > 0 && len(metaMsg.Data) == expectedLen && offset+len(metaMsg.Data) <= len(s.metadataBuf) {
-								copy(s.metadataBuf[offset:], metaMsg.Data)
-								s.metadataPieces[metaMsg.Piece] = true
-								lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
-
-								allCompleted := true
-								for _, done := range s.metadataPieces {
-									if !done {
-										allCompleted = false
-										break
-									}
-								}
-
-								if allCompleted {
-									bufCopy := make([]byte, len(s.metadataBuf))
-									copy(bufCopy, s.metadataBuf)
-									s.mu.Unlock()
-
-									err := s.onMetadataDownloaded(bufCopy)
-									if err != nil {
-										s.mu.Lock()
-										s.lastErr = err
-										s.mu.Unlock()
-									}
-								} else {
-									s.mu.Unlock()
-								}
-							} else {
-								s.mu.Unlock()
-							}
-						} else {
-							s.mu.Unlock()
-						}
-
-					case peer.MetadataReject:
-						// Peer rejected metadata piece request, nothing to do.
-					}
-				}
-			} else if extMsgID == peer.LocalPEXExtID && s.pexEnabled() {
-				if len(payloadBytes) > peer.MaxPEXMessageSize {
-					disconnectReason = "oversized_extension"
-					break peerLoop
-				}
-				pexMsg, err := peer.ParsePEXMessage(payloadBytes)
-				if err == nil {
-					s.handlePEXMessage(peerAddr, pexMsg)
-				}
+			if reason := handleExtendedMessage(msg.Payload); reason != "" {
+				disconnectReason = reason
+				break peerLoop
 			}
 
 		case peer.MsgChoke:
