@@ -130,7 +130,7 @@ func serveTrackers(t *testing.T, n int, h http.HandlerFunc) []string {
 	for i := 0; i < n; i++ {
 		srv := httptest.NewServer(h)
 		t.Cleanup(srv.Close)
-		urls = append(urls, srv.URL+"/a/announce", srv.URL+"/b/announce")
+		urls = append(urls, srv.URL+"/announce/a", srv.URL+"/announce/b")
 	}
 	return urls
 }
@@ -449,7 +449,9 @@ func TestAnnounceDispatchesOnParsedScheme(t *testing.T) {
 }
 
 // TestAnnounceRefusesLocalServiceTracker reproduces a torrent whose tracker
-// is a loopback admin endpoint, directly or through a tracker's redirect.
+// is a loopback admin endpoint, directly or through a tracker's redirect. An
+// "/announce" suffix must not help: a prefix-routed admin handler still
+// serves "/admin/reboot/announce".
 func TestAnnounceRefusesLocalServiceTracker(t *testing.T) {
 	var internalHits atomic.Int32
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -457,12 +459,13 @@ func TestAnnounceRefusesLocalServiceTracker(t *testing.T) {
 	}))
 	defer internal.Close()
 	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, internal.URL+"/admin/reboot?confirm=yes", http.StatusFound)
+		http.Redirect(w, r, internal.URL+"/admin/reboot/announce?confirm=yes", http.StatusFound)
 	}))
 	defer redirector.Close()
 
 	sess := newTrackerTestSession(t, "ssrf",
 		internal.URL+"/admin/reboot?confirm=yes&token=abc",
+		internal.URL+"/admin/reboot/announce?confirm=yes&token=abc",
 		redirector.URL+"/announce",
 	)
 	sess.announceAndConnect()

@@ -59,10 +59,20 @@ func TestNewRequestAppliesDestinationPolicy(t *testing.T) {
 		{"public tracker", PurposeAnnounce, "http://tracker.example/x/y?passkey=1", false},
 		{"loopback announce", PurposeAnnounce, "http://127.0.0.1:6969/announce", false},
 		{"localhost announce", PurposeAnnounce, "http://localhost:6969/announce", false},
+		{"loopback announce.php", PurposeAnnounce, "http://127.0.0.1:6969/announce.php?passkey=1", false},
 		{"loopback admin path", PurposeAnnounce, "http://127.0.0.1:8080/admin/reboot?confirm=yes", true},
 		{"ipv6 loopback admin path", PurposeAnnounce, "http://[::1]:8080/cgi-bin/x", true},
+		// A suffix rule let these reach the admin handler (libtorrent checks
+		// the prefix); dot segments are normalised away by the server.
+		{"loopback admin path ending in announce", PurposeAnnounce, "http://127.0.0.1:8080/admin/reboot/announce?confirm=yes", true},
+		{"loopback PATH_INFO announce", PurposeAnnounce, "http://localhost:8080/admin.php/announce", true},
+		{"loopback dot segments", PurposeAnnounce, "http://127.0.0.1:8080/announce/../admin/reboot", true},
+		{"loopback encoded dot segments", PurposeAnnounce, "http://127.0.0.1:8080/announce/%2e%2e/admin", true},
+		{"loopback dot-semicolon segment", PurposeAnnounce, "http://127.0.0.1:8080/announce/..;/admin", true},
+		{"loopback backslash", PurposeAnnounce, "http://127.0.0.1:8080/announce%5c..%5cadmin", true},
 		{"loopback scrape", PurposeScrape, "http://127.0.0.1:6969/scrape", false},
 		{"loopback scrape bad path", PurposeScrape, "http://127.0.0.1:6969/announce", true},
+		{"loopback scrape suffix only", PurposeScrape, "http://127.0.0.1:6969/admin/scrape", true},
 		{"cloud metadata", PurposeAnnounce, "http://169.254.169.254/latest/meta-data/announce", true},
 		{"ipv6 link-local", PurposeWebseed, "http://[fe80::1]/f.bin", true},
 		{"unspecified", PurposeAnnounce, "http://0.0.0.0/announce", true},
@@ -114,6 +124,9 @@ func TestHTTPClientRefusesRedirectToLocalService(t *testing.T) {
 		// A loopback tracker redirecting to a non-announce path on another
 		// local service (verifier repro: GET /admin/reboot?confirm=yes).
 		internal.URL + "/admin/reboot?confirm=yes&token=abc",
+		// The same with an "/announce" suffix, which prefix routing on the
+		// local service still sends to the admin handler.
+		internal.URL + "/admin/reboot/announce?confirm=yes&token=abc",
 		// Credentials in a redirect would become a Basic auth header.
 		strings.Replace(internal.URL, "http://", "http://admin:admin@", 1) + "/announce",
 		// Link-local is never reachable.

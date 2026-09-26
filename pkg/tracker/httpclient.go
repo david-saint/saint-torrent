@@ -30,8 +30,9 @@ import (
 //     redirects cannot get around it.
 //   - Link-local (including 169.254.169.254 cloud metadata), unspecified,
 //     multicast and broadcast destinations are always refused.
-//   - A loopback tracker's path must end in /announce (or /scrape for its
-//     derived scrape URL), and a local webseed may not carry a query string.
+//   - A loopback tracker's path must start with /announce (or /scrape for its
+//     derived scrape URL) and hold no dot segments, and a local webseed may
+//     not carry a query string.
 //   - At most maxHTTPRedirects redirects, never from https to http, and never
 //     to a URL with userinfo (which Go would turn into Basic auth).
 
@@ -52,11 +53,11 @@ const (
 type Purpose uint8
 
 const (
-	// PurposeAnnounce is a tracker announce; a loopback tracker's path must end
-	// in /announce.
+	// PurposeAnnounce is a tracker announce; a loopback tracker's path must
+	// start with /announce.
 	PurposeAnnounce Purpose = iota
-	// PurposeScrape is a tracker scrape; a loopback tracker's path must end in
-	// /scrape.
+	// PurposeScrape is a tracker scrape; a loopback tracker's path must start
+	// with /scrape.
 	PurposeScrape
 	// PurposeWebseed is a BEP 19 webseed range request; a local webseed URL may
 	// not carry a query string.
@@ -208,14 +209,34 @@ func (p *requestPolicy) checkURL(u *url.URL) error {
 		return fmt.Errorf("%w: %s is not reachable from this URL", ErrDestinationRefused, a)
 	}
 	switch scope := netpolicy.Classify(a); {
-	case scope == netpolicy.ScopeLoopback && p.purpose == PurposeAnnounce && !strings.HasSuffix(u.Path, "/announce"):
-		return fmt.Errorf("%w: loopback tracker path must end in /announce", ErrDestinationRefused)
-	case scope == netpolicy.ScopeLoopback && p.purpose == PurposeScrape && !strings.HasSuffix(u.Path, "/scrape"):
-		return fmt.Errorf("%w: loopback tracker path must end in /scrape", ErrDestinationRefused)
+	case scope == netpolicy.ScopeLoopback && p.purpose == PurposeAnnounce && !trackerEndpointPath(u.Path, "/announce"):
+		return fmt.Errorf("%w: loopback tracker path must start with /announce", ErrDestinationRefused)
+	case scope == netpolicy.ScopeLoopback && p.purpose == PurposeScrape && !trackerEndpointPath(u.Path, "/scrape"):
+		return fmt.Errorf("%w: loopback tracker path must start with /scrape", ErrDestinationRefused)
 	case scope != netpolicy.ScopeGlobal && p.purpose == PurposeWebseed && u.RawQuery != "":
 		return fmt.Errorf("%w: local webseed URL may not carry a query", ErrDestinationRefused)
 	}
 	return nil
+}
+
+// trackerEndpointPath reports whether a loopback tracker's (decoded) path is
+// a conventional tracker endpoint. Like libtorrent's ssrf_mitigation it must
+// start with prefix, so the request can only reach the tracker handler: with
+// a suffix rule, "/admin/reboot/announce" or "/admin.php/announce" still land
+// in whatever serves the prefix. Dot segments (including Tomcat's "..;") and
+// backslashes are refused because servers normalise them into another path
+// ("/announce/../admin" is "/admin").
+func trackerEndpointPath(path, prefix string) bool {
+	if !strings.HasPrefix(path, prefix) || strings.ContainsRune(path, '\\') {
+		return false
+	}
+	for _, seg := range strings.Split(path, "/") {
+		seg, _, _ = strings.Cut(seg, ";")
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // policyTransport checks every hop, including each redirect, before handing
