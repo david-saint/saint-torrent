@@ -792,9 +792,19 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		reason = s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound)
 	}
 	if reason != "" {
-		if reason == "self_connection" {
+		switch reason {
+		case "self_connection":
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Dialable = false
+			}
+		case "per_ip_limit", "duplicate_peer_id":
+			// The dial worked but the connection cannot be used. connectToPeer
+			// cleared the failure count once the handshake succeeded, so count the
+			// refusal here, or the address would be redialled (TCP, encryption and
+			// handshake) every peerRedialBackoff for as long as the refusal holds.
+			if ps, ok := s.Peers[peerAddr]; ok && outbound {
+				ps.noteDialFailed()
+				ps.LastAttempt = time.Now()
 			}
 		}
 		s.mu.Unlock()

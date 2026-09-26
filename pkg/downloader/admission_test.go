@@ -170,6 +170,74 @@ func TestActiveConnectionIsNotOverwritten(t *testing.T) {
 	}
 }
 
+// startDirectedConnA1 is startAdmissionConn with a choice of direction: an
+// outbound connection runs as connectToPeer runs it after a successful dial.
+func startDirectedConnA1(t *testing.T, sess *Session, ip string, port uint16, remoteID [20]byte, outbound bool) *admissionConn {
+	t.Helper()
+	local, remote := net.Pipe()
+	client := peer.NewClient(local, sess.Torrent.InfoHash, sess.PeerID)
+	client.RemotePeerID = remoteID
+	c := &admissionConn{client: client, remote: remote, done: make(chan struct{})}
+	go func() { _, _ = io.Copy(io.Discard, remote) }()
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	go func() {
+		sess.runPeerMessageLoop(client, local, addr, ip, port, fastReserved(), outbound)
+		close(c.done)
+	}()
+	t.Cleanup(func() {
+		_ = remote.Close()
+		select {
+		case <-c.done:
+		case <-time.After(5 * time.Second):
+			t.Error("peer loop did not exit")
+		}
+	})
+	return c
+}
+
+// knownDialedPeerA1 records addr as connectToPeer leaves a peer it just
+// handshook with: dialable, failure count cleared, attempted long ago.
+func knownDialedPeerA1(sess *Session, ip string, port uint16) *PeerState {
+	ps := &PeerState{IP: ip, Port: port, Dialable: true, AmChoking: true, Choked: true, LastAttempt: time.Now().Add(-time.Hour)}
+	sess.mu.Lock()
+	sess.Peers[net.JoinHostPort(ip, strconv.Itoa(int(port)))] = ps
+	sess.mu.Unlock()
+	return ps
+}
+
+// An outbound connection refused at admission (the host is at its connection
+// cap, or the peer ID is connected already) counts as a failed attempt, so the
+// address backs off like one that failed to dial instead of being redialled
+// every peerRedialBackoff.
+func TestRefusedOutboundConnectionBacksOff(t *testing.T) {
+	t.Run("per_ip_limit", func(t *testing.T) {
+		sess := newWireTestSession(t, 4, 16*1024)
+		for i := 0; i < maxConnectionsPerIP; i++ {
+			c := startAdmissionConn(t, sess, "10.3.3.3", uint16(8100+i), peerIDFor(8100+i))
+			admitted(t, sess, fmt.Sprintf("10.3.3.3:%d", 8100+i), c.client)
+		}
+		ps := knownDialedPeerA1(sess, "10.3.3.3", 6881)
+		startDirectedConnA1(t, sess, "10.3.3.3", 6881, peerIDFor(8199), true).rejected(t)
+		sess.mu.RLock()
+		defer sess.mu.RUnlock()
+		if ps.FailCount != 1 || time.Since(ps.LastAttempt) > time.Minute {
+			t.Fatalf("after a per_ip_limit refusal: FailCount %d, LastAttempt %v ago; want 1, just now", ps.FailCount, time.Since(ps.LastAttempt))
+		}
+	})
+	t.Run("duplicate_peer_id", func(t *testing.T) {
+		sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+		c := startAdmissionConn(t, sess, "10.4.4.4", 8200, peerIDFor(1))
+		admitted(t, sess, "10.4.4.4:8200", c.client)
+		ps := knownDialedPeerA1(sess, "10.5.5.5", 6881)
+		startDirectedConnA1(t, sess, "10.5.5.5", 6881, peerIDFor(1), true).rejected(t)
+		sess.mu.RLock()
+		defer sess.mu.RUnlock()
+		if ps.FailCount != 1 || time.Since(ps.LastAttempt) > time.Minute {
+			t.Fatalf("after a duplicate_peer_id refusal: FailCount %d, LastAttempt %v ago; want 1, just now", ps.FailCount, time.Since(ps.LastAttempt))
+		}
+	})
+}
+
 // Dialling an address that answers with our own peer ID (our listener, handed
 // back by a tracker or the DHT) is detected, and the address is not dialled again.
 func TestSelfDialIsRememberedAndNotRepeated(t *testing.T) {
