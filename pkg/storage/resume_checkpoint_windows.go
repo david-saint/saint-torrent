@@ -44,6 +44,17 @@ func fileIdentity(f *os.File, _ os.FileInfo) string {
 	return fmt.Sprintf("%d:%d:%d:%d", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime)
 }
 
+// fileObjectKeyOf keys a file by volume serial number and file index, which
+// every name of one file shares (8.3 short names included). FileInfo does not
+// expose them, so it asks the open handle.
+func fileObjectKeyOf(f *os.File, _ os.FileInfo) (fileObjectKey, bool) {
+	var info windows.ByHandleFileInformation
+	if windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info) != nil {
+		return fileObjectKey{}, false
+	}
+	return fileObjectKey{a: uint64(info.VolumeSerialNumber), b: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, true
+}
+
 func replaceResumeFile(root *DownloadRoot, oldName, newName string, _ bool) error {
 	directory, err := root.OpenFile(".", os.O_RDONLY, 0)
 	if err != nil {

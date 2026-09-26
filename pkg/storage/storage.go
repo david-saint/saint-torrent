@@ -352,6 +352,9 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
 		}
+		if err := checkNoTrailingSeparator(file.Path); err != nil {
+			return nil, err
+		}
 		// Reject torrent-declared paths whose top-level component collides with an
 		// internal file we keep alongside the content in the download dir: the DHT
 		// routing table (.dht_nodes) and the per-torrent fast-resume state
@@ -423,6 +426,10 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	stateFileInfo := make(map[string]os.FileInfo, len(files))
 	initialInfo := make(map[string]os.FileInfo, len(files))
 	trustedIdentity := make(map[string]string, len(files))
+	// openedObjects catches two layouts that open the same file even though
+	// their names differ after folding: 8.3 short names, normalization forms the
+	// fold does not model, hard links. Both would keep overwriting one file.
+	openedObjects := make(map[fileObjectKey]string, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -453,6 +460,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		if created {
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
+		}
+		if key, ok := fileObjectKeyOf(f, fi); ok {
+			if other, dup := openedObjects[key]; dup {
+				f.Close()
+				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", other, path)
+			}
+			openedObjects[key] = path
 		}
 		// Grow a short file (sparsely), but never shrink one: a torrent naming a
 		// file that already exists must not destroy its tail before a single piece
@@ -1056,9 +1070,11 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 // These names are produced only by our own code (dht.saveNodes writes ".dht_nodes";
 // SaveState writes ".<infohash>.state"), so torrent content must never be allowed
 // to claim them. The check mirrors those literal names rather than importing them,
-// to avoid a storage -> dht import cycle. It compares folded names: on a
-// case-insensitive filesystem ".DHT_NODES" opens the same file.
+// to avoid a storage -> dht import cycle. It compares folded names with trailing
+// dots and spaces removed: on a case-insensitive filesystem ".DHT_NODES" opens
+// the same file, and Windows drops the trailing characters of ".dht_nodes. ".
 func isReservedStorageName(name string) bool {
+	name = strings.TrimRight(name, ". ")
 	// Every reserved name starts with a dot, which folding leaves alone.
 	if !strings.HasPrefix(name, ".") {
 		return false
@@ -1069,6 +1085,22 @@ func isReservedStorageName(name string) bool {
 	}
 	// Per-torrent fast-resume files: a leading dot plus a ".state" suffix.
 	return strings.HasSuffix(name, ".state")
+}
+
+// fileObjectKey names the on-disk object an opened file refers to, the same
+// for every path that reaches it (see fileObjectKeyOf).
+type fileObjectKey struct{ a, b uint64 }
+
+// checkNoTrailingSeparator refuses a layout path ending in a separator. Go's
+// os.Root followed a final symlink for such a path (GO-2026-4970), and the
+// storage relies on os.Root to keep payload I/O inside the download directory.
+// Torrent paths are joined from sanitized components and never end in one, so
+// refusing it keeps that defence independent of the toolchain.
+func checkNoTrailingSeparator(path string) error {
+	if path != "" && os.IsPathSeparator(path[len(path)-1]) {
+		return fmt.Errorf("file path ends in a path separator: %q", path)
+	}
+	return nil
 }
 
 // pathFolder is stateless and safe for concurrent use (see cases.Fold).

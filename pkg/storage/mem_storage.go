@@ -65,6 +65,9 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
 		}
+		if err := checkNoTrailingSeparator(file.Path); err != nil {
+			return nil, err
+		}
 
 		cleanPath := filepath.Clean(file.Path)
 		if resolver != nil {
