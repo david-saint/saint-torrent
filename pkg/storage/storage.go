@@ -1118,3 +1118,11 @@ var pathFolder = cases.Fold()
 func pathKey(p string) string {
 	return norm.NFC.String(pathFolder.String(norm.NFD.String(filepath.Clean(p))))
 }
+
+// PathKey is the key under which two paths name the same file on a case- or
+// normalization-insensitive filesystem: the cleaned path, fully case-folded,
+// in Unicode NFC. The downloader compares keys of resolved payload paths to
+// keep two torrents from sharing a file.
+func PathKey(p string) string {
+	return pathKey(p)
+}

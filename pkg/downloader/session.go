@@ -272,6 +272,11 @@ type Session struct {
 	// metadataInitDone is set while onMetadataDownloaded builds storage without
 	// s.mu and is closed once the result is published; Close waits on it.
 	metadataInitDone chan struct{}
+	// claimPaths reserves the payload paths with the manager before storage is
+	// built on them (nil for a standalone session); releaseClaims gives the
+	// reservation back and is called by the manager, never by Close.
+	claimPaths    func(infoHash [20]byte, baseDir string, files []storage.FileInfo) (release func(), err error)
+	releaseClaims func()
 }
 
 // errSessionClosing reports work refused or abandoned because the session is
@@ -1604,6 +1609,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	if factory == nil {
 		factory = storage.NewStorage
 	}
+	claimPaths := s.claimPaths
 	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
 	// Close waits on initDone, so the storage built below is either published
 	// before Close takes the session's storage or never built at all.
@@ -1616,15 +1622,29 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	var (
 		st            storage.Storage
 		chosen        int
+		releaseClaims func()
 		storageErrors []error
 	)
 	for index, downloadDir := range downloadDirs {
+		// Reserve the payload paths before the factory creates or extends a
+		// file another torrent may be using.
+		var release func()
+		if claimPaths != nil {
+			var claimErr error
+			if release, claimErr = claimPaths(s.Torrent.InfoHash, downloadDir, fileInfos); claimErr != nil {
+				storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, claimErr))
+				continue
+			}
+		}
 		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
 		// Success is decided by the error alone, and a nil pointer boxed in the
 		// interface is refused: installing one crashed the first storage call.
 		if createErr == nil && !isNilStorage(candidate) {
-			st, chosen = candidate, index
+			st, chosen, releaseClaims = candidate, index, release
 			break
+		}
+		if release != nil {
+			release()
 		}
 		if createErr == nil {
 			createErr = errors.New("storage factory returned no storage")
@@ -1650,6 +1670,9 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		// Unreachable while Close waits on initDone; never leak the storage.
 		s.mu.Unlock()
 		_ = st.Close()
+		if releaseClaims != nil {
+			releaseClaims()
+		}
 		return errSessionClosing
 	}
 
@@ -1674,6 +1697,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.PieceStates = pieceStates
 	s.pieceAvailability = pieceAvailability
 	s.Storage = st
+	s.releaseClaims = releaseClaims
 	s.statusErr = nil
 	closing := s.closing
 	storageToVerify := st

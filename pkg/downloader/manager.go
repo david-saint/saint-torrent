@@ -58,6 +58,12 @@ type TorrentManager struct {
 	restoring      bool
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+
+	// pathClaims maps each active torrent's resolved payload paths to that
+	// torrent (see claimPaths). claimMu is a leaf lock: nothing else is taken
+	// while it is held.
+	claimMu    sync.Mutex
+	pathClaims map[pathClaimKey]pathClaim
 }
 
 // SetVerifyOnStartup forces full hashing of the torrents restored on this launch,
@@ -262,6 +268,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 	if sess.storageFactory == nil {
 		sess.storageFactory = m.storageFactory
 	}
+	if sess.claimPaths == nil {
+		sess.claimPaths = m.claimPaths
+	}
 	if m.peerListener != nil {
 		sess.sharedInbound = true
 		sess.Port = m.advertisedPeerPort
@@ -285,6 +294,7 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) {
 		// duplicate-add caller, matching RemoveSession and manager Close teardown.
 		m.announceStoppedAll([]*Session{old})
 		old.Close()
+		old.releasePathClaims()
 	}
 
 	if logging.Enabled() {
@@ -463,6 +473,12 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 				}
 			}
 		}
+	}
+
+	// Only now, with the payload deleted or deliberately kept, may another
+	// torrent take its paths.
+	if sessionToClose != nil {
+		sessionToClose.releasePathClaims()
 	}
 
 	// 4. Delete the cached .torrent file
@@ -663,6 +679,9 @@ func (m *TorrentManager) Close() {
 		}(sess)
 	}
 	closeWG.Wait()
+	for _, sess := range sessions {
+		sess.releasePathClaims()
+	}
 
 	if d != nil {
 		d.Close()
@@ -814,8 +833,18 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 		}
 	}
 
-	st, err := storageFactory(downloadDir, files, tor.PieceLength)
+	// Reserve the payload paths before the factory creates or extends a file
+	// another torrent may be using.
+	releaseClaims, err := m.claimPaths(tor.InfoHash, downloadDir, files)
 	if err != nil {
+		return nil, err
+	}
+	st, err := storageFactory(downloadDir, files, tor.PieceLength)
+	if err == nil && isNilStorage(st) {
+		err = errors.New("storage factory returned no storage")
+	}
+	if err != nil {
+		releaseClaims()
 		return nil, err
 	}
 
@@ -826,9 +855,11 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 	sess, err := newSession(tor, st, peerID, m.AdvertisedPeerPort(), downloadDir, verifyOnStartup)
 	if err != nil {
 		st.Close()
+		releaseClaims()
 		return nil, err
 	}
 	sess.storageFactory = storageFactory
+	sess.releaseClaims = releaseClaims
 
 	sess.OnStateChange = func() {
 		m.saveState()
