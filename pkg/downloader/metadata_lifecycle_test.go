@@ -52,6 +52,12 @@ func TestMetadataWithTrailingDataIsRejected(t *testing.T) {
 	dict := testInfoDict(t, "first.bin")
 	infoBytes := append(dict[:len(dict):len(dict)], "3:xyzi1e"...)
 	sess := newTestMagnetSession(t, infoBytes, memStorageFactory)
+	// The accumulator as the ut_metadata handler leaves it on completion.
+	sess.mu.Lock()
+	sess.metadataSize = len(infoBytes)
+	sess.metadataBuf = append([]byte(nil), infoBytes...)
+	sess.metadataPieces = []bool{true}
+	sess.mu.Unlock()
 
 	if err := sess.onMetadataDownloaded(infoBytes); err == nil {
 		t.Fatal("metadata with a value after the info dict was accepted")
@@ -68,6 +74,11 @@ func TestMetadataWithTrailingDataIsRejected(t *testing.T) {
 	// them again would only repeat the failure.
 	if !sess.metadataCompleted || sess.metadataBuf != nil {
 		t.Fatalf("metadataCompleted=%v buffered=%d, want fetching stopped and the buffer released", sess.metadataCompleted, len(sess.metadataBuf))
+	}
+	// A handshake handler that sized its request loop before this still
+	// indexes the piece map, so it must stay as it was.
+	if sess.metadataSize != len(infoBytes) || len(sess.metadataPieces) != 1 {
+		t.Fatalf("metadataSize=%d pieces=%d, want the piece map kept", sess.metadataSize, len(sess.metadataPieces))
 	}
 }
 

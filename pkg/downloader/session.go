@@ -1569,8 +1569,9 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		keepAccumulator = true
 		s.mu.Lock()
 		s.metadataCompleted = true
+		// metadataSize and metadataPieces stay: a handshake handler that sized
+		// its request loop from them before this point still indexes them.
 		s.metadataBuf = nil
-		s.metadataPieces = nil
 		s.lastErr = err
 		s.statusErr = err
 		s.broadcastPieceWaitersLocked()
