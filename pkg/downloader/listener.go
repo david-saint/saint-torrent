@@ -15,6 +15,14 @@ import (
 // StartPeerListener starts the manager-wide BitTorrent TCP listener. All
 // managed sessions share this socket and are selected by the incoming
 // handshake's info-hash.
+//
+// While it runs, the shared uTP socket (StartDHT) refuses inbound
+// connections (utp.Socket.SetRefuseIncoming). Our uTP writes wait for every
+// packet's ack, about one block per round trip, while libtorrent, uTorrent
+// and Transmission dial uTP first and would otherwise stay on it for the
+// whole connection: refused, they reconnect over TCP at once. Without a TCP
+// listener inbound uTP is accepted, and outbound dials still fall back to uTP
+// when TCP fails (see dialPeer).
 func (m *TorrentManager) StartPeerListener(port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -54,6 +62,9 @@ func (m *TorrentManager) StartPeerListener(port uint16) error {
 		sess.mu.RUnlock()
 	}
 	m.peerListener = listener
+	if m.utpSocket != nil {
+		m.utpSocket.SetRefuseIncoming(true)
+	}
 	m.peerListenPort = uint16(actualPort)
 	m.advertisedPeerPort = uint16(actualPort)
 	m.natStatus.ListenPort = uint16(actualPort)

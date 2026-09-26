@@ -207,6 +207,8 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 		}
 		return err
 	}
+	// Set before the listener exists, so no inbound uTP slips in first.
+	udpSocket.SetRefuseIncoming(m.peerListener != nil)
 	utpListener := udpSocket.Listen()
 
 	m.dht = d

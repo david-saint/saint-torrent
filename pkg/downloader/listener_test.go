@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -96,6 +98,10 @@ func TestManagerSharedUTPListenerRoutesByInfoHash(t *testing.T) {
 		t.Fatalf("failed to start shared UDP/DHT listener: %v", err)
 	}
 	defer mgr.Close()
+	// Inbound uTP is refused while the TCP listener runs (see
+	// StartPeerListener); lift that to exercise the uTP routing, which serves
+	// setups without a TCP listener.
+	mgr.utpSocket.SetRefuseIncoming(false)
 
 	newManagedSession := func(name string) *Session {
 		infoHash := sha1.Sum([]byte(name))
@@ -182,6 +188,7 @@ func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
 		t.Fatalf("failed to start shared UDP/DHT listener: %v", err)
 	}
 	defer mgr.Close()
+	mgr.utpSocket.SetRefuseIncoming(false) // as in TestManagerSharedUTPListenerRoutesByInfoHash
 	sess := newEncryptionTestManagedSession(t, mgr, "encrypted-utp")
 
 	clientSocket, err := utp.NewSocket(0)
@@ -217,6 +224,82 @@ func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// TestManagerRefusesInboundUTPWhileTCPListens pins the inbound uTP policy: a
+// uTP SYN is answered with a RESET while the TCP peer listener runs, whichever
+// was started first, so libtorrent, uTorrent and Transmission reconnect over
+// TCP instead of staying on our stop-and-wait uTP. A manager without a TCP
+// listener still accepts and routes inbound uTP.
+func TestManagerRefusesInboundUTPWhileTCPListens(t *testing.T) {
+	dialUTP := func(t *testing.T, mgr *TorrentManager) (net.Conn, error) {
+		t.Helper()
+		client, err := utp.NewSocket(0)
+		if err != nil {
+			t.Fatalf("client uTP socket: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := client.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", mgr.DHTListenPort()))
+		if err == nil {
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+		return conn, err
+	}
+	expectRefused := func(t *testing.T, mgr *TorrentManager) {
+		t.Helper()
+		conn, err := dialUTP(t, mgr)
+		if err == nil {
+			t.Fatalf("inbound uTP to %s was accepted while the TCP listener runs", conn.RemoteAddr())
+		}
+		// A RESET fails the dial at once; a SYN left unanswered would run
+		// into the dial's deadline, which a libtorrent peer waits out too.
+		if errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "reset") {
+			t.Fatalf("inbound uTP dial failed with %v, want a reset", err)
+		}
+	}
+
+	t.Run("tcp-first", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartPeerListener(0); err != nil {
+			t.Fatalf("start peer listener: %v", err)
+		}
+		if err := mgr.StartDHT(t.TempDir(), int(mgr.PeerListenPort())); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		newEncryptionTestManagedSession(t, mgr, "refuse-utp-tcp-first")
+		expectRefused(t, mgr)
+	})
+	t.Run("dht-first", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartDHT(t.TempDir(), 0); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		if err := mgr.StartPeerListener(0); err != nil {
+			t.Fatalf("start peer listener: %v", err)
+		}
+		newEncryptionTestManagedSession(t, mgr, "refuse-utp-dht-first")
+		expectRefused(t, mgr)
+	})
+	t.Run("no-tcp-listener", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartDHT(t.TempDir(), 0); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		sess := newEncryptionTestManagedSession(t, mgr, "accept-utp")
+		conn, err := dialUTP(t, mgr)
+		if err != nil {
+			t.Fatalf("inbound uTP without a TCP listener: %v", err)
+		}
+		handshakeOver(t, conn, sess.Torrent.InfoHash)
+		waitForCondition(t, "the uTP peer to be routed", func() bool {
+			return len(sess.GetActivePeers()) == 1
+		})
+	})
 }
 
 func waitForCondition(t *testing.T, what string, cond func() bool) {
