@@ -1647,3 +1647,37 @@ func TestLockErrors(t *testing.T) {
 		t.Error("expected fatal error to not be errLockContention")
 	}
 }
+
+// TestDeleteKeepingCrossSeedFilesIsNotAnError: a removal that kept files a
+// cross-seed still uses went through, so the TUI shows it as a note and
+// returns to the list instead of showing a deletion error.
+func TestDeleteKeepingCrossSeedFilesIsNotAnError(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	m := initialModel(mgr, ".", "", nil)
+	const infoHashHex = "642e85596f7a0dd05eefdb78b0ac1736496f8626"
+	m.viewMode = viewDeleteConfirm
+	m.deleteTargetHash = infoHashHex
+	m.deleteInProgress = true
+
+	updated, _ := m.Update(deleteFinishedMsg{
+		infoHashHex: infoHashHex,
+		err:         &downloader.FilesKeptError{Kept: 1, Example: "shared.bin"},
+	})
+	m = updated.(model)
+	if m.deleteErr != nil || m.viewMode != viewList || m.deleteInProgress {
+		t.Fatalf("after a removal that kept files: deleteErr=%v view=%v inProgress=%v, want the list and no error", m.deleteErr, m.viewMode, m.deleteInProgress)
+	}
+	if !strings.Contains(m.flash, "kept 1 file(s)") {
+		t.Fatalf("flash %q does not mention the kept file", m.flash)
+	}
+
+	// A real failure still stops on the error.
+	m.viewMode = viewDeleteConfirm
+	m.deleteInProgress = true
+	updated, _ = m.Update(deleteFinishedMsg{infoHashHex: infoHashHex, err: errors.New("disk on fire")})
+	m = updated.(model)
+	if m.deleteErr == nil || m.viewMode != viewDeleteConfirm {
+		t.Fatalf("after a failed removal: deleteErr=%v view=%v, want the error shown", m.deleteErr, m.viewMode)
+	}
+}

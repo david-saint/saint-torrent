@@ -1936,3 +1936,39 @@ func TestEnablePersistenceRemovesStaleTempFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestRemoveSessionReportsKeptFilesAsErrFilesKept: removing one of two
+// cross-seeds with its files keeps the file the other uses. That is not a
+// failed removal, so it is reported as ErrFilesKept rather than as an error
+// among others.
+func TestRemoveSessionReportsKeptFilesAsErrFilesKept(t *testing.T) {
+	downloadDir := t.TempDir()
+	torrentDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	first, firstHash := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "one")
+	cross, _ := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "two")
+	if _, err := mgr.AddTorrentFile(first, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AddTorrentFile(cross, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+	err := mgr.RemoveSession(fmt.Sprintf("%x", firstHash), true)
+	if !errors.Is(err, ErrFilesKept) {
+		t.Fatalf("RemoveSession = %v, want ErrFilesKept", err)
+	}
+	var kept *FilesKeptError
+	if !errors.As(err, &kept) || kept.Kept != 1 || kept.Example != "shared.bin" {
+		t.Fatalf("RemoveSession = %#v, want one kept file, shared.bin", err)
+	}
+	if strings.Contains(err.Error(), "removal completed with errors") {
+		t.Fatalf("kept files reported as a failed removal: %v", err)
+	}
+	if mgr.GetSession(fmt.Sprintf("%x", firstHash)) != nil {
+		t.Fatal("the session was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(downloadDir, "shared.bin")); err != nil {
+		t.Fatalf("the shared file was deleted: %v", err)
+	}
+}

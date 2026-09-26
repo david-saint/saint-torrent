@@ -366,9 +366,31 @@ func (m *TorrentManager) removeSessionSecretLocked(sess *Session) {
 	m.secretKeys.remove(sess.Torrent.InfoHash)
 }
 
+// ErrFilesKept reports a removal that went through except that some of the
+// torrent's files were kept because another torrent (a cross-seed) still uses
+// them. It is not a failure; RemoveSession returns it as a *FilesKeptError.
+var ErrFilesKept = errors.New("files kept for another torrent")
+
+// FilesKeptError is what RemoveSession returns when the only thing it did not
+// do was delete Kept files another torrent still uses, such as Example.
+// errors.Is(err, ErrFilesKept) matches it.
+type FilesKeptError struct {
+	Kept    int
+	Example string
+}
+
+func (e *FilesKeptError) Error() string {
+	return fmt.Sprintf("kept %d file(s) another torrent still uses, such as %q", e.Kept, e.Example)
+}
+
+// Is makes errors.Is(err, ErrFilesKept) report a FilesKeptError.
+func (e *FilesKeptError) Is(target error) bool { return target == ErrFilesKept }
+
 // RemoveSession stops the session associated with the given info hash, removes it from the manager,
 // and deletes state files. If deleteFiles is true, it also deletes the downloaded files.
-// It returns any aggregated errors encountered during the removal process.
+// It returns any aggregated errors encountered during the removal process, or a
+// *FilesKeptError (errors.Is ErrFilesKept) when the only thing left undone is
+// deleting files another torrent still uses.
 func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) error {
 	removalKey := strings.ToLower(infoHashHex)
 	m.mu.Lock()
@@ -427,6 +449,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 	var torrentFiles []torrent.File
 	var infoHash [20]byte
 	var errs []error
+	var kept *FilesKeptError
 
 	// 1. Close session if active (this will block until all goroutines exit)
 	if ok {
@@ -479,7 +502,11 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		if downloadDir == "" {
 			errs = append(errs, fmt.Errorf("cannot delete files: download directory is empty"))
 		} else if len(torrentFiles) > 0 {
-			errs = append(errs, m.deletePayload(infoHash, downloadDir, torrentFiles)...)
+			var deleteErr error
+			kept, deleteErr = m.deletePayload(infoHash, downloadDir, torrentFiles)
+			if deleteErr != nil {
+				errs = append(errs, deleteErr)
+			}
 		}
 	}
 
@@ -506,6 +533,10 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		for _, e := range errs {
 			errStrs = append(errStrs, e.Error())
 		}
+		if kept != nil {
+			// Not an error in itself, but worth saying next to the real ones.
+			errStrs = append(errStrs, kept.Error())
+		}
 		err := fmt.Errorf("removal completed with errors: %s", strings.Join(errStrs, "; "))
 		if logging.Enabled() {
 			logging.Warn("session_remove_failed",
@@ -520,7 +551,11 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		logging.Info("session_removed",
 			logging.String("info_hash", infoHashHex),
 			logging.Bool("delete_files", deleteFiles),
+			logging.Bool("files_kept", kept != nil),
 		)
+	}
+	if kept != nil {
+		return kept
 	}
 	return nil
 }
@@ -529,25 +564,25 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 // storage.RemoveFiles, which anchors every step to a handle on the download
 // directory: a symlink or Windows junction planted in the tree, or a
 // directory swapped for one mid-removal, cannot redirect the delete. Files
-// another active torrent uses are kept and reported.
-func (m *TorrentManager) deletePayload(infoHash [20]byte, downloadDir string, files []torrent.File) []error {
+// another active torrent uses are kept and reported in kept (nil when none
+// were); err reports a failed delete.
+func (m *TorrentManager) deletePayload(infoHash [20]byte, downloadDir string, files []torrent.File) (kept *FilesKeptError, err error) {
 	relPaths := make([]string, len(files))
 	for i, f := range files {
 		relPaths[i] = filepath.Join(f.Path...)
 	}
 	// The paths deleted stay reserved until the delete is done, so no torrent
 	// can be added on them meanwhile.
-	free, kept, release := m.claimFreePaths(infoHash, downloadDir, relPaths)
+	free, keptPaths, release := m.claimFreePaths(infoHash, downloadDir, relPaths)
 	defer release()
 
-	var errs []error
-	if len(kept) > 0 {
-		errs = append(errs, fmt.Errorf("kept %d file(s) another torrent still uses, such as %q", len(kept), kept[0]))
+	if len(keptPaths) > 0 {
+		kept = &FilesKeptError{Kept: len(keptPaths), Example: keptPaths[0]}
 	}
-	if _, err := storage.RemoveFiles(downloadDir, free); err != nil {
-		errs = append(errs, fmt.Errorf("failed to delete files: %w", err))
+	if _, removeErr := storage.RemoveFiles(downloadDir, free); removeErr != nil {
+		err = fmt.Errorf("failed to delete files: %w", removeErr)
 	}
-	return errs
+	return kept, err
 }
 
 // GetSession retrieves a session by its info hash hex string.

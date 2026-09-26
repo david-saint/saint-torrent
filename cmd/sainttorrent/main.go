@@ -966,6 +966,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.deleteInProgress = false
 		m.refreshSessions()
+		if errors.Is(msg.err, downloader.ErrFilesKept) {
+			// Removed; only files a cross-seed still uses were kept.
+			m.flash = "Removed; " + msg.err.Error()
+			m.resumePendingOr(viewList)
+			return m, nil
+		}
 		if msg.err != nil {
 			m.deleteErr = msg.err
 			m.viewMode = viewDeleteConfirm
