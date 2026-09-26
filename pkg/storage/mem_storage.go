@@ -109,6 +109,14 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 	if currentOffset > int64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("total file length overflows addressable memory")
 	}
+	// The whole torrent lives in one allocation, so a torrent larger than the
+	// machine's physical memory can never complete here. Refuse it up front:
+	// asking the runtime for that much fails with a fatal out-of-memory error
+	// that takes the process down, not with an error the caller could handle.
+	// Anything up to physical memory is committed lazily as pieces arrive.
+	if limit, ok := physicalMemory(); ok && uint64(currentOffset) > limit {
+		return nil, fmt.Errorf("torrent size %d exceeds this machine's %d bytes of physical memory, which the mem backend must hold it in", currentOffset, limit)
+	}
 
 	return &MemStorage{
 		baseDir:     resolvedBase,

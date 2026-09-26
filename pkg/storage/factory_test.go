@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -42,5 +43,19 @@ func TestFactoriesReturnUntypedNilOnError(t *testing.T) {
 	st, err := NewStorageWithBackend(BackendFile, t.TempDir(), bad["reserved name"], 16)
 	if err == nil || st != nil {
 		t.Fatalf("NewStorageWithBackend = %T(%v), %v; want untyped nil and an error", st, st, err)
+	}
+}
+
+// TestMemStorageRejectsTorrentsLargerThanRAM: the mem backend allocated the
+// declared total in one make(), so a torrent declaring more than the machine
+// could ever hold died with a fatal, unrecoverable out-of-memory error as soon
+// as it was added.
+func TestMemStorageRejectsTorrentsLargerThanRAM(t *testing.T) {
+	if _, ok := physicalMemory(); !ok && (runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows") {
+		t.Fatal("physicalMemory is unknown on a platform that reports it")
+	}
+	st, err := NewMemStorage("", []FileInfo{{Path: "x.bin", Length: 1 << 46}}, 1<<24)
+	if err == nil || st != nil {
+		t.Fatalf("NewMemStorage(64 TiB) = %v, %v; want an error", st, err)
 	}
 }
