@@ -67,6 +67,22 @@ var peerKeepAliveInterval = 30 * time.Second
 // constant.
 var peerIdleTickInterval = 30 * time.Second
 
+// peerInterestScanInterval bounds how often an Interested from one connection may
+// scan every known peer to decide whether to unchoke it at once. Between scans
+// the peer is only marked interested and the next choke round (every 10 s)
+// decides, so a peer flipping Interested and NotInterested cannot make us walk
+// the peer map under the session write lock per 5-byte message. A var so tests
+// can change it; treat it as a constant.
+var peerInterestScanInterval = 10 * time.Second
+
+// interestScanHook, when set, is called each time an Interested runs the unchoke
+// scan. Tests use it to count scans.
+var interestScanHook func()
+
+// chokeTransitionHook, when set, is called each time a peer's choke state changes
+// (a choke or unchoke that is not a repeat). Tests use it to count them.
+var chokeTransitionHook func(choked bool)
+
 // unsolicitedFloodSlack is how many bytes of piece data we did not ask for (or no
 // longer wait for) a connection may send beyond the late-block allowance before
 // it is dropped as a flood; see the MsgPiece handler.
@@ -1922,12 +1938,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// in-progress piece that another peer has finished (so its state is no longer
 	// PieceDownloading) and sends a Cancel for each of our still-outstanding blocks so
 	// the peer stops feeding us data the swarm no longer needs. Bounded by
-	// the adaptive per-peer piece cap, so it is cheap to run every message.
+	// the adaptive per-peer piece cap, so it is cheap to run every message: it
+	// takes only the read lock unless it has something to drop (pump publishes
+	// the pipeline snapshot, throttled, after every message anyway).
 	dropCompletedElsewhere := func() {
 		if len(activeDownloads) == 0 {
 			return
 		}
-		now := time.Now()
 		var finished []int64
 		s.mu.RLock()
 		for _, dl := range activeDownloads {
@@ -1937,6 +1954,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 		s.mu.RUnlock()
+		if len(finished) == 0 {
+			return
+		}
+		now := time.Now()
 		for _, idx := range finished {
 			dl := findDownload(idx)
 			if dl == nil {
@@ -2329,6 +2350,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	keepAliveDue := func(now time.Time) bool {
 		return now.Sub(lastKeepAliveCheck) >= peerKeepAliveInterval-tickInterval/2
 	}
+
+	// peerChoking mirrors pState.Choked, which only this loop changes once the
+	// connection is registered (choked, as every connection starts), so a repeated
+	// choke or unchoke is recognised without the session lock.
+	peerChoking := true
+	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
+	// peerInterestScanInterval.
+	var lastInterestScanAt time.Time
 peerLoop:
 	for {
 		pooledMsg.Release()
@@ -2565,6 +2594,16 @@ peerLoop:
 			}
 
 		case peer.MsgChoke:
+			// A repeat changes nothing: skip the session lock, the release pass and
+			// the forced snapshot, which a peer re-sending chokes would otherwise
+			// cost us per 5-byte message. Like any message it still runs pump below.
+			if peerChoking {
+				break
+			}
+			peerChoking = true
+			if chokeTransitionHook != nil {
+				chokeTransitionHook(true)
+			}
 			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = true
@@ -2591,6 +2630,13 @@ peerLoop:
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgUnchoke:
+			if !peerChoking {
+				break // a repeat changes nothing; see MsgChoke
+			}
+			peerChoking = false
+			if chokeTransitionHook != nil {
+				chokeTransitionHook(false)
+			}
 			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = false
@@ -2616,28 +2662,46 @@ peerLoop:
 			if alreadyInterested {
 				break
 			}
-			lastActiveAt = time.Now()
+			now := time.Now()
+			lastActiveAt = now
+			// Unchoking a newly interested peer at once, when fewer than four
+			// interested peers are unchoked, takes a walk over every known peer. A
+			// peer flipping its interest gets that walk at most once per
+			// peerInterestScanInterval; in between it is only marked interested
+			// and the choke round decides.
+			scan := lastInterestScanAt.IsZero() || now.Sub(lastInterestScanAt) >= peerInterestScanInterval
 			s.mu.Lock()
 			pState.Interested = true
-			unchokedInterested := 0
-			for _, candidate := range s.Peers {
-				if candidate.Active && candidate.Interested && !candidate.AmChoking {
-					unchokedInterested++
+			if scan && pState.AmChoking {
+				lastInterestScanAt = now
+				if interestScanHook != nil {
+					interestScanHook()
+				}
+				unchokedInterested := 0
+				for _, candidate := range s.Peers {
+					if candidate.Active && candidate.Interested && !candidate.AmChoking {
+						unchokedInterested++
+					}
+				}
+				if unchokedInterested < 4 {
+					pState.AmChoking = false
 				}
 			}
-			if pState.AmChoking && unchokedInterested < 4 {
-				pState.AmChoking = false
-			}
+			amChoking := pState.AmChoking
 			s.mu.Unlock()
-			syncChoke()
+			applyChoke(amChoking)
 
 		case peer.MsgNotInterested:
-			s.mu.Lock()
-			if pState.Interested {
-				// Only a change counts as activity: repeating not-interested
-				// must not keep an idle connection alive.
-				lastActiveAt = time.Now()
+			// Only a change takes the write lock (and counts as activity:
+			// repeating not-interested must not keep an idle connection alive).
+			s.mu.RLock()
+			wasInterested := pState.Interested
+			s.mu.RUnlock()
+			if !wasInterested {
+				break
 			}
+			lastActiveAt = time.Now()
+			s.mu.Lock()
 			pState.Interested = false
 			s.mu.Unlock()
 

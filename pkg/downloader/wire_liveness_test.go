@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
+	"sainttorrent/pkg/storage"
+	"sainttorrent/pkg/torrent"
 )
 
 // livenessPeerA1 is the remote end of a runPeerMessageLoop connection over
@@ -324,5 +327,134 @@ func TestLateBlocksAfterChokeAreNotAFlood(t *testing.T) {
 	}
 	if got := reasons(p.addr); got != "unsolicited_flood" {
 		t.Fatalf("disconnect reason %q, want unsolicited_flood", got)
+	}
+}
+
+// newDataWireSessionA1 is a downloading session whose piece hashes match data.
+func newDataWireSessionA1(t *testing.T, numPieces int, pieceLen int64) (*Session, []byte) {
+	t.Helper()
+	data := make([]byte, int64(numPieces)*pieceLen)
+	for i := range data {
+		data[i] = byte(i*7 + 3)
+	}
+	hashes := make([][20]byte, numPieces)
+	for i := range hashes {
+		hashes[i] = sha1.Sum(data[int64(i)*pieceLen : int64(i+1)*pieceLen])
+	}
+	tor := &torrent.Torrent{
+		Name:        "liveness.bin",
+		InfoHash:    sha1.Sum([]byte("liveness-test")),
+		PieceLength: pieceLen,
+		PieceHashes: hashes,
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"liveness.bin"}}},
+	}
+	st, err := storage.NewMemStorage(t.TempDir(), []storage.FileInfo{{Path: "liveness.bin", Length: int64(len(data))}}, pieceLen)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, t.TempDir())
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	t.Cleanup(sess.Close)
+	return settled(sess), data
+}
+
+// A repeated choke changes nothing: it takes no session lock and must not release
+// (or re-release) the allowed-fast downloads kept across the first choke, whose
+// outstanding requests the peer may still serve.
+func TestRepeatedChokeKeepsAllowedFastDownloads(t *testing.T) {
+	var transitions atomic.Int32
+	orig := chokeTransitionHook
+	chokeTransitionHook = func(bool) { transitions.Add(1) }
+	t.Cleanup(func() { chokeTransitionHook = orig })
+
+	const pieceLen = 4 * BlockSize
+	sess, data := newDataWireSessionA1(t, 8, pieceLen)
+	p := startLivenessPeerA1(t, sess, 7706, false)
+	p.send(&peer.Message{ID: peer.MsgHaveAll})
+	p.send(&peer.Message{ID: peer.MsgAllowedFast, Payload: havePayload(0)})
+	p.send(&peer.Message{ID: peer.MsgUnchoke})
+	var fast [][3]uint32
+	for _, r := range p.requestsA1() {
+		if r[0] == 0 {
+			fast = append(fast, r)
+		}
+	}
+	if len(fast) == 0 {
+		t.Fatal("the allowed-fast piece was not requested")
+	}
+
+	for i := 0; i < 20; i++ {
+		p.send(&peer.Message{ID: peer.MsgChoke})
+	}
+	p.requestsA1()
+	if n := transitions.Load(); n != 2 {
+		t.Fatalf("%d choke transitions, want 2 (one unchoke, one choke)", n)
+	}
+	sess.mu.RLock()
+	state := sess.PieceStates[0]
+	sess.mu.RUnlock()
+	if state != PieceDownloading {
+		t.Fatalf("allowed-fast piece state %v after repeated chokes, want downloading", state)
+	}
+
+	// Its outstanding blocks are still accepted.
+	before := sess.Downloaded.Load()
+	for _, r := range fast {
+		off := int64(r[0])*pieceLen + int64(r[1])
+		frame := pieceFrameA1(r[0], r[1], r[2])
+		copy(frame[13:], data[off:off+int64(r[2])])
+		p.write(frame)
+	}
+	p.requestsA1()
+	if got, want := sess.Downloaded.Load()-before, int64(len(fast))*BlockSize; got != want {
+		t.Fatalf("accepted %d bytes of the allowed-fast piece after repeated chokes, want %d", got, want)
+	}
+}
+
+// A peer flipping Interested and NotInterested gets the unchoke scan of every
+// known peer at most once per peerInterestScanInterval; in between it is only
+// marked interested.
+func TestInterestFlipsScanOncePerInterval(t *testing.T) {
+	var scans atomic.Int32
+	orig := interestScanHook
+	interestScanHook = func() { scans.Add(1) }
+	t.Cleanup(func() { interestScanHook = orig })
+	t.Cleanup(swapDuration(&peerInterestScanInterval, time.Second))
+
+	sess, _ := newSeedingWireTestSession(t, 4, 16*1024)
+	settled(sess)
+	// Four interested peers are unchoked already, so the scan never unchokes this
+	// one and every Interested would scan again.
+	sess.mu.Lock()
+	for i := 0; i < 4; i++ {
+		sess.Peers[fmt.Sprintf("10.0.0.%d:6881", i+1)] = &PeerState{Active: true, Interested: true, AmChoking: false}
+	}
+	sess.mu.Unlock()
+	p := startLivenessPeerA1(t, sess, 7707, false)
+
+	for i := 0; i < 50; i++ {
+		p.send(&peer.Message{ID: peer.MsgInterested})
+		p.send(&peer.Message{ID: peer.MsgNotInterested})
+	}
+	p.send(&peer.Message{ID: peer.MsgInterested})
+	p.requestsA1()
+	if n := scans.Load(); n != 1 {
+		t.Fatalf("a burst of interest flips ran %d unchoke scans, want 1", n)
+	}
+	sess.mu.RLock()
+	interested := sess.Peers[p.addr].Interested
+	sess.mu.RUnlock()
+	if !interested {
+		t.Fatal("the peer's final Interested was not recorded")
+	}
+
+	time.Sleep(peerInterestScanInterval + 50*time.Millisecond)
+	p.send(&peer.Message{ID: peer.MsgNotInterested})
+	p.send(&peer.Message{ID: peer.MsgInterested})
+	p.requestsA1()
+	if n := scans.Load(); n != 2 {
+		t.Fatalf("%d unchoke scans after the interval passed, want 2", n)
 	}
 }

@@ -94,6 +94,8 @@ func TestPeerWithNothingWeNeedIsNotRescannedPerMessage(t *testing.T) {
 // TestRestrictedEmptyPickIsRedoneOnUnchoke checks the other side of the flip
 // rule: an empty pick that set aside pieces the peer rejected is redone when an
 // unchoke clears the rejections, at once rather than after pickRetryInterval.
+// Only an unchoke that follows a choke counts: a repeated unchoke changes
+// nothing.
 func TestRestrictedEmptyPickIsRedoneOnUnchoke(t *testing.T) {
 	sess := newWireTestSession(t, 1, 2*BlockSize)
 	w := startWirePeer(t, sess, 6252, fastReserved())
@@ -106,6 +108,7 @@ func TestRestrictedEmptyPickIsRedoneOnUnchoke(t *testing.T) {
 	w.send(&peer.Message{ID: peer.MsgRejectRequest, Payload: blockPayload(0, 0, BlockSize)})
 	w.barrier()
 
+	w.send(&peer.Message{ID: peer.MsgChoke})
 	w.send(&peer.Message{ID: peer.MsgUnchoke})
 	w.expectRequestFor(0, 2*time.Second)
 }

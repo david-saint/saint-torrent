@@ -1569,7 +1569,11 @@ func TestFastExtensionUnchokeClearsRejectedPiece(t *testing.T) {
 	}
 
 	// A fresh unchoke signals the peer is willing again, so the rejection clears and
-	// the piece becomes requestable from this peer once more.
+	// the piece becomes requestable from this peer once more. (A repeated unchoke
+	// without a choke in between changes nothing.)
+	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgChoke}).Serialize()); err != nil {
+		t.Fatalf("failed to send choke: %v", err)
+	}
 	if _, err := remoteConn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize()); err != nil {
 		t.Fatalf("failed to send second unchoke: %v", err)
 	}
