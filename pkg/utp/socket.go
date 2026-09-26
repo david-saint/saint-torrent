@@ -38,6 +38,13 @@ const (
 	// rest, so copying more only costs the shared read loop a 64 KiB copy per
 	// junk datagram and lets the DHT queue pin up to 64 MiB.
 	maxDHTDatagram = 4096
+
+	// readErrorBackoffMin and readErrorBackoffMax bound the pause after a
+	// failed read of the shared socket (see readLoop): the first failure
+	// waits the minimum, each consecutive one doubles it up to the maximum,
+	// and a successful read starts over.
+	readErrorBackoffMin = 10 * time.Millisecond
+	readErrorBackoffMax = 250 * time.Millisecond
 )
 
 var errListenerClosed = errors.New("utp: listener closed")
@@ -78,6 +85,9 @@ func newConnKey(addr *net.UDPAddr, id uint16) connKey {
 // through DHTConn so the DHT and uTP can share one UDP port.
 type Socket struct {
 	conn *net.UDPConn
+	// readFrom reads the next datagram for readLoop. It is conn.ReadFromUDP;
+	// tests substitute it to inject read errors.
+	readFrom func([]byte) (int, *net.UDPAddr, error)
 
 	mu       sync.Mutex
 	conns    map[connKey]*Conn
@@ -126,8 +136,17 @@ func NewSocket(listenPort int) (*Socket, error) {
 func NewSocketFromUDP(conn *net.UDPConn) *Socket {
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
+	s := newSocket(conn, conn.ReadFromUDP)
+	go s.readLoop()
+	return s
+}
+
+// newSocket builds a Socket around conn that reads through readFrom, without
+// starting its read loop.
+func newSocket(conn *net.UDPConn, readFrom func([]byte) (int, *net.UDPAddr, error)) *Socket {
 	s := &Socket{
 		conn:     conn,
+		readFrom: readFrom,
 		conns:    make(map[connKey]*Conn),
 		halfOpen: make(map[connKey]*halfOpenConn),
 		done:     make(chan struct{}),
@@ -137,7 +156,6 @@ func NewSocketFromUDP(conn *net.UDPConn) *Socket {
 		return &b
 	}
 	s.dhtConn = newPacketConn(s)
-	go s.readLoop()
 	return s
 }
 
@@ -242,17 +260,17 @@ func (s *Socket) writePacket(p packet, addr *net.UDPAddr) error {
 
 func (s *Socket) readLoop() {
 	buf := make([]byte, 64*1024)
+	var backoff time.Duration
 	for {
-		n, addr, err := s.conn.ReadFromUDP(buf)
+		n, addr, err := s.readFrom(buf)
 		if err != nil {
-			select {
-			case <-s.done:
-				return
-			default:
-				s.Close()
+			backoff = nextReadErrorBackoff(backoff)
+			if !s.pauseAfterReadError(err, backoff) {
 				return
 			}
+			continue
 		}
+		backoff = 0
 		if IsPacket(buf[:n]) {
 			// handleUTPPacket runs synchronously in this goroutine and the
 			// Conn copies any payload it retains (into readBuf or the pending
@@ -266,6 +284,45 @@ func (s *Socket) readLoop() {
 		data := append([]byte(nil), buf[:min(n, maxDHTDatagram)]...)
 		s.dhtConn.deliver(udpPacket{data: data, addr: cloneUDPAddr(addr)})
 	}
+}
+
+// pauseAfterReadError handles a failed read of the shared socket and reports
+// whether readLoop should read again. Only a closed socket ends the loop. The
+// socket carries every uTP conn and the DHT, and other read errors (ENOBUFS
+// or ENOMEM under memory pressure, an ICMP error some platforms surface on
+// the next read) are transient, so giving up on one would disable uTP and the
+// DHT until restart. Those wait out backoff instead, so a persistent error
+// cannot spin the loop; Close cuts the wait short.
+func (s *Socket) pauseAfterReadError(err error, backoff time.Duration) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	if errors.Is(err, net.ErrClosed) {
+		// The UDP socket was closed without Close, which owns it: nothing
+		// more can arrive, so release the conns, the listener and the DHT
+		// view instead of leaving them waiting on a dead socket.
+		_ = s.Close()
+		return false
+	}
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// nextReadErrorBackoff returns the pause after a failed read given the pause
+// after the previous consecutive failure, zero if there was none.
+func nextReadErrorBackoff(prev time.Duration) time.Duration {
+	if prev < readErrorBackoffMin {
+		return readErrorBackoffMin
+	}
+	return min(2*prev, readErrorBackoffMax)
 }
 
 func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {

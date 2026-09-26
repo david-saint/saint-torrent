@@ -3,9 +3,12 @@ package utp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1333,5 +1336,263 @@ func sendHandshakeAck(t *testing.T, conn *net.UDPConn, target *net.UDPAddr, syn,
 	}
 	if _, err := conn.WriteToUDP(ack.marshal(), target); err != nil {
 		t.Fatalf("send handshake ACK: %v", err)
+	}
+}
+
+// faultyReader is a Socket.readFrom that fails with each error queued in errs
+// before reading from conn, and reports every call on calls.
+type faultyReader struct {
+	conn  *net.UDPConn
+	errs  chan error
+	calls chan readCall
+}
+
+type readCall struct {
+	at     time.Time
+	failed bool
+}
+
+func (r *faultyReader) readFrom(b []byte) (int, *net.UDPAddr, error) {
+	call := readCall{at: time.Now()}
+	var err error
+	select {
+	case err = <-r.errs:
+		call.failed = true
+	default:
+	}
+	select {
+	case r.calls <- call:
+	default:
+	}
+	if err != nil {
+		return 0, nil, err
+	}
+	return r.conn.ReadFromUDP(b)
+}
+
+// nextCall returns the read loop's next call to readFrom.
+func (r *faultyReader) nextCall(t *testing.T) readCall {
+	t.Helper()
+	select {
+	case c := <-r.calls:
+		return c
+	case <-time.After(5 * time.Second):
+		t.Fatal("read loop stopped reading")
+		return readCall{}
+	}
+}
+
+// startFaultySocket runs a Socket on a loopback UDP socket whose reads first
+// fail with errs, in order. The returned channel is closed when the read loop
+// exits.
+func startFaultySocket(t *testing.T, errs ...error) (*Socket, *faultyReader, <-chan struct{}) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("udp socket: %v", err)
+	}
+	r := &faultyReader{conn: conn, errs: make(chan error, 16), calls: make(chan readCall, 1024)}
+	for _, e := range errs {
+		r.errs <- e
+	}
+	s := newSocket(conn, r.readFrom)
+	exited := make(chan struct{})
+	go func() {
+		s.readLoop()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = s.Close()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("read loop did not exit after Close")
+		}
+	})
+	return s, r, exited
+}
+
+func transientReadError(errno syscall.Errno) error {
+	return &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", errno)}
+}
+
+func socketClosed(s *Socket) bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// TestReadLoopSurvivesTransientReadErrors checks that a read error other than
+// a closed socket (ENOBUFS or ENOMEM under memory pressure, an ICMP-induced
+// error) no longer closes the shared socket, which took every uTP conn, the
+// listener and the DHT down with it until restart. uTP and DHT datagrams
+// that arrive afterwards are still handled.
+func TestReadLoopSurvivesTransientReadErrors(t *testing.T) {
+	s, r, exited := startFaultySocket(t,
+		transientReadError(syscall.ENOBUFS),
+		transientReadError(syscall.ENOMEM),
+		transientReadError(syscall.ECONNREFUSED),
+	)
+	ln := s.Listen()
+	peer := newRawPeer(t, s)
+
+	dhtPayload := []byte("d1:t2:aa1:y1:qe")
+	if _, err := peer.conn.WriteToUDP(dhtPayload, peer.target); err != nil {
+		t.Fatalf("send DHT datagram: %v", err)
+	}
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 64)
+		if n, _, err := s.DHTConn().ReadFromUDP(buf); err == nil {
+			got <- buf[:n]
+		}
+	}()
+	select {
+	case b := <-got:
+		if !bytes.Equal(b, dhtPayload) {
+			t.Fatalf("DHT datagram %q, want %q", b, dhtPayload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DHT datagram was not delivered after transient read errors")
+	}
+
+	accepted := acceptAsync(ln)
+	syn := packet{connID: 7300, seqNr: 40}
+	synAck := peer.synAck(syn)
+	peer.send(packet{typ: packetTypeState, connID: syn.connID + 1, seqNr: syn.seqNr + 1, ackNr: synAck.seqNr - 1})
+	expectAccept(t, accepted, "uTP conn after transient read errors")
+
+	failed := 0
+	for len(r.calls) > 0 {
+		if (<-r.calls).failed {
+			failed++
+		}
+	}
+	if failed != 3 {
+		t.Fatalf("read loop saw %d failed reads, want 3", failed)
+	}
+	if socketClosed(s) {
+		t.Fatal("a transient read error closed the socket")
+	}
+	select {
+	case <-exited:
+		t.Fatal("a transient read error ended the read loop")
+	default:
+	}
+}
+
+// TestReadLoopStopsWhenSocketCloses checks that the read loop still ends at
+// once when the socket is gone: on net.ErrClosed from a UDP socket closed
+// underneath it, and on Close while it waits out a read-error backoff.
+func TestReadLoopStopsWhenSocketCloses(t *testing.T) {
+	t.Run("ErrClosed", func(t *testing.T) {
+		s, _, exited := startFaultySocket(t, &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed})
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("read loop kept running after net.ErrClosed")
+		}
+		// Nothing more can be read, so the Socket is closed rather than
+		// leaving DHT reads and Accept waiting on it forever.
+		if !socketClosed(s) {
+			t.Fatal("socket left open after its UDP socket was closed")
+		}
+		if _, _, err := s.DHTConn().ReadFromUDP(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("DHT read after net.ErrClosed: %v, want %v", err, net.ErrClosed)
+		}
+	})
+
+	t.Run("Close during backoff", func(t *testing.T) {
+		// The pause after the sixth consecutive failure reaches
+		// readErrorBackoffMax, so the seventh is followed by a long wait.
+		const failures = 7
+		errs := make([]error, failures)
+		for i := range errs {
+			errs[i] = transientReadError(syscall.ENOBUFS)
+		}
+		s, r, exited := startFaultySocket(t, errs...)
+		for seen := 0; seen < failures; {
+			if r.nextCall(t).failed {
+				seen++
+			}
+		}
+		closedAt := time.Now()
+		_ = s.Close()
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("read loop did not exit after Close")
+		}
+		// Had the wait ignored Close, the loop would have read once more
+		// after it before noticing.
+		for len(r.calls) > 0 {
+			if c := <-r.calls; c.at.After(closedAt) {
+				t.Fatalf("read loop read again %v after Close instead of ending its backoff", c.at.Sub(closedAt))
+			}
+		}
+	})
+}
+
+// TestReadErrorBackoffIsBounded checks the pause after consecutive failed
+// reads: readErrorBackoffMin at first, doubling up to readErrorBackoffMax,
+// and back to the minimum once a read succeeds.
+func TestReadErrorBackoffIsBounded(t *testing.T) {
+	want := []time.Duration{
+		10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond,
+		160 * time.Millisecond, 250 * time.Millisecond, 250 * time.Millisecond,
+	}
+	var d time.Duration
+	for i, w := range want {
+		if d = nextReadErrorBackoff(d); d != w {
+			t.Fatalf("pause after failure %d = %v, want %v", i+1, d, w)
+		}
+	}
+
+	errs := make([]error, len(want))
+	for i := range errs {
+		errs[i] = transientReadError(syscall.ENOBUFS)
+	}
+	s, r, _ := startFaultySocket(t, errs...)
+	prev := r.nextCall(t)
+	for i, w := range want {
+		next := r.nextCall(t)
+		if !prev.failed {
+			t.Fatalf("call %d succeeded before the queued failures ran out", i+1)
+		}
+		// Timers never fire early, so each gap is at least its pause. The
+		// last pause would be twice readErrorBackoffMax without the cap.
+		gap := next.at.Sub(prev.at)
+		if gap < w {
+			t.Fatalf("read %v after failure %d, want a pause of at least %v", gap, i+1, w)
+		}
+		if i == len(want)-1 && gap >= 2*readErrorBackoffMax {
+			t.Fatalf("read %v after failure %d, want the pause capped at %v", gap, i+1, readErrorBackoffMax)
+		}
+		prev = next
+	}
+	if prev.failed {
+		t.Fatal("read after the queued failures failed")
+	}
+
+	// prev is the loop's blocking read. A datagram completes it, and the
+	// failure queued before that follows a success, so it pauses the minimum
+	// again rather than readErrorBackoffMax.
+	r.errs <- transientReadError(syscall.ENOBUFS)
+	if _, err := r.conn.WriteToUDP([]byte("d1:ae"), r.conn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("send datagram: %v", err)
+	}
+	failedCall := r.nextCall(t)
+	next := r.nextCall(t)
+	if !failedCall.failed || next.failed {
+		t.Fatalf("calls after the datagram failed=%v,%v, want true,false", failedCall.failed, next.failed)
+	}
+	if gap := next.at.Sub(failedCall.at); gap < readErrorBackoffMin || gap >= readErrorBackoffMax {
+		t.Fatalf("read %v after a failure that followed a success, want a pause of %v", gap, readErrorBackoffMin)
+	}
+	if socketClosed(s) {
+		t.Fatal("read errors closed the socket")
 	}
 }
