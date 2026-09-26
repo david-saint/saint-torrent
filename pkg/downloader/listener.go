@@ -216,26 +216,28 @@ func handshakeSource(addr net.Addr) (netip.Addr, bool) {
 }
 
 // admitHandshakeSource counts one more pre-handshake connection from src. The
-// caller already holds a handshake slot. While at most half the budget is in
-// use any source is admitted, so a burst from one address (a cross-seeding
-// box dialing us for many torrents at once) is not slowed; past that, a
-// source holding maxInboundHandshakesPerSource is turned away. One host
-// holding idle sockets can then take about half the budget, not all of it,
-// and the rest stays open to every other peer.
+// caller already holds a handshake slot. While fewer than half the budget's
+// handshakes are in flight any source is admitted, so a burst from one
+// address (a cross-seeding box dialing us for many torrents at once) is not
+// slowed; past that, a source holding maxInboundHandshakesPerSource is turned
+// away. One host holding idle sockets can then take half the budget, not all
+// of it, and the rest stays open to every other peer.
 func (m *TorrentManager) admitHandshakeSource(src netip.Addr) bool {
 	m.handshakeSourcesMu.Lock()
 	defer m.handshakeSourcesMu.Unlock()
 	n := m.handshakeSources[src]
-	if n >= maxInboundHandshakesPerSource && len(m.inboundHandshakeSlots) > maxInboundHandshakes/2 {
+	if n >= maxInboundHandshakesPerSource && m.sourcedHandshakes >= maxInboundHandshakes/2 {
 		return false
 	}
 	m.handshakeSources[src] = n + 1
+	m.sourcedHandshakes++
 	return true
 }
 
 func (m *TorrentManager) releaseHandshakeSource(src netip.Addr) {
 	m.handshakeSourcesMu.Lock()
 	defer m.handshakeSourcesMu.Unlock()
+	m.sourcedHandshakes--
 	if n := m.handshakeSources[src]; n > 1 {
 		m.handshakeSources[src] = n - 1
 	} else {

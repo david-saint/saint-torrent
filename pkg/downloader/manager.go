@@ -40,6 +40,7 @@ type TorrentManager struct {
 	inboundHandshakeSlots chan struct{} // see maxInboundHandshakes
 	handshakeSourcesMu    sync.Mutex
 	handshakeSources      map[netip.Addr]int // pre-handshake conns per source; see admitHandshakeSource
+	sourcedHandshakes     int                // sum of handshakeSources
 	peerListener          net.Listener
 	utpListener           net.Listener
 	peerListenPort        uint16
