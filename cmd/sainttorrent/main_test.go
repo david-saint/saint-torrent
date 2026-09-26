@@ -45,12 +45,12 @@ func TestGetSpaceActionHelp(t *testing.T) {
 
 func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	defaults := parseCLIArgs(nil)
-	if defaults.listenPort != defaultPeerPort || defaults.httpAddr != "" || defaults.headless || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
+	if defaults.listenPort != defaultPeerPort || defaults.httpAddr != "" || defaults.httpAllowRemote || defaults.headless || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn", "--fallback-dir", "/fallback/one", "--fallback-dir", "/fallback/two"})
-	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
+	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--http-allow-remote", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn", "--fallback-dir", "/fallback/one", "--fallback-dir", "/fallback/two"})
+	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.httpAllowRemote || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 	if overrides.logPath != "/tmp/sainttorrent.log" || !overrides.logLevelSet || overrides.logLevel != logging.LevelWarn {
@@ -119,7 +119,7 @@ func TestParseCLIArgsHelpAndVersion(t *testing.T) {
 
 func TestUsageTextMentionsKeyFlags(t *testing.T) {
 	usage := usageText()
-	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage"} {
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage text missing %q", want)
 		}
@@ -283,6 +283,20 @@ func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
 	}
 	if !strings.Contains(got, "Warning: "+warning+"\n") {
 		t.Fatalf("warning message missing warning prefix: %q", got)
+	}
+}
+
+// In TUI mode the stats endpoint address (and the warning for a network-
+// reachable bind) must reach the startup line, not only headless stderr.
+func TestTUIStartupLineIncludesInfos(t *testing.T) {
+	const endpoint = "HTTP stats endpoint: http://0.0.0.0:16666/stats"
+	const warning = "HTTP stats API on 0.0.0.0:16666 is reachable from the network without authentication"
+	got := tuiStartupLine([]string{endpoint}, []string{warning})
+	if got != endpoint+"; "+warning {
+		t.Fatalf("startup line = %q", got)
+	}
+	if got := tuiStartupLine(nil, nil); got != "" {
+		t.Fatalf("empty startup line = %q", got)
 	}
 }
 

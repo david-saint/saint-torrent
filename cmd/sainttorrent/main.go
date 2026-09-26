@@ -182,6 +182,7 @@ type cliOptions struct {
 	theme                string
 	listenPort           int
 	httpAddr             string
+	httpAllowRemote      bool
 	natEnabled           bool
 	encryption           mse.Policy
 	storage              storage.Backend
@@ -1220,6 +1221,9 @@ Options:
       --no-persist          Do not persist fast-resume state
       --recheck             Fully hash-check restored torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
+                            (loopback only, e.g. 127.0.0.1:16666)
+      --http-allow-remote   Allow --http-addr on a LAN or wildcard address; the
+                            API has no authentication
       --log <path>          Write JSON-lines debug logs to a rotating file
       --log-level <level>   Log level: debug, info, warn, or error
       --write-config <path> Write a default config file and exit
@@ -1303,6 +1307,8 @@ func parseCLIArgs(args []string) cliOptions {
 			}
 			opts.httpAddr = args[i+1]
 			i++
+		case "--http-allow-remote":
+			opts.httpAllowRemote = true
 		case "--no-nat":
 			opts.natEnabled = false
 		case "--encryption":
@@ -1892,7 +1898,7 @@ func main() {
 
 	var statsServer *httpapi.Server
 	if opts.httpAddr != "" {
-		statsServer, err = httpapi.Start(opts.httpAddr, mgr)
+		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{AllowRemote: opts.httpAllowRemote})
 		if err != nil {
 			listener.Close()
 			acceptLoopWG.Wait()
@@ -1901,9 +1907,15 @@ func main() {
 			handlersWG.Wait()
 			mgr.Close()
 			fmt.Fprintf(os.Stderr, "Error starting HTTP stats endpoint on %s: %v\n", opts.httpAddr, err)
+			if errors.Is(err, httpapi.ErrNotLoopback) {
+				fmt.Fprintln(os.Stderr, "Use a loopback address such as 127.0.0.1:16666, or pass --http-allow-remote to expose it without authentication.")
+			}
 			os.Exit(1)
 		}
 		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
+		if !statsServer.Loopback() {
+			startupWarns = append(startupWarns, fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr()))
+		}
 	}
 	perfMarkf("http-stats")
 
@@ -1962,10 +1974,7 @@ func main() {
 		})
 	}
 
-	startupWarn := ""
-	if len(startupWarns) > 0 {
-		startupWarn = strings.Join(startupWarns, "; ")
-	}
+	startupWarn := tuiStartupLine(startupInfos, startupWarns)
 
 	var p *tea.Program
 	if !opts.headless {
@@ -2057,6 +2066,13 @@ func waitForShutdownSignal() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	signal.Stop(sigCh)
+}
+
+// tuiStartupLine joins startup infos and warnings into the TUI's single
+// startup line, so a TUI user also sees where the stats API is listening.
+// Headless mode prints them separately via writeHeadlessStartupMessages.
+func tuiStartupLine(infos, warns []string) string {
+	return strings.Join(append(append([]string(nil), infos...), warns...), "; ")
 }
 
 func writeHeadlessStartupMessages(w io.Writer, infos []string, warns []string) {

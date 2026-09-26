@@ -26,7 +26,7 @@ func TestStatsHandlerReturnsManagerAndTorrentSnapshot(t *testing.T) {
 	infoHash := fmt.Sprintf("%x", sess.Torrent.InfoHash)
 	mgr.AddSession(infoHash, sess)
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:16666/stats", nil)
 	rec := httptest.NewRecorder()
 
 	NewHandler(mgr).ServeHTTP(rec, req)
@@ -101,13 +101,13 @@ func TestHealthzAndMethodHandling(t *testing.T) {
 	handler := NewHandler(nil)
 
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:16666/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("health status = %d, want %d", rec.Code, http.StatusOK)
 	}
 
 	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stats", nil))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:16666/stats", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST /stats status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
 	}
@@ -117,7 +117,7 @@ func TestHealthzAndMethodHandling(t *testing.T) {
 }
 
 func TestStartServesHealthzAndShutdown(t *testing.T) {
-	server, err := Start("127.0.0.1:0", nil)
+	server, err := Start("127.0.0.1:0", nil, Options{})
 	if err != nil {
 		t.Fatalf("start server: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestStartServesHealthzAndShutdown(t *testing.T) {
 }
 
 func TestStartConfiguresWriteAndIdleTimeouts(t *testing.T) {
-	server, err := Start("127.0.0.1:0", nil)
+	server, err := Start("127.0.0.1:0", nil, Options{})
 	if err != nil {
 		t.Fatalf("start server: %v", err)
 	}
