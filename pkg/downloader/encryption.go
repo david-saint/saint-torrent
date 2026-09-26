@@ -6,7 +6,6 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	"maps"
 	"net"
 	"sync"
 	"time"
@@ -77,51 +76,62 @@ func (c *bufferedConn) UnderlyingConn() net.Conn {
 	return c.Conn
 }
 
-// secretKeySet indexes the managed torrents by the obfuscated info hash an MSE
-// initiator sends (mse.ObfuscatedHash), so an inbound handshake finds its
+// secretKeyIndex indexes the managed torrents by the obfuscated info hash an
+// MSE initiator sends (mse.ObfuscatedHash), so an inbound handshake finds its
 // torrent with one map lookup instead of hashing every managed info hash.
-// It is copy-on-write: with and without return a new set and never modify
-// the receiver, so a snapshot taken under TorrentManager.mu stays valid, and
-// lock-free, after the lock is released.
-type secretKeySet map[[sha1.Size]byte]secretKeyEntry
+// It has its own lock rather than being a copy-on-write snapshot: a lookup
+// still never waits on TorrentManager.mu, and adding or removing a torrent
+// stays O(1) instead of cloning the whole index, which made restoring N
+// torrents at startup O(N²) under the manager lock.
+type secretKeyIndex struct {
+	mu     sync.RWMutex
+	byHash map[[sha1.Size]byte]secretKeyEntry
+}
 
 type secretKeyEntry struct {
 	infoHash [20]byte
 	refs     int // sessions sharing this info hash
 }
 
-func (s secretKeySet) with(infoHash [20]byte) secretKeySet {
-	next := maps.Clone(s)
-	if next == nil {
-		next = make(secretKeySet, 1)
-	}
+func (x *secretKeyIndex) add(infoHash [20]byte) {
 	key := mse.ObfuscatedHash(infoHash[:])
-	e := next[key]
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.byHash == nil {
+		x.byHash = make(map[[sha1.Size]byte]secretKeyEntry)
+	}
+	e := x.byHash[key]
 	e.infoHash = infoHash
 	e.refs++
-	next[key] = e
-	return next
+	x.byHash[key] = e
 }
 
-func (s secretKeySet) without(infoHash [20]byte) secretKeySet {
+func (x *secretKeyIndex) remove(infoHash [20]byte) {
 	key := mse.ObfuscatedHash(infoHash[:])
-	e, ok := s[key]
-	if !ok {
-		return s
-	}
-	next := maps.Clone(s)
-	if e.refs > 1 {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	e, ok := x.byHash[key]
+	switch {
+	case !ok:
+	case e.refs > 1:
 		e.refs--
-		next[key] = e
-	} else {
-		delete(next, key)
+		x.byHash[key] = e
+	default:
+		delete(x.byHash, key)
 	}
-	return next
 }
 
-// lookup is an mse.SecretKeyLookup over the set.
-func (s secretKeySet) lookup(obfuscated [sha1.Size]byte) ([]byte, bool) {
-	e, ok := s[obfuscated]
+func (x *secretKeyIndex) clear() {
+	x.mu.Lock()
+	x.byHash = nil
+	x.mu.Unlock()
+}
+
+// lookup is an mse.SecretKeyLookup over the index.
+func (x *secretKeyIndex) lookup(obfuscated [sha1.Size]byte) ([]byte, bool) {
+	x.mu.RLock()
+	e, ok := x.byHash[obfuscated]
+	x.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}

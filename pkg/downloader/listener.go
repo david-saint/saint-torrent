@@ -183,10 +183,9 @@ func (m *TorrentManager) readRoutedHandshake(conn net.Conn) (net.Conn, *peer.Han
 	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
 	m.mu.RLock()
 	policy := m.encryptionPolicy
-	secrets := m.secretKeys
 	m.mu.RUnlock()
 
-	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secrets.lookup)
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, m.secretKeys.lookup)
 	if err != nil {
 		return nil, nil, nil
 	}
