@@ -176,6 +176,24 @@ func (w *wirePeer) expect(id peer.MessageID, timeout time.Duration) *peer.Messag
 	}
 }
 
+// collect returns every message that arrives until the connection has been quiet
+// for idle (or closes).
+func (w *wirePeer) collect(idle time.Duration) []*peer.Message {
+	w.t.Helper()
+	var out []*peer.Message
+	for {
+		select {
+		case msg, ok := <-w.in:
+			if !ok {
+				return out
+			}
+			out = append(out, msg)
+		case <-time.After(idle):
+			return out
+		}
+	}
+}
+
 // barrier waits until the loop has processed everything sent before it. A request
 // for a piece index that cannot exist always draws a reject_request from a
 // fast-extension connection, and messages are handled in order, so seeing that

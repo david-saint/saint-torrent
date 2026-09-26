@@ -1334,6 +1334,46 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// other goroutines, so it needs no lock.
 	var uploadQueue []uploadRequest
 
+	// uploadChoked is our AmChoking for this peer as last seen by this loop.
+	// noteUploadChoke drops the queued requests when we start choking the peer:
+	// BEP 3 says a choke discards pending requests, and BEP 6 wants a reject for
+	// each one from a fast peer. Allowed-fast requests stay queued. Without this a
+	// peer could fill the queue just before the choke round and still be served up
+	// to maxUploadQueue blocks after it.
+	uploadChoked := false
+	noteUploadChoke := func(amChoking bool) {
+		if !amChoking {
+			uploadChoked = false
+			return
+		}
+		if uploadChoked {
+			return
+		}
+		uploadChoked = true
+		kept := uploadQueue[:0]
+		for _, r := range uploadQueue {
+			if _, ok := allowedFastForPeer[r.index]; ok {
+				kept = append(kept, r)
+				continue
+			}
+			if fastEnabled {
+				_ = client.SendRejectRequest(uint32(r.index), uint32(r.begin), uint32(r.length))
+			}
+		}
+		uploadQueue = kept
+	}
+	// refreshUploadChoke reads AmChoking for paths that do not already hold s.mu;
+	// it only takes the lock when there is a queue to drop.
+	refreshUploadChoke := func() {
+		if len(uploadQueue) == 0 {
+			return
+		}
+		s.mu.RLock()
+		amChoking := pState.AmChoking
+		s.mu.RUnlock()
+		noteUploadChoke(amChoking)
+	}
+
 	// pump re-arms timed-out requests, then fills the request window across all
 	// active pieces, opening new pieces as needed. Called after each inbound
 	// message — INCLUDING keep-alives — so the pipeline stays full across piece
@@ -1990,6 +2030,7 @@ peerLoop:
 			rateRetry = nil
 			// The timer covers whichever pump was waiting on bandwidth: re-run both the
 			// download request pump and the upload serve pump, then re-arm for the sooner.
+			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		case <-s.ctx.Done():
@@ -2003,6 +2044,7 @@ peerLoop:
 			// time out (and the peer is dropped after its retry budget) instead of the
 			// keep-alive merely resetting the read deadline and stalling forever. Also
 			// drain any queued uploads that have since accrued bandwidth.
+			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		}
@@ -2011,7 +2053,9 @@ peerLoop:
 		inMetaNow := s.metadataMode
 		numPiecesNow := len(s.PieceStates)
 		metadataEpochNow := s.metadataEpoch
+		amChokingNow := pState.AmChoking
 		s.mu.RUnlock()
+		noteUploadChoke(amChokingNow)
 
 		// A failed metadata assembly started a new fetch round: re-ask this peer
 		// for the blocks that are still missing.
@@ -2392,6 +2436,7 @@ peerLoop:
 					pieceLen = s.Storage.PieceLength(index)
 				}
 				s.mu.RUnlock()
+				noteUploadChoke(amChoking)
 				_, requestAllowedFast := allowedFastForPeer[index]
 
 				if paused || (amChoking && !requestAllowedFast) {
@@ -2428,6 +2473,25 @@ peerLoop:
 					}
 				} else if fastEnabled && length > 0 {
 					_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+				}
+			}
+
+		case peer.MsgCancel:
+			// Drop the cancelled block from the upload queue so it is not read from
+			// disk and sent anyway. Under BEP 6 a fast peer gets a reject for it.
+			if len(msg.Payload) != 12 {
+				continue
+			}
+			index := int64(binary.BigEndian.Uint32(msg.Payload[0:4]))
+			begin := int64(binary.BigEndian.Uint32(msg.Payload[4:8]))
+			length := int64(binary.BigEndian.Uint32(msg.Payload[8:12]))
+			for i, r := range uploadQueue {
+				if r.index == index && r.begin == begin && r.length == length {
+					uploadQueue = append(uploadQueue[:i], uploadQueue[i+1:]...)
+					if fastEnabled {
+						_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+					}
+					break
 				}
 			}
 
