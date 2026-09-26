@@ -36,8 +36,12 @@ func init() {
 
 // maxPEXPerInterval is how many ut_pex messages one connection may send within
 // one pexInterval; the next one inside it drops the connection. libtorrent
-// allows the same three a minute, so no client that works with it is dropped.
-const maxPEXPerInterval = 3
+// keeps the arrival times of the last six (ut_pex.cpp) and drops a peer on its
+// seventh within a minute, so no client that works with it is dropped here.
+// Honest clients send one a minute or less often, but we time a message when
+// the loop reads it, and messages that queued while the loop was stalled (on
+// disk backpressure, say) are read back to back.
+const maxPEXPerInterval = 6
 
 // pexRateLimiter decides, per connection, which ut_pex messages we act on. It
 // is owned by the connection's message loop.
