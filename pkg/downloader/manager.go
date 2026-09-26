@@ -48,7 +48,7 @@ type TorrentManager struct {
 	encryptionPolicy      mse.Policy
 	verifyOnStartup       bool
 	storageFactory        storage.Factory
-	secretKeys            [][20]byte
+	secretKeys            secretKeySet
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	wg                    sync.WaitGroup
@@ -303,26 +303,14 @@ func (m *TorrentManager) addSessionSecretLocked(sess *Session) {
 	if sess == nil || sess.Torrent == nil {
 		return
 	}
-	next := make([][20]byte, 0, len(m.secretKeys)+1)
-	next = append(next, m.secretKeys...)
-	next = append(next, sess.Torrent.InfoHash)
-	m.secretKeys = next
+	m.secretKeys = m.secretKeys.with(sess.Torrent.InfoHash)
 }
 
 func (m *TorrentManager) removeSessionSecretLocked(sess *Session) {
 	if sess == nil || sess.Torrent == nil {
 		return
 	}
-	target := sess.Torrent.InfoHash
-	for i, secret := range m.secretKeys {
-		if secret == target {
-			next := make([][20]byte, 0, len(m.secretKeys)-1)
-			next = append(next, m.secretKeys[:i]...)
-			next = append(next, m.secretKeys[i+1:]...)
-			m.secretKeys = next
-			return
-		}
-	}
+	m.secretKeys = m.secretKeys.without(sess.Torrent.InfoHash)
 }
 
 // RemoveSession stops the session associated with the given info hash, removes it from the manager,

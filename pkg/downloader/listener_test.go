@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"fmt"
@@ -225,38 +226,64 @@ func TestManagerSecretKeysSnapshotTracksSessionLifecycle(t *testing.T) {
 	secondHex := fmt.Sprintf("%x", second.Torrent.InfoHash)
 
 	mgr.AddSession(firstHex, first)
+	before := mgr.secretKeySnapshot()
 	mgr.AddSession(secondHex, second)
 
-	mgr.mu.RLock()
-	secrets := append([][20]byte(nil), mgr.secretKeys...)
-	mgr.mu.RUnlock()
+	secrets := mgr.secretKeySnapshot()
 	if len(secrets) != 2 || !hasSecret(secrets, first.Torrent.InfoHash) || !hasSecret(secrets, second.Torrent.InfoHash) {
-		t.Fatalf("unexpected cached secrets after add: %x", secrets)
+		t.Fatalf("unexpected cached secrets after add: %v", secrets)
+	}
+	// A snapshot taken earlier is never modified, so it can be read
+	// without the manager lock.
+	if len(before) != 1 || !hasSecret(before, first.Torrent.InfoHash) {
+		t.Fatalf("earlier snapshot changed: %v", before)
 	}
 
 	if err := mgr.RemoveSession(firstHex, false); err != nil {
 		t.Fatalf("remove first session: %v", err)
 	}
-	mgr.mu.RLock()
-	secrets = append([][20]byte(nil), mgr.secretKeys...)
-	mgr.mu.RUnlock()
+	secrets = mgr.secretKeySnapshot()
 	if len(secrets) != 1 || hasSecret(secrets, first.Torrent.InfoHash) || !hasSecret(secrets, second.Torrent.InfoHash) {
-		t.Fatalf("unexpected cached secrets after remove: %x", secrets)
+		t.Fatalf("unexpected cached secrets after remove: %v", secrets)
 	}
 
 	mgr.Close()
-	mgr.mu.RLock()
-	defer mgr.mu.RUnlock()
-	if len(mgr.secretKeys) != 0 {
-		t.Fatalf("expected cached secrets to clear on close, got %x", mgr.secretKeys)
+	if secrets := mgr.secretKeySnapshot(); len(secrets) != 0 {
+		t.Fatalf("expected cached secrets to clear on close, got %v", secrets)
 	}
 }
 
-func hasSecret(secrets [][20]byte, want [20]byte) bool {
-	for _, secret := range secrets {
-		if secret == want {
-			return true
-		}
+// TestSecretKeySetLookupAndRefcount checks the obfuscated-hash index: a
+// lookup by HASH('req2', infohash) finds the info hash, and an info hash
+// added twice stays until removed twice, as the old list of keys did.
+func TestSecretKeySetLookupAndRefcount(t *testing.T) {
+	a := sha1.Sum([]byte("a"))
+	b := sha1.Sum([]byte("b"))
+	var set secretKeySet
+	set = set.with(a).with(b).with(a)
+	if got, ok := set.lookup(mse.ObfuscatedHash(a[:])); !ok || !bytes.Equal(got, a[:]) {
+		t.Fatalf("lookup(a) = %x, %v", got, ok)
 	}
-	return false
+	if _, ok := set.lookup(sha1.Sum(a[:])); ok {
+		t.Fatal("lookup by the plain info hash must not match")
+	}
+	set = set.without(a)
+	if _, ok := set.lookup(mse.ObfuscatedHash(a[:])); !ok {
+		t.Fatal("info hash added twice was dropped by a single removal")
+	}
+	set = set.without(a).without(sha1.Sum([]byte("never added")))
+	if _, ok := set.lookup(mse.ObfuscatedHash(a[:])); ok || len(set) != 1 {
+		t.Fatalf("after removals: len=%d, a still present=%v", len(set), ok)
+	}
+}
+
+func (m *TorrentManager) secretKeySnapshot() secretKeySet {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.secretKeys
+}
+
+func hasSecret(secrets secretKeySet, want [20]byte) bool {
+	got, ok := secrets.lookup(mse.ObfuscatedHash(want[:]))
+	return ok && bytes.Equal(got, want[:])
 }

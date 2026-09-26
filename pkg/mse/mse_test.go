@@ -477,8 +477,74 @@ func TestWrapConnRejectsUnknownMethod(t *testing.T) {
 	}
 }
 
-func singleSecret(skey []byte) SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		callback(skey)
+func manySecrets(n int) [][]byte {
+	skeys := make([][]byte, n)
+	for i := range skeys {
+		sum := sha1.Sum([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		skeys[i] = sum[:]
 	}
+	return skeys
+}
+
+// TestReceiveMatchesSecretKeyWithOneLookup checks that the receiver finds the
+// initiator's torrent among many with a single lookup of the obfuscated
+// hash. It used to hash every managed info hash per handshake (about 3 ms at
+// 10k torrents), which a peer could trigger at almost no cost of its own.
+func TestReceiveMatchesSecretKeyWithOneLookup(t *testing.T) {
+	skeys := manySecrets(10000)
+	index := SecretKeys(skeys...)
+	var mu sync.Mutex
+	lookups := 0
+	counted := func(obfuscated [sha1.Size]byte) ([]byte, bool) {
+		mu.Lock()
+		lookups++
+		mu.Unlock()
+		return index(obfuscated)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	want := skeys[7777]
+	errs := make(chan error, 1)
+	go func() {
+		_, _, err := Initiate(clientConn, want, nil, CryptoMethodRC4)
+		errs <- err
+	}()
+	_, res, err := Receive(serverConn, counted, SelectRC4)
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("Initiate: %v", err)
+	}
+	if !bytes.Equal(res.SecretKey, want) {
+		t.Fatalf("matched secret %x, want %x", res.SecretKey, want)
+	}
+	if lookups != 1 {
+		t.Fatalf("receiver did %d lookups, want 1", lookups)
+	}
+}
+
+// BenchmarkMatchSecretKey measures matching an inbound handshake against 10k
+// torrents, the per-handshake cost a seedbox pays for every inbound
+// encrypted connection.
+func BenchmarkMatchSecretKey(b *testing.B) {
+	skeys := manySecrets(10000)
+	h := &handshaker{skeys: SecretKeys(skeys...)}
+	copy(h.s[:], bytes.Repeat([]byte{0x5a}, keyLen))
+	got := hash(req2, skeys[9999])
+	xorInPlace(got, got, hash(req3, h.s[:]))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := h.matchSecretKey(got); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func singleSecret(skey []byte) SecretKeyLookup {
+	return SecretKeys(skey)
 }

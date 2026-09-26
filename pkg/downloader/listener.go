@@ -147,7 +147,7 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	secrets := m.secretKeys
 	m.mu.RUnlock()
 
-	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(secrets...))
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secrets.lookup)
 	if err != nil {
 		return
 	}

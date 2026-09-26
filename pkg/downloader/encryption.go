@@ -3,8 +3,10 @@ package downloader
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"sync"
 	"time"
@@ -73,17 +75,58 @@ func (c *bufferedConn) UnderlyingConn() net.Conn {
 	return c.Conn
 }
 
-func secretKeyIter(secrets ...[20]byte) mse.SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		for i := range secrets {
-			if !callback(secrets[i][:]) {
-				return
-			}
-		}
-	}
+// secretKeySet indexes the managed torrents by the obfuscated info hash an MSE
+// initiator sends (mse.ObfuscatedHash), so an inbound handshake finds its
+// torrent with one map lookup instead of hashing every managed info hash.
+// It is copy-on-write: with and without return a new set and never modify
+// the receiver, so a snapshot taken under TorrentManager.mu stays valid, and
+// lock-free, after the lock is released.
+type secretKeySet map[[sha1.Size]byte]secretKeyEntry
+
+type secretKeyEntry struct {
+	infoHash [20]byte
+	refs     int // sessions sharing this info hash
 }
 
-func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.SecretKeyIter) (net.Conn, mse.Result, bool, error) {
+func (s secretKeySet) with(infoHash [20]byte) secretKeySet {
+	next := maps.Clone(s)
+	if next == nil {
+		next = make(secretKeySet, 1)
+	}
+	key := mse.ObfuscatedHash(infoHash[:])
+	e := next[key]
+	e.infoHash = infoHash
+	e.refs++
+	next[key] = e
+	return next
+}
+
+func (s secretKeySet) without(infoHash [20]byte) secretKeySet {
+	key := mse.ObfuscatedHash(infoHash[:])
+	e, ok := s[key]
+	if !ok {
+		return s
+	}
+	next := maps.Clone(s)
+	if e.refs > 1 {
+		e.refs--
+		next[key] = e
+	} else {
+		delete(next, key)
+	}
+	return next
+}
+
+// lookup is an mse.SecretKeyLookup over the set.
+func (s secretKeySet) lookup(obfuscated [sha1.Size]byte) ([]byte, bool) {
+	e, ok := s[obfuscated]
+	if !ok {
+		return nil, false
+	}
+	return e.infoHash[:], true
+}
+
+func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.SecretKeyLookup) (net.Conn, mse.Result, bool, error) {
 	buffered := newBufferedConn(conn)
 	if policy == mse.PolicyDisable {
 		return buffered, mse.Result{}, false, nil
@@ -153,7 +196,7 @@ func (s *Session) parseIncomingHandshake(conn net.Conn) (net.Conn, *peer.Handsha
 	infoHash := s.Torrent.InfoHash
 	s.mu.RUnlock()
 
-	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(infoHash))
+	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, mse.SecretKeys(infoHash[:]))
 	if err != nil {
 		return nil, nil, err
 	}

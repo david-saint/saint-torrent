@@ -74,9 +74,29 @@ func ParsePolicy(s string) (Policy, error) {
 	}
 }
 
-// SecretKeyIter visits acceptable torrent info hashes for a receiver. Returning
-// false from callback stops iteration.
-type SecretKeyIter func(callback func(skey []byte) bool)
+// SecretKeyLookup resolves the obfuscated form in which an initiator names
+// its torrent, HASH('req2', SKEY) (see ObfuscatedHash), to SKEY, normally the
+// info hash. It reports false when no acceptable torrent matches.
+type SecretKeyLookup func(obfuscated [sha1.Size]byte) (skey []byte, ok bool)
+
+// ObfuscatedHash returns HASH('req2', skey), the form in which an initiator
+// names its torrent. A receiver precomputes it once per torrent, so matching
+// a handshake is one lookup rather than a hash of every torrent it serves.
+func ObfuscatedHash(skey []byte) [sha1.Size]byte {
+	return sha1.Sum(append(append([]byte(nil), req2...), skey...))
+}
+
+// SecretKeys returns a lookup over a fixed set of secret keys.
+func SecretKeys(skeys ...[]byte) SecretKeyLookup {
+	byHash := make(map[[sha1.Size]byte][]byte, len(skeys))
+	for _, skey := range skeys {
+		byHash[ObfuscatedHash(skey)] = append([]byte(nil), skey...)
+	}
+	return func(obfuscated [sha1.Size]byte) ([]byte, bool) {
+		skey, ok := byHash[obfuscated]
+		return skey, ok
+	}
+}
 
 // Result describes a completed MSE handshake.
 type Result struct {
@@ -255,7 +275,7 @@ type handshaker struct {
 	out   *asyncWriter
 	s     [keyLen]byte
 	skey  []byte
-	skeys SecretKeyIter
+	skeys SecretKeyLookup
 }
 
 // Initiate performs the outgoing MSE handshake using skey, normally the torrent
@@ -286,9 +306,9 @@ func Initiate(conn net.Conn, skey []byte, initialPayload []byte, methods CryptoM
 // Receive performs the incoming MSE handshake. selectMethod chooses one method
 // from the initiator-provided bitmask and must return either CryptoMethodRC4,
 // CryptoMethodPlaintext, or 0 to reject the peer.
-func Receive(conn net.Conn, skeys SecretKeyIter, selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
+func Receive(conn net.Conn, skeys SecretKeyLookup, selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
 	if skeys == nil {
-		return nil, Result{}, errors.New("mse: nil secret-key iterator")
+		return nil, Result{}, errors.New("mse: nil secret-key lookup")
 	}
 	if selectMethod == nil {
 		selectMethod = SelectRC4
@@ -526,22 +546,17 @@ func (h *handshaker) postPadded(key []byte) error {
 	return h.out.post(b)
 }
 
+// matchSecretKey resolves the initiator's HASH('req2', SKEY) xor
+// HASH('req3', S). Undoing the xor leaves the obfuscated hash, so the match
+// costs one hash and one lookup however many torrents the receiver serves.
 func (h *handshaker) matchSecretKey(got []byte) error {
-	expectedReq3 := hash(req3, h.s[:])
-	var match []byte
-	h.skeys(func(skey []byte) bool {
-		req2Hash := hash(req2, skey)
-		xorInPlace(req2Hash, req2Hash, expectedReq3)
-		if bytes.Equal(req2Hash, got) {
-			match = append([]byte(nil), skey...)
-			return false
-		}
-		return true
-	})
-	if match == nil {
+	var obfuscated [sha1.Size]byte
+	xorInPlace(obfuscated[:], got, hash(req3, h.s[:]))
+	skey, ok := h.skeys(obfuscated)
+	if !ok {
 		return ErrNoSecretKeyMatch
 	}
-	h.skey = match
+	h.skey = append([]byte(nil), skey...)
 	return nil
 }
 
