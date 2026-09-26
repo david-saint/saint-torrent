@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
@@ -489,7 +490,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	}
 	acquiredSlots = true
 
-	conn, err := s.dialPeer(peerAddr)
+	conn, transport, err := s.dialPeer(peerAddr)
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
 		if logging.Enabled() {
@@ -500,7 +501,6 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 		return
 	}
-	tunePeerConn(conn)
 
 	// Spawn context monitor before encryption negotiation so shutdown interrupts
 	// both MSE handshakes and the later peer-wire message loop.
@@ -521,39 +521,37 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 	}()
 
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn, connMonitor)
+	out, step, err := s.handshakeOutgoingPeer(peerAddr, conn, transport, connMonitor, s.dialPeer)
+	if err != nil && out.transport == "utp" && isTimeoutErr(err) && s.ctx.Err() == nil {
+		// The uTP connection came up but the handshake over it timed out: most
+		// often a peer running an older saintTorrent, whose uTP numbering
+		// stalls against ours, or a path that passes uTP's SYN but not its
+		// data. Retry once, straight away and over TCP only, in the slots
+		// already held, instead of charging the peer a failed attempt.
+		if tcpConn, _, tcpErr := s.dialPeerTCP(peerAddr); tcpErr != nil {
+			err = errors.Join(err, tcpErr)
+		} else {
+			out, step, err = s.handshakeOutgoingPeer(peerAddr, tcpConn, "tcp", connMonitor, s.dialPeerTCP)
+		}
+	}
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
 		if logging.Enabled() {
-			logging.Debug("peer_negotiation_failed",
+			event := "peer_handshake_failed"
+			if step == "negotiation" {
+				event = "peer_negotiation_failed"
+			}
+			logging.Debug(event,
 				logging.String("peer", peerAddr),
+				logging.String("transport", out.transport),
 				logging.Err(err),
 			)
 		}
 		return
 	}
-	connMonitor.set(conn)
+	conn = out.conn
 	defer conn.Close()
-
-	// Handshake with deadline
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
-	s.mu.RLock()
-	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
-	s.mu.RUnlock()
-	handshake, err := client.Handshake()
-	if err != nil {
-		s.markPeerAttemptFailed(peerAddr)
-		if logging.Enabled() {
-			logging.Debug("peer_handshake_failed",
-				logging.String("peer", peerAddr),
-				logging.Err(err),
-			)
-		}
-		return
-	}
-	_ = conn.SetDeadline(time.Time{}) // clear deadline
+	client, handshake := out.client, out.handshake
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
 		s.markPeerAttemptFailed(peerAddr)
@@ -578,51 +576,184 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	s.runPeerMessageLoop(client, conn, peerAddr, p.IP.String(), p.Port, handshake.Reserved, true)
 }
 
-func (s *Session) dialPeer(peerAddr string) (net.Conn, error) {
-	// Transport policy: prefer TCP for existing swarm compatibility, then fall
-	// back to uTP on the same endpoint. Race both when uTP is available so a
-	// firewalled TCP path does not hold the bounded outbound slot for two full
-	// dial timeouts before uTP gets a chance.
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+// outgoingPeer is an outbound connection that completed its handshake.
+type outgoingPeer struct {
+	conn      net.Conn
+	transport string // "tcp" or "utp"; set on failure too
+	client    *peer.Client
+	handshake *peer.Handshake
+}
+
+// handshakeOutgoingPeer runs the encryption negotiation (per the session's
+// policy) and the BitTorrent handshake on conn, a fresh connection to peerAddr
+// over transport, each bounded by peerDialHandshakeTimeout. redial dials the
+// peer again for a plaintext fallback after a failed MSE handshake. On failure
+// the connection is closed, and step names the step that failed
+// ("negotiation" or "handshake").
+func (s *Session) handshakeOutgoingPeer(peerAddr string, conn net.Conn, transport string, monitor *monitoredPeerConn, redial func(string) (net.Conn, string, error)) (out outgoingPeer, step string, err error) {
+	tunePeerConn(conn)
+	monitor.set(conn)
+	_ = conn.SetDeadline(time.Now().Add(peerDialHandshakeTimeout))
+	conn, transport, err = s.negotiateOutgoingPeerConn(peerAddr, conn, transport, monitor, redial)
+	if err != nil {
+		return outgoingPeer{transport: transport}, "negotiation", err
+	}
+	monitor.set(conn)
+
+	_ = conn.SetDeadline(time.Now().Add(peerDialHandshakeTimeout))
+	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	s.mu.RLock()
+	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
+	handshake, err := client.Handshake()
+	if err != nil {
+		_ = conn.Close()
+		return outgoingPeer{transport: transport}, "handshake", err
+	}
+	_ = conn.SetDeadline(time.Time{}) // clear deadline
+	return outgoingPeer{conn: conn, transport: transport, client: client, handshake: handshake}, "", nil
+}
+
+// isTimeoutErr reports whether err is, or wraps, an I/O timeout.
+func isTimeoutErr(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// peerDialTimeout bounds one dial attempt, whatever the transport.
+const peerDialTimeout = 5 * time.Second
+
+// peerDialHandshakeTimeout bounds each of an outbound connection's encryption
+// negotiation and BitTorrent handshake. A var so tests can shorten it; treat it
+// as a constant.
+var peerDialHandshakeTimeout = peerHandshakeTimeout
+
+// dialTCPGraceMin and dialTCPGraceMax bound how long a uTP connection that came
+// up first waits for the TCP dial to the same peer (see pickDialResult). Vars
+// so tests can change them; treat them as constants.
+var (
+	dialTCPGraceMin = 250 * time.Millisecond
+	dialTCPGraceMax = time.Second
+)
+
+// peerTCPDial dials addr over TCP. A var so tests can slow or fail it.
+var peerTCPDial = func(ctx context.Context, addr string) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "tcp", addr)
+}
+
+// dialPeer connects to peerAddr and reports the transport it used. TCP is
+// preferred: our uTP has no congestion control or fast retransmit yet, so it
+// recovers from loss far more slowly, and it stalls against older
+// saintTorrent peers. When uTP is available both are dialed at once, so a
+// firewalled TCP path does not hold the bounded outbound slot for a whole dial
+// timeout before uTP gets a chance; pickDialResult then keeps uTP only if TCP
+// fails or does not connect soon after it.
+func (s *Session) dialPeer(peerAddr string) (net.Conn, string, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, peerDialTimeout)
 	defer cancel()
 
 	s.mu.RLock()
 	udpSocket := s.utpSocket
 	s.mu.RUnlock()
 
-	dialCount := 1
-	if udpSocket != nil {
-		dialCount = 2
+	if udpSocket == nil {
+		conn, err := peerTCPDial(ctx, peerAddr)
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, "tcp", nil
 	}
-	results := make(chan transportDialResult, dialCount)
 
+	dialStart := time.Now()
+	tcpCtx, cancelTCP := context.WithCancel(ctx)
+	defer cancelTCP()
+	utpCtx, cancelUTP := context.WithCancel(ctx)
+	defer cancelUTP()
+	results := make(chan transportDialResult, 2)
 	go func() {
-		dialer := net.Dialer{}
-		conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
+		conn, err := peerTCPDial(tcpCtx, peerAddr)
 		results <- transportDialResult{transport: "tcp", conn: conn, err: err}
 	}()
-
-	if udpSocket == nil {
-		res := <-results
-		return res.conn, res.err
-	}
-
 	go func() {
-		conn, err := udpSocket.DialContext(ctx, peerAddr)
+		conn, err := udpSocket.DialContext(utpCtx, peerAddr)
 		results <- transportDialResult{transport: "utp", conn: conn, err: err}
 	}()
+	return pickDialResult(results, 2, dialStart, cancelTCP, cancelUTP)
+}
 
-	var errs []error
-	for i := 0; i < dialCount; i++ {
-		res := <-results
-		if res.err == nil {
-			cancel()
-			go closeLateDialSuccesses(results, dialCount-i-1)
-			return res.conn, nil
-		}
-		errs = append(errs, fmt.Errorf("%s dial failed: %w", res.transport, res.err))
+// dialPeerTCP connects to peerAddr over TCP only.
+func (s *Session) dialPeerTCP(peerAddr string) (net.Conn, string, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, peerDialTimeout)
+	defer cancel()
+	conn, err := peerTCPDial(ctx, peerAddr)
+	if err != nil {
+		return nil, "", fmt.Errorf("tcp dial failed: %w", err)
 	}
-	return nil, errors.Join(errs...)
+	return conn, "tcp", nil
+}
+
+// pickDialResult picks the connection dialPeer uses from the pending results of
+// its TCP and uTP dials, started at dialStart. A TCP connection wins at once
+// and cancels the uTP dial. A uTP connection that comes first waits up to
+// dialTCPGrace for TCP: TCP still wins if it connects within that, and uTP is
+// used if TCP fails or the grace runs out, which cancels the TCP dial. A
+// failure waits for the other transport. Every connection that loses is
+// closed, including ones that complete after the pick.
+func pickDialResult(results <-chan transportDialResult, pending int, dialStart time.Time, cancelTCP, cancelUTP func()) (net.Conn, string, error) {
+	var errs []error
+	var utpConn net.Conn
+	var grace *time.Timer
+	var graceC <-chan time.Time
+	defer func() {
+		if grace != nil {
+			grace.Stop()
+		}
+	}()
+	for pending > 0 {
+		var res transportDialResult
+		select {
+		case res = <-results:
+			pending--
+		case <-graceC:
+			cancelTCP()
+			go closeLateDialSuccesses(results, pending)
+			return utpConn, "utp", nil
+		}
+		switch {
+		case res.err != nil:
+			errs = append(errs, fmt.Errorf("%s dial failed: %w", res.transport, res.err))
+			if utpConn != nil {
+				return utpConn, "utp", nil // TCP failed within the grace
+			}
+		case res.transport == "tcp":
+			cancelUTP()
+			if utpConn != nil {
+				_ = utpConn.Close()
+			}
+			if pending > 0 {
+				go closeLateDialSuccesses(results, pending)
+			}
+			return res.conn, "tcp", nil
+		case pending == 0:
+			return res.conn, "utp", nil // TCP already failed
+		default:
+			utpConn = res.conn
+			grace = time.NewTimer(dialTCPGrace(time.Since(dialStart)))
+			graceC = grace.C
+		}
+	}
+	return nil, "", errors.Join(errs...)
+}
+
+// dialTCPGrace is how long a uTP connection that took utpConnect to come up
+// waits for the TCP dial: twice that (TCP's handshake needs about the same
+// round trip), within [dialTCPGraceMin, dialTCPGraceMax].
+func dialTCPGrace(utpConnect time.Duration) time.Duration {
+	return min(max(2*utpConnect, dialTCPGraceMin), dialTCPGraceMax)
 }
 
 func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {

@@ -164,13 +164,17 @@ func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.Sec
 	return wrapped, res, true, nil
 }
 
-func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, monitor *monitoredPeerConn) (net.Conn, error) {
+// negotiateOutgoingPeerConn runs the MSE handshake on conn (over transport) as
+// the encryption policy asks. After a failed MSE handshake the prefer policy
+// falls back to plaintext on a new connection from redial; the transport of
+// the connection returned is returned with it.
+func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, transport string, monitor *monitoredPeerConn, redial func(string) (net.Conn, string, error)) (net.Conn, string, error) {
 	s.mu.RLock()
 	policy := s.EncryptionPolicy
 	infoHash := s.Torrent.InfoHash
 	s.mu.RUnlock()
 	if policy == mse.PolicyDisable {
-		return conn, nil
+		return conn, transport, nil
 	}
 
 	wrapped, _, err := mse.Initiate(conn, infoHash[:], nil, mse.CryptoMethodRC4)
@@ -178,19 +182,19 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, moni
 		if monitor != nil {
 			monitor.set(wrapped)
 		}
-		return wrapped, nil
+		return wrapped, transport, nil
 	}
 	_ = conn.Close()
 	if monitor != nil {
 		monitor.set(nil)
 	}
 	if policy == mse.PolicyRequire {
-		return nil, fmt.Errorf("mse handshake failed: %w", err)
+		return nil, transport, fmt.Errorf("mse handshake failed: %w", err)
 	}
 
-	fallback, dialErr := s.dialPeer(peerAddr)
+	fallback, fallbackTransport, dialErr := redial(peerAddr)
 	if dialErr != nil {
-		return nil, errors.Join(
+		return nil, transport, errors.Join(
 			fmt.Errorf("mse handshake failed: %w", err),
 			fmt.Errorf("plaintext fallback dial failed: %w", dialErr),
 		)
@@ -201,9 +205,9 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, moni
 	}
 	if ctxErr := s.ctx.Err(); ctxErr != nil {
 		_ = fallback.Close()
-		return nil, ctxErr
+		return nil, fallbackTransport, ctxErr
 	}
-	return fallback, nil
+	return fallback, fallbackTransport, nil
 }
 
 func (s *Session) parseIncomingHandshake(conn net.Conn) (net.Conn, *peer.Handshake, error) {
