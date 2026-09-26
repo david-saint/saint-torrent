@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -300,7 +301,7 @@ func (s *Session) announceAndConnect() int {
 			if !trackerPeerAllowed(p, source) {
 				continue
 			}
-			peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+			peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 			if seenPeers[peerAddr] {
 				continue
 			}
@@ -352,7 +353,7 @@ func (s *Session) announceAndConnect() int {
 		if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
 			continue
 		}
-		peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+		peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 		s.mu.Lock()
 		if s.closed || s.paused {
 			s.mu.Unlock()

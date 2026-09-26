@@ -86,6 +86,37 @@ func TestFailingPeerIsNotRedialedEveryMinute(t *testing.T) {
 	}
 }
 
+// TestIPv6DialIsAccountedOnItsEntry covers IPv6 peers from DHT or PEX, which
+// addPeer keys as "[ip]:port". connectToPeer looked them up as "ip:port", so a
+// dial never found its entry: the entry stayed Dialing (never redialed), its
+// failures were never counted, and a successful dial registered a second entry.
+func TestIPv6DialIsAccountedOnItsEntry(t *testing.T) {
+	sess, _, _ := newStallTestTorrent(t, 1)
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+
+	port := refusingLoopbackPort(t)
+	addr := net.JoinHostPort("::1", strconv.Itoa(port))
+	sess.mu.Lock()
+	sess.Peers[addr] = &PeerState{IP: "::1", Port: uint16(port), AmChoking: true, Choked: true,
+		Dialable: true, Dialing: true, LastAttempt: time.Now(), Source: PeerSourceDiscovery}
+	sess.mu.Unlock()
+
+	sess.connectToPeer(trackerPeer("::1", uint16(port)))
+	ps, ok := knownPeerState(sess, addr)
+	if !ok || ps.Dialing || ps.FailCount != 1 {
+		t.Fatalf("after a failed dial: known %v, Dialing %v, FailCount %d; want known, not dialing, one failure", ok, ps.Dialing, ps.FailCount)
+	}
+	sess.mu.RLock()
+	known := len(sess.Peers)
+	sess.mu.RUnlock()
+	if known != 1 {
+		t.Fatalf("known peers = %d after dialing one IPv6 peer, want 1", known)
+	}
+}
+
 // TestSuccessfulHandshakeClearsFailCount checks that failures only count in a
 // row: a peer that answers again is a normal redial candidate.
 func TestSuccessfulHandshakeClearsFailCount(t *testing.T) {
