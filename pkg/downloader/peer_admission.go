@@ -218,18 +218,7 @@ func (s *Session) strikePieceSourceLocked(src *pieceSource, now time.Time) bool 
 // strikePeerHostLocked records a hash failure for hostKey and reports whether it
 // banned the host. Caller holds s.mu.
 func (s *Session) strikePeerHostLocked(hostKey string, now time.Time) bool {
-	a := &s.admission
-	st := a.strikes[hostKey]
-	if st == nil {
-		if a.strikes == nil {
-			a.strikes = make(map[string]*hostStrikes)
-		}
-		if len(a.strikes) >= maxStrikeEntries {
-			a.evictStrikeLocked(now)
-		}
-		st = &hostStrikes{}
-		a.strikes[hostKey] = st
-	}
+	st := s.admission.hostStrikesLocked(hostKey, now)
 	if now.Sub(st.last) > peerBanDuration {
 		st.count = 0 // an old strike is forgotten
 	}
@@ -241,6 +230,39 @@ func (s *Session) strikePeerHostLocked(hostKey string, now time.Time) bool {
 	st.count = 0
 	st.bannedUntil = now.Add(peerBanDuration)
 	return true
+}
+
+// banHostLocked bans hostKey for peerBanDuration at once, for a failure whose
+// blame is certain: a ut_metadata assembly that failed the infohash check with
+// every block from this one host. Unlike a piece, whose hash failure may be a
+// fault, a wrong info dict from a single source can only be a lie. An exempt
+// host ("") is never banned. The caller closes the host's connections. Caller
+// holds s.mu.
+func (s *Session) banHostLocked(hostKey string, now time.Time) {
+	if hostKey == "" {
+		return
+	}
+	st := s.admission.hostStrikesLocked(hostKey, now)
+	st.count = 0
+	st.last = now
+	st.bannedUntil = now.Add(peerBanDuration)
+}
+
+// hostStrikesLocked returns hostKey's strike entry, creating it (and making room
+// in a full table) if there is none. Caller holds s.mu.
+func (a *peerAdmission) hostStrikesLocked(hostKey string, now time.Time) *hostStrikes {
+	st := a.strikes[hostKey]
+	if st == nil {
+		if a.strikes == nil {
+			a.strikes = make(map[string]*hostStrikes)
+		}
+		if len(a.strikes) >= maxStrikeEntries {
+			a.evictStrikeLocked(now)
+		}
+		st = &hostStrikes{}
+		a.strikes[hostKey] = st
+	}
+	return st
 }
 
 // evictStrikeLocked makes room in a full strike table: it drops every entry that

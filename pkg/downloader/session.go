@@ -277,14 +277,38 @@ type Session struct {
 	optimisticTimer *time.Ticker
 
 	// Metadata exchange state
-	metadataSize         int
-	metadataBuf          []byte
-	metadataPieces       []bool
-	metadataCompleted    bool
-	metadataMode         bool
-	metadataEpoch        uint64    // advances whenever the accumulator is discarded; peers re-request
-	metadataProgressAt   time.Time // when the accumulator was last sized or took a block
-	metadataCompletedCh  chan struct{}
+	metadataSize        int
+	metadataBuf         []byte
+	metadataPieces      []bool
+	metadataCompleted   bool
+	metadataMode        bool
+	metadataEpoch       uint64    // advances whenever the accumulator is discarded; peers re-request
+	metadataProgressAt  time.Time // when the accumulator was last sized or took a block
+	metadataCompletedCh chan struct{}
+	// Blame for failed ut_metadata assemblies (see noteMetadataRoundFailedLocked).
+	// metadataFrom is the admission host key that supplied each accepted block
+	// (parallel to metadataPieces; "" for loopback, which is never blamed).
+	// metadataSizedBy, metadataSizedAt and metadataRoundBlocks describe the
+	// current round: who sized the accumulator, when, and how many blocks it has
+	// taken since, which is how a round fed too slowly is told from a live one.
+	// metadataResetAt is when the last failed round was discarded. After a failed
+	// round several hosts fed, metadataSolo makes every later round come from a
+	// single connection, metadataOwner (since metadataOwnedAt), so the next
+	// failure has exactly one supplier. metadataSuspects holds the hosts that
+	// sized or fed a failed round (see maxMetadataSuspects), and
+	// metadataFailStreak and metadataNextRoundAt back off new rounds after
+	// consecutive failures. All guarded by mu.
+	metadataFrom         []string
+	metadataSizedBy      string
+	metadataSizedAt      time.Time
+	metadataRoundBlocks  int
+	metadataResetAt      time.Time
+	metadataSolo         bool
+	metadataOwner        *peer.Client
+	metadataOwnedAt      time.Time
+	metadataSuspects     map[string]time.Time
+	metadataFailStreak   int
+	metadataNextRoundAt  time.Time
 	DHT                  *dht.DHT
 	downloadDir          string
 	fallbackDownloadDirs []string
@@ -1577,6 +1601,7 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	keepAccumulator := false
+	hashMismatch := false
 	defer func() {
 		if err != nil && !keepAccumulator {
 			// A full assembly that fails the infohash check means the size/blocks we
@@ -1586,10 +1611,17 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			// the next peer's advertised size can take over instead of every honest peer
 			// being rejected forever by the size-mismatch guard.
 			s.mu.Lock()
+			if hashMismatch {
+				s.noteMetadataRoundFailedLocked(time.Now())
+			}
 			s.metadataCompleted = false
 			s.metadataSize = 0
 			s.metadataBuf = nil
 			s.metadataPieces = nil
+			s.metadataFrom = nil
+			s.metadataSizedBy = ""
+			s.metadataOwner = nil
+			s.metadataRoundBlocks = 0
 			s.metadataEpoch++
 			s.mu.Unlock()
 		}
@@ -1597,6 +1629,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 
 	hash := sha1.Sum(infoBytes)
 	if hash != s.Torrent.InfoHash {
+		hashMismatch = true
 		return fmt.Errorf("metadata hash mismatch: expected %x, got %x", s.Torrent.InfoHash, hash)
 	}
 
@@ -1616,6 +1649,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		// metadataSize and metadataPieces stay: a handshake handler that sized
 		// its request loop from them before this point still indexes them.
 		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
 		s.lastErr = err
 		s.statusErr = err
 		s.broadcastPieceWaitersLocked()
@@ -1714,6 +1748,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		keepAccumulator = true
 		s.metadataCompleted = true
 		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
 		s.verifiedMetadata = infoBytes
 		s.scheduleMetadataStorageRetryLocked()
 		s.broadcastPieceWaitersLocked()
@@ -1758,6 +1793,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and
 	// any bytes kept for a retry are no longer needed.
 	s.metadataBuf = nil
+	s.clearMetadataBlameLocked()
 	s.verifiedMetadata = nil
 	s.metadataRetryDelay = 0
 	if s.metadataRetryTimer != nil {
@@ -1824,4 +1860,140 @@ func (s *Session) retryMetadataStorage() {
 	if ready {
 		_ = s.onMetadataDownloaded(infoBytes)
 	}
+}
+
+// maxMetadataSuspects bounds the hosts remembered for sizing or feeding a failed
+// ut_metadata assembly; metadataSuspectTTL is how long one is remembered.
+const (
+	maxMetadataSuspects = 64
+	metadataSuspectTTL  = time.Hour
+)
+
+// Backoff between fetch rounds after consecutive failed assemblies: from the
+// second failure in a row, metadataRoundBackoffBase doubling up to
+// metadataRoundBackoffMax. Vars so tests can shorten them; treat them as
+// constants.
+var (
+	metadataRoundBackoffBase = 2 * time.Second
+	metadataRoundBackoffMax  = time.Minute
+)
+
+// noteMetadataRoundFailedLocked blames a ut_metadata assembly that failed the
+// infohash check, before the accumulator is discarded. A round fed entirely by
+// one host proves that host lied: it is banned and its connections closed. A
+// round fed by several cannot be pinned on one of them, so the contributors
+// become suspects and later rounds run solo (one connection feeds a whole
+// round), which makes the next failure attributable. The host that sized the
+// round is a suspect too, as a bogus metadata_size fails whoever supplies the
+// blocks. Suspects wait before they may size or own a new round (see
+// requestMetadataBlocks), and failures in a row back off new rounds. Loopback
+// ("") is never blamed. Caller holds s.mu.
+func (s *Session) noteMetadataRoundFailedLocked(now time.Time) {
+	// Blocks are attributed only for a whole assembly; one discarded part-way
+	// (a round replaced in the meantime) has no complete supplier list.
+	complete := len(s.metadataPieces) > 0 && len(s.metadataFrom) == len(s.metadataPieces)
+	for _, have := range s.metadataPieces {
+		if !have {
+			complete = false
+			break
+		}
+	}
+	if complete {
+		hosts := make(map[string]struct{}, 4)
+		for _, host := range s.metadataFrom {
+			hosts[host] = struct{}{}
+		}
+		for host := range hosts {
+			s.addMetadataSuspectLocked(host, now)
+		}
+		if len(hosts) == 1 {
+			if host := s.metadataFrom[0]; host != "" {
+				s.banHostLocked(host, now)
+				s.closeHostConnsLocked(host)
+			}
+		} else {
+			s.metadataSolo = true
+		}
+	}
+	s.addMetadataSuspectLocked(s.metadataSizedBy, now)
+	s.metadataFailStreak++
+	if s.metadataFailStreak >= 2 {
+		s.metadataNextRoundAt = now.Add(metadataRoundBackoff(s.metadataFailStreak))
+	}
+	s.metadataResetAt = now
+}
+
+// metadataRoundBackoff is the pause before a new fetch round after streak
+// failed assemblies in a row (streak >= 2).
+func metadataRoundBackoff(streak int) time.Duration {
+	d := metadataRoundBackoffBase
+	for i := 2; i < streak && d < metadataRoundBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, metadataRoundBackoffMax)
+}
+
+// clearMetadataBlameLocked forgets the blame state once the fetched info dict
+// passed the infohash check: nobody lied about it. Caller holds s.mu.
+func (s *Session) clearMetadataBlameLocked() {
+	s.metadataFrom = nil
+	s.metadataSolo = false
+	s.metadataOwner = nil
+	s.metadataSuspects = nil
+	s.metadataFailStreak = 0
+	s.metadataNextRoundAt = time.Time{}
+}
+
+// addMetadataSuspectLocked records host as a suspect of a failed assembly. The
+// set holds at most maxMetadataSuspects hosts: expired entries go first, then
+// the one recorded longest ago. Caller holds s.mu.
+func (s *Session) addMetadataSuspectLocked(host string, now time.Time) {
+	if host == "" {
+		return
+	}
+	if _, known := s.metadataSuspects[host]; !known && len(s.metadataSuspects) >= maxMetadataSuspects {
+		var oldestHost string
+		var oldest time.Time
+		for h, at := range s.metadataSuspects {
+			if now.Sub(at) >= metadataSuspectTTL {
+				delete(s.metadataSuspects, h)
+				continue
+			}
+			if oldestHost == "" || at.Before(oldest) {
+				oldestHost, oldest = h, at
+			}
+		}
+		if len(s.metadataSuspects) >= maxMetadataSuspects {
+			delete(s.metadataSuspects, oldestHost)
+		}
+	}
+	if s.metadataSuspects == nil {
+		s.metadataSuspects = make(map[string]time.Time)
+	}
+	s.metadataSuspects[host] = now
+}
+
+// metadataSuspectLocked reports whether host sized or fed a failed assembly
+// within metadataSuspectTTL. Caller holds s.mu (read or write).
+func (s *Session) metadataSuspectLocked(host string, now time.Time) bool {
+	if host == "" {
+		return false
+	}
+	at, ok := s.metadataSuspects[host]
+	return ok && now.Sub(at) < metadataSuspectTTL
+}
+
+// metadataFeedSlow reports whether a ut_metadata feed that began at since, has
+// taken blocks blocks and last took one at lastBlock has become too slow to
+// wait on: nothing for metadataSizeStallTimeout, or, after a first
+// metadataSizeStallTimeout of grace, fewer than one block per
+// metadataMinBlockPeriod on average. Honest peers deliver a whole info dict in
+// seconds, so only a feed dripping blocks to hold on to the round fails this.
+func metadataFeedSlow(now, since, lastBlock time.Time, blocks int) bool {
+	if now.Sub(lastBlock) >= metadataSizeStallTimeout {
+		return true
+	}
+	elapsed := now.Sub(since)
+	return elapsed >= metadataSizeStallTimeout &&
+		time.Duration(blocks)*metadataMinBlockPeriod < elapsed-metadataSizeStallTimeout
 }

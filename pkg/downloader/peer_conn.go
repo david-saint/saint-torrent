@@ -11,6 +11,7 @@ import (
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/tracker"
 	"sainttorrent/pkg/utp"
+	"slices"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -129,9 +130,32 @@ var metadataRetryInterval = 2 * time.Second
 // replace it. The first peer to advertise a size fixes it for everyone and peers
 // advertising another size are not asked, so without this one peer advertising a
 // bogus size and never answering would stall a magnet for good; honest peers,
-// which all advertise the true size, deliver a block well within it. A var so
-// tests can shorten it; treat it as a constant in production.
+// which all advertise the true size, deliver a block well within it. It is also
+// how long an owner of a solo round may go without a block before another
+// connection takes the round over, and how long a suspect host waits after a
+// failed round before it may size or own the next. A var so tests can shorten
+// it; treat it as a constant in production.
 var metadataSizeStallTimeout = 20 * time.Second
+
+// metadataMinBlockPeriod is the slowest average feed (one 16 KiB block per
+// period, 8 KiB/s) a ut_metadata round may run at, past its first
+// metadataSizeStallTimeout, before a peer advertising another size may replace
+// it (see metadataFeedSlow). Without it a peer that sized the round with a bogus
+// size could hold it for hours by answering one block just inside every stall
+// timeout. A var so tests can change it; treat it as a constant.
+var metadataMinBlockPeriod = 2 * time.Second
+
+// metadataRejectRetryAfter is how long after a peer rejected a ut_metadata
+// request (libtorrent does so while rate limiting) we ask it for that block
+// again, as libtorrent waits a minute after a reject; metadataRequestTimeout is
+// how long a request may go unanswered before it is asked again. Without them a
+// single-source magnet whose peer dropped or refused one request stalled until
+// the connection was replaced. Vars so tests can shorten them; treat them as
+// constants.
+var (
+	metadataRejectRetryAfter = time.Minute
+	metadataRequestTimeout   = 30 * time.Second
+)
 
 // metadataServeWindow and metadataServeRequestsPerBlock bound how many ut_metadata
 // blocks one connection may have us serve: an honest fetcher asks for each block
@@ -216,6 +240,14 @@ func minRetry(a, b time.Duration) time.Duration {
 	default:
 		return b
 	}
+}
+
+// laterTime returns the later of a and b.
+func laterTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
@@ -878,6 +910,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	defer func() {
 		s.mu.Lock()
 		reconnectAfterResume := false
+		if s.metadataOwner == client {
+			s.metadataOwner = nil // the next connection to ask takes the solo round over
+		}
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
 			s.releasePeerLocked(peerAddr, hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
@@ -1989,9 +2024,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// peer in fetch round metadataRound (the session's metadataEpoch, which moves on
 	// whenever a failed assembly discards the accumulator). A block is accepted from
 	// this peer only if it was asked for in the current round, so a peer cannot slip
-	// unsolicited blocks into an assembly other peers are feeding.
+	// unsolicited blocks into an assembly other peers are feeding. metadataAskedAt
+	// is when each block was last asked for, or when the peer rejected it
+	// (metadataRejected), so the retry tick can ask again for a block the peer
+	// dropped or refused.
 	peerMetadataSize := 0
 	var metadataRequested []bool
+	var metadataAskedAt []time.Time
+	var metadataRejected []bool
 	var metadataRound uint64
 	var metadataRetryTicker *time.Ticker
 	var metadataRetryTick <-chan time.Time
@@ -2009,11 +2049,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// marks a call made because a new fetch round began; those are skipped while
 	// the session has a blocking error (storage could not be set up), so a
 	// persistent failure does not turn into an endless re-download of metadata.
+	//
+	// After failed assemblies (see noteMetadataRoundFailedLocked) a host that
+	// sized or fed one waits metadataSizeStallTimeout before it may size or own a
+	// new round, so a peer that has not failed us gets the round first, and new
+	// rounds back off after failures in a row; in a solo round only the owner is
+	// asked. Each is re-checked from the retry tick.
 	requestMetadataBlocks := func(newRound bool) {
 		if peerUtMetadataID == -1 || peerMetadataSize <= 0 {
 			return
 		}
 		var missing []int
+		now := time.Now()
 		s.mu.Lock()
 		if !s.metadataMode || s.metadataCompleted {
 			s.mu.Unlock()
@@ -2024,29 +2071,74 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.Unlock()
 			return
 		}
-		resize := s.metadataSize == 0 // the first sized peer, or the first after a reset
-		if !resize && s.metadataSize != peerMetadataSize && s.statusErr == nil &&
-			time.Since(s.metadataProgressAt) >= metadataSizeStallTimeout {
-			// Whoever sized the accumulator has delivered nothing for a while: start
-			// a new round at this peer's size. Peers on the old size are no longer
-			// asked, and their late blocks fail the round check.
+		suspect := s.metadataSuspectLocked(source.host, now)
+		suspectWaiting := suspect && now.Sub(s.metadataResetAt) < metadataSizeStallTimeout
+		stalled := now.Sub(s.metadataProgressAt) >= metadataSizeStallTimeout
+		resize := false
+		switch {
+		case s.metadataSize == 0:
+			// The first sized peer, or the first after a reset.
+			resize = !now.Before(s.metadataNextRoundAt) && !suspectWaiting
+		case s.metadataSize != peerMetadataSize && s.statusErr == nil &&
+			((stalled && !suspectWaiting) ||
+				(!suspect && metadataFeedSlow(now, s.metadataSizedAt, s.metadataProgressAt, s.metadataRoundBlocks))):
+			// Whoever sized the accumulator delivers nothing, or too little to be
+			// an honest peer: start a new round at this peer's size, and suspect
+			// the old sizer. Peers on the old size are no longer asked, and their
+			// late blocks fail the round check. A suspect may replace only a
+			// round that takes no blocks at all, never one that is merely slow,
+			// so it cannot keep taking a slow honest peer's round away, while a
+			// peer made a suspect by a mixed round can still replace a silent
+			// sizer.
 			resize = true
 			s.metadataEpoch++
+			s.addMetadataSuspectLocked(s.metadataSizedBy, now)
 		}
 		if resize {
+			numBlocks := (peerMetadataSize + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
 			s.metadataSize = peerMetadataSize
 			s.metadataBuf = make([]byte, peerMetadataSize)
-			s.metadataPieces = make([]bool, (peerMetadataSize+peer.MetadataBlockSize-1)/peer.MetadataBlockSize)
-			s.metadataProgressAt = time.Now()
+			s.metadataPieces = make([]bool, numBlocks)
+			s.metadataFrom = make([]string, numBlocks)
+			s.metadataProgressAt = now
+			s.metadataSizedBy = source.host
+			s.metadataSizedAt = now
+			s.metadataRoundBlocks = 0
+			s.metadataOwner = nil
+		}
+		ask := s.metadataSize == peerMetadataSize
+		if ask && s.metadataSolo && s.metadataOwner != client {
+			// A solo round is fed by its owner alone. Another connection takes it
+			// over once the owner is gone or has taken no block for
+			// metadataSizeStallTimeout, dropping what the owner supplied, so the
+			// round keeps a single supplier to blame. A slow owner keeps the
+			// round: taking it away would restart a slow swarm's fetch for good.
+			ownerGone := s.metadataOwner == nil ||
+				now.Sub(laterTime(s.metadataOwnedAt, s.metadataProgressAt)) >= metadataSizeStallTimeout
+			if ownerGone && !suspectWaiting {
+				if slices.Contains(s.metadataPieces, true) {
+					clear(s.metadataPieces)
+					clear(s.metadataFrom)
+					s.metadataEpoch++ // every connection's requests start over
+				}
+				s.metadataOwner = client
+				s.metadataOwnedAt = now
+			} else {
+				ask = false
+			}
 		}
 		if s.metadataEpoch != metadataRound || len(metadataRequested) != len(s.metadataPieces) {
 			metadataRound = s.metadataEpoch
 			metadataRequested = make([]bool, len(s.metadataPieces))
+			metadataAskedAt = make([]time.Time, len(s.metadataPieces))
+			metadataRejected = make([]bool, len(s.metadataPieces))
 		}
-		if s.metadataSize == peerMetadataSize {
+		if ask {
 			for i, have := range s.metadataPieces {
 				if !have && !metadataRequested[i] {
 					metadataRequested[i] = true
+					metadataAskedAt[i] = now
+					metadataRejected[i] = false
 					missing = append(missing, i)
 				}
 			}
@@ -2063,17 +2155,21 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// acceptMetadataBlock stores a ut_metadata data block this peer was asked for
 	// and, once every block is in, hands the assembled info dict to
 	// onMetadataDownloaded (which discards the accumulator and advances
-	// metadataEpoch if it fails the infohash check).
+	// metadataEpoch if it fails the infohash check). The block is recorded
+	// against this connection's host, so a failed assembly can be blamed; in a
+	// solo round only the owner's blocks count.
 	acceptMetadataBlock := func(metaMsg *peer.MetadataMessage) {
 		piece := metaMsg.Piece
 		if piece < 0 || piece >= len(metadataRequested) || !metadataRequested[piece] {
 			return // unsolicited, or asked for in an earlier round
 		}
 		metadataRequested[piece] = false
+		metadataRejected[piece] = false
 		s.mu.Lock()
 		if s.metadataEpoch != metadataRound || !s.metadataMode || s.metadataCompleted ||
 			s.metadataSize == 0 || piece >= len(s.metadataPieces) || s.metadataPieces[piece] ||
-			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) {
+			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) ||
+			(s.metadataSolo && s.metadataOwner != client) {
 			s.mu.Unlock()
 			return
 		}
@@ -2085,6 +2181,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		copy(s.metadataBuf[offset:], metaMsg.Data)
 		s.metadataPieces[piece] = true
+		if piece < len(s.metadataFrom) {
+			s.metadataFrom[piece] = source.host
+		}
+		s.metadataRoundBlocks++
 		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
 		lastActiveAt = lastProgressAt
 		s.metadataProgressAt = lastProgressAt
@@ -2230,8 +2330,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			case peer.MetadataData:
 				acceptMetadataBlock(metaMsg)
 			case peer.MetadataReject:
-				// The block stays marked as asked of this peer, so it is not re-asked
-				// this round; other peers can still supply it.
+				// The block stays marked as asked of this peer, so other peers
+				// supply it first; the retry tick asks this peer again after
+				// metadataRejectRetryAfter.
+				if p := metaMsg.Piece; p >= 0 && p < len(metadataRequested) && metadataRequested[p] && !metadataRejected[p] {
+					metadataRejected[p] = true
+					metadataAskedAt[p] = time.Now()
+				}
 			}
 
 		case extMsgID == peer.LocalPEXExtID && s.pexEnabled():
@@ -2496,22 +2601,34 @@ peerLoop:
 		case <-pexTick:
 			sendPEXDelta()
 			continue
-		case <-metadataRetryTick:
+		case now := <-metadataRetryTick:
 			s.mu.RLock()
 			fetching := s.metadataMode && !s.metadataCompleted
-			epoch := s.metadataEpoch
-			otherSize := s.metadataSize != peerMetadataSize
 			s.mu.RUnlock()
-			switch {
-			case !fetching:
+			if !fetching {
 				metadataRetryTicker.Stop()
 				metadataRetryTicker = nil
 				metadataRetryTick = nil
-			case epoch != metadataRound || otherSize:
-				// A new round began, or the accumulator is sized differently from
-				// what this peer advertised and may have stalled.
-				requestMetadataBlocks(true)
+				continue
 			}
+			// Ask again for blocks this peer rejected a while ago or never
+			// answered, then re-run the round checks: a new round may have begun,
+			// a stalled or too-slow round may be ours to replace or own, or a
+			// suspect's wait may be over. Blocks already in are not re-asked.
+			for i, asked := range metadataRequested {
+				if !asked {
+					continue
+				}
+				wait := metadataRequestTimeout
+				if metadataRejected[i] {
+					wait = metadataRejectRetryAfter
+				}
+				if now.Sub(metadataAskedAt[i]) >= wait {
+					metadataRequested[i] = false
+					metadataRejected[i] = false
+				}
+			}
+			requestMetadataBlocks(false)
 			continue
 		case <-rateRetry:
 			rateRetry = nil
