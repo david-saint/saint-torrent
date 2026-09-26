@@ -450,16 +450,12 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		// For failed restoration entries, try to parse the cached torrent file if files list is empty
 		if failedRemoved && len(torrentFiles) == 0 && stateDir != "" {
 			cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
-			if torrentData, err := os.ReadFile(cachedPath); err == nil {
-				if tor, err := torrent.Parse(torrentData); err == nil {
-					torrentFiles = tor.Files
-				} else {
-					errs = append(errs, fmt.Errorf("failed to parse cached torrent file for file list: %w", err))
-				}
-			} else if !os.IsNotExist(err) {
-				errs = append(errs, fmt.Errorf("failed to read cached torrent file for file list: %w", err))
-			} else {
+			if tor, _, err := loadTorrentFile(cachedPath, infoHashHex); err == nil {
+				torrentFiles = tor.Files
+			} else if os.IsNotExist(err) {
 				errs = append(errs, fmt.Errorf("cannot delete files: cached torrent file is missing"))
+			} else {
+				errs = append(errs, fmt.Errorf("failed to load cached torrent file for file list: %w", err))
 			}
 		}
 
@@ -765,6 +761,13 @@ func (m *TorrentManager) announceStoppedAll(sessions []*Session) {
 
 // AddMagnet parses a magnet URI and adds it to the manager as a metadata session.
 func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, error) {
+	return m.addMagnet(uri, downloadDir, false)
+}
+
+// addMagnet is AddMagnet for a torrent already known to be private (BEP 27):
+// the session is private from the start, so it never uses DHT or PEX while it
+// fetches metadata. Metadata, once it arrives, is authoritative.
+func (m *TorrentManager) addMagnet(uri string, downloadDir string, private bool) (*Session, error) {
 	mag, err := torrent.ParseMagnet(uri)
 	if err != nil {
 		return nil, err
@@ -796,6 +799,7 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 		InfoHash: mag.InfoHash,
 		Name:     mag.Name,
 		Trackers: mag.Trackers,
+		Private:  private,
 	}
 	if tor.Name == "" {
 		tor.Name = fmt.Sprintf("magnet-%x", mag.InfoHash[:6])
@@ -827,16 +831,45 @@ func (m *TorrentManager) AddMagnet(uri string, downloadDir string) (*Session, er
 
 // AddTorrentFile parses a bencoded torrent file and adds it to the manager.
 func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) (*Session, error) {
+	sess, _, err := m.addTorrentFile(torrentPath, downloadDir, "")
+	return sess, err
+}
+
+// errCachedTorrentMismatch reports a cached .torrent whose info-hash is not the
+// one it was cached under.
+var errCachedTorrentMismatch = errors.New("cached torrent does not match its info hash")
+
+// loadTorrentFile reads and parses a .torrent. When wantHashHex is set, the
+// torrent must have that info-hash: a cached copy is trusted only for the
+// torrent it was saved for.
+func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte, error) {
 	torrentData, err := os.ReadFile(torrentPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
 	tor, err := torrent.Parse(torrentData)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	if wantHashHex != "" && !strings.EqualFold(fmt.Sprintf("%x", tor.InfoHash), wantHashHex) {
+		return nil, nil, fmt.Errorf("%w: %s holds %x, want %s", errCachedTorrentMismatch, torrentPath, tor.InfoHash, wantHashHex)
+	}
+	return tor, torrentData, nil
+}
 
+// addTorrentFile is AddTorrentFile that can require the info-hash (see
+// loadTorrentFile). It also returns the parsed torrent whenever parsing
+// succeeded, so a caller can still learn about a torrent whose add failed.
+func (m *TorrentManager) addTorrentFile(torrentPath, downloadDir, wantHashHex string) (*Session, *torrent.Torrent, error) {
+	tor, torrentData, err := loadTorrentFile(torrentPath, wantHashHex)
+	if err != nil {
+		return nil, nil, err
+	}
+	sess, err := m.addParsedTorrent(tor, torrentData, torrentPath, downloadDir)
+	return sess, tor, err
+}
+
+func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []byte, torrentPath, downloadDir string) (*Session, error) {
 	absDir, err := filepath.Abs(downloadDir)
 	if err == nil {
 		downloadDir = absDir
@@ -935,6 +968,9 @@ type PersistedTorrent struct {
 	Paused               bool           `json:"paused"`
 	FilePriorities       []FilePriority `json:"file_priorities,omitempty"`
 	AddedAt              *time.Time     `json:"added_at,omitempty"`
+	// Private records BEP 27, so a restore that falls back to the magnet URI
+	// keeps the torrent off DHT and PEX.
+	Private bool `json:"private,omitempty"`
 }
 
 type PersistedState struct {
@@ -968,6 +1004,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		fallbackDownloadDirs := append([]string(nil), sess.fallbackDownloadDirs...)
 		paused := sess.paused
 		addedAt := sess.AddedAt
+		private := sess.Torrent.Private
 		sess.mu.RUnlock()
 
 		var addedAtPtr *time.Time
@@ -984,6 +1021,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 			Paused:               paused,
 			FilePriorities:       priorities,
 			AddedAt:              addedAtPtr,
+			Private:              private,
 		})
 	}
 
@@ -1161,10 +1199,8 @@ const (
 // failed to restore, used only for surfacing the failure to the user. It is
 // best-effort: cached .torrent name, then the magnet dn=, then a short hash.
 func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
-	if data, err := os.ReadFile(cachedPath); err == nil {
-		if tor, err := torrent.Parse(data); err == nil && tor.Name != "" {
-			return tor.Name
-		}
+	if tor, _, err := loadTorrentFile(cachedPath, entry.InfoHashHex); err == nil && tor.Name != "" {
+		return tor.Name
 	}
 	if entry.MagnetURI != "" {
 		if mag, err := torrent.ParseMagnet(entry.MagnetURI); err == nil && mag.Name != "" {
@@ -1250,19 +1286,27 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			// retry deterministic errors: a permission denial (macOS TCC on
 			// ~/Downloads etc.) or a corrupt torrent will never succeed on retry,
 			// so retrying only wastes startup time.
+			//
+			// The cached copy is trusted only if it has the entry's info-hash:
+			// restoring it under another one would bring back a different torrent.
+			var cached *torrent.Torrent
 			for attempt := 1; ; attempt++ {
-				sess, loadErr = m.AddTorrentFile(cachedPath, absoluteDownloadDir)
-				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) {
+				sess, cached, loadErr = m.addTorrentFile(cachedPath, absoluteDownloadDir, entry.InfoHashHex)
+				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) || errors.Is(loadErr, errCachedTorrentMismatch) {
 					break
 				}
 				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
 			}
 			if loadErr != nil && entry.MagnetURI != "" {
-				// Fallback to MagnetURI if cached torrent failed to parse
-				sess, loadErr = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
+				// Fall back to the magnet URI, which also reaches the fallback
+				// download directories. A torrent known to be private stays
+				// private, rather than using DHT and PEX until its metadata
+				// arrives again.
+				private := entry.Private || (cached != nil && cached.Private)
+				sess, loadErr = m.addMagnet(entry.MagnetURI, absoluteDownloadDir, private)
 			}
 		} else if entry.MagnetURI != "" {
-			sess, loadErr = m.AddMagnet(entry.MagnetURI, absoluteDownloadDir)
+			sess, loadErr = m.addMagnet(entry.MagnetURI, absoluteDownloadDir, entry.Private)
 		} else {
 			loadErr = fmt.Errorf("no cached torrent file or magnet URI available")
 		}
