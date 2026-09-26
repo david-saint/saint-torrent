@@ -414,6 +414,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 
 	var downloadDir string
 	var torrentFiles []torrent.File
+	var infoHash [20]byte
 	var errs []error
 
 	// 1. Close session if active (this will block until all goroutines exit)
@@ -432,10 +433,14 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		}
 		if sess.Torrent != nil {
 			torrentFiles = sess.Torrent.Files
+			infoHash = sess.Torrent.InfoHash
 		}
 		sess.mu.RUnlock()
 	} else {
 		downloadDir = failedEntry.DownloadDir
+		if decoded, err := hex.DecodeString(removalKey); err == nil && len(decoded) == len(infoHash) {
+			copy(infoHash[:], decoded)
+		}
 	}
 
 	// 2. Delete the fast-resume state file
@@ -463,7 +468,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		if downloadDir == "" {
 			errs = append(errs, fmt.Errorf("cannot delete files: download directory is empty"))
 		} else if len(torrentFiles) > 0 {
-			errs = append(errs, m.deletePayload(removalKey, downloadDir, torrentFiles)...)
+			errs = append(errs, m.deletePayload(infoHash, downloadDir, torrentFiles)...)
 		}
 	}
 
@@ -514,11 +519,7 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 // directory: a symlink or Windows junction planted in the tree, or a
 // directory swapped for one mid-removal, cannot redirect the delete. Files
 // another active torrent uses are kept and reported.
-func (m *TorrentManager) deletePayload(infoHashHex, downloadDir string, files []torrent.File) []error {
-	var infoHash [20]byte
-	if decoded, err := hex.DecodeString(infoHashHex); err == nil && len(decoded) == len(infoHash) {
-		copy(infoHash[:], decoded)
-	}
+func (m *TorrentManager) deletePayload(infoHash [20]byte, downloadDir string, files []torrent.File) []error {
 	relPaths := make([]string, len(files))
 	for i, f := range files {
 		relPaths[i] = filepath.Join(f.Path...)
@@ -876,18 +877,21 @@ func readTorrentFile(torrentPath string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	tooLarge := fmt.Errorf("torrent file %s is larger than the maximum of %d bytes", torrentPath, maxTorrentFileSize)
 	if info.Size() > maxTorrentFileSize {
-		return nil, tooLarge
+		return nil, torrentFileTooLarge(torrentPath)
 	}
 	buf := bytes.NewBuffer(make([]byte, 0, info.Size()+bytes.MinRead))
 	if _, err := buf.ReadFrom(io.LimitReader(f, maxTorrentFileSize+1)); err != nil {
 		return nil, err
 	}
 	if buf.Len() > maxTorrentFileSize {
-		return nil, tooLarge
+		return nil, torrentFileTooLarge(torrentPath)
 	}
 	return buf.Bytes(), nil
+}
+
+func torrentFileTooLarge(torrentPath string) error {
+	return fmt.Errorf("torrent file %s is larger than the maximum of %d bytes", torrentPath, maxTorrentFileSize)
 }
 
 // addTorrentFile is AddTorrentFile that can require the info-hash (see
@@ -1343,7 +1347,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			var cached *torrent.Torrent
 			for attempt := 1; ; attempt++ {
 				sess, cached, loadErr = m.addTorrentFile(cachedPath, absoluteDownloadDir, entry.InfoHashHex)
-				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) || errors.Is(loadErr, errCachedTorrentMismatch) {
+				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) ||
+					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) {
 					break
 				}
 				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
