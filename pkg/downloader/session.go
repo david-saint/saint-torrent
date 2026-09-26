@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -267,6 +268,24 @@ type Session struct {
 	downloadDir          string
 	fallbackDownloadDirs []string
 	storageFactory       storage.Factory
+
+	// metadataInitDone is set while onMetadataDownloaded builds storage without
+	// s.mu and is closed once the result is published; Close waits on it.
+	metadataInitDone chan struct{}
+}
+
+// errSessionClosing reports work refused or abandoned because the session is
+// shutting down.
+var errSessionClosing = errors.New("session is closing")
+
+// isNilStorage reports whether st is nil, including a nil pointer boxed in the
+// interface, which a factory must never hand back as a usable Storage.
+func isNilStorage(st storage.Storage) bool {
+	if st == nil {
+		return true
+	}
+	v := reflect.ValueOf(st)
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // NewSession creates a new download session for a torrent.
@@ -615,6 +634,9 @@ func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closing = true
+		// Storage being built for metadata was admitted before closing was set;
+		// nothing new is admitted after it.
+		metadataInit := s.metadataInitDone
 		// Shutdown is the last chance to record what has been downloaded. The
 		// periodic hint flush clears stateDirty, so re-arm it when there is
 		// anything to checkpoint.
@@ -639,6 +661,12 @@ func (s *Session) Close() {
 		}
 		if s.cancel != nil {
 			s.cancel()
+		}
+		// Let that storage be published so it is closed below and RemoveSession
+		// sees the files it created. The build never takes s.mu or lifecycleMu
+		// before signalling, so this wait cannot deadlock.
+		if metadataInit != nil {
+			<-metadataInit
 		}
 		// The peer loops are cancelled and their connections gone, so nothing can
 		// touch the files behind the checkpoint.
@@ -1316,14 +1344,21 @@ func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
 	return false
 }
 
-// resetFilePrioritiesLocked allocates a fresh PriorityNormal-filled slice of size numFiles,
-// overlays any valid priority values from s.pendingFilePriorities, and clears the pending slice.
-// Caller holds s.mu.
-func (s *Session) resetFilePrioritiesLocked(numFiles int) {
-	s.filePriorities = make([]FilePriority, numFiles)
-	for i := range s.filePriorities {
-		s.filePriorities[i] = PriorityNormal
+// newFilePriorities returns a PriorityNormal-filled slice for numFiles files. It
+// is built before s.mu is taken, so a many-file torrent never allocates under it.
+func newFilePriorities(numFiles int) []FilePriority {
+	priorities := make([]FilePriority, numFiles)
+	for i := range priorities {
+		priorities[i] = PriorityNormal
 	}
+	return priorities
+}
+
+// installFilePrioritiesLocked installs priorities (from newFilePriorities),
+// overlays any valid priority values from s.pendingFilePriorities, and clears
+// the pending slice. Caller holds s.mu.
+func (s *Session) installFilePrioritiesLocked(priorities []FilePriority) {
+	s.filePriorities = priorities
 	if len(s.pendingFilePriorities) > 0 {
 		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
@@ -1525,33 +1560,57 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return err
 	}
 
-	// Initialize storage now that we know the files
-	var fileInfos []storage.FileInfo
-	for _, f := range parsed.Files {
-		fileInfos = append(fileInfos, storage.FileInfo{
+	// Build everything the session will publish before taking s.mu: a torrent
+	// can declare millions of pieces and hundreds of thousands of files.
+	fileInfos := make([]storage.FileInfo, len(parsed.Files))
+	for i, f := range parsed.Files {
+		fileInfos[i] = storage.FileInfo{
 			Path:   filepath.Join(f.Path...),
 			Length: f.Length,
-		})
+		}
 	}
+	numPieces := len(parsed.PieceHashes)
+	pieceStates := make([]PieceState, numPieces) // all PieceEmpty
+	pieceAvailability := make([]int, numPieces)
+	priorities := newFilePriorities(len(parsed.Files))
 
 	s.mu.Lock()
+	// A closing session must not start creating files: Close may already have
+	// taken the storage it will close.
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	if !s.metadataMode || s.Storage != nil || s.metadataInitDone != nil {
+		s.mu.Unlock()
+		// Not this call's metadata to discard: another call owns it.
+		keepAccumulator = true
+		return errors.New("metadata is already being applied")
+	}
 	factory := s.storageFactory
 	if factory == nil {
 		factory = storage.NewStorage
 	}
 	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
+	// Close waits on initDone, so the storage built below is either published
+	// before Close takes the session's storage or never built at all.
+	initDone := make(chan struct{})
+	s.metadataInitDone = initDone
+	s.mu.Unlock()
+
+	// The factory creates, sizes and stats every file, so it runs without s.mu:
+	// under the lock it froze every peer loop and the UI for as long as that took.
 	var (
 		st            storage.Storage
+		chosen        int
 		storageErrors []error
 	)
 	for index, downloadDir := range downloadDirs {
-		// Success is decided by the error alone: a factory that returns a nil
-		// pointer boxed in the interface must never be installed.
 		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
-		if createErr == nil && candidate != nil {
-			st = candidate
-			s.downloadDir = st.BaseDir()
-			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
+		// Success is decided by the error alone, and a nil pointer boxed in the
+		// interface is refused: installing one crashed the first storage call.
+		if createErr == nil && !isNilStorage(candidate) {
+			st, chosen = candidate, index
 			break
 		}
 		if createErr == nil {
@@ -1559,6 +1618,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		}
 		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
 	}
+
+	s.mu.Lock()
+	s.metadataInitDone = nil
+	close(initDone)
 	if st == nil {
 		// Leave the session exactly as it was before the metadata arrived: no
 		// pieces and no storage, a state every peer and reader path handles. Sizing
@@ -1570,7 +1633,21 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		s.mu.Unlock()
 		return statusErr
 	}
+	if s.closed {
+		// Unreachable while Close waits on initDone; never leak the storage.
+		s.mu.Unlock()
+		_ = st.Close()
+		return errSessionClosing
+	}
 
+	// Publish the torrent, its storage and its piece state in one step. A
+	// closing session still takes them: Close is waiting to close this storage,
+	// and RemoveSession reads the file list only after Close returns.
+	s.downloadDir = st.BaseDir()
+	if chosen > 0 {
+		// Otherwise keep the live list, which may have gained entries meanwhile.
+		s.fallbackDownloadDirs = append([]string(nil), downloadDirs[chosen+1:]...)
+	}
 	s.Torrent.PieceLength = parsed.PieceLength
 	s.Torrent.PieceHashes = parsed.PieceHashes
 	s.Torrent.Name = parsed.Name
@@ -1580,21 +1657,17 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	if parsed.Private {
 		s.DHT = nil
 	}
-
-	// Reinitialize priorities
-	s.resetFilePrioritiesLocked(len(s.Torrent.Files))
-
-	// Reinitialize piece states
-	numPieces := len(s.Torrent.PieceHashes)
-	s.PieceStates = make([]PieceState, numPieces)
-	for i := range s.PieceStates {
-		s.PieceStates[i] = PieceEmpty
-	}
-	s.pieceAvailability = make([]int, numPieces)
+	s.installFilePrioritiesLocked(priorities)
+	s.PieceStates = pieceStates
+	s.pieceAvailability = pieceAvailability
 	s.Storage = st
 	s.statusErr = nil
+	closing := s.closing
 	storageToVerify := st
 	s.mu.Unlock()
+	if closing {
+		return errSessionClosing
+	}
 
 	// Load any fast-resume hint and verify in the background (metadata just arrived, so
 	// most pieces are not on disk yet; verification stays off the hot path).
