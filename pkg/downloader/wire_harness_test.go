@@ -97,6 +97,12 @@ func (w *wirePeer) send(m *peer.Message) {
 	}
 }
 
+// sendExtended sends a BEP 10 message with the given extended id and payload.
+func (w *wirePeer) sendExtended(extID byte, payload []byte) {
+	w.t.Helper()
+	w.send(&peer.Message{ID: peer.MsgExtended, Payload: append([]byte{extID}, payload...)})
+}
+
 func (w *wirePeer) sendRequest(index, begin, length uint32) {
 	w.t.Helper()
 	w.send(&peer.Message{ID: peer.MsgRequest, Payload: blockPayload(index, begin, length)})
@@ -161,6 +167,16 @@ func (w *wirePeer) close() {
 	case <-w.done:
 	case <-time.After(5 * time.Second):
 		w.t.Error("peer loop did not exit")
+	}
+}
+
+// waitClosed fails unless the loop drops the connection within timeout.
+func (w *wirePeer) waitClosed(timeout time.Duration) {
+	w.t.Helper()
+	select {
+	case <-w.done:
+	case <-time.After(timeout):
+		w.t.Fatal("peer loop did not drop the connection")
 	}
 }
 

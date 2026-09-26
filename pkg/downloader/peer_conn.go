@@ -60,6 +60,11 @@ const maxOutboundPeers = 200
 // It is a SEPARATE budget from outbound, so an inbound flood can never starve downloads.
 const maxInboundPeers = 100
 
+// maxExtHandshakesPerConn bounds how many BEP 10 extension handshakes one
+// connection may have decoded and acted on. Real clients send one, occasionally a
+// second to update it; later ones are ignored.
+const maxExtHandshakesPerConn = 4
+
 // maxKnownPeers bounds the size of the Peers map so a tracker/DHT feeding an endless
 // stream of unique addresses cannot grow it without limit. Active peers are retained;
 // inactive entries are evicted oldest-first.
@@ -1076,6 +1081,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	var peerUtMetadataID int = -1
 	var peerUtPexID int = -1
+	extHandshakes := 0
 	pexAdvertised := make(map[string]struct{})
 	var pexTicker *time.Ticker
 	var pexTick <-chan time.Time
@@ -1776,6 +1782,18 @@ peerLoop:
 			payloadBytes := msg.Payload[1:]
 
 			if extMsgID == peer.ExtHandshake {
+				// Size gates run before any bencode decode: see the caps in pkg/peer.
+				if len(payloadBytes) > peer.MaxExtHandshakeSize {
+					disconnectReason = "oversized_extension"
+					break peerLoop
+				}
+				// BEP 10 lets a peer re-send its handshake to update it, but each one
+				// is decoded and can restart the metadata requests, so only the first
+				// few per connection are honoured.
+				extHandshakes++
+				if extHandshakes > maxExtHandshakesPerConn {
+					break
+				}
 				hs, err := peer.ParseExtensionHandshake(payloadBytes)
 				if err == nil {
 					if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
@@ -1827,6 +1845,10 @@ peerLoop:
 					}
 				}
 			} else if extMsgID == peer.LocalMetadataExtID {
+				if len(payloadBytes) > peer.MaxMetadataMessageSize {
+					disconnectReason = "oversized_extension"
+					break peerLoop
+				}
 				metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
 				if err == nil {
 					switch metaMsg.MsgType {
@@ -1909,6 +1931,10 @@ peerLoop:
 					}
 				}
 			} else if extMsgID == peer.LocalPEXExtID && s.pexEnabled() {
+				if len(payloadBytes) > peer.MaxPEXMessageSize {
+					disconnectReason = "oversized_extension"
+					break peerLoop
+				}
 				pexMsg, err := peer.ParsePEXMessage(payloadBytes)
 				if err == nil {
 					s.handlePEXMessage(peerAddr, pexMsg)

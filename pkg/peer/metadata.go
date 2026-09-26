@@ -35,6 +35,17 @@ const MaxMetadataSize = 16 * 1024 * 1024
 
 const maxMetadataPieces = MaxMetadataSize / MetadataBlockSize
 
+// Size caps for BEP 10 sub-messages, checked before any bencode decode. The wire
+// cap (MaxMessageLength) is sized for piece blocks, and decoding a 2 MiB payload of
+// tiny containers builds a tree ~50x its size, so control messages get their own
+// limits. Real extension handshakes are well under 1 KiB, and a ut_metadata data
+// message is a small dict plus at most one 16 KiB block (libtorrent drops anything
+// over 17 KiB too).
+const (
+	MaxExtHandshakeSize    = 64 * 1024
+	MaxMetadataMessageSize = MetadataBlockSize + 1024
+)
+
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
 // the total metadata size, and an optional client identifier.
@@ -47,6 +58,9 @@ type ExtensionHandshake struct {
 // ParseExtensionHandshake parses a BEP 10 extension handshake from bencoded data.
 // The input must be a bencoded dictionary containing at least an "m" key.
 func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
+	if len(data) > MaxExtHandshakeSize {
+		return nil, fmt.Errorf("extension handshake too large: %d bytes", len(data))
+	}
 	decoded, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode extension handshake: %w", err)
@@ -162,6 +176,9 @@ type MetadataMessage struct {
 func ParseMetadataMessage(data []byte) (*MetadataMessage, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty metadata message")
+	}
+	if len(data) > MaxMetadataMessageSize {
+		return nil, fmt.Errorf("metadata message too large: %d bytes", len(data))
 	}
 
 	// Find the end of the bencoded dictionary so we can separate the
