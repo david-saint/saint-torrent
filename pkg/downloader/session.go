@@ -1824,6 +1824,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		}
 		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
 	}
+	// Read any checkpoint while the storage is still private to this call: it
+	// opens every payload file, which under s.mu stalled the peer loops too.
+	var (
+		resume    storage.ResumeState
+		resumeErr error
+	)
+	if st != nil {
+		resume, resumeErr = readResumeState(st, s.Torrent.InfoHash)
+	}
 
 	s.mu.Lock()
 	s.metadataInitDone = nil
@@ -1902,16 +1911,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return errSessionClosing
 	}
 
-	// Load any fast-resume hint and verify in the background (metadata just arrived, so
-	// most pieces are not on disk yet; verification stays off the hot path).
-	s.loadResumeState()
-	s.maybeStartVerification()
-
 	s.mu.Lock()
 	if s.Storage != storageToVerify {
 		s.mu.Unlock()
 		return fmt.Errorf("storage changed while completing metadata")
 	}
+	// Install the fast-resume state read above; verification runs in the
+	// background (metadata just arrived, so most pieces are not on disk yet and
+	// hashing stays off the hot path).
+	s.applyResumeStateLocked(resume, resumeErr)
 	s.metadataCompleted = true
 	s.metadataMode = false
 	close(s.metadataCompletedCh)
@@ -1923,6 +1931,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		c.Notify()
 	}
 	s.mu.Unlock()
+	s.maybeStartVerification()
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()

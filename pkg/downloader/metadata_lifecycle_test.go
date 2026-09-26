@@ -412,3 +412,59 @@ func TestCloseStopsMetadataStorageRetry(t *testing.T) {
 		t.Fatalf("storage factory ran %d times, want only the first attempt before Close", n)
 	}
 }
+
+// resumeProbeStorage records whether s.mu was free while the session read its
+// checkpoint, and reports piece 0 as verified.
+type resumeProbeStorage struct {
+	storage.Storage
+	sess     *Session
+	reads    atomic.Int32
+	lockHeld atomic.Bool
+}
+
+func (p *resumeProbeStorage) LoadResumeState(string) (storage.ResumeState, error) {
+	p.reads.Add(1)
+	if p.sess.mu.TryLock() {
+		p.sess.mu.Unlock()
+	} else {
+		p.lockHeld.Store(true)
+	}
+	return storage.ResumeState{Verified: []int{0}}, nil
+}
+
+func (p *resumeProbeStorage) SaveResumeState(string, []int, []int, bool) error { return nil }
+
+// TestMetadataResumeStateIsReadWithoutSessionLock: reading a magnet's
+// checkpoint opens the .state file and every payload file. It ran under the
+// s.mu write lock once peers were connected, stalling every peer loop, the UI
+// snapshot and saveState for as long as that took on a many-file torrent.
+func TestMetadataResumeStateIsReadWithoutSessionLock(t *testing.T) {
+	infoBytes := testInfoDict(t, "resume.bin")
+	var probe *resumeProbeStorage
+	var sess *Session
+	sess = newTestMagnetSession(t, infoBytes, func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		st, err := memStorageFactory(dir, files, pieceLength)
+		if err != nil {
+			return nil, err
+		}
+		probe = &resumeProbeStorage{Storage: st, sess: sess}
+		return probe, nil
+	})
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded: %v", err)
+	}
+	if n := probe.reads.Load(); n != 1 {
+		t.Fatalf("checkpoint read %d times, want once", n)
+	}
+	if probe.lockHeld.Load() {
+		t.Fatal("s.mu was held while the checkpoint was read")
+	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if len(sess.PieceStates) != 1 || sess.PieceStates[0] != PieceCompleted {
+		t.Fatalf("PieceStates=%v, want the checkpoint's verified piece installed", sess.PieceStates)
+	}
+	if sess.metadataMode || !sess.metadataCompleted {
+		t.Fatalf("metadataMode=%v completed=%v, want the torrent published", sess.metadataMode, sess.metadataCompleted)
+	}
+}
