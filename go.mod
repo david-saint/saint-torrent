@@ -7,7 +7,9 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.8
-	github.com/libp2p/go-nat v0.2.0
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/go-nat-pmp v1.1.0
+	github.com/libp2p/go-netroute v0.4.0
 	golang.org/x/sys v0.48.0
 )
 
@@ -21,10 +23,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
-	github.com/huin/goupnp v1.3.0 // indirect
-	github.com/jackpal/go-nat-pmp v1.1.0 // indirect
-	github.com/koron/go-ssdp v0.9.1 // indirect
-	github.com/libp2p/go-netroute v0.4.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
