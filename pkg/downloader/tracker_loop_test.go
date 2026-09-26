@@ -539,7 +539,7 @@ func TestAnnounceKeysIPv6PeersWithBrackets(t *testing.T) {
 	})
 }
 
-func TestFreshTrackerPeersAppliesNetpolicy(t *testing.T) {
+func TestFreshTrackerPeersAppliesAdmissionPolicy(t *testing.T) {
 	peers := []tracker.Peer{
 		{IP: net.ParseIP("8.8.8.8"), Port: 6881},
 		{IP: net.ParseIP("8.8.8.8").To4(), Port: 6881}, // duplicate in another form
@@ -550,8 +550,10 @@ func TestFreshTrackerPeersAppliesNetpolicy(t *testing.T) {
 		{IP: net.IPv4zero, Port: 6881},
 		{IP: net.ParseIP("2001:db8::1"), Port: 6881},
 	}
+	// A tracker reached by name may list LAN peers (trackerPeerAllowed), but
+	// never loopback, link-local or non-unicast ones.
 	got := freshTrackerPeers(peers, netip.Addr{}, map[netip.AddrPort]struct{}{})
-	if fmt.Sprint(got) != "[8.8.8.8:6881 [2001:db8::1]:6881]" {
+	if fmt.Sprint(got) != "[8.8.8.8:6881 192.168.1.1:80 [2001:db8::1]:6881]" {
 		t.Fatalf("public tracker peers = %v", got)
 	}
 	got = freshTrackerPeers(peers, netip.MustParseAddr("127.0.0.1"), map[netip.AddrPort]struct{}{})

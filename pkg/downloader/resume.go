@@ -99,7 +99,10 @@ type pieceWriteJob struct {
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
 	// disconnect-on-corruption.
-	conn                    net.Conn
+	conn net.Conn
+	// source identifies that connection for hash-failure strikes against its host
+	// (see strikePieceSourceLocked); nil for webseed pieces.
+	source                  *pieceSource
 	result                  chan<- pieceWriteResult
 	recoverableStorageError bool
 }
@@ -128,10 +131,12 @@ func (job pieceWriteJob) sendResult(status pieceWriteStatus, err error) {
 	}
 }
 
-// pieceWriteQueueDepth bounds how many completed-piece buffers can be queued for the
-// write pool. Each entry holds a full piece, so this caps the pool's memory; once
-// full, submitting applies backpressure to the peer goroutine, which is the intended
-// bound (a peer can't outrun the disk without limit).
+// pieceWriteQueueDepth bounds how many completed-piece buffers wait in the channel
+// for the write pool. Once it is full, submitting blocks the peer goroutine, which
+// stops reading its socket, so disk backpressure reaches the peer. That does not
+// cap memory by itself: each peer goroutine blocked on the send still holds its
+// assembled piece (plus its open pieces, see peerOpenPieceBytesCap), so completed
+// pieces in flight are bounded by queue + workers + blocked connections, not by 8.
 const pieceWriteQueueDepth = 8
 
 // ensurePieceWritePool lazily starts the background hash/write workers. Idempotent.
@@ -189,6 +194,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
+		// Closing the connection alone let the peer reconnect at once and do it
+		// again; a repeat offender is banned, and its other connections go too.
+		banned := s.strikePieceSourceLocked(job.source, time.Now())
+		if banned {
+			s.closeHostConnsLocked(job.source.host)
+		}
 		s.mu.Unlock()
 		if job.conn != nil {
 			_ = job.conn.Close()
@@ -197,6 +208,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			logging.Int64("piece", job.index),
 			logging.Err(verifyErr),
 		)
+		if banned {
+			s.logSessionEvent(logging.LevelWarn, "peer_banned",
+				logging.String("host", job.source.host),
+				logging.Duration("duration", peerBanDuration),
+			)
+		}
 		job.sendResult(pieceWriteHashFailed, verifyErr)
 		return
 	}

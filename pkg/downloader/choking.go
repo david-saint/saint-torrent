@@ -38,6 +38,9 @@ func (s *Session) chokeLoop() {
 	}
 }
 
+// recalculateChoking and recalculateOptimistic only update AmChoking and wake the
+// peer's message loop (peer.Client.Notify), which sends the choke or unchoke
+// itself: the choker holds s.mu and must never write to a peer's socket.
 func (s *Session) recalculateChoking(optimisticPeer *string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,7 +101,7 @@ func (s *Session) recalculateChoking(optimisticPeer *string) {
 			pState := s.Peers[cand.addr]
 			if pState.AmChoking {
 				pState.AmChoking = false
-				s.sendPeerControlLocked(cand.client, (*peer.Client).SendUnchoke)
+				cand.client.Notify()
 			}
 		} else {
 			break
@@ -127,7 +130,7 @@ func (s *Session) recalculateChoking(optimisticPeer *string) {
 				pState.AmChoking = false
 				topPeers[addr] = true
 				unchokedCount++
-				s.sendPeerControlLocked(client, (*peer.Client).SendUnchoke)
+				client.Notify()
 			} else if !pState.AmChoking {
 				topPeers[addr] = true
 			}
@@ -137,7 +140,7 @@ func (s *Session) recalculateChoking(optimisticPeer *string) {
 		// Otherwise, choke
 		if !pState.AmChoking {
 			pState.AmChoking = true
-			s.sendPeerControlLocked(client, (*peer.Client).SendChoke)
+			client.Notify()
 		}
 	}
 }
@@ -172,6 +175,6 @@ func (s *Session) recalculateOptimistic(optimisticPeer *string) {
 	pState := s.Peers[chosenAddr]
 	pState.AmChoking = false
 	if client, ok := s.activePeers[chosenAddr]; ok {
-		s.sendPeerControlLocked(client, (*peer.Client).SendUnchoke)
+		client.Notify()
 	}
 }

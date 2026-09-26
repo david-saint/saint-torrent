@@ -283,17 +283,17 @@ func TestPieceCompletingWhileClosingIsDropped(t *testing.T) {
 	}
 }
 
-// hugePieceStorage reports a piece length no buffer can hold.
-type hugePieceStorage struct{ storage.Storage }
+// unaddressablePieceStorage reports a piece length no buffer can hold.
+type unaddressablePieceStorage struct{ storage.Storage }
 
-func (hugePieceStorage) PieceLengthValue() int64 { return 1 << 62 }
+func (unaddressablePieceStorage) PieceLengthValue() int64 { return 1 << 62 }
 
 // TestPieceBufferRefusesUnallocatableLengths: getPieceBuf rounded every buffer
 // up to the storage's piece length, so a one-block piece of a torrent declaring
 // a 2^62-byte piece length died in make() on the peer goroutine, taking the
 // whole process down.
 func TestPieceBufferRefusesUnallocatableLengths(t *testing.T) {
-	sess := &Session{Storage: hugePieceStorage{}}
+	sess := &Session{Storage: unaddressablePieceStorage{}}
 	bp := sess.getPieceBuf(BlockSize)
 	if len(*bp) != BlockSize || cap(*bp) != BlockSize {
 		t.Fatalf("buffer len=%d cap=%d, want exactly one block", len(*bp), cap(*bp))

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"sainttorrent/pkg/logging"
-	"sainttorrent/pkg/netpolicy"
 	"sainttorrent/pkg/tracker"
 )
 
@@ -644,8 +643,9 @@ func (s *Session) finishTrackerEventLocked(event string, delivered bool) {
 }
 
 // freshTrackerPeers converts a tracker's peers to endpoints, dropping ones
-// already seen this round and ones netpolicy forbids for this tracker (port 0,
-// non-unicast, and loopback or LAN addresses from a public tracker).
+// already seen this round and ones trackerPeerAllowed refuses for this tracker
+// (port 0, non-unicast, and loopback or link-local addresses from a tracker
+// that is not itself that local).
 func freshTrackerPeers(peers []tracker.Peer, source netip.Addr, seen map[netip.AddrPort]struct{}) []netip.AddrPort {
 	out := make([]netip.AddrPort, 0, len(peers))
 	for _, p := range peers {
@@ -654,7 +654,7 @@ func freshTrackerPeers(peers []tracker.Peer, source netip.Addr, seen map[netip.A
 			continue
 		}
 		ap := netip.AddrPortFrom(addr.Unmap(), p.Port)
-		if !netpolicy.PeerAllowed(ap, source) {
+		if !trackerPeerAllowed(p, source) {
 			continue
 		}
 		if _, dup := seen[ap]; dup {
@@ -695,6 +695,7 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 			// A tracker response is authoritative evidence that this endpoint is
 			// dialable, even if the same address was first seen as an inbound peer.
 			pState.Dialable = true
+			pState.markTrackerListed()
 			if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
 				shouldDial = true
 			}
@@ -711,6 +712,7 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 					LastAttempt: time.Now(),
 					Dialable:    true,
 					Dialing:     true,
+					Source:      PeerSourceTracker,
 				}
 			} else {
 				s.Peers[peerAddr].LastAttempt = time.Now()

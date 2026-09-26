@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"container/heap"
+	"math"
 	"sort"
 )
 
@@ -294,6 +295,7 @@ func (b *neededPieceBuckets) firstMatch(match func(int) neededBucketMatch) (int,
 // state changes (resume load, metadata arrival, storage repair, priority changes).
 // Caller holds s.mu.
 func (s *Session) recomputeNeededLocked() {
+	s.pickGen.Add(1)
 	if s.neededPieces == nil {
 		s.neededPieces = make(map[int]struct{}, len(s.PieceStates))
 	} else {
@@ -336,6 +338,7 @@ func (s *Session) addNeededLocked(idx int) {
 	}
 	s.neededPieces[idx] = struct{}{}
 	s.neededBuckets.add(s.piecePriority(int64(idx)), s.pieceAvailabilityAt(idx), idx)
+	s.pickGen.Add(1)
 }
 
 // removeNeededLocked drops a piece from the needed set when it leaves PieceEmpty.
@@ -349,6 +352,16 @@ func (s *Session) removeNeededLocked(idx int) {
 	}
 	delete(s.neededPieces, idx)
 	s.neededBuckets.remove(idx)
+	s.noteNeededShrunkLocked()
+}
+
+// noteNeededShrunkLocked advances pickGen when the needed set has just emptied:
+// endgame begins, so pieces in flight elsewhere become pickable as endgame
+// copies. Caller holds s.mu.
+func (s *Session) noteNeededShrunkLocked() {
+	if len(s.neededPieces) == 0 {
+		s.pickGen.Add(1)
+	}
 }
 
 // neededBucketsFreshLocked checks if the needed-piece bucket structures are fresh.
@@ -401,6 +414,9 @@ func (s *Session) selectNeededPieceLocked(hasPiece func(pieceIndex int64) bool) 
 	})
 	for _, idx := range dropped {
 		delete(s.neededPieces, idx)
+	}
+	if len(dropped) > 0 {
+		s.noteNeededShrunkLocked()
 	}
 	return bestIdx
 }
@@ -646,6 +662,9 @@ func (s *Session) hasSelectableNeededPieceLocked(hasPiece func(pieceIndex int64)
 	for _, idx := range dropped {
 		delete(s.neededPieces, idx)
 	}
+	if len(dropped) > 0 {
+		s.noteNeededShrunkLocked()
+	}
 	return bestIdx != -1
 }
 
@@ -730,16 +749,36 @@ func (s *Session) addPieceAvailability(idx int) {
 // applyBitfieldAvailability folds the delta between a peer's previous and new
 // advertised bitfield into the swarm availability counts. This handles a peer that
 // re-sends or extends its bitfield without double-counting.
+//
+// It walks the bitfields a byte at a time and skips bytes that did not change, so
+// unchanged regions cost one compare per eight pieces under the write lock and only
+// changed pieces touch the needed buckets.
 func (s *Session) applyBitfieldAvailability(oldBF, newBF []byte) {
 	s.mu.Lock()
-	for i := range s.pieceAvailability {
-		old := bitfieldHas(oldBF, i)
-		now := bitfieldHas(newBF, i)
-		switch {
-		case now && !old:
-			s.changePieceAvailabilityLocked(i, 1)
-		case old && !now:
-			s.changePieceAvailabilityLocked(i, -1)
+	n := len(s.pieceAvailability)
+	for byteIdx := 0; byteIdx < (n+7)/8; byteIdx++ {
+		var oldByte, newByte byte
+		if byteIdx < len(oldBF) {
+			oldByte = oldBF[byteIdx]
+		}
+		if byteIdx < len(newBF) {
+			newByte = newBF[byteIdx]
+		}
+		if oldByte == newByte {
+			continue
+		}
+		for bit := 0; bit < 8; bit++ {
+			i := byteIdx*8 + bit
+			if i >= n {
+				break
+			}
+			mask := byte(0x80) >> bit
+			switch {
+			case newByte&mask != 0 && oldByte&mask == 0:
+				s.changePieceAvailabilityLocked(i, 1)
+			case oldByte&mask != 0 && newByte&mask == 0:
+				s.changePieceAvailabilityLocked(i, -1)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -747,15 +786,27 @@ func (s *Session) applyBitfieldAvailability(oldBF, newBF []byte) {
 
 // removePeerAvailability drops a disconnecting peer's contribution to the counts,
 // using the bitfield it had accumulated (Haves set bits incrementally, so this is
-// the exact set it added). Caller does not hold s.mu.
+// the exact set it added). Empty bytes are skipped, so a peer that advertised
+// little costs little. Caller does not hold s.mu.
 func (s *Session) removePeerAvailability(bf []byte) {
 	if bf == nil {
 		return
 	}
 	s.mu.Lock()
-	for i := range s.pieceAvailability {
-		if bitfieldHas(bf, i) {
-			s.changePieceAvailabilityLocked(i, -1)
+	n := len(s.pieceAvailability)
+	for byteIdx := 0; byteIdx < len(bf) && byteIdx < (n+7)/8; byteIdx++ {
+		b := bf[byteIdx]
+		if b == 0 {
+			continue
+		}
+		for bit := 0; bit < 8; bit++ {
+			i := byteIdx*8 + bit
+			if i >= n {
+				break
+			}
+			if b&(byte(0x80)>>bit) != 0 {
+				s.changePieceAvailabilityLocked(i, -1)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -796,6 +847,17 @@ func (s *Session) selectEndgamePieceLocked(hasPiece func(pieceIndex int64) bool,
 		}
 	}
 	return bestIdx
+}
+
+// maxWirePieceLength is the largest piece the peer wire protocol can address:
+// request and piece messages carry the offset within a piece as a uint32.
+const maxWirePieceLength = int64(1) << 32
+
+// pieceLengthAssemblable reports whether a piece of this length can be fetched
+// over the wire and assembled into a single buffer on this platform (an int is
+// 32 bits on 386, so there a piece must stay below 2 GiB).
+func pieceLengthAssemblable(length int64) bool {
+	return length > 0 && length <= maxWirePieceLength && uint64(length) <= uint64(math.MaxInt)
 }
 
 func (s *Session) blocksInPiece(pieceIndex int64) int64 {

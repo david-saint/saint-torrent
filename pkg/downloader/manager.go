@@ -212,8 +212,9 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 				}
 				m.mu.RLock()
 				sess, exists := m.sessions[fmt.Sprintf("%x", peer.InfoHash)]
+				self := m.isOwnPeerEndpointLocked(peer.IP, peer.Port)
 				m.mu.RUnlock()
-				if exists {
+				if exists && !self {
 					addr := net.JoinHostPort(peer.IP.String(), fmt.Sprintf("%d", peer.Port))
 					sess.AddPeerFromDiscovery(addr)
 				}

@@ -32,6 +32,13 @@ import (
 // A var (not const) so tests can shorten it; treat it as a constant in production.
 var peerStallTimeout = 60 * time.Second
 
+// peerInactivityTimeout drops a connection, in either direction, on which neither
+// side has been interested and no payload has moved for this long (libtorrent's
+// inactivity_timeout). The stall reaper only covers outbound connections while we
+// download, so without this an idle peer sending keep-alives could hold an inbound
+// slot for good. A var so tests can shorten it; treat it as a constant.
+var peerInactivityTimeout = 10 * time.Minute
+
 // peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
 // outbound connection set. New dials previously happened ONLY on a tracker
 // announce (interval up to an hour) or a 30 s DHT lookup, so a slot freed by a
@@ -50,8 +57,10 @@ const peerSocketBufferSize = 4 * 1024 * 1024
 
 // maxOutboundPeers bounds how many peers a single session dials concurrently. This is
 // the download engine: it governs throughput on swarms made of many slow peers, so it
-// is set generously (mainline/libtorrent use ~200 per torrent). An attacker cannot
-// occupy these slots — they are only ever filled by peers we chose to connect to.
+// is set generously (mainline/libtorrent use ~200 per torrent). These slots are only
+// filled by peers we chose to dial, but those addresses come from trackers, DHT and
+// PEX, so a hostile endpoint can still hold one: the stall reaper and the peer write
+// timeout (pkg/peer) are what free it again.
 const maxOutboundPeers = 200
 
 // maxInboundPeers bounds how many incoming peer connections a session accepts at once.
@@ -59,6 +68,55 @@ const maxOutboundPeers = 200
 // surface: the cap stops a flood of inbound connections from exhausting file descriptors.
 // It is a SEPARATE budget from outbound, so an inbound flood can never starve downloads.
 const maxInboundPeers = 100
+
+// metadataRetryInterval is how often a metadata-phase connection whose peer
+// offers ut_metadata checks whether a failed assembly started a new fetch round
+// and, if so, re-asks the peer for the missing blocks. A var so tests can shorten
+// it; treat it as a constant in production.
+var metadataRetryInterval = 2 * time.Second
+
+// metadataSizeStallTimeout is how long the ut_metadata accumulator may go without
+// taking a block before a peer that advertised a different metadata_size may
+// replace it. The first peer to advertise a size fixes it for everyone and peers
+// advertising another size are not asked, so without this one peer advertising a
+// bogus size and never answering would stall a magnet for good; honest peers,
+// which all advertise the true size, deliver a block well within it. A var so
+// tests can shorten it; treat it as a constant in production.
+var metadataSizeStallTimeout = 20 * time.Second
+
+// metadataServeWindow and metadataServeRequestsPerBlock bound how many ut_metadata
+// blocks one connection may have us serve: an honest fetcher asks for each block
+// once, so twice the info dict's block count per minute leaves room for retries
+// while stopping a peer from re-requesting blocks without end. Requests beyond the
+// budget are rejected.
+const (
+	metadataServeWindow           = time.Minute
+	metadataServeRequestsPerBlock = 2
+)
+
+// maxPeerDHTPortUpdates bounds how many BEP 5 PORT messages from one connection
+// are fed to the DHT. An honest peer sends one; a few more allow for a port
+// change, while a peer alternating ports cannot make us scan the routing table
+// with every 7-byte message.
+const maxPeerDHTPortUpdates = 4
+
+// pickRetryInterval bounds how long a peer loop trusts an empty pick (see noPick
+// in runPeerMessageLoop) when nothing it tracks has changed: a backstop for any
+// way a piece becomes pickable that does not advance Session.pickGen.
+const pickRetryInterval = 5 * time.Second
+
+// selectNeededPiece is the peer loop's picker scan. A var so tests can count the
+// scans.
+var selectNeededPiece = (*Session).selectNeededPieceLocked
+
+// addDHTNode feeds a peer-advertised DHT endpoint to the routing table. A var so
+// tests can observe the calls.
+var addDHTNode = (*dht.DHT).AddNode
+
+// maxExtHandshakesPerConn bounds how many BEP 10 extension handshakes one
+// connection may have decoded and acted on. Real clients send one, occasionally a
+// second to update it; later ones are ignored.
+const maxExtHandshakesPerConn = 4
 
 // maxKnownPeers bounds the size of the Peers map so a tracker/DHT feeding an endless
 // stream of unique addresses cannot grow it without limit. Active peers are retained;
@@ -112,23 +170,29 @@ func minRetry(a, b time.Duration) time.Duration {
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
-// maxKnownPeers, oldest-attempt-first; active peers are never evicted. Caller holds s.mu.
+// maxKnownPeers: first those past maxPeerFailCount, so a flood of dead addresses
+// cannot push out peers that work, then oldest-attempt-first. Active peers are
+// never evicted. Caller holds s.mu.
 func (s *Session) prunePeersLocked() {
 	if len(s.Peers) <= maxKnownPeers {
 		return
 	}
 	type agedPeer struct {
-		addr string
-		at   time.Time
+		addr   string
+		at     time.Time
+		failed bool
 	}
 	inactive := make([]agedPeer, 0, len(s.Peers))
 	for addr, ps := range s.Peers {
 		if ps.Active {
 			continue
 		}
-		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt})
+		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt, failed: ps.FailCount >= maxPeerFailCount})
 	}
 	sort.Slice(inactive, func(i, j int) bool {
+		if inactive[i].failed != inactive[j].failed {
+			return inactive[i].failed
+		}
 		return inactive[i].at.Before(inactive[j].at)
 	})
 	// Evict down to ~75% of the cap so pruning isn't triggered on every insert.
@@ -171,36 +235,23 @@ func (s *Session) markPeerAttemptFailed(peerAddr string) {
 	if ps, ok := s.Peers[peerAddr]; ok {
 		ps.Active = false
 		ps.LastAttempt = time.Now()
+		ps.noteDialFailed()
 	}
 	s.mu.Unlock()
 }
 
+// broadcastHave queues a Have for piece index on every active connection. Each
+// connection's own message loop sends it, batched with any other queued Haves, so
+// completing a piece starts no goroutines and never waits on a peer's socket: a
+// peer that reads slowly cannot pile up senders.
 func (s *Session) broadcastHave(index uint32) {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed || s.ctx.Err() != nil {
-		s.mu.RUnlock()
 		return
 	}
-	var clients []*peer.Client
 	for _, client := range s.activePeers {
-		clients = append(clients, client)
-	}
-	s.mu.RUnlock()
-
-	for _, client := range clients {
-		s.wg.Add(1)
-		go func(c *peer.Client) {
-			defer s.wg.Done()
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-			}
-			_ = c.SendHave(index)
-		}(client)
+		client.QueueHave(index)
 	}
 }
 
@@ -254,19 +305,20 @@ func (s *Session) maintainPeerConnections() {
 
 	launched := 0
 	now := time.Now()
-	for _, ps := range s.Peers {
+	for addr, ps := range s.Peers {
 		if slotsHeld+launched >= maxOutboundPeers || launched >= globalRoom {
 			break
 		}
-		// Skip connected peers, attempts already in flight, and inbound-only source
-		// endpoints whose ports were never advertised as listening ports.
-		if ps.Active || ps.Dialing || !ps.Dialable {
+		// Skip connected peers, attempts already in flight, inbound-only source
+		// endpoints whose ports were never advertised as listening ports, and
+		// DHT/PEX peers of a torrent that turned out private.
+		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr, ps.IP) || s.privateRefusesDialLocked(ps) {
 			continue
 		}
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
 		// "dial now" (e.g. Resume clears it on every inactive peer); the dedup against a
 		// concurrent dial is the LastAttempt = now set below, under the lock.
-		if !ps.LastAttempt.IsZero() && now.Sub(ps.LastAttempt) <= peerRedialBackoff {
+		if !ps.LastAttempt.IsZero() && now.Sub(ps.LastAttempt) <= ps.redialBackoff() {
 			continue
 		}
 		ip := net.ParseIP(ps.IP)
@@ -287,9 +339,12 @@ func (s *Session) maintainPeerConnections() {
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
+	// Keyed like addPeer, PEX, DHT and inbound connections (net.JoinHostPort), so
+	// an IPv6 peer's entry is found here too.
 	peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
+	refused := s.refusesDialLocked(peerAddr, p.IP.String()) || s.privateRefusesDialLocked(s.Peers[peerAddr])
 	s.mu.RUnlock()
 	acquiredSlots := false
 	defer func() {
@@ -299,13 +354,18 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 			// A full per-session or manager-wide pool means no network attempt was
 			// made. Keep the peer immediately eligible instead of burning a full
 			// redial backoff because a lock-free capacity hint raced another session.
+			// A refused address keeps its backoff.
 			resumedDuringDial := s.pauseEpoch != dialPauseEpoch && !s.paused && !s.closed
-			if (!acquiredSlots || resumedDuringDial) && !ps.Active {
+			if (!acquiredSlots || resumedDuringDial) && !ps.Active && !refused {
 				ps.LastAttempt = time.Time{}
 			}
+			s.forgetRefusedPeerLocked(peerAddr)
 		}
 		s.mu.Unlock()
 	}()
+	if refused {
+		return
+	}
 
 	// Acquire an outbound slot so concurrent dials stay bounded (see maxOutboundPeers).
 	// outboundSlots is nil only for sessions built outside NewSession (tests), which
@@ -426,6 +486,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		ps.LastAttempt = time.Now()
 		ps.Dialable = true
 		ps.Dialing = false
+		ps.FailCount = 0
 	}
 	s.mu.Unlock()
 
@@ -576,8 +637,9 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	s.mu.RLock()
 	paused := s.paused
 	closed := s.closed
+	banned := s.refusesIncomingLocked(conn.RemoteAddr())
 	s.mu.RUnlock()
-	if paused || closed {
+	if paused || closed || banned {
 		return
 	}
 
@@ -635,6 +697,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	_ = conn.SetDeadline(time.Time{})
 
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	client.RemotePeerID = handshake.PeerID
 	peerAddr := conn.RemoteAddr().String()
 	host, portStr, err := net.SplitHostPort(peerAddr)
 	if err != nil {
@@ -656,9 +719,43 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		direction = "outbound"
 	}
 
+	hostKey, loopback := peerHostKey(ip)
+	remoteID := client.RemotePeerID
+	// A piece from this connection that fails its hash check is charged to its
+	// host; loopback peers are exempt, as from the per-host cap.
+	source := &pieceSource{host: hostKey}
+	if loopback {
+		source.host = ""
+	}
 	s.mu.Lock()
 	if s.paused || s.closed {
 		s.mu.Unlock()
+		return
+	}
+	// A dial started before metadata showed the torrent is private is refused
+	// here, under the same lock that registers the connection, so none slips
+	// past purgeDiscoveryPeersLocked.
+	var reason string
+	if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
+		reason = "private_discovery_peer"
+		s.forgetRefusedPeerLocked(peerAddr)
+	} else {
+		reason = s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound)
+	}
+	if reason != "" {
+		if reason == "self_connection" {
+			if ps, ok := s.Peers[peerAddr]; ok {
+				ps.Dialable = false
+			}
+		}
+		s.mu.Unlock()
+		if logging.Enabled() {
+			logging.Debug("peer_rejected",
+				logging.String("peer", peerAddr),
+				logging.String("direction", direction),
+				logging.String("reason", reason),
+			)
+		}
 		return
 	}
 	connectionPauseEpoch := s.pauseEpoch
@@ -686,8 +783,15 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// connection does not erase prior tracker/DHT evidence for the same endpoint.
 	if outbound {
 		pState.Dialable = true
+	} else {
+		pState.Source |= PeerSourceIncoming
 	}
 	pState.Active = true
+	// Choke and interest start over on every connection (BEP 3); an entry kept
+	// from an earlier connection to this address still holds that one's state.
+	pState.AmChoking = true
+	pState.Choked = true
+	pState.Interested = false
 	s.activePeers[peerAddr] = client
 	if logEnabled {
 		logInfoHash, logName = s.logIdentityLocked()
@@ -709,6 +813,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Lock()
 		reconnectAfterResume := false
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
+			s.releasePeerLocked(hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Active = false
 				ps.Choked = true
@@ -723,7 +828,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				// source port: they're worthless as redial candidates, so retaining
 				// them past disconnect only feeds unbounded growth from reconnect
 				// churn. Drop them outright rather than leaving them inactive forever.
-				if !ps.Dialable && !reconnectAfterResume {
+				// So are DHT/PEX peers of a torrent that turned out private.
+				if s.privateRefusesDialLocked(ps) {
+					reconnectAfterResume = false
+					delete(s.Peers, peerAddr)
+				} else if !ps.Dialable && !reconnectAfterResume {
 					delete(s.Peers, peerAddr)
 				}
 			}
@@ -767,6 +876,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// short-circuits the re-check once every index in it has been offered.
 	var localAllowedFast []int
 	allowedFastFullyAdvertised := false
+	// allowedFastServed counts blocks of each allowed-fast piece queued for this
+	// peer while we choke it (keys are limited to allowedFastForPeer).
+	allowedFastServed := make(map[int64]int64)
 	// Fast messages that arrive before we have metadata reference piece indices we
 	// cannot validate yet; remember them and replay once the piece count is known
 	// (a seed sends have_all exactly once, right after the handshake — well before
@@ -775,7 +887,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// pendingAllowedFast buffers allowed_fast offers that arrive before metadata,
 	// deduped and capped at pendingAllowedFastCap. The cap sits far above any real
 	// client's allowed-fast set so legitimate offers all replay once metadata lands
-	// (matching the post-metadata path, which is bounded only by the piece count),
+	// (the post-metadata path applies the same cap to peerAllowedFast),
 	// while still preventing a peer from growing our memory at wire rate by spamming
 	// distinct indices we cannot yet validate. The map is sized for the common case
 	// (~allowedFastSetSize offers); it grows on its own if a peer sends more.
@@ -850,10 +962,19 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// Send extension handshake if peer supports extensions (BEP 10)
 	if peerReserved[5]&0x10 != 0 {
 		s.mu.RLock()
-		infoLen := len(s.Torrent.InfoBytes)
 		extensions := s.extensionHandshakeMapLocked()
+		infoLen := 0
+		if _, ok := extensions[peer.ExtNameMetadata]; ok {
+			infoLen = len(s.Torrent.InfoBytes)
+		}
 		s.mu.RUnlock()
-		_ = client.SendExtHandshakeWithExtensions(extensions, infoLen)
+		// reqq tells the peer how many requests we queue (maxUploadQueue), so it
+		// does not pipeline requests we would have to reject.
+		_ = client.SendExtensionHandshake(&peer.ExtensionHandshake{
+			Extensions:   extensions,
+			MetadataSize: infoLen,
+			RequestQueue: maxUploadQueue,
+		})
 	}
 
 	// Advertise our DHT UDP port to DHT-capable peers (BEP 5 PORT message). This
@@ -876,10 +997,29 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if !inMeta {
 		peerBitfield = make([]byte, (numPieces+7)/8)
 	}
+	// peerIsSeed marks a peer that announced every piece (have_all or a full
+	// bitfield). Seeds are left out of pieceAvailability: a seed raises every
+	// piece's count by one, which never changes rarest-first order, so skipping it
+	// keeps a seed's connect and disconnect O(1) under s.mu instead of O(pieces).
+	peerIsSeed := false
 	// Drop this peer's contribution to swarm piece availability on exit. peerBitfield
 	// accumulates exactly the pieces we counted (bitfield delta + Haves), so the
 	// closure reads its final value here. (#7, rarest-first.)
-	defer func() { s.removePeerAvailability(peerBitfield) }()
+	defer func() {
+		if !peerIsSeed {
+			s.removePeerAvailability(peerBitfield)
+		}
+	}()
+	// availabilityReceived is set by the peer's first bitfield, have_all or
+	// have_none. BEP 3/6 allow exactly one of them, right after the handshake, and
+	// each one rewrites the peer's whole contribution to availability under s.mu,
+	// so later ones are ignored: a peer flipping have_all/have_none would otherwise
+	// hold the session write lock for O(pieces) per 5-byte message.
+	availabilityReceived := false
+	// pendingBitfield buffers a bitfield that arrives before metadata, when its
+	// length cannot be checked yet; it is replayed once the piece count is known,
+	// like peerHaveAllPending.
+	var pendingBitfield []byte
 
 	// A peer downloads several pieces at once (activeDownloads, filled in slice
 	// order so earlier pieces complete first). The dynamic pipeline window spans
@@ -902,6 +1042,22 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	}
 	var activeDownloads []*activeDownload
 	pipeline := newPeerPipelineController(defaultPeerPipelineConfig())
+	// noPick records that the last pick for this peer found nothing it can serve,
+	// at session pickGen noPickGen and time noPickAt. pump then skips the picker,
+	// whose scan of the needed pieces under the session write lock costs O(needed)
+	// when the peer has none of them, until pickGen moves, the peer's side changes
+	// (a new piece, an allowed_fast grant, one of our pieces closing, or an unchoke
+	// when noPickRestricted; each clears noPick), or pickRetryInterval passes as a
+	// backstop. Without it a peer that unchoked us but has nothing we need paid
+	// that scan for every message it sent, keep-alives and its own block requests
+	// included. noPickRestricted marks an empty pick made while the peer choked us
+	// (allowed-fast pieces only) or with pieces it rejected set aside: an unchoke
+	// widens those, so only then does it clear noPick, and a peer flipping choke
+	// and unchoke cannot force a scan per flip.
+	noPick := false
+	noPickRestricted := false
+	var noPickGen uint64
+	var noPickAt time.Time
 
 	type requestFinishReason int
 	const (
@@ -932,6 +1088,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 	}
 	removeDownload := func(index int64) {
+		noPick = false // a freed piece slot or endgame copy may allow a new pick
 		for i, dl := range activeDownloads {
 			if dl.pieceIndex == index {
 				releaseDownloadBuffers(dl)
@@ -1057,7 +1214,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	var peerUtMetadataID int = -1
 	var peerUtPexID int = -1
+	extHandshakes := 0
+	// The DHT port this peer last advertised with PORT (BEP 5) that we acted on.
+	var peerDHTPort uint16
+	peerDHTPortUpdates := 0
 	pexAdvertised := make(map[string]struct{})
+	// pexLimit rate-limits the ut_pex messages this peer sends us.
+	var pexLimit pexRateLimiter
 	var pexTicker *time.Ticker
 	var pexTick <-chan time.Time
 	sendPEXDelta := func() {
@@ -1100,9 +1263,29 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// delta into swarm availability. Shared by the bitfield, have_all, and have_none
 	// handlers so the one on-the-wire bookkeeping lives in a single place.
 	setPeerBitfield := func(newBF []byte) {
+		noPick = false
 		oldBF := append([]byte(nil), peerBitfield...)
 		peerBitfield = newBF
 		s.applyBitfieldAvailability(oldBF, peerBitfield)
+	}
+	// markPeerSeed records that the peer has every piece without touching per-piece
+	// availability (see peerIsSeed). Haves counted before the announcement are
+	// withdrawn first so the peer is not counted twice.
+	markPeerSeed := func(numPieces int) {
+		if bitfieldAny(peerBitfield) {
+			s.removePeerAvailability(peerBitfield)
+		}
+		peerBitfield = fullPieceBitfield(numPieces)
+		peerIsSeed = true
+		noPick = false
+	}
+	// applyAnnouncedBitfield installs a length-checked bitfield announcement.
+	applyAnnouncedBitfield := func(payload []byte, numPieces int) {
+		if bitfieldComplete(payload, numPieces) {
+			markPeerSeed(numPieces)
+			return
+		}
+		setPeerBitfield(append([]byte(nil), payload...))
 	}
 
 	// hasAllowedFastWork reports whether any piece the peer granted us via
@@ -1139,21 +1322,38 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	openNewPiece := func(canRequestPiece func(int64) bool) *activeDownload {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.paused || s.closed {
+		if s.paused || s.closed || s.Storage == nil {
 			return nil
 		}
+		// Never claim a piece we could not request over the wire or assemble into
+		// one buffer: opening it allocates per-block state up front, before any data
+		// arrives. Only a malformed torrent has such pieces, so a normal torrent
+		// pays a single comparison here and its picker callback is left untouched.
+		if !pieceLengthAssemblable(s.Storage.PieceLengthValue()) {
+			requestable := canRequestPiece
+			canRequestPiece = func(index int64) bool {
+				return requestable(index) && pieceLengthAssemblable(s.Storage.PieceLength(index))
+			}
+		}
 		endgame := false
-		bestIdx := s.selectNeededPieceLocked(canRequestPiece)
+		bestIdx := selectNeededPiece(s, canRequestPiece)
 		if bestIdx == -1 {
 			if s.endgameActiveLocked() {
 				owned := make(map[int64]bool, len(activeDownloads))
+				copies := 0
 				for _, dl := range activeDownloads {
 					owned[dl.pieceIndex] = true
+					if dl.endgame {
+						copies++
+					}
 				}
-				bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
-				endgame = true
+				if copies < maxEndgamePiecesPerPeer {
+					bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
+					endgame = true
+				}
 			}
 			if bestIdx == -1 {
+				noPick, noPickGen, noPickAt = true, s.pickGen.Load(), time.Now()
 				return nil
 			}
 		}
@@ -1208,6 +1408,43 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	requestable := func(dl *activeDownload) bool {
 		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
 	}
+	anyRequestable := func() bool {
+		for _, dl := range activeDownloads {
+			if requestable(dl) {
+				return true
+			}
+		}
+		return false
+	}
+	endgameCopies := func() int {
+		n := 0
+		for _, dl := range activeDownloads {
+			if dl.endgame {
+				n++
+			}
+		}
+		return n
+	}
+	// roomForPiece reports whether one more piece fits in this connection's open
+	// piece bytes (peerOpenPieceBytesCap). The open bytes are summed here instead of
+	// counted per block: a piece is only opened once every open one is fully
+	// requested, and the block path stays free of accounting.
+	var torrentPieceLen int64
+	roomForPiece := func() bool {
+		if len(activeDownloads) < minOpenPiecesPerPeer {
+			return true
+		}
+		if torrentPieceLen <= 0 {
+			s.mu.RLock()
+			torrentPieceLen = s.Torrent.PieceLength
+			s.mu.RUnlock()
+		}
+		var open int64
+		for _, dl := range activeDownloads {
+			open += dl.length
+		}
+		return open+torrentPieceLen <= peerOpenPieceBytesCap(torrentPieceLen)
+	}
 	avgBlocksPerPiece := func() int {
 		if len(activeDownloads) > 0 {
 			var total int64
@@ -1225,12 +1462,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return max(1, int((pieceLength+BlockSize-1)/BlockSize))
 	}
 	requestableWorkAvailable := func(pieceCap int, canRequestPiece func(int64) bool) bool {
-		for _, dl := range activeDownloads {
-			if requestable(dl) {
-				return true
-			}
+		if anyRequestable() {
+			return true
 		}
-		if len(activeDownloads) >= pieceCap {
+		if len(activeDownloads) >= pieceCap || !roomForPiece() {
 			return false
 		}
 		s.mu.Lock()
@@ -1238,7 +1473,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if s.hasSelectableNeededPieceLocked(canRequestPiece) {
 			return true
 		}
-		if s.endgameActiveLocked() {
+		if s.endgameActiveLocked() && endgameCopies() < maxEndgamePiecesPerPeer {
 			for i := range s.downloadingPieces {
 				if canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
 					return true
@@ -1263,11 +1498,79 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	lastProgressAt := time.Now()
 	lastRequestAt := time.Time{}
 	waitingForBandwidth := false
+	// lastActiveAt is when payload last moved either way or the peer's interest
+	// changed; see peerInactivityTimeout.
+	lastActiveAt := time.Now()
+	// lastPumpAt is when pump last ran. The loop runs pump itself once it has not
+	// run for pumpSweepInterval; see the check at the top of the loop.
+	var lastPumpAt time.Time
+	pumpSweepInterval := blockRequestTimeout / 4
 
 	// uploadQueue holds this peer's block requests awaiting upload bandwidth. It is
 	// owned by this peer goroutine and drained FIFO by uploadPump; never touched by
 	// other goroutines, so it needs no lock.
 	var uploadQueue []uploadRequest
+
+	// uploadChoked is our AmChoking for this peer as last seen by this loop.
+	// noteUploadChoke drops the queued requests when we start choking the peer:
+	// BEP 3 says a choke discards pending requests, and BEP 6 wants a reject for
+	// each one from a fast peer. Allowed-fast requests stay queued. Without this a
+	// peer could fill the queue just before the choke round and still be served up
+	// to maxUploadQueue blocks after it.
+	uploadChoked := false
+	noteUploadChoke := func(amChoking bool) {
+		if !amChoking {
+			uploadChoked = false
+			return
+		}
+		if uploadChoked {
+			return
+		}
+		uploadChoked = true
+		kept := uploadQueue[:0]
+		for _, r := range uploadQueue {
+			if _, ok := allowedFastForPeer[r.index]; ok {
+				kept = append(kept, r)
+				continue
+			}
+			if fastEnabled {
+				_ = client.SendRejectRequest(uint32(r.index), uint32(r.begin), uint32(r.length))
+			}
+		}
+		uploadQueue = kept
+	}
+	// wireAmChoking is the choke state last sent to the peer; connections start
+	// choked. The choker only updates pState.AmChoking and wakes this loop
+	// (peer.Client.Notify). applyChoke runs wherever the loop reads AmChoking: it
+	// sends a change in order with everything else the loop writes, ahead of the
+	// rejects noteUploadChoke sends for the requests a choke drops.
+	wireAmChoking := true
+	applyChoke := func(amChoking bool) {
+		if amChoking != wireAmChoking {
+			wireAmChoking = amChoking
+			if amChoking {
+				_ = client.SendChoke()
+			} else {
+				_ = client.SendUnchoke()
+			}
+		}
+		noteUploadChoke(amChoking)
+	}
+	syncChoke := func() {
+		s.mu.RLock()
+		amChoking := pState.AmChoking
+		s.mu.RUnlock()
+		applyChoke(amChoking)
+	}
+
+	// refreshUploadChoke reads AmChoking for paths that do not already hold s.mu;
+	// it only takes the lock when there is a queue to drop.
+	refreshUploadChoke := func() {
+		if len(uploadQueue) == 0 {
+			return
+		}
+		syncChoke()
+	}
 
 	// pump re-arms timed-out requests, then fills the request window across all
 	// active pieces, opening new pieces as needed. Called after each inbound
@@ -1292,6 +1595,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		choked := pState.Choked
 		s.mu.RUnlock()
 		now := time.Now()
+		lastPumpAt = now
 		canRequestPiece := func(index int64) bool {
 			if !hasPiece(index) {
 				return false
@@ -1351,8 +1655,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		// for not leaking a stalled connection. Fast peers may still serve pieces
 		// they explicitly listed with allowed_fast — but only proceed when at least
 		// one such piece is still worth fetching, so a choked connection whose fast
-		// set is exhausted doesn't run the full piece scan on every message.
-		if choked && !hasAllowedFastWork() {
+		// set is exhausted doesn't run the full piece scan on every message. The
+		// allowed-fast pieces kept across the choke count too: a block of one that
+		// timed out must be re-sent, or it never runs out of retries and the peer
+		// could hold the piece (and its received blocks) forever.
+		if choked && !anyRequestable() && !hasAllowedFastWork() {
 			waitingForBandwidth = false
 			publishPipelineSnapshot(now, false)
 			return 0
@@ -1380,12 +1687,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				}
 			}
 			if chosen == nil {
-				if len(activeDownloads) >= pieceCap {
+				if len(activeDownloads) >= pieceCap || !roomForPiece() {
 					pipeline.OnPieceCapLimited(now)
 					break
 				}
+				if noPick && s.pickGen.Load() == noPickGen && now.Sub(noPickAt) < pickRetryInterval {
+					break // nothing this peer can serve has appeared since the last pick
+				}
 				newDL := openNewPiece(canRequestPiece)
 				if newDL == nil {
+					noPickRestricted = choked || len(peerRejectedPieces) > 0
 					break
 				}
 				activeDownloads = append(activeDownloads, newDL)
@@ -1458,6 +1769,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// the delay after which it should run again (0 when the queue is empty or fully
 	// drained) so the caller can arm the shared rate-retry timer alongside pump().
 	uploadPump := func() time.Duration {
+		served := false
+		defer func() {
+			if served {
+				lastActiveAt = time.Now()
+			}
+		}()
 		for len(uploadQueue) > 0 {
 			r := uploadQueue[0]
 			reserved, retryAfter, refund := s.reserveUploadWithRefund(int(r.length))
@@ -1496,12 +1813,44 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				return 0
 			}
 			s.putUploadBlockBuf(bufPtr)
+			served = true
 			// Lock-free counter update (see the download hot path above).
 			s.Uploaded.Add(r.length)
 			atomic.AddInt64(&pState.Uploaded, r.length)
 			uploadQueue = uploadQueue[1:]
 		}
 		return 0
+	}
+
+	// eitherSideInterested reports whether the peer wants data from us or has a
+	// piece we still want. It scans the picker, so it only runs once the
+	// connection has been idle for peerInactivityTimeout.
+	eitherSideInterested := func() bool {
+		if len(activeDownloads) > 0 {
+			return true
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// While fetching metadata or rechecking we cannot tell yet what the peer
+		// has that we need.
+		if pState.Interested || s.metadataMode || s.verifying {
+			return true
+		}
+		if s.isCompletedLocked() {
+			return false
+		}
+		peerHas := func(index int64) bool { return hasPiece(index) }
+		if s.hasSelectableNeededPieceLocked(peerHas) {
+			return true
+		}
+		if s.endgameActiveLocked() {
+			for i := range s.downloadingPieces {
+				if hasPiece(int64(i)) && s.isPieceWanted(int64(i)) {
+					return true
+				}
+			}
+		}
+		return false
 	}
 
 	// dropCompletedElsewhere is the endgame "cancel on receipt" path: it drops any
@@ -1539,6 +1888,275 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		publishPipelineSnapshot(now, true)
 	}
 
+	// ut_metadata fetch state (BEP 9) for this connection. peerMetadataSize is the
+	// size this peer advertised. metadataRequested marks the blocks asked of this
+	// peer in fetch round metadataRound (the session's metadataEpoch, which moves on
+	// whenever a failed assembly discards the accumulator). A block is accepted from
+	// this peer only if it was asked for in the current round, so a peer cannot slip
+	// unsolicited blocks into an assembly other peers are feeding.
+	peerMetadataSize := 0
+	var metadataRequested []bool
+	var metadataRound uint64
+	var metadataRetryTicker *time.Ticker
+	var metadataRetryTick <-chan time.Time
+	defer func() {
+		if metadataRetryTicker != nil {
+			metadataRetryTicker.Stop()
+		}
+	}()
+
+	// requestMetadataBlocks asks this peer for every block the shared accumulator
+	// still lacks and that it has not been asked for this round. The session state
+	// is read in a single locked pass that re-checks the fetch is still running and
+	// sized as this peer advertised, and the requests go out after unlocking, so a
+	// concurrent reset can never leave us indexing a stale block list. newRound
+	// marks a call made because a new fetch round began; those are skipped while
+	// the session has a blocking error (storage could not be set up), so a
+	// persistent failure does not turn into an endless re-download of metadata.
+	requestMetadataBlocks := func(newRound bool) {
+		if peerUtMetadataID == -1 || peerMetadataSize <= 0 {
+			return
+		}
+		var missing []int
+		s.mu.Lock()
+		if !s.metadataMode || s.metadataCompleted {
+			s.mu.Unlock()
+			return
+		}
+		if newRound && s.statusErr != nil {
+			metadataRound = s.metadataEpoch
+			s.mu.Unlock()
+			return
+		}
+		resize := s.metadataSize == 0 // the first sized peer, or the first after a reset
+		if !resize && s.metadataSize != peerMetadataSize && s.statusErr == nil &&
+			time.Since(s.metadataProgressAt) >= metadataSizeStallTimeout {
+			// Whoever sized the accumulator has delivered nothing for a while: start
+			// a new round at this peer's size. Peers on the old size are no longer
+			// asked, and their late blocks fail the round check.
+			resize = true
+			s.metadataEpoch++
+		}
+		if resize {
+			s.metadataSize = peerMetadataSize
+			s.metadataBuf = make([]byte, peerMetadataSize)
+			s.metadataPieces = make([]bool, (peerMetadataSize+peer.MetadataBlockSize-1)/peer.MetadataBlockSize)
+			s.metadataProgressAt = time.Now()
+		}
+		if s.metadataEpoch != metadataRound || len(metadataRequested) != len(s.metadataPieces) {
+			metadataRound = s.metadataEpoch
+			metadataRequested = make([]bool, len(s.metadataPieces))
+		}
+		if s.metadataSize == peerMetadataSize {
+			for i, have := range s.metadataPieces {
+				if !have && !metadataRequested[i] {
+					metadataRequested[i] = true
+					missing = append(missing, i)
+				}
+			}
+		}
+		s.mu.Unlock()
+		for _, i := range missing {
+			if err := client.SendMetadataRequest(byte(peerUtMetadataID), i); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+
+	// acceptMetadataBlock stores a ut_metadata data block this peer was asked for
+	// and, once every block is in, hands the assembled info dict to
+	// onMetadataDownloaded (which discards the accumulator and advances
+	// metadataEpoch if it fails the infohash check).
+	acceptMetadataBlock := func(metaMsg *peer.MetadataMessage) {
+		piece := metaMsg.Piece
+		if piece < 0 || piece >= len(metadataRequested) || !metadataRequested[piece] {
+			return // unsolicited, or asked for in an earlier round
+		}
+		metadataRequested[piece] = false
+		s.mu.Lock()
+		if s.metadataEpoch != metadataRound || !s.metadataMode || s.metadataCompleted ||
+			s.metadataSize == 0 || piece >= len(s.metadataPieces) || s.metadataPieces[piece] ||
+			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) {
+			s.mu.Unlock()
+			return
+		}
+		offset := piece * peer.MetadataBlockSize
+		expectedLen := min(peer.MetadataBlockSize, s.metadataSize-offset)
+		if expectedLen <= 0 || len(metaMsg.Data) != expectedLen || offset+expectedLen > len(s.metadataBuf) {
+			s.mu.Unlock()
+			return
+		}
+		copy(s.metadataBuf[offset:], metaMsg.Data)
+		s.metadataPieces[piece] = true
+		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
+		lastActiveAt = lastProgressAt
+		s.metadataProgressAt = lastProgressAt
+		for _, done := range s.metadataPieces {
+			if !done {
+				s.mu.Unlock()
+				return
+			}
+		}
+		bufCopy := append([]byte(nil), s.metadataBuf...)
+		s.mu.Unlock()
+		if err := s.onMetadataDownloaded(bufCopy); err != nil {
+			s.mu.Lock()
+			s.lastErr = err
+			s.mu.Unlock()
+		}
+	}
+
+	// Per-connection budget for serving ut_metadata blocks (see metadataServeWindow).
+	var metadataServeWindowStart time.Time
+	metadataServed := 0
+
+	// serveMetadataRequest answers a peer's ut_metadata request from our info dict.
+	// Replies are charged to the upload limiters without waiting (a shortfall is
+	// answered with a reject, never a stall of this loop), counted in the upload
+	// stats, and capped per connection, so 30-byte requests cannot be turned into an
+	// unmetered 16 KiB-per-request stream.
+	serveMetadataRequest := func(metaMsg *peer.MetadataMessage) {
+		if peerUtMetadataID == -1 {
+			return // the peer never told us which id to answer on
+		}
+		s.mu.RLock()
+		// Nothing to serve while fetching; once known, a private torrent's info dict
+		// stays within its tracker's swarm (BEP 27), even on connections that were
+		// set up while the private flag was still unknown.
+		serve := !s.metadataMode && !s.Torrent.Private
+		infoBytes := s.Torrent.InfoBytes
+		s.mu.RUnlock()
+
+		offset := int64(metaMsg.Piece) * peer.MetadataBlockSize
+		if !serve || len(infoBytes) == 0 || offset < 0 || offset >= int64(len(infoBytes)) {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		now := time.Now()
+		if now.Sub(metadataServeWindowStart) >= metadataServeWindow {
+			metadataServeWindowStart = now
+			metadataServed = 0
+		}
+		numBlocks := (len(infoBytes) + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
+		if metadataServed >= metadataServeRequestsPerBlock*numBlocks {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		blockLen := min(int64(peer.MetadataBlockSize), int64(len(infoBytes))-offset)
+		reserved, _, refund := s.reserveUploadWithRefund(int(blockLen))
+		if !reserved {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		if err := client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), infoBytes[offset:offset+blockLen]); err != nil {
+			if refund != nil {
+				refund()
+			}
+			_ = conn.Close()
+			return
+		}
+		metadataServed++
+		lastActiveAt = now
+		s.Uploaded.Add(blockLen)
+		atomic.AddInt64(&pState.Uploaded, blockLen)
+	}
+
+	// handleExtendedMessage processes one BEP 10 message and returns a non-empty
+	// disconnect reason when the peer must be dropped.
+	handleExtendedMessage := func(payload []byte) string {
+		if len(payload) < 2 {
+			return ""
+		}
+		extMsgID := payload[0]
+		payloadBytes := payload[1:]
+
+		switch {
+		case extMsgID == peer.ExtHandshake:
+			// Size gates run before any bencode decode: see the caps in pkg/peer.
+			if len(payloadBytes) > peer.MaxExtHandshakeSize {
+				return "oversized_extension"
+			}
+			// BEP 10 lets a peer re-send its handshake to update it, but each one
+			// is decoded and can restart the metadata requests, so only the first
+			// few per connection are honoured.
+			extHandshakes++
+			if extHandshakes > maxExtHandshakesPerConn {
+				return ""
+			}
+			hs, err := peer.ParseExtensionHandshake(payloadBytes)
+			if err != nil {
+				return ""
+			}
+			// Keep our request window within the queue the peer says it has.
+			pipeline.LimitWindowBlocks(hs.RequestQueue)
+			if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
+				peerUtPexID = utPexID
+				startPEX()
+			}
+			utID, ok := hs.Extensions[peer.ExtNameMetadata]
+			if !ok {
+				return ""
+			}
+			peerUtMetadataID = utID
+			s.mu.RLock()
+			fetching := s.metadataMode && !s.metadataCompleted
+			s.mu.RUnlock()
+			if !fetching {
+				return ""
+			}
+			if hs.MetadataSize <= 0 || hs.MetadataSize > peer.MaxMetadataSize {
+				s.mu.Lock()
+				s.lastErr = fmt.Errorf("invalid metadata size from peer: %d", hs.MetadataSize)
+				s.mu.Unlock()
+				return ""
+			}
+			peerMetadataSize = hs.MetadataSize
+			requestMetadataBlocks(false)
+			// Keep checking for a new fetch round while this peer idles, so an
+			// assembly reset re-asks it instead of waiting for fresh connections.
+			if metadataRetryTicker == nil && metadataRetryInterval > 0 {
+				metadataRetryTicker = time.NewTicker(metadataRetryInterval)
+				metadataRetryTick = metadataRetryTicker.C
+			}
+
+		case extMsgID == peer.LocalMetadataExtID:
+			if len(payloadBytes) > peer.MaxMetadataMessageSize {
+				return "oversized_extension"
+			}
+			metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
+			if err != nil {
+				return ""
+			}
+			switch metaMsg.MsgType {
+			case peer.MetadataRequest:
+				serveMetadataRequest(metaMsg)
+			case peer.MetadataData:
+				acceptMetadataBlock(metaMsg)
+			case peer.MetadataReject:
+				// The block stays marked as asked of this peer, so it is not re-asked
+				// this round; other peers can still supply it.
+			}
+
+		case extMsgID == peer.LocalPEXExtID && s.pexEnabled():
+			if len(payloadBytes) > peer.MaxPEXMessageSize {
+				return "oversized_extension"
+			}
+			// BEP 11 peers send ut_pex about once a minute; see pexRateLimiter.
+			use, flood := pexLimit.admit(time.Now())
+			if flood {
+				return "pex_flood"
+			}
+			if !use {
+				return ""
+			}
+			if pexMsg, err := peer.ParsePEXMessage(payloadBytes); err == nil {
+				s.handlePEXMessage(peerAddr, ip, pexMsg)
+			}
+		}
+		return ""
+	}
+
 	type peerReadResult struct {
 		msg *peer.Message
 		err error
@@ -1551,6 +2169,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msg, err := client.ReadMessage()
+			if err != nil {
+				// Close before handing the error over: if the loop is blocked in a
+				// write to this peer, that ends the write now instead of when the
+				// write timeout fires.
+				_ = conn.Close()
+			}
 			select {
 			case readCh <- peerReadResult{msg: msg, err: err}:
 			case <-s.ctx.Done():
@@ -1628,11 +2252,12 @@ peerLoop:
 		// redial — reaping it just drops a productive uploader). A recently issued
 		// request also grants a fresh timeout window, which prevents an intentionally
 		// slow limiter wait from making the request look stale before it is sent.
+		loopNow := time.Now()
 		lastUsefulAt := lastProgressAt
 		if lastRequestAt.After(lastUsefulAt) {
 			lastUsefulAt = lastRequestAt
 		}
-		if outbound && !waitingForBandwidth && time.Since(lastUsefulAt) > peerStallTimeout {
+		if outbound && !waitingForBandwidth && loopNow.Sub(lastUsefulAt) > peerStallTimeout {
 			s.mu.RLock()
 			seeding := s.isCompletedLocked()
 			// Background resume verification can hold pieces PieceUnverified, so there
@@ -1648,11 +2273,32 @@ peerLoop:
 						logging.String("name", logName),
 						logging.String("peer", peerAddr),
 						logging.String("direction", direction),
-						logging.Duration("idle", time.Since(lastUsefulAt)),
+						logging.Duration("idle", loopNow.Sub(lastUsefulAt)),
 					)
 				}
 				break
 			}
+		}
+
+		// Drop a connection neither side has any use for: an idle peer that only
+		// sends keep-alives would otherwise hold its slot for good.
+		if loopNow.Sub(lastActiveAt) > peerInactivityTimeout {
+			if eitherSideInterested() {
+				lastActiveAt = time.Now()
+			} else {
+				disconnectReason = "inactive"
+				break
+			}
+		}
+
+		// The request timeout sweep lives in pump, which runs after every message we
+		// act on, but the many messages we discard (bad lengths, unknown indices,
+		// unsolicited blocks, requests we reject) skip it. Run it here once it is
+		// overdue, or a peer that took our requests could stream only such messages,
+		// never time out, and hold the requested pieces (and their received blocks)
+		// for good; an inbound peer has no stall reaper to fall back on.
+		if len(activeDownloads) > 0 && loopNow.Sub(lastPumpAt) >= pumpSweepInterval {
+			scheduleRateRetry(minRetry(pump(), uploadPump()))
 		}
 
 		var msg *peer.Message
@@ -1665,13 +2311,42 @@ peerLoop:
 			}
 			msg = result.msg
 			pooledMsg = msg // release its pooled buffer at the top of the next iteration
+		case <-client.Notified():
+			// The choker changed our choke state or pieces completed.
+			syncChoke()
+			if initializedPeersAndBitfield {
+				_ = client.SendQueuedHaves()
+			} else {
+				// Nothing may precede the bitfield, which is sent once metadata
+				// is in and already covers these pieces.
+				client.DropQueuedHaves()
+			}
+			continue
 		case <-pexTick:
 			sendPEXDelta()
+			continue
+		case <-metadataRetryTick:
+			s.mu.RLock()
+			fetching := s.metadataMode && !s.metadataCompleted
+			epoch := s.metadataEpoch
+			otherSize := s.metadataSize != peerMetadataSize
+			s.mu.RUnlock()
+			switch {
+			case !fetching:
+				metadataRetryTicker.Stop()
+				metadataRetryTicker = nil
+				metadataRetryTick = nil
+			case epoch != metadataRound || otherSize:
+				// A new round began, or the accumulator is sized differently from
+				// what this peer advertised and may have stalled.
+				requestMetadataBlocks(true)
+			}
 			continue
 		case <-rateRetry:
 			rateRetry = nil
 			// The timer covers whichever pump was waiting on bandwidth: re-run both the
 			// download request pump and the upload serve pump, then re-arm for the sooner.
+			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		case <-s.ctx.Done():
@@ -1685,6 +2360,7 @@ peerLoop:
 			// time out (and the peer is dropped after its retry budget) instead of the
 			// keep-alive merely resetting the read deadline and stalling forever. Also
 			// drain any queued uploads that have since accrued bandwidth.
+			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
 		}
@@ -1692,26 +2368,49 @@ peerLoop:
 		s.mu.RLock()
 		inMetaNow := s.metadataMode
 		numPiecesNow := len(s.PieceStates)
+		metadataEpochNow := s.metadataEpoch
+		amChokingNow := pState.AmChoking
 		s.mu.RUnlock()
+		applyChoke(amChokingNow)
+
+		// A failed metadata assembly started a new fetch round: re-ask this peer
+		// for the blocks that are still missing.
+		if inMetaNow && peerMetadataSize > 0 && metadataEpochNow != metadataRound {
+			requestMetadataBlocks(true)
+		}
 
 		if !inMetaNow && !initializedPeersAndBitfield {
 			// Initialize now that metadata is downloaded!
 			sendInitialPeerState()
 
-			peerBitfield = make([]byte, (numPiecesNow+7)/8)
+			// onMetadataDownloaded installs the piece table before it leaves
+			// metadata mode, so a bitfield or have_all handled in between was
+			// applied at its real length already; replacing it with an empty one
+			// would hide the peer's pieces and leak their availability.
+			if len(peerBitfield) != (numPiecesNow+7)/8 {
+				peerBitfield = make([]byte, (numPiecesNow+7)/8)
+			}
 			initializedPeersAndBitfield = true
 
-			// Replay any fast-extension availability the peer announced before we had
-			// metadata (have_none is the default zero bitfield, so nothing to do).
-			if peerHaveAllPending && numPiecesNow > 0 {
-				setPeerBitfield(fullPieceBitfield(numPiecesNow))
+			// Replay any availability the peer announced before we had metadata
+			// (have_none is the default zero bitfield, so nothing to do). A buffered
+			// bitfield whose length does not fit the real piece count is dropped.
+			if numPiecesNow > 0 {
+				switch {
+				case peerHaveAllPending:
+					markPeerSeed(numPiecesNow)
+				case pendingBitfield != nil && len(pendingBitfield) == (numPiecesNow+7)/8:
+					applyAnnouncedBitfield(pendingBitfield, numPiecesNow)
+				}
 			}
 			peerHaveAllPending = false
+			pendingBitfield = nil
 			for _, idx := range pendingAllowedFast {
 				if idx >= 0 && idx < int64(numPiecesNow) {
 					peerAllowedFast[idx] = struct{}{}
 				}
 			}
+			noPick = false
 			pendingAllowedFast = nil
 			pendingAllowedFastSet = nil
 		}
@@ -1725,150 +2424,9 @@ peerLoop:
 
 		switch msg.ID {
 		case peer.MsgExtended:
-			if len(msg.Payload) < 2 {
-				continue
-			}
-			extMsgID := msg.Payload[0]
-			payloadBytes := msg.Payload[1:]
-
-			if extMsgID == peer.ExtHandshake {
-				hs, err := peer.ParseExtensionHandshake(payloadBytes)
-				if err == nil {
-					if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
-						peerUtPexID = utPexID
-						startPEX()
-					}
-					if utID, ok := hs.Extensions[peer.ExtNameMetadata]; ok {
-						peerUtMetadataID = utID
-
-						// If we are in metadata mode, request the metadata blocks
-						s.mu.Lock()
-						inMetaMode := s.metadataMode
-						metadataComp := s.metadataCompleted
-						sz := s.metadataSize
-						s.mu.Unlock()
-
-						if inMetaMode && !metadataComp {
-							if hs.MetadataSize <= 0 || hs.MetadataSize > peer.MaxMetadataSize {
-								s.mu.Lock()
-								s.lastErr = fmt.Errorf("invalid metadata size from peer: %d", hs.MetadataSize)
-								s.mu.Unlock()
-								continue
-							}
-							s.mu.Lock()
-							if s.metadataSize == 0 {
-								s.metadataSize = hs.MetadataSize
-								s.metadataBuf = make([]byte, hs.MetadataSize)
-								numBlocks := (hs.MetadataSize + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
-								s.metadataPieces = make([]bool, numBlocks)
-								sz = hs.MetadataSize
-							} else if s.metadataSize != hs.MetadataSize {
-								s.mu.Unlock()
-								continue
-							}
-							s.mu.Unlock()
-
-							if sz > 0 {
-								numBlocks := (sz + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
-								for i := 0; i < numBlocks; i++ {
-									s.mu.Lock()
-									alreadyGot := s.metadataPieces[i]
-									s.mu.Unlock()
-									if !alreadyGot {
-										_ = client.SendMetadataRequest(byte(peerUtMetadataID), i)
-									}
-								}
-							}
-						}
-					}
-				}
-			} else if extMsgID == peer.LocalMetadataExtID {
-				metaMsg, err := peer.ParseMetadataMessage(payloadBytes)
-				if err == nil {
-					switch metaMsg.MsgType {
-					case peer.MetadataRequest:
-						s.mu.Lock()
-						inMetaMode := s.metadataMode
-						infoBytes := s.Torrent.InfoBytes
-						s.mu.Unlock()
-
-						if !inMetaMode && len(infoBytes) > 0 {
-							offset := int64(metaMsg.Piece) * peer.MetadataBlockSize
-							if offset >= 0 && offset < int64(len(infoBytes)) {
-								blockLen := int64(peer.MetadataBlockSize)
-								if offset+blockLen > int64(len(infoBytes)) {
-									blockLen = int64(len(infoBytes)) - offset
-								}
-								blockData := infoBytes[offset : offset+blockLen]
-								if peerUtMetadataID != -1 {
-									_ = client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), blockData)
-								}
-							} else {
-								if peerUtMetadataID != -1 {
-									_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
-								}
-							}
-						} else {
-							if peerUtMetadataID != -1 {
-								_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
-							}
-						}
-
-					case peer.MetadataData:
-						s.mu.Lock()
-						if s.metadataMode && !s.metadataCompleted && s.metadataSize > 0 && metaMsg.Piece >= 0 && metaMsg.Piece < len(s.metadataPieces) && !s.metadataPieces[metaMsg.Piece] {
-							if metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize {
-								s.mu.Unlock()
-								continue
-							}
-							offset := metaMsg.Piece * peer.MetadataBlockSize
-							expectedLen := peer.MetadataBlockSize
-							if offset+expectedLen > s.metadataSize {
-								expectedLen = s.metadataSize - offset
-							}
-							if expectedLen > 0 && len(metaMsg.Data) == expectedLen && offset+len(metaMsg.Data) <= len(s.metadataBuf) {
-								copy(s.metadataBuf[offset:], metaMsg.Data)
-								s.metadataPieces[metaMsg.Piece] = true
-								lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
-
-								allCompleted := true
-								for _, done := range s.metadataPieces {
-									if !done {
-										allCompleted = false
-										break
-									}
-								}
-
-								if allCompleted {
-									bufCopy := make([]byte, len(s.metadataBuf))
-									copy(bufCopy, s.metadataBuf)
-									s.mu.Unlock()
-
-									err := s.onMetadataDownloaded(bufCopy)
-									if err != nil {
-										s.mu.Lock()
-										s.lastErr = err
-										s.mu.Unlock()
-									}
-								} else {
-									s.mu.Unlock()
-								}
-							} else {
-								s.mu.Unlock()
-							}
-						} else {
-							s.mu.Unlock()
-						}
-
-					case peer.MetadataReject:
-						// Peer rejected metadata piece request, nothing to do.
-					}
-				}
-			} else if extMsgID == peer.LocalPEXExtID && s.pexEnabled() {
-				pexMsg, err := peer.ParsePEXMessage(payloadBytes)
-				if err == nil {
-					s.handlePEXMessage(peerAddr, pexMsg)
-				}
+			if reason := handleExtendedMessage(msg.Payload); reason != "" {
+				disconnectReason = reason
+				break peerLoop
 			}
 
 		case peer.MsgChoke:
@@ -1907,10 +2465,23 @@ peerLoop:
 			// a permanent refusal. Without this a single (often transient) reject
 			// would bar the piece from this peer for the whole connection.
 			clear(peerRejectedPieces)
+			if noPickRestricted {
+				noPick = false
+			}
 			pipeline.OnUnchoke(now)
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgInterested:
+			// A repeat changes nothing, so skip the write lock and the upload-slot
+			// scan of s.Peers: a peer could otherwise hold s.mu for a full map walk
+			// with every 5-byte message.
+			s.mu.RLock()
+			alreadyInterested := pState.Interested
+			s.mu.RUnlock()
+			if alreadyInterested {
+				break
+			}
+			lastActiveAt = time.Now()
 			s.mu.Lock()
 			pState.Interested = true
 			unchokedInterested := 0
@@ -1919,17 +2490,19 @@ peerLoop:
 					unchokedInterested++
 				}
 			}
-			shouldUnchoke := pState.AmChoking && unchokedInterested < 4
-			if shouldUnchoke {
+			if pState.AmChoking && unchokedInterested < 4 {
 				pState.AmChoking = false
 			}
 			s.mu.Unlock()
-			if shouldUnchoke {
-				_ = client.SendUnchoke()
-			}
+			syncChoke()
 
 		case peer.MsgNotInterested:
 			s.mu.Lock()
+			if pState.Interested {
+				// Only a change counts as activity: repeating not-interested
+				// must not keep an idle connection alive.
+				lastActiveAt = time.Now()
+			}
 			pState.Interested = false
 			s.mu.Unlock()
 
@@ -1949,6 +2522,7 @@ peerLoop:
 				if !bitfieldHas(peerBitfield, i) {
 					setBit(peerBitfield, i)
 					s.addPieceAvailability(i)
+					noPick = false
 				}
 			}
 
@@ -1956,33 +2530,54 @@ peerLoop:
 			if len(msg.Payload) != 0 {
 				continue
 			}
+			if availabilityReceived {
+				break // only the first announcement counts; see availabilityReceived
+			}
+			availabilityReceived = true
 			if numPiecesNow == 0 {
 				// Before metadata: remember it and replay once the count is known.
 				peerHaveAllPending = true
 				continue
 			}
-			setPeerBitfield(fullPieceBitfield(numPiecesNow))
+			markPeerSeed(numPiecesNow)
 
 		case peer.MsgHaveNone:
 			if len(msg.Payload) != 0 {
 				continue
 			}
+			if availabilityReceived {
+				break
+			}
+			availabilityReceived = true
 			if numPiecesNow == 0 {
-				// The default zeroed bitfield already represents have_none; just make
-				// sure a previously buffered have_all isn't replayed.
-				peerHaveAllPending = false
+				// The default zeroed bitfield already represents have_none.
 				continue
 			}
-			setPeerBitfield(make([]byte, (numPiecesNow+7)/8))
+			if bitfieldAny(peerBitfield) {
+				// Only reachable if Haves arrived before the announcement.
+				setPeerBitfield(make([]byte, (numPiecesNow+7)/8))
+			}
 
 		case peer.MsgBitfield:
-			expectedLen := (numPiecesNow + 7) / 8
-			if expectedLen == 0 || len(msg.Payload) != expectedLen {
+			if availabilityReceived {
+				break
+			}
+			if numPiecesNow == 0 {
+				// Before metadata the length cannot be checked yet. Buffer it (no
+				// valid torrent needs more than maxPendingBitfieldLen bytes) and
+				// replay it once the piece count is known, as with have_all.
+				if len(msg.Payload) == 0 || len(msg.Payload) > maxPendingBitfieldLen {
+					continue
+				}
+				availabilityReceived = true
+				pendingBitfield = append([]byte(nil), msg.Payload...)
 				continue
 			}
-			newBF := make([]byte, expectedLen)
-			copy(newBF, msg.Payload)
-			setPeerBitfield(newBF)
+			if len(msg.Payload) != (numPiecesNow+7)/8 {
+				continue
+			}
+			availabilityReceived = true
+			applyAnnouncedBitfield(msg.Payload, numPiecesNow)
 
 		case peer.MsgSuggestPiece:
 			// Advisory only. We still require Have/Bitfield/HaveAll before requesting.
@@ -2007,8 +2602,12 @@ peerLoop:
 				}
 				continue
 			}
-			if index >= 0 && index < int64(numPiecesNow) {
+			// The same cap applies once metadata is known: the set is scanned by
+			// hasAllowedFastWork on every pump while we are choked, so it must not
+			// grow to the piece count.
+			if index >= 0 && index < int64(numPiecesNow) && len(peerAllowedFast) < pendingAllowedFastCap {
 				peerAllowedFast[index] = struct{}{}
+				noPick = false
 			}
 
 		case peer.MsgRejectRequest:
@@ -2083,6 +2682,7 @@ peerLoop:
 			req.received = true
 			dl.blocksReceived++
 			lastProgressAt = now // forward progress; keeps the stall reaper off
+			lastActiveAt = now
 
 			// Counters are bumped lock-free on this hot path; s.mu would
 			// otherwise be taken per 16 KB block by every peer goroutine.
@@ -2141,7 +2741,7 @@ peerLoop:
 			s.ensurePieceWritePool()
 			writeQueueStarted := time.Now()
 			select {
-			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn}:
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source}:
 				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
 					pipeline.OnWriterLimited(time.Now())
 					publishPipelineSnapshot(time.Now(), true)
@@ -2168,6 +2768,7 @@ peerLoop:
 					pieceLen = s.Storage.PieceLength(index)
 				}
 				s.mu.RUnlock()
+				applyChoke(amChoking)
 				_, requestAllowedFast := allowedFastForPeer[index]
 
 				if paused || (amChoking && !requestAllowedFast) {
@@ -2178,6 +2779,18 @@ peerLoop:
 				}
 
 				if isCompleted && length > 0 && length <= BlockSize && begin >= 0 && begin+length <= pieceLen {
+					// While we choke the peer, an allowed-fast piece may be fetched only a
+					// few times over (libtorrent's mitigation): otherwise a choked peer
+					// could re-download its fast set forever, bypassing the choker.
+					if amChoking {
+						if allowedFastServed[index] >= allowedFastServeRounds*((pieceLen+BlockSize-1)/BlockSize) {
+							_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+							continue
+						}
+						if len(uploadQueue) < maxUploadQueue {
+							allowedFastServed[index]++
+						}
+					}
 					// Queue the block for upload rather than blocking on the limiter here:
 					// waiting for upload tokens inside the message loop would stop this
 					// goroutine running pump(), stalling the download side (issue #59).
@@ -2195,20 +2808,49 @@ peerLoop:
 				}
 			}
 
+		case peer.MsgCancel:
+			// Drop the cancelled block from the upload queue so it is not read from
+			// disk and sent anyway. Under BEP 6 a fast peer gets a reject for it.
+			if len(msg.Payload) != 12 {
+				continue
+			}
+			index := int64(binary.BigEndian.Uint32(msg.Payload[0:4]))
+			begin := int64(binary.BigEndian.Uint32(msg.Payload[4:8]))
+			length := int64(binary.BigEndian.Uint32(msg.Payload[8:12]))
+			for i, r := range uploadQueue {
+				if r.index == index && r.begin == begin && r.length == length {
+					uploadQueue = append(uploadQueue[:i], uploadQueue[i+1:]...)
+					if fastEnabled {
+						_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+					}
+					break
+				}
+			}
+
 		case peer.MsgPort:
 			// BEP 5: the peer advertises its DHT UDP port. Combine it with the
 			// peer's source IP and feed it into the routing table so live peers
 			// grow our DHT beyond bootstrap nodes and lookups.
-			if len(msg.Payload) == 2 {
-				dhtPort := binary.BigEndian.Uint16(msg.Payload)
-				s.mu.RLock()
-				d := s.DHT
-				allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
-				s.mu.RUnlock()
-				if allowDHT && d != nil && dhtPort != 0 {
-					if pip := net.ParseIP(ip); pip != nil {
-						d.AddNode(pip, dhtPort)
-					}
+			//
+			// Each AddNode scans the routing table under the DHT lock, so only act on
+			// the first PORT and on real changes, a few times per connection at most;
+			// repeats cost nothing.
+			if len(msg.Payload) != 2 {
+				break
+			}
+			dhtPort := binary.BigEndian.Uint16(msg.Payload)
+			if dhtPort == 0 || dhtPort == peerDHTPort || peerDHTPortUpdates >= maxPeerDHTPortUpdates {
+				break
+			}
+			s.mu.RLock()
+			d := s.DHT
+			allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+			s.mu.RUnlock()
+			if allowDHT && d != nil {
+				if pip := net.ParseIP(ip); pip != nil {
+					peerDHTPort = dhtPort
+					peerDHTPortUpdates++
+					addDHTNode(d, pip, dhtPort)
 				}
 			}
 		}
@@ -2303,23 +2945,6 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 	return stats
 }
 
-// sendPeerControlLocked queues a peer control message while s.mu is held.
-func (s *Session) sendPeerControlLocked(c *peer.Client, fn func(*peer.Client) error) {
-	if s.closed {
-		return
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-		_ = fn(c)
-	}()
-}
-
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
@@ -2383,7 +3008,8 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 // learned via decentralized discovery (DHT/PEX); those are rejected for private
 // torrents. Reconnecting an already-known peer (e.g. after a resume) passes
 // fromDiscovery=false, so a private torrent can still re-establish its
-// tracker-sourced connections.
+// tracker-sourced connections, but not ones DHT/PEX supplied before a magnet's
+// metadata showed it is private.
 func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	host, portStr, err := net.SplitHostPort(peerAddr)
 	if err != nil {
@@ -2413,6 +3039,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	}
 
 	pState, exists := s.Peers[peerAddr]
+	if exists && s.privateRefusesDialLocked(pState) {
+		s.mu.Unlock()
+		return
+	}
+	var source PeerSource
+	if fromDiscovery {
+		source = PeerSourceDiscovery
+	}
 	var shouldDial bool
 	if !exists {
 		shouldDial = true
@@ -2420,13 +3054,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		// Discovery supplies a listening endpoint, so an inbound-only entry with the
 		// same address becomes eligible for maintenance retries.
 		pState.Dialable = true
-		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
+		pState.Source |= source
+		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > pState.redialBackoff() {
 			shouldDial = true
 		}
 	}
 
 	// Don't exceed the outbound connection cap.
-	if shouldDial && len(s.outboundSlots) >= maxOutboundPeers {
+	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host)) {
 		shouldDial = false
 	}
 
@@ -2441,6 +3076,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 				LastAttempt: time.Now(),
 				Dialable:    true,
 				Dialing:     true,
+				Source:      source,
 			}
 		} else {
 			s.Peers[peerAddr].LastAttempt = time.Now()

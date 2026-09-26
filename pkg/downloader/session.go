@@ -82,6 +82,12 @@ type PeerState struct {
 	// WebSeed marks a synthetic HTTP source entry. It is kept out of peer-wire
 	// choking and upload stats because no BitTorrent peer exists behind it.
 	WebSeed bool
+	// Source records who supplied this address, so a magnet whose metadata
+	// turns out private can drop what DHT and PEX gave it (BEP 27).
+	Source PeerSource
+	// FailCount counts connection attempts that failed in a row; past
+	// maxPeerFailCount the peer is rarely redialed.
+	FailCount uint8
 
 	WindowBlocks         int
 	TargetWindowBlocks   int
@@ -144,6 +150,11 @@ type Session struct {
 	// every lookup. Guarded by s.mu.
 	fileStartOffsets  []int64
 	downloadingPieces map[int]struct{}
+	// pickGen advances (under s.mu) whenever a piece may have become pickable: it
+	// joined the needed set, the set was rebuilt, or the set emptied (endgame
+	// begins). A peer loop whose last pick found nothing skips the picker until it
+	// moves (see pump); it is read without s.mu.
+	pickGen atomic.Uint64
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length
@@ -151,6 +162,7 @@ type Session struct {
 	pieceAvailability []int
 	Peers             map[string]*PeerState
 	activePeers       map[string]*peer.Client // for sending Have messages
+	admission         peerAdmission           // connection admission and bans; see peer_admission.go
 	pipelineBudget    *pipelineByteBudget
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
@@ -263,6 +275,8 @@ type Session struct {
 	metadataPieces       []bool
 	metadataCompleted    bool
 	metadataMode         bool
+	metadataEpoch        uint64    // advances whenever the accumulator is discarded; peers re-request
+	metadataProgressAt   time.Time // when the accumulator was last sized or took a block
 	metadataCompletedCh  chan struct{}
 	DHT                  *dht.DHT
 	downloadDir          string
@@ -1564,6 +1578,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			s.metadataSize = 0
 			s.metadataBuf = nil
 			s.metadataPieces = nil
+			s.metadataEpoch++
 			s.mu.Unlock()
 		}
 	}()
@@ -1717,6 +1732,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.Torrent.Files = parsed.Files
 	s.Torrent.InfoBytes = parsed.InfoBytes
 	s.Torrent.Private = parsed.Private
+	s.purgeDiscoveryPeersLocked()
 	if parsed.Private {
 		s.DHT = nil
 	}
