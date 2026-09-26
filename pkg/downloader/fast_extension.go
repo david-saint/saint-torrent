@@ -4,6 +4,8 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"net"
+
+	"sainttorrent/pkg/peer"
 )
 
 const allowedFastSetSize = 10
@@ -34,15 +36,53 @@ func completedPieceBitfield(states []PieceState) (bitfield []byte, hasAny bool, 
 	return bitfield, hasAny, hasAll
 }
 
+// maxPendingBitfieldLen bounds a bitfield buffered before metadata is known.
+// Metadata is capped at peer.MaxMetadataSize and every piece costs a 20-byte hash
+// in it, so no valid torrent needs a longer bitfield than this (~100 KiB).
+const maxPendingBitfieldLen = (peer.MaxMetadataSize/sha1.Size + 7) / 8
+
 func fullPieceBitfield(numPieces int) []byte {
 	if numPieces <= 0 {
 		return nil
 	}
 	bitfield := make([]byte, (numPieces+7)/8)
-	for i := 0; i < numPieces; i++ {
-		setBit(bitfield, i)
+	for i := range bitfield {
+		bitfield[i] = 0xff
+	}
+	// Spare bits past the last piece stay clear, as BEP 3 requires.
+	if spare := numPieces % 8; spare != 0 {
+		bitfield[len(bitfield)-1] = byte(0xff) << (8 - spare)
 	}
 	return bitfield
+}
+
+// bitfieldComplete reports whether bf has all of the first numPieces bits set.
+// Spare bits are ignored.
+func bitfieldComplete(bf []byte, numPieces int) bool {
+	if numPieces <= 0 || len(bf) < (numPieces+7)/8 {
+		return false
+	}
+	full := numPieces / 8
+	for _, b := range bf[:full] {
+		if b != 0xff {
+			return false
+		}
+	}
+	if spare := numPieces % 8; spare != 0 {
+		mask := byte(0xff) << (8 - spare)
+		return bf[full]&mask == mask
+	}
+	return true
+}
+
+// bitfieldAny reports whether any bit of bf is set.
+func bitfieldAny(bf []byte) bool {
+	for _, b := range bf {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedFastSet(infoHash [20]byte, ip string, numPieces int, limit int) []int {

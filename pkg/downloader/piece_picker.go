@@ -730,16 +730,36 @@ func (s *Session) addPieceAvailability(idx int) {
 // applyBitfieldAvailability folds the delta between a peer's previous and new
 // advertised bitfield into the swarm availability counts. This handles a peer that
 // re-sends or extends its bitfield without double-counting.
+//
+// It walks the bitfields a byte at a time and skips bytes that did not change, so
+// unchanged regions cost one compare per eight pieces under the write lock and only
+// changed pieces touch the needed buckets.
 func (s *Session) applyBitfieldAvailability(oldBF, newBF []byte) {
 	s.mu.Lock()
-	for i := range s.pieceAvailability {
-		old := bitfieldHas(oldBF, i)
-		now := bitfieldHas(newBF, i)
-		switch {
-		case now && !old:
-			s.changePieceAvailabilityLocked(i, 1)
-		case old && !now:
-			s.changePieceAvailabilityLocked(i, -1)
+	n := len(s.pieceAvailability)
+	for byteIdx := 0; byteIdx < (n+7)/8; byteIdx++ {
+		var oldByte, newByte byte
+		if byteIdx < len(oldBF) {
+			oldByte = oldBF[byteIdx]
+		}
+		if byteIdx < len(newBF) {
+			newByte = newBF[byteIdx]
+		}
+		if oldByte == newByte {
+			continue
+		}
+		for bit := 0; bit < 8; bit++ {
+			i := byteIdx*8 + bit
+			if i >= n {
+				break
+			}
+			mask := byte(0x80) >> bit
+			switch {
+			case newByte&mask != 0 && oldByte&mask == 0:
+				s.changePieceAvailabilityLocked(i, 1)
+			case oldByte&mask != 0 && newByte&mask == 0:
+				s.changePieceAvailabilityLocked(i, -1)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -747,15 +767,27 @@ func (s *Session) applyBitfieldAvailability(oldBF, newBF []byte) {
 
 // removePeerAvailability drops a disconnecting peer's contribution to the counts,
 // using the bitfield it had accumulated (Haves set bits incrementally, so this is
-// the exact set it added). Caller does not hold s.mu.
+// the exact set it added). Empty bytes are skipped, so a peer that advertised
+// little costs little. Caller does not hold s.mu.
 func (s *Session) removePeerAvailability(bf []byte) {
 	if bf == nil {
 		return
 	}
 	s.mu.Lock()
-	for i := range s.pieceAvailability {
-		if bitfieldHas(bf, i) {
-			s.changePieceAvailabilityLocked(i, -1)
+	n := len(s.pieceAvailability)
+	for byteIdx := 0; byteIdx < len(bf) && byteIdx < (n+7)/8; byteIdx++ {
+		b := bf[byteIdx]
+		if b == 0 {
+			continue
+		}
+		for bit := 0; bit < 8; bit++ {
+			i := byteIdx*8 + bit
+			if i >= n {
+				break
+			}
+			if b&(byte(0x80)>>bit) != 0 {
+				s.changePieceAvailabilityLocked(i, -1)
+			}
 		}
 	}
 	s.mu.Unlock()

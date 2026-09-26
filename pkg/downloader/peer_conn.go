@@ -876,10 +876,29 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if !inMeta {
 		peerBitfield = make([]byte, (numPieces+7)/8)
 	}
+	// peerIsSeed marks a peer that announced every piece (have_all or a full
+	// bitfield). Seeds are left out of pieceAvailability: a seed raises every
+	// piece's count by one, which never changes rarest-first order, so skipping it
+	// keeps a seed's connect and disconnect O(1) under s.mu instead of O(pieces).
+	peerIsSeed := false
 	// Drop this peer's contribution to swarm piece availability on exit. peerBitfield
 	// accumulates exactly the pieces we counted (bitfield delta + Haves), so the
 	// closure reads its final value here. (#7, rarest-first.)
-	defer func() { s.removePeerAvailability(peerBitfield) }()
+	defer func() {
+		if !peerIsSeed {
+			s.removePeerAvailability(peerBitfield)
+		}
+	}()
+	// availabilityReceived is set by the peer's first bitfield, have_all or
+	// have_none. BEP 3/6 allow exactly one of them, right after the handshake, and
+	// each one rewrites the peer's whole contribution to availability under s.mu,
+	// so later ones are ignored: a peer flipping have_all/have_none would otherwise
+	// hold the session write lock for O(pieces) per 5-byte message.
+	availabilityReceived := false
+	// pendingBitfield buffers a bitfield that arrives before metadata, when its
+	// length cannot be checked yet; it is replayed once the piece count is known,
+	// like peerHaveAllPending.
+	var pendingBitfield []byte
 
 	// A peer downloads several pieces at once (activeDownloads, filled in slice
 	// order so earlier pieces complete first). The dynamic pipeline window spans
@@ -1103,6 +1122,24 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		oldBF := append([]byte(nil), peerBitfield...)
 		peerBitfield = newBF
 		s.applyBitfieldAvailability(oldBF, peerBitfield)
+	}
+	// markPeerSeed records that the peer has every piece without touching per-piece
+	// availability (see peerIsSeed). Haves counted before the announcement are
+	// withdrawn first so the peer is not counted twice.
+	markPeerSeed := func(numPieces int) {
+		if bitfieldAny(peerBitfield) {
+			s.removePeerAvailability(peerBitfield)
+		}
+		peerBitfield = fullPieceBitfield(numPieces)
+		peerIsSeed = true
+	}
+	// applyAnnouncedBitfield installs a length-checked bitfield announcement.
+	applyAnnouncedBitfield := func(payload []byte, numPieces int) {
+		if bitfieldComplete(payload, numPieces) {
+			markPeerSeed(numPieces)
+			return
+		}
+		setPeerBitfield(append([]byte(nil), payload...))
 	}
 
 	// hasAllowedFastWork reports whether any piece the peer granted us via
@@ -1701,12 +1738,19 @@ peerLoop:
 			peerBitfield = make([]byte, (numPiecesNow+7)/8)
 			initializedPeersAndBitfield = true
 
-			// Replay any fast-extension availability the peer announced before we had
-			// metadata (have_none is the default zero bitfield, so nothing to do).
-			if peerHaveAllPending && numPiecesNow > 0 {
-				setPeerBitfield(fullPieceBitfield(numPiecesNow))
+			// Replay any availability the peer announced before we had metadata
+			// (have_none is the default zero bitfield, so nothing to do). A buffered
+			// bitfield whose length does not fit the real piece count is dropped.
+			if numPiecesNow > 0 {
+				switch {
+				case peerHaveAllPending:
+					markPeerSeed(numPiecesNow)
+				case pendingBitfield != nil && len(pendingBitfield) == (numPiecesNow+7)/8:
+					applyAnnouncedBitfield(pendingBitfield, numPiecesNow)
+				}
 			}
 			peerHaveAllPending = false
+			pendingBitfield = nil
 			for _, idx := range pendingAllowedFast {
 				if idx >= 0 && idx < int64(numPiecesNow) {
 					peerAllowedFast[idx] = struct{}{}
@@ -1956,33 +2000,54 @@ peerLoop:
 			if len(msg.Payload) != 0 {
 				continue
 			}
+			if availabilityReceived {
+				break // only the first announcement counts; see availabilityReceived
+			}
+			availabilityReceived = true
 			if numPiecesNow == 0 {
 				// Before metadata: remember it and replay once the count is known.
 				peerHaveAllPending = true
 				continue
 			}
-			setPeerBitfield(fullPieceBitfield(numPiecesNow))
+			markPeerSeed(numPiecesNow)
 
 		case peer.MsgHaveNone:
 			if len(msg.Payload) != 0 {
 				continue
 			}
+			if availabilityReceived {
+				break
+			}
+			availabilityReceived = true
 			if numPiecesNow == 0 {
-				// The default zeroed bitfield already represents have_none; just make
-				// sure a previously buffered have_all isn't replayed.
-				peerHaveAllPending = false
+				// The default zeroed bitfield already represents have_none.
 				continue
 			}
-			setPeerBitfield(make([]byte, (numPiecesNow+7)/8))
+			if bitfieldAny(peerBitfield) {
+				// Only reachable if Haves arrived before the announcement.
+				setPeerBitfield(make([]byte, (numPiecesNow+7)/8))
+			}
 
 		case peer.MsgBitfield:
-			expectedLen := (numPiecesNow + 7) / 8
-			if expectedLen == 0 || len(msg.Payload) != expectedLen {
+			if availabilityReceived {
+				break
+			}
+			if numPiecesNow == 0 {
+				// Before metadata the length cannot be checked yet. Buffer it (no
+				// valid torrent needs more than maxPendingBitfieldLen bytes) and
+				// replay it once the piece count is known, as with have_all.
+				if len(msg.Payload) == 0 || len(msg.Payload) > maxPendingBitfieldLen {
+					continue
+				}
+				availabilityReceived = true
+				pendingBitfield = append([]byte(nil), msg.Payload...)
 				continue
 			}
-			newBF := make([]byte, expectedLen)
-			copy(newBF, msg.Payload)
-			setPeerBitfield(newBF)
+			if len(msg.Payload) != (numPiecesNow+7)/8 {
+				continue
+			}
+			availabilityReceived = true
+			applyAnnouncedBitfield(msg.Payload, numPiecesNow)
 
 		case peer.MsgSuggestPiece:
 			// Advisory only. We still require Have/Bitfield/HaveAll before requesting.
