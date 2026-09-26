@@ -122,6 +122,65 @@ func disconnectReasonsA1(t *testing.T) func(addr string) string {
 	}
 }
 
+// A connection on which we have nothing to say still hears from us: once a
+// keep-alive interval passes without a write, the loop sends a keep-alive, so a
+// peer that drops silent connections (libtorrent after 120 s) keeps us.
+func TestQuietConnectionSendsKeepAlives(t *testing.T) {
+	t.Cleanup(swapDuration(&peerKeepAliveInterval, 40*time.Millisecond))
+	t.Cleanup(swapDuration(&peerIdleTickInterval, 20*time.Millisecond))
+	sess, _ := newSeedingWireTestSession(t, 4, 16*1024)
+	p := startLivenessPeerA1(t, settled(sess), 7700, false)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for p.keepAlives.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a quiet connection sent %d keep-alives in 3s", p.keepAlives.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The read deadline used to be 30 s, re-armed per message, so a quiet but honest
+// peer (BEP 3 allows two minutes between keep-alives) was dropped. The deadline
+// is now the dead-socket backstop, peerReadTimeout: a peer silent for longer than
+// the old deadline (scaled) stays, one silent for longer than peerReadTimeout is
+// dropped.
+func TestQuietPeerOutlivesOldReadDeadline(t *testing.T) {
+	t.Cleanup(swapDuration(&peerReadTimeout, 600*time.Millisecond))
+	reasons := disconnectReasonsA1(t)
+	sess, _ := newSeedingWireTestSession(t, 4, 16*1024)
+	p := startLivenessPeerA1(t, settled(sess), 7701, false)
+
+	// The old 30 s deadline is 1/5 of peerReadTimeout: stay silent for twice that.
+	if p.closedWithin(2 * peerReadTimeout / 5) {
+		t.Fatal("a peer silent for less than peerReadTimeout was dropped")
+	}
+	if !p.closedWithin(5 * time.Second) {
+		t.Fatal("a peer silent for longer than peerReadTimeout was kept")
+	}
+	if got := reasons(p.addr); got != "read_error" {
+		t.Fatalf("disconnect reason %q, want read_error", got)
+	}
+}
+
+// An outbound peer that sends nothing at all after the handshake is reaped by the
+// stall reaper. Before the liveness ticker the loop only ran its checks when a
+// message arrived, so a silent peer held its slot until the read deadline.
+func TestSilentOutboundPeerIsReapedByTicker(t *testing.T) {
+	t.Cleanup(swapDuration(&peerStallTimeout, 200*time.Millisecond))
+	t.Cleanup(swapDuration(&peerIdleTickInterval, 20*time.Millisecond))
+	reasons := disconnectReasonsA1(t)
+	sess := settled(newWireTestSession(t, 4, 16*1024))
+	p := startLivenessPeerA1(t, sess, 7702, true)
+
+	if !p.closedWithin(3 * time.Second) {
+		t.Fatal("a silent outbound peer was not reaped")
+	}
+	if got := reasons(p.addr); got != "stalled" {
+		t.Fatalf("disconnect reason %q, want stalled", got)
+	}
+}
+
 // A message whose length its type does not allow drops the peer. One too large
 // for a pooled buffer is refused from its header, without reading or allocating
 // the payload (only the header is sent here); a small one is read, then refused.

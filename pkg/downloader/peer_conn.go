@@ -20,8 +20,9 @@ import (
 // peerStallTimeout bounds how long an outbound peer may hold its connection slot
 // without delivering a single block of data we want. A connection's slot is held
 // for the whole life of its read loop, and a peer that chokes us forever — or
-// trickles only keep-alives/Have messages — resets the socket read deadline
-// without ever giving us data, so without this it would occupy a slot indefinitely.
+// trickles only keep-alives/Have messages, or sends nothing at all — keeps its
+// socket alive without ever giving us data, so without this it would occupy a
+// slot indefinitely. The loop's liveness ticker runs the check for a silent peer.
 // In a slow swarm those dead-weight connections accumulate until the (shared,
 // manager-wide) outbound pool is full and NO session can dial a fresh peer, which
 // flatlines every torrent at once until a restart clears the pools. Any single
@@ -34,10 +35,37 @@ var peerStallTimeout = 60 * time.Second
 
 // peerInactivityTimeout drops a connection, in either direction, on which neither
 // side has been interested and no payload has moved for this long (libtorrent's
-// inactivity_timeout). The stall reaper only covers outbound connections while we
-// download, so without this an idle peer sending keep-alives could hold an inbound
-// slot for good. A var so tests can shorten it; treat it as a constant.
+// inactivity_timeout): the idle drop. The stall reaper only covers outbound
+// connections while we download, so without this an idle peer sending keep-alives
+// could hold an inbound slot for good. A var so tests can shorten it; treat it as
+// a constant.
 var peerInactivityTimeout = 10 * time.Minute
+
+// peerReadTimeout is how long a connection may go without receiving a byte before
+// its read fails: the backstop for a dead socket, not the silent-peer timeout
+// (the stall reaper and the inactivity drop are). BEP 3 peers send a keep-alive
+// at least every two minutes, and libtorrent drops a peer after 120 s of silence,
+// so 150 s leaves slack. The reader arms the deadline lazily, 1.5x this far out
+// once less than this remains, so a silent peer is dropped 150-225 s after its
+// last byte at a cost of one deadline update per 75 s, not one per message. A var
+// so tests can shorten it; treat it as a constant.
+var peerReadTimeout = 150 * time.Second
+
+// peerKeepAliveInterval is how often a connection checks whether it wrote
+// anything to the peer and sends a keep-alive if not, so the gap between two of
+// our writes stays under twice this (plus one liveness tick), well within the
+// 120 s after which libtorrent drops a silent peer. A write to a peer that stopped
+// reading is bounded by the peer write timeout (pkg/peer). A var so tests can
+// shorten it; treat it as a constant.
+var peerKeepAliveInterval = 30 * time.Second
+
+// peerIdleTickInterval is the period of a connection's liveness ticker while it
+// has no piece in flight; with pieces in flight it ticks every pumpSweepInterval
+// so request timeouts fire on time. Each tick runs the loop's top-of-loop checks
+// (stall reaper, inactivity drop, request-timeout sweep) for a peer that sends
+// nothing, and the keep-alive check. A var so tests can shorten it; treat it as a
+// constant.
+var peerIdleTickInterval = 30 * time.Second
 
 // peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
 // outbound connection set. New dials previously happened ONLY on a tracker
@@ -1584,7 +1612,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// message — INCLUDING keep-alives — so the pipeline stays full across piece
 	// boundaries and, crucially, so the timeout sweep below still runs when a peer
 	// that already took our requests goes quiet but keeps the socket warm with
-	// keep-alives (which otherwise reset the read deadline and skipped pump).
+	// keep-alives. For a peer that sends nothing at all, the liveness ticker runs
+	// the sweep from the top of the loop.
 	pump := func() time.Duration {
 		// Block requests below are queued into the client's write buffer; flush the
 		// whole burst in one syscall on the way out, regardless of which branch
@@ -1838,9 +1867,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		// While fetching metadata or rechecking we cannot tell yet what the peer
-		// has that we need.
-		if pState.Interested || s.metadataMode || s.verifying {
+		if pState.Interested {
+			return true
+		}
+		// While fetching metadata we cannot tell yet what the peer has that we
+		// need, but a peer that cannot serve the metadata is of no use until we
+		// have it; without this an inbound one would never be dropped.
+		if s.metadataMode {
+			return peerUtMetadataID != -1
+		}
+		// While rechecking we cannot tell yet what we still need.
+		if s.verifying {
 			return true
 		}
 		if s.isCompletedLocked() {
@@ -2173,8 +2210,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	readStop := make(chan struct{})
 	go func() {
 		defer close(readDone)
+		// The read deadline is the dead-socket backstop (see peerReadTimeout). It
+		// is moved only once less than peerReadTimeout remains, so a busy
+		// connection updates it once per peerReadTimeout/2 instead of per message.
+		// time.Until on a deadline with a monotonic reading is cheaper than
+		// time.Now.
+		var readDeadline time.Time
 		for {
-			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if time.Until(readDeadline) < peerReadTimeout {
+				readDeadline = time.Now().Add(peerReadTimeout * 3 / 2)
+				_ = conn.SetReadDeadline(readDeadline)
+			}
 			msg, err := client.ReadMessage()
 			if err != nil {
 				// Close before handing the error over: if the loop is blocked in a
@@ -2238,6 +2284,30 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// themselves (pooledMsg = nil) and are released after piece assembly instead.
 	var pooledMsg *peer.Message
 	defer func() { pooledMsg.Release() }()
+
+	// The liveness ticker wakes the loop when the peer sends nothing, so the checks
+	// at the top of the loop (stall reaper, inactivity drop, request-timeout sweep)
+	// still run for a silent peer, and drives our keep-alives. It ticks every
+	// pumpSweepInterval while pieces are in flight, so their requests time out on
+	// time, and every peerIdleTickInterval otherwise: one timer per connection,
+	// reset only when the period changes.
+	livenessInterval := func() time.Duration {
+		if len(activeDownloads) > 0 && pumpSweepInterval > 0 {
+			return pumpSweepInterval
+		}
+		return peerIdleTickInterval
+	}
+	tickInterval := livenessInterval()
+	lastKeepAliveCheck := time.Now()
+	livenessTicker := time.NewTicker(tickInterval)
+	defer livenessTicker.Stop()
+	// keepAliveDue reports whether a keep-alive check is due at now. Ticks are not
+	// exact, so half a tick of slack keeps a tick that lands a hair early from
+	// putting the check off by a whole tick: checks stay about
+	// peerKeepAliveInterval apart, and our writes at most two of those.
+	keepAliveDue := func(now time.Time) bool {
+		return now.Sub(lastKeepAliveCheck) >= peerKeepAliveInterval-tickInterval/2
+	}
 peerLoop:
 	for {
 		pooledMsg.Release()
@@ -2303,9 +2373,28 @@ peerLoop:
 		// unsolicited blocks, requests we reject) skip it. Run it here once it is
 		// overdue, or a peer that took our requests could stream only such messages,
 		// never time out, and hold the requested pieces (and their received blocks)
-		// for good; an inbound peer has no stall reaper to fall back on.
+		// for good; an inbound peer has no stall reaper to fall back on. The
+		// liveness ticker brings a peer that sends nothing here too. Pieces another
+		// peer finished are cancelled first, as after every message.
 		if len(activeDownloads) > 0 && loopNow.Sub(lastPumpAt) >= pumpSweepInterval {
+			dropCompletedElsewhere()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
+		}
+
+		if want := livenessInterval(); want != tickInterval {
+			tickInterval = want
+			livenessTicker.Reset(want)
+			// A switch to the longer idle period restarts the tick phase; check
+			// now if a check is due, so the switch cannot stretch the gap between
+			// two checks by a whole idle period.
+			if keepAliveDue(loopNow) {
+				lastKeepAliveCheck = loopNow
+				if err := client.SendKeepAliveIfIdle(); err != nil {
+					disconnectReason = "write_error"
+					disconnectErr = err
+					break
+				}
+			}
 		}
 
 		var msg *peer.Message
@@ -2331,6 +2420,18 @@ peerLoop:
 				// is in and already covers these pieces.
 				client.DropQueuedHaves()
 			}
+			continue
+		case now := <-livenessTicker.C:
+			if keepAliveDue(now) {
+				lastKeepAliveCheck = now
+				if err := client.SendKeepAliveIfIdle(); err != nil {
+					disconnectReason = "write_error"
+					disconnectErr = err
+					break peerLoop
+				}
+			}
+			// Back to the top of the loop, which runs the reaper, the inactivity
+			// check and any overdue request-timeout sweep.
 			continue
 		case <-pexTick:
 			sendPEXDelta()
@@ -2366,10 +2467,10 @@ peerLoop:
 		}
 
 		if msg == nil {
-			// Keep alive: still run pump so outstanding requests to a now-silent peer
-			// time out (and the peer is dropped after its retry budget) instead of the
-			// keep-alive merely resetting the read deadline and stalling forever. Also
-			// drain any queued uploads that have since accrued bandwidth.
+			// Keep alive: still run pump so outstanding requests to a peer that now
+			// sends only keep-alives time out (and the peer is dropped after its
+			// retry budget) instead of stalling forever. Also drain any queued
+			// uploads that have since accrued bandwidth.
 			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue

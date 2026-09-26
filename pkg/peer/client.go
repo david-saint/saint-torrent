@@ -50,6 +50,11 @@ type Client struct {
 	writeTimeout  time.Duration
 	writeDeadline time.Time
 
+	// wrote records that something was written to w since the last
+	// SendKeepAliveIfIdle. Guarded by writeMu; set with a plain store, so the
+	// write paths pay no clock read for keep-alive tracking.
+	wrote bool
+
 	// bitfieldLimit is the largest bitfield payload ReadMessage accepts; see
 	// SetBitfieldLimit. Read by the reader goroutine, set by the connection owner.
 	bitfieldLimit atomic.Int32
@@ -178,6 +183,7 @@ func (c *Client) Handshake() (*Handshake, error) {
 func (c *Client) SendMessage(msg *Message) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.wrote = true
 	c.armWriteDeadlineLocked()
 	if _, err := c.w.Write(msg.Serialize()); err != nil {
 		return c.writeFailedLocked(err)
@@ -194,6 +200,7 @@ func (c *Client) SendMessage(msg *Message) error {
 func (c *Client) WriteRequest(index, begin, length uint32) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.wrote = true
 	buf := &c.reqBuf // 4-byte length prefix + 1-byte ID + 12-byte payload
 	binary.BigEndian.PutUint32(buf[0:4], 13)
 	buf[4] = byte(MsgRequest)
@@ -278,6 +285,7 @@ func (c *Client) SendQueuedHaves() error {
 		return nil
 	}
 	c.writeMu.Lock()
+	c.wrote = true
 	buf := &c.haveBuf // 4-byte length prefix + 1-byte ID + 4-byte index
 	binary.BigEndian.PutUint32(buf[0:4], 5)
 	buf[4] = byte(MsgHave)
@@ -312,6 +320,27 @@ func (c *Client) DropQueuedHaves() {
 // SendKeepAlive sends a keep-alive message (zero-length prefix).
 func (c *Client) SendKeepAlive() error {
 	return c.SendMessage(nil)
+}
+
+// keepAliveFrame is a keep-alive on the wire: a zero length prefix.
+const keepAliveFrame = "\x00\x00\x00\x00"
+
+// SendKeepAliveIfIdle sends a keep-alive unless something was written to the peer
+// since the previous call, and starts a new interval either way. Calling it every
+// interval keeps the gap between two writes under two intervals without a clock
+// read on any write path. A failed write closes the connection.
+func (c *Client) SendKeepAliveIfIdle() error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.wrote {
+		c.wrote = false
+		return nil
+	}
+	c.armWriteDeadlineLocked()
+	if _, err := c.w.WriteString(keepAliveFrame); err != nil {
+		return c.writeFailedLocked(err)
+	}
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // SendChoke sends a choke message to the peer.
@@ -365,6 +394,7 @@ func (c *Client) SendHaveNone() error {
 func (c *Client) SendPiece(index, begin uint32, block []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.wrote = true
 	buf := &c.pieceHdrBuf // 4-byte length prefix + 1-byte ID + 8-byte index/begin
 	length := uint32(9 + len(block))
 	binary.BigEndian.PutUint32(buf[0:4], length)

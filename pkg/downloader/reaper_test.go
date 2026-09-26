@@ -21,9 +21,9 @@ import (
 // startStalledMockPeer accepts one connection, completes the handshake, advertises
 // all pieces, unchokes on Interested, and then deliberately delivers NO piece data
 // while keeping the socket warm with frequent keep-alives. It is the canonical
-// "dead weight" peer: it holds its connection slot and resets the read deadline
-// forever without ever giving us a block. The single read goroutine sends a
-// keep-alive whenever the read deadline elapses, so writes never race.
+// "dead weight" peer: it holds its connection slot and looks alive forever
+// without ever giving us a block. The single read goroutine sends a keep-alive
+// whenever its own read deadline elapses, so writes never race.
 func startStalledMockPeer(t *testing.T, ln net.Listener, fullBitfield []byte) {
 	t.Helper()
 	go func() {

@@ -274,3 +274,73 @@ func TestSendPieceWireFormat(t *testing.T) {
 		t.Fatalf("got %#v, want id=%d payload=%v", msg, MsgPiece, wantPayload)
 	}
 }
+
+// recordConnA1 is a net.Conn that records everything written to it.
+type recordConnA1 struct {
+	net.Conn
+	written bytes.Buffer
+}
+
+func (c *recordConnA1) Write(p []byte) (int, error)      { return c.written.Write(p) }
+func (c *recordConnA1) SetWriteDeadline(time.Time) error { return nil }
+func (c *recordConnA1) Close() error                     { return nil }
+
+// expect fails unless exactly want was written since the last check.
+func (c *recordConnA1) expect(t *testing.T, step string, want []byte) {
+	t.Helper()
+	got := append([]byte(nil), c.written.Bytes()...)
+	c.written.Reset()
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%s: wrote %x, want %x", step, got, want)
+	}
+}
+
+// SendKeepAliveIfIdle sends a keep-alive only when nothing was written since the
+// previous call, whichever write path wrote it.
+func TestSendKeepAliveIfIdle(t *testing.T) {
+	conn := &recordConnA1{}
+	c := NewClient(conn, [20]byte{}, [20]byte{})
+	keepAlive := []byte{0, 0, 0, 0}
+
+	if err := c.SendKeepAliveIfIdle(); err != nil {
+		t.Fatal(err)
+	}
+	conn.expect(t, "idle since connect", keepAlive)
+	if err := c.SendKeepAliveIfIdle(); err != nil {
+		t.Fatal(err)
+	}
+	conn.expect(t, "idle after a keep-alive", keepAlive)
+
+	writers := []struct {
+		name  string
+		write func() error
+	}{
+		{"SendMessage", c.SendInterested},
+		{"WriteRequest", func() error {
+			if err := c.WriteRequest(1, 0, 16384); err != nil {
+				return err
+			}
+			return c.Flush()
+		}},
+		{"SendQueuedHaves", func() error {
+			c.QueueHave(3)
+			return c.SendQueuedHaves()
+		}},
+		{"SendPiece", func() error { return c.SendPiece(1, 0, []byte("block")) }},
+		{"SendMetadataData", func() error { return c.SendMetadataData(1, 0, 5, []byte("hello")) }},
+	}
+	for _, w := range writers {
+		if err := w.write(); err != nil {
+			t.Fatalf("%s: %v", w.name, err)
+		}
+		conn.written.Reset()
+		if err := c.SendKeepAliveIfIdle(); err != nil {
+			t.Fatal(err)
+		}
+		conn.expect(t, "right after "+w.name, nil)
+		if err := c.SendKeepAliveIfIdle(); err != nil {
+			t.Fatal(err)
+		}
+		conn.expect(t, "idle after "+w.name, keepAlive)
+	}
+}
