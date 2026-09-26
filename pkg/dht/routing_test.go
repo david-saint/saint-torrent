@@ -230,7 +230,7 @@ func TestQuestionableHeadReplacement(t *testing.T) {
 			}
 			select {
 			case <-deadline:
-				t.Fatal("head challenge never finished")
+				t.Fatal("challenge never finished")
 			case <-time.After(5 * time.Millisecond):
 			}
 		}
@@ -413,4 +413,58 @@ func BenchmarkAddNodeKnownEndpoint(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		d.AddNode(ip, 6881)
 	}
+}
+
+// TestChallengePicksLeastRecentlySeen verifies the contact challenged for a
+// newcomer is the bucket's least recently seen one, wherever it sits.
+func TestChallengePicksLeastRecentlySeen(t *testing.T) {
+	const bucket = 25
+	d, conn := newFakeDHT(t)
+	nodes := fillBucket(t, d, bucket, 3)
+	stale := nodes[3]
+	backdateNode(t, d, bucket, stale.ID, time.Now().Add(-nodeQuestionableAfter-time.Minute))
+
+	newcomer := idInBucket(d.nodeID, bucket, 99)
+	d.addNode(newcomer, &net.UDPAddr{IP: net.ParseIP("198.51.100.13"), Port: 6881})
+
+	tid := awaitQueryTo(t, conn, stale.Addr, "ping")
+	if got := conn.queriesTo(nodes[0].Addr, "ping"); got != 0 {
+		t.Fatalf("the fresh head was pinged %d times instead of the stale contact", got)
+	}
+	conn.injectPingReply(t, tid, idInBucket(d.nodeID, 91, 1), stale.Addr)
+	deadline := time.After(5 * time.Second)
+	for storedAddrFor(d, newcomer) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("newcomer never replaced the stale contact")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	if storedAddrFor(d, stale.ID) != nil {
+		t.Fatal("the stale contact kept its slot")
+	}
+	checkRoutingIndex(t, d)
+}
+
+// TestQuerySenderProbesLeaveRoomForOtherProbes verifies a spoofed query flood
+// from many source addresses cannot take every probe slot: PORT-advertised
+// nodes and bootstrap referrals still get probed.
+func TestQuerySenderProbesLeaveRoomForOtherProbes(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	for i := 0; i < 2*maxInFlightProbes; i++ {
+		id := idInBucket(d.nodeID, i%140, uint16(i))
+		src := &net.UDPAddr{IP: net.IPv4(198, 18, byte(i>>8), byte(i)), Port: 6881}
+		d.handleQuery("tx", "ping", map[string]interface{}{"id": string(id[:])}, src)
+	}
+	d.txMu.Lock()
+	inFlight, fromQueries := len(d.inFlightProbes), d.querySenderProbes
+	d.txMu.Unlock()
+	if fromQueries > maxQuerySenderProbes || inFlight > maxQuerySenderProbes {
+		t.Fatalf("query senders hold %d probes (%d in flight), cap %d", fromQueries, inFlight, maxQuerySenderProbes)
+	}
+
+	advertised := &net.UDPAddr{IP: net.ParseIP("203.0.113.200"), Port: 6881}
+	d.AddNode(advertised.IP, uint16(advertised.Port))
+	awaitQueryTo(t, conn, advertised, "ping")
 }

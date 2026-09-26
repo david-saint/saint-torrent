@@ -73,7 +73,8 @@ type DHT struct {
 	nodeAddrs map[nodeAddrKey][20]byte
 	nodeIPs   map[[4]byte]int
 
-	inFlightProbes map[nodeAddrKey]struct{} // in-flight probes, keyed by probeKey
+	inFlightProbes    map[nodeAddrKey]struct{} // in-flight probes, keyed by probeKey
+	querySenderProbes int                      // in-flight probes started by inbound queries
 
 	// limiter and started are owned by the read goroutine; started anchors the
 	// monotonic clock the limiter runs on.
@@ -115,6 +116,10 @@ const (
 	// maxInFlightProbes bounds concurrent pings to unverified endpoints: PORT
 	// messages, unknown query senders and bootstrap referrals.
 	maxInFlightProbes = 100
+	// maxQuerySenderProbes is the share of those that unknown query senders may
+	// hold, so a spoofed query flood from many source addresses cannot starve
+	// probes of bootstrap referrals and PORT-advertised nodes.
+	maxQuerySenderProbes = 32
 	// nodeProbeTimeout bounds each of those probes.
 	nodeProbeTimeout = 5 * time.Second
 	// nodePingTimeout bounds every routing-table liveness ping.
@@ -717,6 +722,19 @@ func (b *bucket) indexOf(id [20]byte) int {
 	return -1
 }
 
+// oldest returns b's least recently seen contact, the one BEP 5 checks first
+// when a newcomer wants a slot. Buckets are kept roughly in that order, but a
+// scan of K entries makes it exact.
+func (b *bucket) oldest() Node {
+	o := 0
+	for i := 1; i < len(b.nodes); i++ {
+		if b.nodes[i].LastSeen.Before(b.nodes[o].LastSeen) {
+			o = i
+		}
+	}
+	return b.nodes[o]
+}
+
 // appendNodeLocked adds n at the tail of b and indexes it. Callers hold d.mu
 // and have already checked admission.
 func (d *DHT) appendNodeLocked(b *bucket, n Node) {
@@ -825,22 +843,22 @@ func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 		return
 	}
 	// BEP 5: a bucket full of good contacts simply discards the newcomer; only
-	// a questionable head is challenged, one challenge per bucket at a time.
-	head := b.nodes[0]
-	if b.pingInProgress || !questionable(head, time.Now()) {
+	// a questionable contact is challenged, one challenge per bucket at a time.
+	stale := b.oldest()
+	if b.pingInProgress || !questionable(stale, time.Now()) {
 		return
 	}
 	b.pingInProgress = true
 	d.goTracked(func() {
-		d.challengeHead(idx, head, n)
+		d.challenge(idx, stale, n)
 	})
 }
 
-// challengeHead pings a full bucket's questionable head on behalf of a
-// newcomer. The head keeps its slot if it answers with its own ID. It is
+// challenge pings a full bucket's questionable contact on behalf of a
+// newcomer. The contact keeps its slot if it answers with its own ID. It is
 // replaced after maxNodePingFailures consecutive misses, or at once if its
 // address answers as a different node. d.mu is never held across a ping.
-func (d *DHT) challengeHead(idx int, head, newcomer Node) {
+func (d *DHT) challenge(idx int, stale, newcomer Node) {
 	defer func() {
 		d.mu.Lock()
 		if b := d.buckets[idx]; b != nil {
@@ -852,14 +870,14 @@ func (d *DHT) challengeHead(idx int, head, newcomer Node) {
 	failures := 0
 	for failures < maxNodePingFailures {
 		ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
-		gotID, err := d.queryNodeID(ctx, head.Addr)
+		gotID, err := d.queryNodeID(ctx, stale.Addr)
 		cancel()
 		if d.ctx.Err() != nil {
 			return
 		}
 		switch {
-		case err == nil && gotID == head.ID:
-			d.refreshNode(head.ID, head.Addr)
+		case err == nil && gotID == stale.ID:
+			d.refreshNode(stale.ID, stale.Addr)
 			return
 		case err == nil:
 			// Something else owns that address now: the contact is proven wrong.
@@ -868,7 +886,7 @@ func (d *DHT) challengeHead(idx int, head, newcomer Node) {
 			failures++
 		}
 	}
-	d.replaceNode(idx, head, newcomer)
+	d.replaceNode(idx, stale, newcomer)
 }
 
 // replaceNode evicts old from bucket idx, if it is still stored there and still
@@ -937,7 +955,7 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	d.mu.Unlock()
 
 	if probe {
-		d.probeNode(k)
+		d.probeNode(k, true)
 	}
 }
 
@@ -953,7 +971,7 @@ func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
 	if b == nil || len(b.nodes) < bucketSize {
 		return true
 	}
-	return !b.pingInProgress && questionable(b.nodes[0], time.Now())
+	return !b.pingInProgress && questionable(b.oldest(), time.Now())
 }
 
 // considerAddressChange queues a candidate address for a node ID already in the
@@ -1279,7 +1297,7 @@ func (d *DHT) probeUnknown(k nodeAddrKey) {
 	if held || ipTaken {
 		return
 	}
-	d.probeNode(k)
+	d.probeNode(k, false)
 }
 
 // probeKey is the in-flight identity of a probe to k: the IP alone where only
@@ -1293,9 +1311,10 @@ func probeKey(k nodeAddrKey) nodeAddrKey {
 }
 
 // probeNode pings k and admits whatever node ID answers from it. Probes are
-// deduplicated per probeKey, capped at maxInFlightProbes, and run on tracked
-// goroutines so callers never block on the network.
-func (d *DHT) probeNode(k nodeAddrKey) {
+// deduplicated per probeKey, capped at maxInFlightProbes (maxQuerySenderProbes
+// for those fromQuery), and run on tracked goroutines so callers never block
+// on the network.
+func (d *DHT) probeNode(k nodeAddrKey, fromQuery bool) {
 	pk := probeKey(k)
 	d.txMu.Lock()
 	if d.inFlightProbes == nil {
@@ -1306,11 +1325,14 @@ func (d *DHT) probeNode(k nodeAddrKey) {
 		d.txMu.Unlock()
 		return
 	}
-	if len(d.inFlightProbes) >= maxInFlightProbes {
+	if len(d.inFlightProbes) >= maxInFlightProbes || (fromQuery && d.querySenderProbes >= maxQuerySenderProbes) {
 		d.txMu.Unlock()
 		return
 	}
 	d.inFlightProbes[pk] = struct{}{}
+	if fromQuery {
+		d.querySenderProbes++
+	}
 	d.txMu.Unlock()
 
 	addr := k.udpAddr()
@@ -1318,6 +1340,9 @@ func (d *DHT) probeNode(k nodeAddrKey) {
 		defer func() {
 			d.txMu.Lock()
 			delete(d.inFlightProbes, pk)
+			if fromQuery {
+				d.querySenderProbes--
+			}
 			d.txMu.Unlock()
 		}()
 
