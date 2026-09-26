@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/bits"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/logging"
+	"sainttorrent/pkg/netpolicy"
 )
 
 // Node represents a contact in the Kademlia routing table.
@@ -66,6 +68,11 @@ type DHT struct {
 	txCounter    uint32
 
 	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
+
+	// limiter and started are owned by the read goroutine; started anchors the
+	// monotonic clock the limiter runs on.
+	limiter *queryLimiter
+	started time.Time
 
 	addrMu sync.Mutex
 	// addrChanges holds only the node IDs with a verification in flight, so a
@@ -163,6 +170,8 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 		inFlightProbes: make(map[string]struct{}),
 		addrChanges:    make(map[[20]byte]struct{}),
 		addrCooldowns:  make(map[addrChangeKey]time.Time),
+		limiter:        newQueryLimiter(),
+		started:        time.Now(),
 		ctx:            ctx,
 		cancel:         cancel,
 		downloadDir:    downloadDir,
@@ -298,6 +307,11 @@ func (d *DHT) handlePacket(data []byte, addr *net.UDPAddr) {
 
 	switch yStr {
 	case "q":
+		// Responses to our own transactions skip this gate, so lookups and
+		// liveness checks are never throttled.
+		if !d.admitQuery(addr) {
+			return
+		}
 		qStr, _ := dict["q"].(string)
 		aDict, _ := dict["a"].(map[string]interface{})
 		d.handleQuery(tStr, qStr, aDict, addr)
@@ -305,6 +319,31 @@ func (d *DHT) handlePacket(data []byte, addr *net.UDPAddr) {
 		rDict, _ := dict["r"].(map[string]interface{})
 		d.handleResponse(tStr, rDict, addr)
 	}
+}
+
+// admitQuery reports whether a query from addr should be handled. Sources that
+// can never be a peer are dropped, and every other IPv4 source is held to a
+// per-IP rate so we cannot be used to reflect responses at a spoofed victim.
+// Loopback is exempt: it can only originate on this host, and local test
+// networks run many nodes on 127.0.0.1. The DHT is IPv4-only, so IPv6 sources
+// (possible on a dual-stack socket) are dropped rather than left unlimited.
+func (d *DHT) admitQuery(addr *net.UDPAddr) bool {
+	if addr == nil || addr.Port <= 0 || addr.Port > 65535 {
+		return false
+	}
+	ip4 := addr.IP.To4()
+	if ip4 == nil {
+		return false
+	}
+	var ip [4]byte
+	copy(ip[:], ip4)
+	switch netpolicy.Classify(netip.AddrFrom4(ip)) {
+	case netpolicy.ScopeInvalid:
+		return false
+	case netpolicy.ScopeLoopback:
+		return true
+	}
+	return d.limiter.allow(ip, int64(time.Since(d.started)))
 }
 
 func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *net.UDPAddr) {
