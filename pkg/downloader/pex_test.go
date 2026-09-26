@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"crypto/sha1"
+	"fmt"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -257,6 +258,77 @@ func refusingLoopbackPort(t *testing.T) int {
 	port := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close()
 	return port
+}
+
+func sessionKnowsPeer(sess *Session, addr string) bool {
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	_, ok := sess.Peers[addr]
+	return ok
+}
+
+// TestPEXIgnoresTooFrequentMessagesAndDropsFlooder covers a peer streaming
+// ut_pex messages back to back, each naming endpoints for us to dial: only the
+// first is used, early ones are ignored, and a peer that keeps sending them is
+// dropped.
+func TestPEXIgnoresTooFrequentMessagesAndDropsFlooder(t *testing.T) {
+	sess := newWireTestSession(t, 4, BlockSize)
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	w := startWirePeer(t, sess, 7500, fastReserved())
+	port := refusingLoopbackPort(t)
+
+	sendPEX := func(ip string) string {
+		payload, err := peer.SerializePEXMessage(&peer.PEXMessage{
+			Added: []peer.PEXPeer{{IP: net.ParseIP(ip), Port: uint16(port)}},
+		})
+		if err != nil {
+			t.Fatalf("serialize PEX: %v", err)
+		}
+		w.sendExtended(peer.LocalPEXExtID, payload)
+		return net.JoinHostPort(ip, strconv.Itoa(port))
+	}
+
+	first := sendPEX("127.0.1.1")
+	w.barrier()
+	if !sessionKnowsPeer(sess, first) {
+		t.Fatal("the first ut_pex message was not used")
+	}
+
+	second := sendPEX("127.0.1.2")
+	w.barrier()
+	if sessionKnowsPeer(sess, second) {
+		t.Fatal("a ut_pex message sent right after the previous one was acted on")
+	}
+
+	for i := 1; i < maxPEXFloods; i++ {
+		sendPEX(fmt.Sprintf("127.0.1.%d", 10+i))
+	}
+	w.waitClosed(5 * time.Second)
+}
+
+// TestPEXActsOnAtMostFiftyAddedPeers covers a ut_pex message listing far more
+// peers than BEP 11 allows: only pexIngestLimit of them are taken.
+func TestPEXActsOnAtMostFiftyAddedPeers(t *testing.T) {
+	sess := newWireTestSession(t, 1, BlockSize)
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	port := refusingLoopbackPort(t)
+
+	msg := &peer.PEXMessage{}
+	for i := 0; i < 3*pexIngestLimit; i++ {
+		msg.Added = append(msg.Added, peer.PEXPeer{IP: net.IPv4(127, 0, 2, byte(i+1)), Port: uint16(port)})
+	}
+	sess.handlePEXMessage("127.0.0.1:7601", "127.0.0.1", msg)
+
+	sess.mu.RLock()
+	known := len(sess.Peers)
+	sess.mu.RUnlock()
+	if known != pexIngestLimit {
+		t.Fatalf("known peers after one ut_pex message = %d, want %d", known, pexIngestLimit)
+	}
 }
 
 // TestPEXRejectsAddressesMoreLocalThanSender covers a remote peer using PEX to

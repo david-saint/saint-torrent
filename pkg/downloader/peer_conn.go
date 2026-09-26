@@ -1156,6 +1156,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	var peerDHTPort uint16
 	peerDHTPortUpdates := 0
 	pexAdvertised := make(map[string]struct{})
+	// lastPEXAt is when we last used a ut_pex message from this peer; pexFloods
+	// counts the ones it sent too soon after that.
+	var lastPEXAt time.Time
+	pexFloods := 0
 	var pexTicker *time.Ticker
 	var pexTick <-chan time.Time
 	sendPEXDelta := func() {
@@ -2055,6 +2059,19 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if len(payloadBytes) > peer.MaxPEXMessageSize {
 				return "oversized_extension"
 			}
+			// BEP 11 peers send ut_pex about once a minute. One that comes sooner
+			// than half of that after the last one we used is ignored undecoded, so
+			// a peer cannot make us dial at the rate it sends; a peer that keeps
+			// doing it is dropped, as libtorrent does.
+			now := time.Now()
+			if !lastPEXAt.IsZero() && now.Sub(lastPEXAt) < pexInterval/2 {
+				pexFloods++
+				if pexFloods >= maxPEXFloods {
+					return "pex_flood"
+				}
+				return ""
+			}
+			lastPEXAt = now
 			if pexMsg, err := peer.ParsePEXMessage(payloadBytes); err == nil {
 				s.handlePEXMessage(peerAddr, ip, pexMsg)
 			}

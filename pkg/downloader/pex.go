@@ -14,6 +14,15 @@ var pexInterval = 60 * time.Second
 
 const pexDeltaLimit = 50
 
+// pexIngestLimit is how many added peers of one ut_pex message we act on. BEP 11
+// allows 50 per message (we send at most pexDeltaLimit), so the rest of a longer
+// list is ignored rather than dialed.
+const pexIngestLimit = 50
+
+// maxPEXFloods is how many ut_pex messages one connection may send too soon
+// (under half of pexInterval after the last one we used) before it is dropped.
+const maxPEXFloods = 3
+
 func (s *Session) pexEnabledLocked() bool {
 	return s.Torrent != nil && !s.Torrent.Private
 }
@@ -48,7 +57,11 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 		return
 	}
 	source, _ := netip.ParseAddr(fromIP)
-	for _, p := range msg.Added {
+	added := msg.Added
+	if len(added) > pexIngestLimit {
+		added = added[:pexIngestLimit]
+	}
+	for _, p := range added {
 		ap, ok := peerAddrPort(p.IP, p.Port)
 		if !ok || !netpolicy.PeerAllowed(ap, source) {
 			continue
