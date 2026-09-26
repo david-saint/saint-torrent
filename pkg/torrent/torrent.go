@@ -33,6 +33,11 @@ const maxPathDepth = 128
 type File struct {
 	Length int64
 	Path   []string
+	// LegacyPath is where versions before the current name sanitizer laid the
+	// file out, set only when that differs from Path (see
+	// legacyPathComponent). The downloader moves a file it finds there to
+	// Path, so upgrading does not orphan it and download it again.
+	LegacyPath []string
 }
 
 // Torrent represents the metadata extracted from a torrent file.
@@ -196,6 +201,7 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 			return nil, fmt.Errorf("files list cannot be empty")
 		}
 		cleanName := sanitizePathComponent(name)
+		legacyName, legacyRoot := legacyComponent(name, cleanName)
 		for _, fVal := range filesSlice {
 			fMap, ok := fVal.(map[string]interface{})
 			if !ok {
@@ -222,6 +228,7 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 			}
 			path := make([]string, 0, len(pathSlice)+1)
 			path = append(path, cleanName) // root under sanitized torrent name
+			legacyDiffers := legacyRoot
 			for _, pVal := range pathSlice {
 				pStr, ok := pVal.(string)
 				if !ok {
@@ -231,14 +238,21 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 				if cleanedComp != "" {
 					path = append(path, cleanedComp)
 				}
+				if _, differs := legacyComponent(pStr, cleanedComp); differs {
+					legacyDiffers = true
+				}
 			}
 			if len(path) == 1 { // Only contains the torrent name, no actual files
 				path = append(path, "unknown_file")
 			}
-			files = append(files, File{
+			file := File{
 				Length: length,
 				Path:   path,
-			})
+			}
+			if legacyDiffers {
+				file.LegacyPath = legacyFilePath(legacyName, pathSlice)
+			}
+			files = append(files, file)
 		}
 	} else {
 		// Single-file mode
@@ -250,11 +264,15 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 			return nil, err
 		}
 		totalLength = length
+		cleanName := sanitizePathComponent(name)
 		files = []File{
 			{
 				Length: length,
-				Path:   []string{sanitizePathComponent(name)},
+				Path:   []string{cleanName},
 			},
+		}
+		if legacyName, differs := legacyComponent(name, cleanName); differs && len(legacyName) <= maxLegacyComponentBytes {
+			files[0].LegacyPath = []string{legacyName}
 		}
 	}
 	if totalLength <= 0 {

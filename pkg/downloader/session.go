@@ -354,6 +354,10 @@ type Session struct {
 	// reservation back and is called by the manager, never by Close.
 	claimPaths    func(infoHash [20]byte, baseDir string, files []storage.FileInfo) (release func(), err error)
 	releaseClaims func()
+	// migratePaths moves payload files an older version wrote under their
+	// pre-sanitizer names to the current ones once the paths are claimed (nil
+	// for a standalone session; see TorrentManager.migrateLegacyPaths).
+	migratePaths func(infoHash [20]byte, baseDir string, files []torrent.File) (moved int)
 }
 
 // errSessionClosing reports work refused or abandoned because the session is
@@ -1783,6 +1787,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		factory = storage.NewStorage
 	}
 	claimPaths := s.claimPaths
+	migratePaths := s.migratePaths
 	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
 	// Close waits on initDone, so the storage built below is either published
 	// before Close takes the session's storage or never built at all.
@@ -1808,6 +1813,9 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 				storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, claimErr))
 				continue
 			}
+		}
+		if migratePaths != nil {
+			migratePaths(s.Torrent.InfoHash, downloadDir, parsed.Files)
 		}
 		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
 		// Success is decided by the error alone, and a nil pointer boxed in the

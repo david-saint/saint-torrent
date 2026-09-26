@@ -66,6 +66,9 @@ type TorrentManager struct {
 	startPaused    bool // see SetStartPaused
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+	// restoreMigrations tallies the files restore moved from their legacy
+	// names (see migrateLegacyPaths), for the startup notice.
+	restoreMigrations legacyMigrations
 	// removing holds the lowercase info-hash of every RemoveSession still
 	// deleting state and payload; the channel closes when it finishes. Adds of
 	// that hash are refused meanwhile so they cannot open files being deleted.
@@ -312,6 +315,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) error {
 	}
 	if sess.claimPaths == nil {
 		sess.claimPaths = m.claimPaths
+	}
+	if sess.migratePaths == nil {
+		sess.migratePaths = m.migrateLegacyPaths
 	}
 	if m.peerListener != nil {
 		sess.sharedInbound = true
@@ -948,7 +954,8 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrRemovalInProgress, infoHashHex)
 	}
-	verifyOnStartup := m.verifyOnStartup && m.restoring
+	restoreAdd := m.restoring
+	verifyOnStartup := m.verifyOnStartup && restoreAdd
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -969,6 +976,11 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	releaseClaims, err := m.claimPaths(tor.InfoHash, downloadDir, files)
 	if err != nil {
 		return nil, err
+	}
+	// Files an older version wrote under their pre-sanitizer names move to
+	// the current ones before the factory would create them empty.
+	if moved := m.migrateLegacyPaths(tor.InfoHash, downloadDir, tor.Files); moved > 0 && restoreAdd {
+		m.noteRestoreMigration(tor.Name, moved)
 	}
 	st, err := storageFactory(downloadDir, files, tor.PieceLength)
 	if err == nil && isNilStorage(st) {
@@ -1680,6 +1692,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	crashNotices = append(crashNotices, unloadedQuarantine...)
 	if warning != "" {
 		crashNotices = append(crashNotices, warning)
+	}
+	if notice := m.takeRestoreMigrationNotice(); notice != "" {
+		crashNotices = append(crashNotices, notice)
 	}
 	warning = strings.Join(crashNotices, "; ")
 
