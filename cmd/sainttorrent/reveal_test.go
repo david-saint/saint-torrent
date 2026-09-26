@@ -1,34 +1,44 @@
 package main
 
 import (
-	"path/filepath"
-	"runtime"
+	"strings"
 	"testing"
 )
 
-func TestRevealCommand(t *testing.T) {
-	const path = "/tmp/downloads/MyShow"
-	cmd := revealCommand(path)
-	if cmd == nil {
-		t.Fatal("revealCommand returned nil")
+// explorer.exe splits /select on commas; a torrent named "Movie,calc.exe"
+// must reach it as one quoted path, and paths that cannot be quoted fall
+// back to opening the parent folder.
+func TestExplorerCmdLineQuotesTorrentControlledPath(t *testing.T) {
+	const exe = `C:\Windows\explorer.exe`
+	const parent = `C:\Users\me\Downloads`
+	cases := []struct {
+		path string
+		want string
+		ok   bool
+	}{
+		{parent + `\Movie,calc.exe`, `"` + exe + `" /select,"` + parent + `\Movie,calc.exe"`, true},
+		{parent + `\Movie,/root,C:\x`, `"` + exe + `" /select,"` + parent + `\Movie,/root,C:\x"`, true},
+		{parent + `\My Show`, `"` + exe + `" /select,"` + parent + `\My Show"`, true},
+		{parent + `\bad"name`, `"` + exe + `" "` + parent + `"`, true},
+		{parent + "\\ctl\nname", `"` + exe + `" "` + parent + `"`, true},
+		{`C:\`, `"` + exe + `" /select,"C:\."`, true},
 	}
-
-	var wantArgs []string
-	switch runtime.GOOS {
-	case "darwin":
-		wantArgs = []string{"open", "-R", path}
-	case "windows":
-		wantArgs = []string{"explorer", "/select," + path}
-	default:
-		wantArgs = []string{"xdg-open", filepath.Dir(path)}
-	}
-
-	if len(cmd.Args) != len(wantArgs) {
-		t.Fatalf("cmd.Args = %v, want %v", cmd.Args, wantArgs)
-	}
-	for i := range wantArgs {
-		if cmd.Args[i] != wantArgs[i] {
-			t.Errorf("cmd.Args[%d] = %q, want %q", i, cmd.Args[i], wantArgs[i])
+	for _, tc := range cases {
+		got, ok := explorerCmdLine(exe, tc.path, parent)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("explorerCmdLine(%q) = %q, %v; want %q, %v", tc.path, got, ok, tc.want, tc.ok)
 		}
+		if strings.Count(got, `"`)%2 != 0 {
+			t.Errorf("unbalanced quotes in %q", got)
+		}
+	}
+	if _, ok := explorerCmdLine(exe, `C:\a"b`, `C:\a"`); ok {
+		t.Error("unquotable path and parent were accepted")
+	}
+}
+
+func TestRevealInFileManagerRejectsRelativePath(t *testing.T) {
+	if err := revealInFileManager("-R"); err == nil {
+		t.Fatal("relative path accepted; it could be read as an option")
 	}
 }
