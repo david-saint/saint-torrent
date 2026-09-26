@@ -1700,8 +1700,16 @@ func TestResetCarryingOurSendIDClosesConn(t *testing.T) {
 			if conns, _ := socketState(s); conns != 0 {
 				t.Fatalf("%d conns still registered after the RESET", conns)
 			}
-			if p, ok := peer.recv(150 * time.Millisecond); ok {
-				t.Fatalf("RESETs drew a reply of type %d", p.typ)
+			for {
+				p, ok := peer.recv(150 * time.Millisecond)
+				if !ok {
+					break
+				}
+				// A dial whose retransmit timer fired together with the
+				// SYN-ACK sends one more SYN; that is no reply.
+				if p.typ != packetTypeSyn {
+					t.Fatalf("RESETs drew a reply of type %d", p.typ)
+				}
 			}
 		})
 	}
