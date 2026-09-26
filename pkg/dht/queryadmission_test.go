@@ -15,8 +15,9 @@ type fakePacket struct {
 	addr *net.UDPAddr
 }
 
-// fakeConn is a PacketConn that records everything the DHT sends and never
-// answers, so routing-table behaviour can be asserted without real sockets.
+// fakeConn is a PacketConn that records everything the DHT sends and, unless
+// scripted with setAnswer, never answers, so routing-table behaviour can be
+// asserted without real sockets.
 type fakeConn struct {
 	local  *net.UDPAddr
 	mu     sync.Mutex
@@ -24,6 +25,18 @@ type fakeConn struct {
 	in     chan fakePacket
 	closed chan struct{}
 	once   sync.Once
+	answer answerFunc
+}
+
+// answerFunc scripts a remote node: given a query we sent to `to`, it returns
+// the "r" dictionary to answer with, or nil to stay silent.
+type answerFunc func(to *net.UDPAddr, q string, args map[string]interface{}) map[string]interface{}
+
+// setAnswer scripts replies to every query sent from now on.
+func (c *fakeConn) setAnswer(fn answerFunc) {
+	c.mu.Lock()
+	c.answer = fn
+	c.mu.Unlock()
 }
 
 func newFakeConn() *fakeConn {
@@ -52,8 +65,42 @@ func (c *fakeConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 	stored := &net.UDPAddr{IP: append(net.IP(nil), addr.IP...), Port: addr.Port, Zone: addr.Zone}
 	c.mu.Lock()
 	c.sent = append(c.sent, fakePacket{data: append([]byte(nil), b...), addr: stored})
+	answer := c.answer
 	c.mu.Unlock()
+	if answer != nil {
+		if reply, ok := scriptedReply(answer, b, stored); ok {
+			// Deliver asynchronously: the writer may be the read loop itself.
+			go func() {
+				select {
+				case c.in <- reply:
+				case <-c.closed:
+				}
+			}()
+		}
+	}
 	return len(b), nil
+}
+
+func scriptedReply(answer answerFunc, b []byte, to *net.UDPAddr) (fakePacket, bool) {
+	parsed, err := bencode.Unmarshal(b)
+	if err != nil {
+		return fakePacket{}, false
+	}
+	dict, ok := parsed.(map[string]interface{})
+	if !ok || dict["y"] != "q" {
+		return fakePacket{}, false
+	}
+	q, _ := dict["q"].(string)
+	args, _ := dict["a"].(map[string]interface{})
+	r := answer(to, q, args)
+	if r == nil {
+		return fakePacket{}, false
+	}
+	payload, err := bencode.Marshal(map[string]interface{}{"t": dict["t"], "y": "r", "r": r})
+	if err != nil {
+		return fakePacket{}, false
+	}
+	return fakePacket{data: payload, addr: cloneUDPAddr(to)}, true
 }
 
 func (c *fakeConn) LocalAddr() net.Addr { return c.local }

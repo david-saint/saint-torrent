@@ -1407,6 +1407,9 @@ func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) 
 		if !ok {
 			return nil, errors.New("invalid response")
 		}
+		if idStr, _ := rDict["id"].(string); len(idStr) != 20 {
+			return nil, errors.New("invalid responder id")
+		}
 		nodesStr, _ := rDict["nodes"].(string)
 		return parseCompactNodes(nodesStr), nil
 	case <-ctx.Done():
@@ -1416,6 +1419,8 @@ func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) 
 
 // GetPeersResult contains token, closer nodes, or discovered peers.
 type GetPeersResult struct {
+	// ID is the node ID the responder reported for itself.
+	ID    [20]byte
 	Token string
 	Peers []string
 	Nodes []Node
@@ -1453,8 +1458,13 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 		if !ok {
 			return nil, errors.New("invalid response")
 		}
+		idStr, _ := rDict["id"].(string)
+		if len(idStr) != 20 {
+			return nil, errors.New("invalid responder id")
+		}
 		token, _ := rDict["token"].(string)
 		res := &GetPeersResult{Token: token}
+		copy(res.ID[:], idStr)
 
 		if val, exists := rDict["values"]; exists {
 			list, ok := val.([]interface{})
@@ -1588,154 +1598,161 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 // LookupWithOptions queries the DHT swarm for a given torrent's info-hash.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	d.goTracked(func() {
-		logEnabled := logging.Enabled()
-		infoHashHex := ""
-		if logEnabled {
-			infoHashHex = fmt.Sprintf("%x", infoHash)
-			logging.Debug("dht_lookup_started",
+		d.lookup(infoHash, peerPort, opts)
+	})
+}
+
+// lookup runs one get_peers lookup to completion on the calling goroutine.
+func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
+	logEnabled := logging.Enabled()
+	infoHashHex := ""
+	if logEnabled {
+		infoHashHex = fmt.Sprintf("%x", infoHash)
+		logging.Debug("dht_lookup_started",
+			logging.String("info_hash", infoHashHex),
+			logging.Uint16("peer_port", peerPort),
+			logging.Bool("announce", opts.Announce),
+		)
+	}
+	queriesCount := 0
+	discoveredPeers := 0
+	defer func(start time.Time) {
+		if logging.Enabled() {
+			logging.Debug("dht_lookup_finished",
 				logging.String("info_hash", infoHashHex),
-				logging.Uint16("peer_port", peerPort),
-				logging.Bool("announce", opts.Announce),
+				logging.Int("queries", queriesCount),
+				logging.Int("peers", discoveredPeers),
+				logging.Duration("duration", time.Since(start)),
 			)
 		}
-		queriesCount := 0
-		discoveredPeers := 0
-		defer func(start time.Time) {
-			if logging.Enabled() {
-				logging.Debug("dht_lookup_finished",
-					logging.String("info_hash", infoHashHex),
-					logging.Int("queries", queriesCount),
-					logging.Int("peers", discoveredPeers),
-					logging.Duration("duration", time.Since(start)),
-				)
-			}
-		}(time.Now())
+	}(time.Now())
 
-		startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
+	startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
+	if len(startNodes) == 0 {
+		d.bootstrap()
+		select {
+		case <-time.After(1 * time.Second):
+		case <-d.ctx.Done():
+			return
+		}
+		startNodes = d.getCloserNodes(infoHash, dhtLookupStartNodes)
 		if len(startNodes) == 0 {
-			d.bootstrap()
-			select {
-			case <-time.After(1 * time.Second):
-			case <-d.ctx.Done():
-				return
-			}
-			startNodes = d.getCloserNodes(infoHash, dhtLookupStartNodes)
-			if len(startNodes) == 0 {
-				return
-			}
+			return
+		}
+	}
+
+	visited := make(map[string]bool)
+	queue := append([]Node{}, startNodes...)
+
+	for len(queue) > 0 && queriesCount < dhtLookupQueryLimit {
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
 		}
 
-		visited := make(map[string]bool)
-		queue := append([]Node{}, startNodes...)
+		batch := make([]Node, 0, dhtLookupParallelism)
+		for len(queue) > 0 && len(batch) < dhtLookupParallelism && queriesCount < dhtLookupQueryLimit {
+			curr := queue[0]
+			queue = queue[1:]
 
-		for len(queue) > 0 && queriesCount < dhtLookupQueryLimit {
-			select {
-			case <-d.ctx.Done():
-				return
-			default:
+			addrStr := curr.Addr.String()
+			if visited[addrStr] {
+				continue
 			}
+			visited[addrStr] = true
+			queriesCount++
+			batch = append(batch, curr)
+		}
+		if len(batch) == 0 {
+			continue
+		}
 
-			batch := make([]Node, 0, dhtLookupParallelism)
-			for len(queue) > 0 && len(batch) < dhtLookupParallelism && queriesCount < dhtLookupQueryLimit {
-				curr := queue[0]
-				queue = queue[1:]
+		type lookupResult struct {
+			node Node
+			res  *GetPeersResult
+			err  error
+		}
+		results := make(chan lookupResult, len(batch))
+		for _, node := range batch {
+			n := node
+			go func() {
+				ctx, cancel := context.WithTimeout(d.ctx, 3*time.Second)
+				res, err := d.getPeersQuery(ctx, infoHash, n.Addr)
+				cancel()
+				results <- lookupResult{node: n, res: res, err: err}
+			}()
+		}
 
-				addrStr := curr.Addr.String()
-				if visited[addrStr] {
-					continue
-				}
-				visited[addrStr] = true
-				queriesCount++
-				batch = append(batch, curr)
-			}
-			if len(batch) == 0 {
+		for range batch {
+			result := <-results
+			if result.err != nil {
 				continue
 			}
 
-			type lookupResult struct {
-				node Node
-				res  *GetPeersResult
-				err  error
-			}
-			results := make(chan lookupResult, len(batch))
-			for _, node := range batch {
-				n := node
-				go func() {
-					ctx, cancel := context.WithTimeout(d.ctx, 3*time.Second)
-					res, err := d.getPeersQuery(ctx, infoHash, n.Addr)
-					cancel()
-					results <- lookupResult{node: n, res: res, err: err}
-				}()
-			}
+			// Store the responder under the ID it reported itself, never
+			// the one a referrer claimed for its address.
+			d.addNode(result.res.ID, result.node.Addr)
 
-			for range batch {
-				result := <-results
-				if result.err != nil {
+			for _, cp := range result.res.Peers {
+				if len(cp) != 6 {
+					continue
+				}
+				ip := net.IP([]byte(cp[0:4]))
+				port := binary.BigEndian.Uint16([]byte(cp[4:6]))
+				if port == 0 {
 					continue
 				}
 
-				d.addNode(result.node.ID, result.node.Addr)
-
-				for _, cp := range result.res.Peers {
-					if len(cp) != 6 {
-						continue
+				select {
+				case d.peerChan <- DiscoveredPeer{
+					InfoHash: infoHash,
+					IP:       ip,
+					Port:     port,
+				}:
+					discoveredPeers++
+					if logging.Enabled() {
+						logging.Debug("dht_peer_discovered",
+							logging.String("info_hash", infoHashHex),
+							logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
+						)
 					}
-					ip := net.IP([]byte(cp[0:4]))
-					port := binary.BigEndian.Uint16([]byte(cp[4:6]))
-					if port == 0 {
-						continue
-					}
+				case <-d.ctx.Done():
+					return
+				default:
+				}
+			}
 
+			if opts.Announce && result.res.Token != "" && peerPort != 0 {
+				n := result.node
+				token := result.res.Token
+				d.goTracked(func() {
 					select {
-					case d.peerChan <- DiscoveredPeer{
-						InfoHash: infoHash,
-						IP:       ip,
-						Port:     port,
-					}:
-						discoveredPeers++
-						if logging.Enabled() {
-							logging.Debug("dht_peer_discovered",
-								logging.String("info_hash", infoHashHex),
-								logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
-							)
-						}
 					case <-d.ctx.Done():
 						return
 					default:
 					}
-				}
-
-				if opts.Announce && result.res.Token != "" && peerPort != 0 {
-					n := result.node
-					token := result.res.Token
-					d.goTracked(func() {
-						select {
-						case <-d.ctx.Done():
-							return
-						default:
+					ctxAnn, cancelAnn := context.WithTimeout(d.ctx, 3*time.Second)
+					defer cancelAnn()
+					if err := d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr); err != nil {
+						if logging.Enabled() {
+							logging.Debug("dht_announce_peer_failed",
+								logging.String("info_hash", infoHashHex),
+								logging.String("node", n.Addr.String()),
+								logging.Err(err),
+							)
 						}
-						ctxAnn, cancelAnn := context.WithTimeout(d.ctx, 3*time.Second)
-						defer cancelAnn()
-						if err := d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, n.Addr); err != nil {
-							if logging.Enabled() {
-								logging.Debug("dht_announce_peer_failed",
-									logging.String("info_hash", infoHashHex),
-									logging.String("node", n.Addr.String()),
-									logging.Err(err),
-								)
-							}
-						}
-					})
-				}
-
-				for _, n := range result.res.Nodes {
-					if !visited[n.Addr.String()] {
-						queue = append(queue, n)
 					}
+				})
+			}
+
+			for _, n := range result.res.Nodes {
+				if !visited[n.Addr.String()] {
+					queue = append(queue, n)
 				}
 			}
 		}
-	})
+	}
 }
 
 func (d *DHT) generateNodeID() [20]byte {
