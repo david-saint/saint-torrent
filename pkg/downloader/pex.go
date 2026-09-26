@@ -19,6 +19,21 @@ const pexDeltaLimit = 50
 // list is ignored rather than dialed.
 const pexIngestLimit = 50
 
+// pexMaxPortsPerIP is how many ports of one IP a ut_pex message may have us
+// dial. BEP 11 advises ignoring an IP listed with many ports: a sender could
+// otherwise aim all pexIngestLimit dials of every message at one host's ports.
+// Two leaves room for two clients behind one NAT.
+const pexMaxPortsPerIP = 2
+
+// pexDiscoverPeer hands a PEX-learned address to the session; tests swap it to
+// see the dial candidates without dialing. It is set in init because a direct
+// initializer would form a cycle (the peer loop calls handlePEXMessage).
+var pexDiscoverPeer func(s *Session, addr string)
+
+func init() {
+	pexDiscoverPeer = (*Session).AddPeerFromDiscovery
+}
+
 // maxPEXPerInterval is how many ut_pex messages one connection may send within
 // one pexInterval; the next one inside it drops the connection. libtorrent
 // allows the same three a minute, so no client that works with it is dropped.
@@ -86,7 +101,8 @@ func (s *Session) extensionHandshakeMapLocked() map[string]int {
 // handlePEXMessage acts on the peers a ut_pex message from fromAddr (at fromIP)
 // added. A sender may only point us at addresses as local as its own
 // (netpolicy): a public peer cannot aim our dials at loopback or LAN services,
-// nor anyone at multicast or broadcast addresses.
+// nor anyone at multicast or broadcast addresses. Nor may it list one IP with
+// more than pexMaxPortsPerIP ports.
 func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage) {
 	if msg == nil || !s.pexEnabled() {
 		return
@@ -95,6 +111,10 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 	added := msg.Added
 	if len(added) > pexIngestLimit {
 		added = added[:pexIngestLimit]
+	}
+	var portsPerIP map[netip.Addr]uint8 // only a list of 2+ can repeat an IP
+	if len(added) > 1 {
+		portsPerIP = make(map[netip.Addr]uint8, len(added))
 	}
 	for _, p := range added {
 		ap, ok := peerAddrPort(p.IP, p.Port)
@@ -105,7 +125,13 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 		if addr == fromAddr {
 			continue
 		}
-		s.AddPeerFromDiscovery(addr)
+		if portsPerIP != nil {
+			if portsPerIP[ap.Addr()] >= pexMaxPortsPerIP {
+				continue
+			}
+			portsPerIP[ap.Addr()]++
+		}
+		pexDiscoverPeer(s, addr)
 	}
 }
 

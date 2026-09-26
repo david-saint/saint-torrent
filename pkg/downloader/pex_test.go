@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -389,6 +391,60 @@ func TestPEXActsOnAtMostFiftyAddedPeers(t *testing.T) {
 	sess.mu.RUnlock()
 	if known != pexIngestLimit {
 		t.Fatalf("known peers after one ut_pex message = %d, want %d", known, pexIngestLimit)
+	}
+}
+
+// recordPEXCandidates swaps pexDiscoverPeer for a recorder, so no address is
+// dialed, and returns what it saw.
+func recordPEXCandidates(t *testing.T) func() []string {
+	t.Helper()
+	var mu sync.Mutex
+	var seen []string
+	old := pexDiscoverPeer
+	pexDiscoverPeer = func(_ *Session, addr string) {
+		mu.Lock()
+		seen = append(seen, addr)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { pexDiscoverPeer = old })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		out := seen
+		seen = nil
+		return out
+	}
+}
+
+// TestPEXDialsAtMostTwoPortsPerIP covers a ut_pex sender listing one victim
+// IP under many ports: every entry used to become its own dial, so each
+// message could aim 50 connection attempts at one host.
+func TestPEXDialsAtMostTwoPortsPerIP(t *testing.T) {
+	sess := newWireTestSession(t, 1, BlockSize)
+	candidates := recordPEXCandidates(t)
+
+	msg := &peer.PEXMessage{}
+	for port := 6881; port < 6886; port++ {
+		msg.Added = append(msg.Added, peer.PEXPeer{IP: net.ParseIP("198.51.100.7"), Port: uint16(port)})
+	}
+	msg.Added = append(msg.Added,
+		peer.PEXPeer{IP: net.ParseIP("::ffff:198.51.100.7"), Port: 7000}, // the same IP, mapped
+		peer.PEXPeer{IP: net.ParseIP("198.51.100.8"), Port: 6881},
+		peer.PEXPeer{IP: net.ParseIP("2001:db8::8"), Port: 6881},
+		peer.PEXPeer{IP: net.ParseIP("2001:db8::8"), Port: 6882},
+	)
+	sess.handlePEXMessage("203.0.113.9:6881", "203.0.113.9", msg)
+	want := []string{"198.51.100.7:6881", "198.51.100.7:6882", "198.51.100.8:6881", "[2001:db8::8]:6881", "[2001:db8::8]:6882"}
+	if got := candidates(); !slices.Equal(got, want) {
+		t.Fatalf("dial candidates = %v, want %v", got, want)
+	}
+
+	// The cap is per message: the next one may name that IP's other ports.
+	sess.handlePEXMessage("203.0.113.9:6881", "203.0.113.9", &peer.PEXMessage{Added: []peer.PEXPeer{
+		{IP: net.ParseIP("198.51.100.7"), Port: 6883},
+	}})
+	if got := candidates(); !slices.Equal(got, []string{"198.51.100.7:6883"}) {
+		t.Fatalf("dial candidates from a second message = %v", got)
 	}
 }
 
