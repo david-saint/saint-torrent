@@ -277,7 +277,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		if h := s.liveHalfOpenLocked(key, time.Now()); h != nil {
 			halfOpen = true
 			if h.acknowledgedBy(p) {
-				c = s.promoteLocked(h)
+				c = s.promoteLocked(h, p.ackNr)
 				listener = s.listener
 			}
 		}
@@ -437,15 +437,22 @@ func (s *Socket) addHalfOpenLocked(h *halfOpenConn) {
 	s.halfOpen[h.key] = h
 }
 
-// promoteLocked turns a half-open entry whose SYN-ACK was acknowledged into an
-// established Conn registered for routing.
-func (s *Socket) promoteLocked(h *halfOpenConn) *Conn {
+// promoteLocked turns a half-open entry whose SYN-ACK was acknowledged by ack
+// into an established Conn registered for routing.
+func (s *Socket) promoteLocked(h *halfOpenConn, ack uint16) *Conn {
 	delete(s.halfOpen, h.key)
 	if s.closed {
 		return nil
 	}
-	// Our SYN-ACK consumed h.seq, so the first DATA carries h.seq+1.
-	c := newInboundConn(s, h.addr, h.connID, h.synSeq, h.seq+1)
+	// Our first DATA goes where the initiator expects it: at the SYN-ACK's
+	// seq_nr for a libutp-style initiator (ack seq-1), one past it for an
+	// earlier saintTorrent initiator, which treated the SYN-ACK as consuming
+	// its seq_nr (ack seq).
+	localSeq := h.seq
+	if ack == h.seq {
+		localSeq++
+	}
+	c := newInboundConn(s, h.addr, h.connID, h.synSeq, localSeq)
 	s.conns[h.key] = c
 	return c
 }

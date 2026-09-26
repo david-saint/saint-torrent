@@ -127,7 +127,10 @@ func TestOutboundConnectionIDsMatchBEP29(t *testing.T) {
 			return
 		}
 
-		// The dialer completes the handshake with a STATE of its own.
+		// The dialer completes the handshake with a STATE of its own. As in
+		// libutp, the SYN consumed its seq_nr, the STATE carries the next one
+		// without consuming it, and serverSeq-1 acks the SYN-ACK: its seq_nr
+		// is the first DATA seq_nr the acceptor will send.
 		n, _, err = rawPeer.ReadFromUDP(buf)
 		if err != nil {
 			serverDone <- err
@@ -138,9 +141,10 @@ func TestOutboundConnectionIDsMatchBEP29(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if ackOfSynAck.typ != packetTypeState || ackOfSynAck.connID != syn.connID+1 || ackOfSynAck.ackNr != serverSeq {
-			serverDone <- fmt.Errorf("handshake ACK type=%d connID=%d ack=%d, want STATE connID=%d ack=%d",
-				ackOfSynAck.typ, ackOfSynAck.connID, ackOfSynAck.ackNr, syn.connID+1, serverSeq)
+		if ackOfSynAck.typ != packetTypeState || ackOfSynAck.connID != syn.connID+1 ||
+			ackOfSynAck.seqNr != syn.seqNr+1 || ackOfSynAck.ackNr != serverSeq-1 {
+			serverDone <- fmt.Errorf("handshake ACK type=%d connID=%d seq=%d ack=%d, want STATE connID=%d seq=%d ack=%d",
+				ackOfSynAck.typ, ackOfSynAck.connID, ackOfSynAck.seqNr, ackOfSynAck.ackNr, syn.connID+1, syn.seqNr+1, serverSeq-1)
 			return
 		}
 
@@ -160,6 +164,10 @@ func TestOutboundConnectionIDsMatchBEP29(t *testing.T) {
 		}
 		if data.connID != syn.connID+1 {
 			serverDone <- fmt.Errorf("DATA connID = %d, want SYN connID+1 %d", data.connID, syn.connID+1)
+			return
+		}
+		if data.seqNr != syn.seqNr+1 || data.ackNr != serverSeq-1 {
+			serverDone <- fmt.Errorf("first DATA seq=%d ack=%d, want seq=%d ack=%d", data.seqNr, data.ackNr, syn.seqNr+1, serverSeq-1)
 			return
 		}
 		if string(data.payload) != "x" {
@@ -234,7 +242,7 @@ func TestInboundConnectionIDsMatchBEP29(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     state.seqNr,
+		ackNr:     state.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -293,7 +301,7 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     state.seqNr,
+		ackNr:     state.seqNr - 1,
 		payload:   []byte("a"),
 	}
 	if _, err := rawClient.WriteToUDP(first.marshal(), target); err != nil {
@@ -310,7 +318,7 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 3,
-		ackNr:     state.seqNr,
+		ackNr:     state.seqNr - 1,
 	}
 	if _, err := rawClient.WriteToUDP(fin.marshal(), target); err != nil {
 		t.Fatalf("send FIN: %v", err)
@@ -320,7 +328,7 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 2,
-		ackNr:     state.seqNr,
+		ackNr:     state.seqNr - 1,
 		payload:   []byte("z"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -751,7 +759,7 @@ func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
 		typ:       packetTypeData,
 		connID:    hs.syn.connID,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     peerSeq + 1,
+		seqNr:     peerSeq, // the SYN-ACK seq_nr is the first DATA seq_nr
 		ackNr:     data.seqNr,
 		payload:   []byte("pong"),
 	}
@@ -842,7 +850,7 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -888,7 +896,7 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 2,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("world"),
 	}
 	if _, err := rawClient.WriteToUDP(more.marshal(), target); err != nil {
@@ -949,7 +957,7 @@ func TestSynRetransmitAfterListenerCloseKeepsInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 	}
 	if _, err := rawClient.WriteToUDP(handshakeAck.marshal(), target); err != nil {
 		t.Fatalf("send handshake ACK: %v", err)
@@ -988,7 +996,7 @@ func TestSynRetransmitAfterListenerCloseKeepsInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("after-close"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -1110,7 +1118,7 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     reply.seqNr,
+		ackNr:     reply.seqNr - 1,
 	}
 	if _, err := rawPeer.WriteToUDP(handshakeAck.marshal(), hs.addr); err != nil {
 		t.Fatalf("send handshake ACK: %v", err)
@@ -1178,7 +1186,7 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 		typ:       packetTypeData,
 		connID:    hs.syn.connID,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     peerSeq + 1,
+		seqNr:     peerSeq, // the SYN-ACK seq_nr is the first DATA seq_nr
 		ackNr:     data.seqNr,
 		payload:   []byte("pong"),
 	}
@@ -1279,7 +1287,7 @@ func TestSynMatchingInboundRecvIDOpensSecondInboundConn(t *testing.T) {
 		connID:    connA.recvID,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     firstSyn.seqNr + 1,
-		ackNr:     firstState.seqNr,
+		ackNr:     firstState.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -1321,7 +1329,7 @@ func sendHandshakeAck(t *testing.T, conn *net.UDPConn, target *net.UDPAddr, syn,
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     synAck.seqNr,
+		ackNr:     synAck.seqNr - 1,
 	}
 	if _, err := conn.WriteToUDP(ack.marshal(), target); err != nil {
 		t.Fatalf("send handshake ACK: %v", err)

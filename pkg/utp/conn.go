@@ -50,6 +50,13 @@ func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
 // Conn is a BEP 29 uTP stream exposed as a net.Conn.
+//
+// Sequence numbers follow libutp and libtorrent, which BEP 29's pseudo-code
+// does not pin down: localSeq is always the seq_nr the next DATA or FIN will
+// consume (a SYN consumes one too), and a STATE carries localSeq without
+// consuming it. A SYN-ACK's seq_nr is therefore the acceptor's first DATA
+// seq_nr, and the initiator acks seq_nr-1 until that DATA arrives. remoteSeq
+// is the last in-order seq_nr received, which every packet acks.
 type Conn struct {
 	socket *Socket
 	remote *net.UDPAddr
@@ -90,8 +97,9 @@ type Conn struct {
 }
 
 func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
-	seq := randomUint16()
-	return newConn(socket, remote, baseID+1, baseID, seq, 0, false)
+	// The SYN consumes the random initial seq_nr (see dial).
+	synSeq := randomUint16()
+	return newConn(socket, remote, baseID+1, baseID, synSeq+1, 0, false)
 }
 
 // newInboundConn builds the Conn for an inbound connection whose initiator has
@@ -136,7 +144,7 @@ func (c *Conn) dial(ctx context.Context) error {
 			}
 			return err
 		}
-		p := c.packetLocked(packetTypeSyn, c.localSeq, nil)
+		p := c.packetLocked(packetTypeSyn, c.localSeq-1, nil)
 		c.mu.Unlock()
 
 		if err := c.socket.writePacket(p, c.remote); err != nil {
@@ -230,9 +238,12 @@ func (c *Conn) handleState(p packet) bool {
 	if c.establishedClosed {
 		return false
 	}
-	c.remoteSeq = p.seqNr
-	c.remoteSeqSet = true
-	c.localSeq++
+	// The SYN-ACK's seq_nr is the acceptor's first DATA seq_nr, so
+	// everything before it counts as received.
+	if !c.remoteSeqSet {
+		c.remoteSeq = p.seqNr - 1
+		c.remoteSeqSet = true
+	}
 	c.establishedClosed = true
 	close(c.established)
 	return true
@@ -368,6 +379,14 @@ func (c *Conn) packetLocked(typ packetType, seq uint16, payload []byte) packet {
 	}
 }
 
+// statePacketLocked builds a STATE. Like libutp's, it carries the next
+// seq_nr we will send without consuming it: a receiver that has everything
+// we sent sees it as the next expected seq_nr, while one carrying the last
+// consumed seq_nr would be discarded by libutp as an old packet, ack and all.
+func (c *Conn) statePacketLocked() packet {
+	return c.packetLocked(packetTypeState, c.localSeq, nil)
+}
+
 func (c *Conn) packetForSeq(typ packetType, seq uint16, payload []byte) packet {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -395,8 +414,7 @@ func (c *Conn) flushAck() {
 	if c.ackTimer != nil {
 		c.ackTimer.Stop()
 	}
-	seq := c.localSeq - 1
-	p := c.packetLocked(packetTypeState, seq, nil)
+	p := c.statePacketLocked()
 	c.mu.Unlock()
 	_ = c.socket.writePacket(p, c.remote)
 }
@@ -417,8 +435,7 @@ func (c *Conn) scheduleAck() {
 		if c.ackTimer != nil {
 			c.ackTimer.Stop()
 		}
-		seq := c.localSeq - 1
-		p := c.packetLocked(packetTypeState, seq, nil)
+		p := c.statePacketLocked()
 		c.mu.Unlock()
 		_ = c.socket.writePacket(p, c.remote)
 		return
@@ -447,8 +464,7 @@ func (c *Conn) flushDelayedAck() {
 		return
 	}
 	c.unsentAcks = 0
-	seq := c.localSeq - 1
-	p := c.packetLocked(packetTypeState, seq, nil)
+	p := c.statePacketLocked()
 	c.mu.Unlock()
 	_ = c.socket.writePacket(p, c.remote)
 }
