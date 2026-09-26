@@ -39,11 +39,15 @@ var (
 )
 
 const (
-	// maxWebseedWorkers bounds concurrent webseed downloads per torrent
-	// (libtorrent's max_web_seed_connections is 3). Workers rotate through the
-	// whole url-list, so large mirror lists are still used, while connections,
+	// minWebseedWorkers and maxWebseedWorkers bound the concurrent webseed
+	// downloads per torrent; see webseedWorkerCount. Workers rotate through the
+	// whole url-list, so a longer mirror list is still used, while connections,
 	// goroutines and piece buffers stay bounded however long the list is.
-	maxWebseedWorkers = 4
+	minWebseedWorkers = 4
+	maxWebseedWorkers = 16
+	// webseedBufferBudget is the piece-buffer memory a torrent's webseed
+	// workers are sized to, one piece each, above minWebseedWorkers.
+	webseedBufferBudget = 128 << 20
 	// maxWebseedSources bounds how many distinct url-list entries are kept.
 	maxWebseedSources = 1024
 	// maxWebseedScan bounds how many raw url-list entries are parsed to find them.
@@ -107,8 +111,8 @@ type webseedPiece struct {
 	endgame       bool
 }
 
-// webseedSpecsForStart returns the webseed workers Session.Start should run:
-// at most maxWebseedWorkers, all sharing one pool of the torrent's sources.
+// webseedSpecsForStart returns the webseed workers Session.Start should run
+// (webseedWorkerCount of them), all sharing one pool of the torrent's sources.
 func (s *Session) webseedSpecsForStart() []webseedWorker {
 	s.mu.RLock()
 	if s.Torrent == nil || s.Storage == nil || s.metadataMode || len(s.Torrent.WebSeeds) == 0 || len(s.Torrent.Files) == 0 {
@@ -117,17 +121,32 @@ func (s *Session) webseedSpecsForStart() []webseedWorker {
 	}
 	files := makeWebseedTorrentFiles(s.Torrent.Files)
 	webseedURLs := append([]string(nil), s.Torrent.WebSeeds...)
+	pieceLen := s.Torrent.PieceLength
 	s.mu.RUnlock()
 
 	pool := newWebseedPool(webseedURLs, files)
 	if len(pool.sources) == 0 {
 		return nil
 	}
-	workers := make([]webseedWorker, min(maxWebseedWorkers, len(pool.sources)))
+	workers := make([]webseedWorker, webseedWorkerCount(len(pool.sources), pieceLen))
 	for i := range workers {
 		workers[i] = webseedWorker{pool: pool}
 	}
 	return workers
+}
+
+// webseedWorkerCount is how many webseed workers a torrent with sources
+// distinct url-list entries and pieces of pieceLen bytes runs: one per source,
+// so a mirror-bound download gets every mirror's rate, up to what
+// webseedBufferBudget holds in piece buffers, clamped to
+// [minWebseedWorkers, maxWebseedWorkers]. Small pieces get up to
+// maxWebseedWorkers streams; huge ones stay at minWebseedWorkers.
+func webseedWorkerCount(sources int, pieceLen int64) int {
+	byMemory := maxWebseedWorkers
+	if pieceLen > 0 {
+		byMemory = int(min(int64(maxWebseedWorkers), max(int64(minWebseedWorkers), webseedBufferBudget/pieceLen)))
+	}
+	return min(sources, byMemory)
 }
 
 type webseedTorrentFile struct {

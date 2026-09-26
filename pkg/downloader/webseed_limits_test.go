@@ -86,8 +86,9 @@ func TestWebseedSourcesDedupeAndWorkersBounded(t *testing.T) {
 	tor, _ := multiPieceWebseedTorrent("dedupe.bin", 2, 16, seeds)
 	sess := newWebseedTestSession(t, tor)
 	workers := sess.webseedSpecsForStart()
-	if len(workers) != maxWebseedWorkers {
-		t.Fatalf("%d webseed workers, want %d", len(workers), maxWebseedWorkers)
+	// One worker per distinct source: the per-host cap leaves 12.
+	if want := maxWebseedSourcesPerHost + 10; len(workers) != want {
+		t.Fatalf("%d webseed workers, want %d", len(workers), want)
 	}
 	pool := workers[0].pool
 	for _, w := range workers {
@@ -129,15 +130,15 @@ func TestWebseedWorkersBoundedAndRotateThroughList(t *testing.T) {
 		http.NotFound(w, r)
 	})
 
-	// Ten mirrors: distinct servers, as maxWebseedSourcesPerHost allows only
-	// two sources on one.
+	// More mirrors than workers: distinct servers, as maxWebseedSourcesPerHost
+	// allows only two sources on one.
 	var seeds []string
-	for i := 0; i < 10; i++ {
+	for i := 0; i < maxWebseedWorkers+4; i++ {
 		srv := httptest.NewServer(handler)
 		t.Cleanup(srv.Close)
 		seeds = append(seeds, fmt.Sprintf("%s/m%d/f.bin", srv.URL, i))
 	}
-	tor, _ := multiPieceWebseedTorrent("rotate.bin", 8, 16, seeds)
+	tor, _ := multiPieceWebseedTorrent("rotate.bin", 4*maxWebseedWorkers, 16, seeds)
 	sess := newWebseedTestSession(t, tor)
 	startWebseedsForTest(t, sess)
 
@@ -158,6 +159,33 @@ func TestWebseedWorkersBoundedAndRotateThroughList(t *testing.T) {
 	counts, total := paths.snapshot()
 	if total != len(seeds) || len(counts) != len(seeds) {
 		t.Fatalf("requests = %v (total %d), want each of %d webseeds once", counts, total, len(seeds))
+	}
+}
+
+// TestWebseedWorkerCount: a torrent runs a webseed worker per distinct
+// mirror, so a download bound by per-mirror rates gets all of them (a flat
+// four workers took 67% longer from eight mirrors), up to what the piece
+// buffer budget holds, never past maxWebseedWorkers and, whatever the piece
+// size, at least minWebseedWorkers when there are that many mirrors.
+func TestWebseedWorkerCount(t *testing.T) {
+	for _, tc := range []struct {
+		sources  int
+		pieceLen int64
+		want     int
+	}{
+		{1, 256 << 10, 1},
+		{8, 256 << 10, 8},
+		{100, 256 << 10, maxWebseedWorkers},
+		{100, 8 << 20, maxWebseedWorkers},
+		{100, 16 << 20, 8},
+		{100, 64 << 20, minWebseedWorkers},
+		{100, 1 << 30, minWebseedWorkers},
+		{2, 1 << 30, 2},
+		{100, 0, maxWebseedWorkers},
+	} {
+		if got := webseedWorkerCount(tc.sources, tc.pieceLen); got != tc.want {
+			t.Errorf("webseedWorkerCount(%d sources, %d-byte pieces) = %d, want %d", tc.sources, tc.pieceLen, got, tc.want)
+		}
 	}
 }
 
