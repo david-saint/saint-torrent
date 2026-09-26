@@ -1188,13 +1188,24 @@ func atomicWriteState(stateDir string, state PersistedState) error {
 	return atomicWriteFile(statePath, data)
 }
 
+// atomicWriteFile replaces destPath with data, readable by the owner only:
+// cached .torrent files carry private-tracker passkeys and session.json lists
+// every torrent. The temporary file comes from os.CreateTemp (a fresh random
+// name opened O_EXCL with mode 0600) next to destPath, so the write never goes
+// through a name or symlink someone else planted.
 func atomicWriteFile(destPath string, data []byte) error {
-	tmpPath := destPath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	tmpPath := f.Name()
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = f.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
 	if _, err := f.Write(data); err != nil {
 		return err
@@ -1202,11 +1213,14 @@ func atomicWriteFile(destPath string, data []byte) error {
 	if err := f.Sync(); err != nil {
 		return err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
 
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		return err
 	}
+	renamed = true
 
 	parentDir := filepath.Dir(destPath)
 	if dir, err := os.Open(parentDir); err == nil {
@@ -1249,10 +1263,14 @@ func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
 // EnablePersistence initializes the manager state directory and restores previous torrents.
 // It returns a non-fatal warning message (if any recovery was needed) and a fatal error.
 func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
-	// 1. Directory creation outside lock
-	if err := os.MkdirAll(filepath.Join(stateDir, "torrents"), 0755); err != nil {
+	// 1. Directory creation outside lock. The state is private to the user; a
+	// torrents directory left 0755 by an older version is tightened, since the
+	// cached files in it carry tracker passkeys.
+	torrentsDir := filepath.Join(stateDir, "torrents")
+	if err := os.MkdirAll(torrentsDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create persistence directories: %w", err)
 	}
+	_ = os.Chmod(torrentsDir, 0700)
 
 	statePath := filepath.Join(stateDir, "session.json")
 	var savedState PersistedState
@@ -1495,7 +1513,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		// be diagnosed after the fact (the warning banner is transient). Each line
 		// records the exact syscall error, which is what reveals the root cause.
 		if logPath := filepath.Join(stateDir, "restore-failures.log"); logPath != "" {
-			if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+				_ = lf.Chmod(0600) // a log an older version created 0644
 				ts := time.Now().Format(time.RFC3339)
 				for _, f := range restoreFailures {
 					fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
