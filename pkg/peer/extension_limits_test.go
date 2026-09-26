@@ -4,7 +4,40 @@ import (
 	"bytes"
 	"net"
 	"testing"
+	"time"
 )
+
+// TestSendMetadataDataWireFormat checks the directly framed ut_metadata data
+// message parses back to the same piece, total size and block.
+func TestSendMetadataDataWireFormat(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	client := NewClient(clientConn, [20]byte{1}, [20]byte{2})
+
+	block := bytes.Repeat([]byte{0xab}, MetadataBlockSize)
+	errCh := make(chan error, 1)
+	go func() { errCh <- client.SendMetadataData(7, 3, 5*MetadataBlockSize, block) }()
+
+	_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	msg, err := ParseMessage(serverConn)
+	if err != nil {
+		t.Fatalf("ParseMessage: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("SendMetadataData: %v", err)
+	}
+	if msg.ID != MsgExtended || msg.Payload[0] != 7 {
+		t.Fatalf("got message %d on extended id %d, want %d on 7", msg.ID, msg.Payload[0], MsgExtended)
+	}
+	m, err := ParseMetadataMessage(msg.Payload[1:])
+	if err != nil {
+		t.Fatalf("ParseMetadataMessage: %v", err)
+	}
+	if m.MsgType != MetadataData || m.Piece != 3 || m.TotalSize != 5*MetadataBlockSize || !bytes.Equal(m.Data, block) {
+		t.Fatalf("round trip mismatch: type=%d piece=%d total=%d len=%d", m.MsgType, m.Piece, m.TotalSize, len(m.Data))
+	}
+}
 
 // TestExtensionParsersRejectOversizedPayloads checks the pre-decode size caps: a
 // payload past the cap is refused before bencode builds a tree for it, while the

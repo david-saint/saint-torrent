@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -337,7 +338,9 @@ func bencodedDictSpan(data []byte) (int, error) {
 	return bencode.ValueSpan(data)
 }
 
-// SendMetadataData sends a BEP 9 metadata piece message.
+// SendMetadataData sends a BEP 9 metadata piece message. Like SendPiece it frames
+// the message straight into the write buffer, so the up-to-16 KiB block is not
+// copied into a payload and then again by Message.Serialize.
 func (c *Client) SendMetadataData(extMsgID byte, piece int, totalSize int, data []byte) error {
 	payloadDict := map[string]interface{}{
 		"msg_type":   MetadataData,
@@ -349,15 +352,20 @@ func (c *Client) SendMetadataData(extMsgID byte, piece int, totalSize int, data 
 		return err
 	}
 
-	msgPayload := make([]byte, 1+len(dictBytes)+len(data))
-	msgPayload[0] = extMsgID
-	copy(msgPayload[1:], dictBytes)
-	copy(msgPayload[1+len(dictBytes):], data)
+	// 4-byte length prefix + message ID + extended message ID.
+	var hdr [6]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(2+len(dictBytes)+len(data)))
+	hdr[4] = byte(MsgExtended)
+	hdr[5] = extMsgID
 
-	return c.SendMessage(&Message{
-		ID:      MsgExtended,
-		Payload: msgPayload,
-	})
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	for _, part := range [][]byte{hdr[:], dictBytes, data} {
+		if _, err := c.w.Write(part); err != nil {
+			return err
+		}
+	}
+	return c.w.Flush()
 }
 
 // SendMetadataReject sends a BEP 9 metadata reject message.

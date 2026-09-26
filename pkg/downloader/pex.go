@@ -22,9 +22,14 @@ func (s *Session) pexEnabled() bool {
 	return s.pexEnabledLocked()
 }
 
+// extensionHandshakeMapLocked returns the BEP 10 extensions we advertise. A magnet
+// still fetching needs ut_metadata to download the info dict (its private flag is
+// not known yet), but once metadata is known a private torrent stops offering it,
+// so its info dict is never handed to peers outside its tracker's swarm (BEP 27).
 func (s *Session) extensionHandshakeMapLocked() map[string]int {
-	extensions := map[string]int{
-		peer.ExtNameMetadata: peer.LocalMetadataExtID,
+	extensions := make(map[string]int, 2)
+	if s.metadataMode || s.Torrent == nil || !s.Torrent.Private {
+		extensions[peer.ExtNameMetadata] = peer.LocalMetadataExtID
 	}
 	if s.pexEnabledLocked() {
 		extensions[peer.ExtNamePEX] = peer.LocalPEXExtID

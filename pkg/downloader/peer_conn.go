@@ -66,6 +66,16 @@ const maxInboundPeers = 100
 // it; treat it as a constant in production.
 var metadataRetryInterval = 2 * time.Second
 
+// metadataServeWindow and metadataServeRequestsPerBlock bound how many ut_metadata
+// blocks one connection may have us serve: an honest fetcher asks for each block
+// once, so twice the info dict's block count per minute leaves room for retries
+// while stopping a peer from re-requesting blocks without end. Requests beyond the
+// budget are rejected.
+const (
+	metadataServeWindow           = time.Minute
+	metadataServeRequestsPerBlock = 2
+)
+
 // maxExtHandshakesPerConn bounds how many BEP 10 extension handshakes one
 // connection may have decoded and acted on. Real clients send one, occasionally a
 // second to update it; later ones are ignored.
@@ -861,8 +871,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// Send extension handshake if peer supports extensions (BEP 10)
 	if peerReserved[5]&0x10 != 0 {
 		s.mu.RLock()
-		infoLen := len(s.Torrent.InfoBytes)
 		extensions := s.extensionHandshakeMapLocked()
+		infoLen := 0
+		if _, ok := extensions[peer.ExtNameMetadata]; ok {
+			infoLen = len(s.Torrent.InfoBytes)
+		}
 		s.mu.RUnlock()
 		_ = client.SendExtHandshakeWithExtensions(extensions, infoLen)
 	}
@@ -1688,23 +1701,58 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 	}
 
+	// Per-connection budget for serving ut_metadata blocks (see metadataServeWindow).
+	var metadataServeWindowStart time.Time
+	metadataServed := 0
+
 	// serveMetadataRequest answers a peer's ut_metadata request from our info dict.
+	// Replies are charged to the upload limiters without waiting (a shortfall is
+	// answered with a reject, never a stall of this loop), counted in the upload
+	// stats, and capped per connection, so 30-byte requests cannot be turned into an
+	// unmetered 16 KiB-per-request stream.
 	serveMetadataRequest := func(metaMsg *peer.MetadataMessage) {
 		if peerUtMetadataID == -1 {
 			return // the peer never told us which id to answer on
 		}
 		s.mu.RLock()
-		inMetaMode := s.metadataMode
+		// Nothing to serve while fetching; once known, a private torrent's info dict
+		// stays within its tracker's swarm (BEP 27), even on connections that were
+		// set up while the private flag was still unknown.
+		serve := !s.metadataMode && !s.Torrent.Private
 		infoBytes := s.Torrent.InfoBytes
 		s.mu.RUnlock()
 
 		offset := int64(metaMsg.Piece) * peer.MetadataBlockSize
-		if inMetaMode || len(infoBytes) == 0 || offset < 0 || offset >= int64(len(infoBytes)) {
+		if !serve || len(infoBytes) == 0 || offset < 0 || offset >= int64(len(infoBytes)) {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		now := time.Now()
+		if now.Sub(metadataServeWindowStart) >= metadataServeWindow {
+			metadataServeWindowStart = now
+			metadataServed = 0
+		}
+		numBlocks := (len(infoBytes) + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
+		if metadataServed >= metadataServeRequestsPerBlock*numBlocks {
 			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
 			return
 		}
 		blockLen := min(int64(peer.MetadataBlockSize), int64(len(infoBytes))-offset)
-		_ = client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), infoBytes[offset:offset+blockLen])
+		reserved, _, refund := s.reserveUploadWithRefund(int(blockLen))
+		if !reserved {
+			_ = client.SendMetadataReject(byte(peerUtMetadataID), metaMsg.Piece)
+			return
+		}
+		if err := client.SendMetadataData(byte(peerUtMetadataID), metaMsg.Piece, len(infoBytes), infoBytes[offset:offset+blockLen]); err != nil {
+			if refund != nil {
+				refund()
+			}
+			_ = conn.Close()
+			return
+		}
+		metadataServed++
+		s.Uploaded.Add(blockLen)
+		atomic.AddInt64(&pState.Uploaded, blockLen)
 	}
 
 	// handleExtendedMessage processes one BEP 10 message and returns a non-empty

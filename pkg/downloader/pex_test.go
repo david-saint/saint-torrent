@@ -33,8 +33,18 @@ func TestExtensionHandshakeMapAdvertisesPEXUnlessPrivate(t *testing.T) {
 	if _, ok := extensions[peer.ExtNamePEX]; ok {
 		t.Fatal("private torrent advertised ut_pex")
 	}
+	// BEP 27: once metadata is known, a private torrent's info dict is not offered.
+	if _, ok := extensions[peer.ExtNameMetadata]; ok {
+		t.Fatal("private torrent with known metadata advertised ut_metadata")
+	}
+
+	// A magnet still fetching needs ut_metadata whatever its (unknown) flag says.
+	sess.metadataMode = true
+	sess.mu.Lock()
+	extensions = sess.extensionHandshakeMapLocked()
+	sess.mu.Unlock()
 	if extensions[peer.ExtNameMetadata] != peer.LocalMetadataExtID {
-		t.Fatalf("private torrent did not keep ut_metadata")
+		t.Fatal("metadata-mode session did not advertise ut_metadata")
 	}
 }
 
