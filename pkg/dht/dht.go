@@ -407,7 +407,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 
 		d.noteQuerySender(senderID, addr)
 
-		closerNodes := d.getCloserNodes(targetID, 8)
+		closerNodes := d.closestHeardNodes(targetID, 8)
 		d.sendResponse(t, map[string]interface{}{
 			"id":    string(d.nodeID[:]),
 			"nodes": compactNodes(closerNodes),
@@ -432,7 +432,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 				"values": peers,
 			}, addr)
 		} else {
-			closerNodes := d.getCloserNodes(infoHash, 8)
+			closerNodes := d.closestHeardNodes(infoHash, 8)
 			d.sendResponse(t, map[string]interface{}{
 				"id":    string(d.nodeID[:]),
 				"token": token,
@@ -596,11 +596,27 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 }
 
 // getCloserNodes returns up to count nodes from the routing table closest to
-// target, ordered nearest-first. Rather than copying every node out of the
-// table and sorting the copy (which recomputes each XOR distance on every
-// comparison), it keeps a small sorted candidate slice of size <= count and
-// inserts each node into it in place, computing its distance exactly once.
+// target, ordered nearest-first, for seeding our own lookups.
 func (d *DHT) getCloserNodes(target [20]byte, count int) []Node {
+	return d.closestNodes(target, count, false)
+}
+
+// closestHeardNodes is getCloserNodes for the find_node and get_peers answers
+// we give other nodes. It leaves out contacts loaded from disk that have not
+// been heard from this run: the file may predate one-contact-per-IP admission
+// or have been planted, so a saved contact is only handed to the rest of the
+// DHT once it has answered us again. Our own lookups may still start from it.
+func (d *DHT) closestHeardNodes(target [20]byte, count int) []Node {
+	return d.closestNodes(target, count, true)
+}
+
+// closestNodes returns up to count contacts closest to target, nearest first,
+// skipping never-heard (zero LastSeen) contacts when heardOnly is set. Rather
+// than copying every node out of the table and sorting the copy (which
+// recomputes each XOR distance on every comparison), it keeps a small sorted
+// candidate slice of size <= count and inserts each node into it in place,
+// computing its distance exactly once.
+func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -620,6 +636,9 @@ func (d *DHT) getCloserNodes(target [20]byte, count int) []Node {
 			continue
 		}
 		for _, n := range b.nodes {
+			if heardOnly && n.LastSeen.IsZero() {
+				continue
+			}
 			dist := xorDistance(n.ID, target)
 
 			if len(best) < count {
@@ -2112,12 +2131,13 @@ func (d *DHT) loadNodes() {
 		// Parse without resolving: the file holds literal addresses, and a
 		// hostname in it must not make startup wait on DNS.
 		ap, err := netip.ParseAddrPort(addrStr)
-		if err != nil || !ap.Addr().Unmap().Is4() {
+		if err != nil || !ap.Addr().Unmap().Is4() || netpolicy.Classify(ap.Addr()) == netpolicy.ScopeInvalid {
 			continue
 		}
 		addr := &net.UDPAddr{IP: ap.Addr().Unmap().AsSlice(), Port: int(ap.Port())}
 		// A zero LastSeen leaves saved contacts questionable, so the first
-		// newcomer to their bucket re-checks them before they can keep it.
+		// newcomer to their bucket re-checks them before they can keep it,
+		// and keeps them out of our answers until they are heard from.
 		d.addNodeSeen(id, addr, time.Time{})
 	}
 }

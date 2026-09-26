@@ -51,6 +51,79 @@ func TestSavedNodeIDIsIgnored(t *testing.T) {
 	}
 }
 
+// servedNodes returns the contacts carried by our response with transaction tid.
+func servedNodes(t *testing.T, c *fakeConn, tid string) []Node {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.sent {
+		parsed, err := bencode.Unmarshal(p.data)
+		if err != nil {
+			continue
+		}
+		dict, ok := parsed.(map[string]interface{})
+		if !ok || dict["y"] != "r" || dict["t"] != tid {
+			continue
+		}
+		r, _ := dict["r"].(map[string]interface{})
+		nodes, _ := r["nodes"].(string)
+		return parseCompactNodes(nodes)
+	}
+	t.Fatalf("no response with transaction %q was sent", tid)
+	return nil
+}
+
+// TestSavedContactsAreNotServedUntilHeardFrom verifies contacts loaded from a
+// nodes file, which may predate one-contact-per-IP admission or be planted,
+// still seed our own lookups but are not handed to other nodes until they
+// answer us, and that addresses that can never be a node are not loaded.
+func TestSavedContactsAreNotServedUntilHeardFrom(t *testing.T) {
+	dir := t.TempDir()
+	var contact, multicast, broadcast, zero [20]byte
+	copy(contact[:], "saved-contact-id----")
+	copy(multicast[:], "saved-multicast-id--")
+	copy(broadcast[:], "saved-broadcast-id--")
+	copy(zero[:], "saved-zero-net-id---")
+	addr := &net.UDPAddr{IP: net.ParseIP("198.51.100.51"), Port: 6881}
+	writeLegacyNodesFile(t, filepath.Join(dir, nodesFileName), contact, map[[20]byte]string{
+		contact:   addr.String(),
+		multicast: "224.0.0.251:5353",
+		broadcast: "255.255.255.255:6881",
+		zero:      "0.0.0.0:6881",
+	})
+	conn := newFakeConn()
+	d, err := NewDHTWithConn(dir, conn)
+	if err != nil {
+		t.Fatalf("failed to start DHT: %v", err)
+	}
+	defer d.Close()
+
+	if got := d.NodesCount(); got != 1 || !d.HasNodeAddress(addr.IP, uint16(addr.Port)) {
+		t.Fatalf("want only the unicast contact loaded, table holds %d", got)
+	}
+	if seeds := d.getCloserNodes(contact, 8); len(seeds) != 1 || seeds[0].ID != contact {
+		t.Fatalf("a saved contact no longer seeds our own lookups: %v", seeds)
+	}
+
+	asker := &net.UDPAddr{IP: net.ParseIP("203.0.113.40"), Port: 6881}
+	askerID := idInBucket(d.nodeID, 5, 1)
+	ask := func(tid string) []Node {
+		d.handleQuery(tid+"f", "find_node", map[string]interface{}{"id": string(askerID[:]), "target": string(contact[:])}, asker)
+		d.handleQuery(tid+"g", "get_peers", map[string]interface{}{"id": string(askerID[:]), "info_hash": string(contact[:])}, asker)
+		return append(servedNodes(t, conn, tid+"f"), servedNodes(t, conn, tid+"g")...)
+	}
+	if served := ask("a"); len(served) != 0 {
+		t.Fatalf("a saved contact not heard from this run was handed out: %x", served[0].ID)
+	}
+
+	// It answers one of our queries, so it may be handed out again.
+	d.addNode(contact, addr)
+	served := ask("b")
+	if len(served) != 2 || served[0].ID != contact || served[1].ID != contact {
+		t.Fatalf("a saved contact that answered us is still withheld: %v", served)
+	}
+}
+
 // symlinkOrSkip creates link -> target, skipping where symlinks need privileges.
 func symlinkOrSkip(t *testing.T, target, link string) {
 	t.Helper()
