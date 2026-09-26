@@ -36,6 +36,7 @@ type TorrentManager struct {
 	globalUploadLimiter   *RateLimiter
 	globalOutboundSlots   chan struct{}
 	globalInboundSlots    chan struct{}
+	inboundHandshakeSlots chan struct{} // see maxInboundHandshakes
 	peerListener          net.Listener
 	utpListener           net.Listener
 	peerListenPort        uint16
@@ -102,6 +103,7 @@ func NewTorrentManager() *TorrentManager {
 		globalUploadLimiter:   NewRateLimiter(0), // unlimited by default
 		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
 		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
+		inboundHandshakeSlots: make(chan struct{}, maxInboundHandshakes),
 		storageFactory:        storage.NewStorage,
 		ctx:                   ctx,
 		cancel:                cancel,

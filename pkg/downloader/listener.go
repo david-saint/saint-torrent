@@ -130,39 +130,40 @@ func (m *TorrentManager) acceptLoop(listener net.Listener, current func() bool) 
 	}
 }
 
+// maxInboundHandshakes caps inbound connections that have not yet completed a
+// BitTorrent handshake for a torrent we serve. They draw from this budget
+// instead of globalInboundSlots, so connections that stall before the
+// handshake (or never send a byte) cannot hold the slots of established
+// peers; a real handshake takes a few round trips, so 256 in flight is far
+// more than legitimate arrivals need.
+const maxInboundHandshakes = 256
+
 func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	defer m.wg.Done()
 	defer conn.Close()
 
+	// With every established slot taken the peer could not be served anyway,
+	// so it is turned away before its handshake costs anything.
+	if len(m.globalInboundSlots) == cap(m.globalInboundSlots) {
+		return
+	}
+	select {
+	case m.inboundHandshakeSlots <- struct{}{}:
+	default:
+		return
+	}
+	conn, handshake, sess := m.readRoutedHandshake(conn)
+	<-m.inboundHandshakeSlots
+	if sess == nil {
+		return
+	}
+
+	// Only a peer that named one of our torrents takes an established slot,
+	// held for the life of the connection.
 	select {
 	case m.globalInboundSlots <- struct{}{}:
 		defer func() { <-m.globalInboundSlots }()
 	default:
-		return
-	}
-
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	m.mu.RLock()
-	policy := m.encryptionPolicy
-	secrets := m.secretKeys
-	m.mu.RUnlock()
-
-	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secrets.lookup)
-	if err != nil {
-		return
-	}
-	handshake, err := peer.ParseHandshake(conn)
-	if err != nil {
-		return
-	}
-	if encrypted && !bytes.Equal(mseResult.SecretKey, handshake.InfoHash[:]) {
-		return
-	}
-
-	m.mu.RLock()
-	sess := m.sessions[fmt.Sprintf("%x", handshake.InfoHash)]
-	m.mu.RUnlock()
-	if sess == nil {
 		return
 	}
 
@@ -173,6 +174,37 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		)
 	}
 	sess.handleRoutedIncomingConnection(conn, handshake)
+}
+
+// readRoutedHandshake negotiates MSE and reads the BitTorrent handshake under
+// peerHandshakeTimeout, returning the session it names, or a nil session if
+// the peer fails to complete it or names a torrent we do not serve.
+func (m *TorrentManager) readRoutedHandshake(conn net.Conn) (net.Conn, *peer.Handshake, *Session) {
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
+	m.mu.RLock()
+	policy := m.encryptionPolicy
+	secrets := m.secretKeys
+	m.mu.RUnlock()
+
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secrets.lookup)
+	if err != nil {
+		return nil, nil, nil
+	}
+	handshake, err := peer.ParseHandshake(conn)
+	if err != nil {
+		return nil, nil, nil
+	}
+	if encrypted && !bytes.Equal(mseResult.SecretKey, handshake.InfoHash[:]) {
+		return nil, nil, nil
+	}
+
+	m.mu.RLock()
+	sess := m.sessions[fmt.Sprintf("%x", handshake.InfoHash)]
+	m.mu.RUnlock()
+	if sess == nil {
+		return nil, nil, nil
+	}
+	return conn, handshake, sess
 }
 
 func (m *TorrentManager) setAdvertisedPeerPort(port uint16) {

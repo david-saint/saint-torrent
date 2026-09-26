@@ -217,6 +217,127 @@ func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
 	}
 }
 
+func waitForCondition(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func dialIdle(t *testing.T, port uint16) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial shared listener: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func handshakeWith(t *testing.T, port uint16, infoHash [20]byte) net.Conn {
+	t.Helper()
+	conn := dialIdle(t, port)
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	hs := &peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: infoHash, PeerID: [20]byte{8, 8, 8}}
+	if _, err := conn.Write(hs.Serialize()); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+	resp, err := peer.ParseHandshake(conn)
+	if err != nil {
+		t.Fatalf("read handshake response: %v", err)
+	}
+	if resp.InfoHash != infoHash {
+		t.Fatalf("response for %x, want %x", resp.InfoHash, infoHash)
+	}
+	return conn
+}
+
+// TestPreHandshakeConnectionsHoldNoEstablishedSlot reproduces inbound slot
+// starvation: connections that never send a handshake used to take one of
+// the maxGlobalInboundPeers slots for the whole handshake timeout, so enough
+// of them (or spoofed uTP SYNs) turned every real peer away. They now draw
+// from the separate handshake budget, and a slot is taken only once a
+// handshake names a torrent we serve.
+func TestPreHandshakeConnectionsHoldNoEstablishedSlot(t *testing.T) {
+	mgr := NewTorrentManager()
+	if err := mgr.StartPeerListener(0); err != nil {
+		t.Fatalf("start shared listener: %v", err)
+	}
+	t.Cleanup(mgr.Close) // after the idle conns are closed
+	sess := newEncryptionTestManagedSession(t, mgr, "admission")
+	port := mgr.PeerListenPort()
+
+	const idle = 20
+	for i := 0; i < idle; i++ {
+		dialIdle(t, port)
+	}
+	waitForCondition(t, "idle connections to reach the handshake stage", func() bool {
+		return len(mgr.inboundHandshakeSlots) == idle
+	})
+	if n := len(mgr.globalInboundSlots); n != 0 {
+		t.Fatalf("%d idle connections hold %d established slots, want 0", idle, n)
+	}
+
+	handshakeWith(t, port, sess.Torrent.InfoHash)
+	waitForCondition(t, "the routed peer to hold one established slot", func() bool {
+		return len(mgr.globalInboundSlots) == 1 && len(mgr.inboundHandshakeSlots) == idle
+	})
+
+	// A handshake for a torrent we do not serve never takes a slot.
+	stranger := dialIdle(t, port)
+	_ = stranger.SetDeadline(time.Now().Add(3 * time.Second))
+	hs := &peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: sha1.Sum([]byte("not ours"))}
+	if _, err := stranger.Write(hs.Serialize()); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+	if _, err := stranger.Read(make([]byte, 1)); err == nil {
+		t.Fatal("handshake for an unknown torrent was answered")
+	}
+	if n := len(mgr.globalInboundSlots); n != 1 {
+		t.Fatalf("established slots = %d after an unknown-torrent handshake, want 1", n)
+	}
+}
+
+// TestInboundHandshakeBudgetIsBounded checks that pre-handshake connections
+// beyond maxInboundHandshakes are turned away at once, and that a freed
+// handshake slot admits a real peer again.
+func TestInboundHandshakeBudgetIsBounded(t *testing.T) {
+	mgr := NewTorrentManager()
+	if err := mgr.StartPeerListener(0); err != nil {
+		t.Fatalf("start shared listener: %v", err)
+	}
+	t.Cleanup(mgr.Close) // after the idle conns are closed
+	sess := newEncryptionTestManagedSession(t, mgr, "admission-budget")
+	port := mgr.PeerListenPort()
+
+	idle := make([]net.Conn, 0, maxInboundHandshakes)
+	for i := 0; i < maxInboundHandshakes; i++ {
+		idle = append(idle, dialIdle(t, port))
+	}
+	waitForCondition(t, "the handshake budget to fill", func() bool {
+		return len(mgr.inboundHandshakeSlots) == maxInboundHandshakes
+	})
+
+	extra := dialIdle(t, port)
+	_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := extra.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection beyond the handshake budget was not closed")
+	}
+	if n := len(mgr.globalInboundSlots); n != 0 {
+		t.Fatalf("established slots = %d with only idle connections, want 0", n)
+	}
+
+	_ = idle[0].Close()
+	waitForCondition(t, "a handshake slot to free up", func() bool {
+		return len(mgr.inboundHandshakeSlots) < maxInboundHandshakes
+	})
+	handshakeWith(t, port, sess.Torrent.InfoHash)
+}
+
 func TestManagerSecretKeysSnapshotTracksSessionLifecycle(t *testing.T) {
 	mgr := NewTorrentManager()
 
