@@ -301,6 +301,22 @@ func normalizePeerPipelineConfig(cfg peerPipelineConfig) peerPipelineConfig {
 	return cfg
 }
 
+// LimitWindowBlocks caps this peer's request window at n outstanding blocks, for
+// a peer that advertised a request queue (BEP 10 reqq) smaller than our maximum:
+// requests past its queue are rejected or silently dropped, costing a whole piece
+// or a 20 s timeout each. Values at or above the current maximum change nothing.
+func (p *peerPipelineController) LimitWindowBlocks(n int) {
+	if n <= 0 || n >= p.cfg.MaxWindowBlocks {
+		return
+	}
+	p.cfg.MaxWindowBlocks = n
+	p.cfg.MinWindowBlocks = min(p.cfg.MinWindowBlocks, n)
+	p.cfg.InitialWindowBlocks = min(p.cfg.InitialWindowBlocks, n)
+	p.cfg.StartupProbeCeilingBlocks = min(p.cfg.StartupProbeCeilingBlocks, n)
+	p.windowBlocks = min(p.windowBlocks, n)
+	p.targetWindowBlocks = min(p.targetWindowBlocks, n)
+}
+
 func (p *peerPipelineController) WindowBlocks(now time.Time) int {
 	p.updateWindow(now)
 	return p.windowBlocks

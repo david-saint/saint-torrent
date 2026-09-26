@@ -49,12 +49,18 @@ const (
 
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
-// the total metadata size, and an optional client identifier.
+// the total metadata size, an optional client identifier, and the optional
+// number of outstanding requests the sender is willing to queue.
 type ExtensionHandshake struct {
 	Extensions   map[string]int // m dict: extension name -> message ID
 	MetadataSize int            // metadata_size field
 	ClientName   string         // v field (optional)
+	RequestQueue int            // reqq field (optional; 0 when absent or invalid)
 }
+
+// maxRequestQueue caps a parsed reqq value; real clients advertise a few hundred
+// to a few thousand.
+const maxRequestQueue = 1 << 20
 
 // ParseExtensionHandshake parses a BEP 10 extension handshake from bencoded data.
 // The input must be a bencoded dictionary containing at least an "m" key.
@@ -118,6 +124,14 @@ func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
 		hs.ClientName = v
 	}
 
+	// reqq is advisory, so a malformed value is ignored rather than failing the
+	// whole handshake.
+	if rVal, exists := dict["reqq"]; exists {
+		if reqq, ok := rVal.(int64); ok && reqq > 0 {
+			hs.RequestQueue = int(min(reqq, maxRequestQueue))
+		}
+	}
+
 	return hs, nil
 }
 
@@ -133,8 +147,14 @@ func SerializeExtensionHandshake(utMetadataID int, metadataSize int) ([]byte, er
 // SerializeExtensionHandshakeWithExtensions creates the bencoded extension
 // handshake payload for an arbitrary BEP 10 extension map.
 func SerializeExtensionHandshakeWithExtensions(extensions map[string]int, metadataSize int) ([]byte, error) {
-	mDict := make(map[string]interface{}, len(extensions))
-	for name, id := range extensions {
+	return (&ExtensionHandshake{Extensions: extensions, MetadataSize: metadataSize}).Serialize()
+}
+
+// Serialize creates the bencoded extension handshake payload. Zero-valued
+// optional fields are left out.
+func (hs *ExtensionHandshake) Serialize() ([]byte, error) {
+	mDict := make(map[string]interface{}, len(hs.Extensions))
+	for name, id := range hs.Extensions {
 		if name == "" {
 			return nil, errors.New("extension name cannot be empty")
 		}
@@ -149,8 +169,14 @@ func SerializeExtensionHandshakeWithExtensions(extensions map[string]int, metada
 	payload := map[string]interface{}{
 		"m": mDict,
 	}
-	if metadataSize > 0 {
-		payload["metadata_size"] = metadataSize
+	if hs.MetadataSize > 0 {
+		payload["metadata_size"] = hs.MetadataSize
+	}
+	if hs.ClientName != "" {
+		payload["v"] = hs.ClientName
+	}
+	if hs.RequestQueue > 0 {
+		payload["reqq"] = hs.RequestQueue
 	}
 
 	data, err := bencode.Marshal(payload)
@@ -293,6 +319,15 @@ func (c *Client) SendExtHandshakeWithExtensions(extensions map[string]int, metad
 		return err
 	}
 
+	return c.sendExtendedPayload(ExtHandshake, payload)
+}
+
+// SendExtensionHandshake sends a BEP 10 extension handshake built from hs.
+func (c *Client) SendExtensionHandshake(hs *ExtensionHandshake) error {
+	payload, err := hs.Serialize()
+	if err != nil {
+		return err
+	}
 	return c.sendExtendedPayload(ExtHandshake, payload)
 }
 

@@ -7,6 +7,37 @@ import (
 	"time"
 )
 
+// TestExtensionHandshakeRequestQueue checks BEP 10 reqq round-trips and that a
+// malformed value is ignored rather than failing the handshake.
+func TestExtensionHandshakeRequestQueue(t *testing.T) {
+	data, err := (&ExtensionHandshake{
+		Extensions:   map[string]int{ExtNameMetadata: 3},
+		MetadataSize: 100,
+		ClientName:   "saintTorrent",
+		RequestQueue: 512,
+	}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	hs, err := ParseExtensionHandshake(data)
+	if err != nil {
+		t.Fatalf("ParseExtensionHandshake: %v", err)
+	}
+	if hs.RequestQueue != 512 || hs.Extensions[ExtNameMetadata] != 3 || hs.MetadataSize != 100 || hs.ClientName != "saintTorrent" {
+		t.Fatalf("round trip = %+v", hs)
+	}
+
+	for _, input := range []string{"d1:mde4:reqq3:abce", "d1:mde4:reqqi-5ee", "d1:mde4:reqqi0ee"} {
+		hs, err := ParseExtensionHandshake([]byte(input))
+		if err != nil {
+			t.Fatalf("%q: %v", input, err)
+		}
+		if hs.RequestQueue != 0 {
+			t.Fatalf("%q: RequestQueue = %d, want 0", input, hs.RequestQueue)
+		}
+	}
+}
+
 // TestSendMetadataDataWireFormat checks the directly framed ut_metadata data
 // message parses back to the same piece, total size and block.
 func TestSendMetadataDataWireFormat(t *testing.T) {

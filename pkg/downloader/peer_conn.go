@@ -890,7 +890,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			infoLen = len(s.Torrent.InfoBytes)
 		}
 		s.mu.RUnlock()
-		_ = client.SendExtHandshakeWithExtensions(extensions, infoLen)
+		// reqq tells the peer how many requests we queue (maxUploadQueue), so it
+		// does not pipeline requests we would have to reject.
+		_ = client.SendExtensionHandshake(&peer.ExtensionHandshake{
+			Extensions:   extensions,
+			MetadataSize: infoLen,
+			RequestQueue: maxUploadQueue,
+		})
 	}
 
 	// Advertise our DHT UDP port to DHT-capable peers (BEP 5 PORT message). This
@@ -1847,6 +1853,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if err != nil {
 				return ""
 			}
+			// Keep our request window within the queue the peer says it has.
+			pipeline.LimitWindowBlocks(hs.RequestQueue)
 			if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
 				peerUtPexID = utPexID
 				startPEX()
