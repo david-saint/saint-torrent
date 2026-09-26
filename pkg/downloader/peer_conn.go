@@ -76,6 +76,16 @@ const (
 	metadataServeRequestsPerBlock = 2
 )
 
+// maxPeerDHTPortUpdates bounds how many BEP 5 PORT messages from one connection
+// are fed to the DHT. An honest peer sends one; a few more allow for a port
+// change, while a peer alternating ports cannot make us scan the routing table
+// with every 7-byte message.
+const maxPeerDHTPortUpdates = 4
+
+// addDHTNode feeds a peer-advertised DHT endpoint to the routing table. A var so
+// tests can observe the calls.
+var addDHTNode = (*dht.DHT).AddNode
+
 // maxExtHandshakesPerConn bounds how many BEP 10 extension handshakes one
 // connection may have decoded and acted on. Real clients send one, occasionally a
 // second to update it; later ones are ignored.
@@ -1104,6 +1114,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	var peerUtMetadataID int = -1
 	var peerUtPexID int = -1
 	extHandshakes := 0
+	// The DHT port this peer last advertised with PORT (BEP 5) that we acted on.
+	var peerDHTPort uint16
+	peerDHTPortUpdates := 0
 	pexAdvertised := make(map[string]struct{})
 	var pexTicker *time.Ticker
 	var pexTick <-chan time.Time
@@ -2499,16 +2512,26 @@ peerLoop:
 			// BEP 5: the peer advertises its DHT UDP port. Combine it with the
 			// peer's source IP and feed it into the routing table so live peers
 			// grow our DHT beyond bootstrap nodes and lookups.
-			if len(msg.Payload) == 2 {
-				dhtPort := binary.BigEndian.Uint16(msg.Payload)
-				s.mu.RLock()
-				d := s.DHT
-				allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
-				s.mu.RUnlock()
-				if allowDHT && d != nil && dhtPort != 0 {
-					if pip := net.ParseIP(ip); pip != nil {
-						d.AddNode(pip, dhtPort)
-					}
+			//
+			// Each AddNode scans the routing table under the DHT lock, so only act on
+			// the first PORT and on real changes, a few times per connection at most;
+			// repeats cost nothing.
+			if len(msg.Payload) != 2 {
+				break
+			}
+			dhtPort := binary.BigEndian.Uint16(msg.Payload)
+			if dhtPort == 0 || dhtPort == peerDHTPort || peerDHTPortUpdates >= maxPeerDHTPortUpdates {
+				break
+			}
+			s.mu.RLock()
+			d := s.DHT
+			allowDHT := s.allowsDecentralizedPeerDiscoveryLocked()
+			s.mu.RUnlock()
+			if allowDHT && d != nil {
+				if pip := net.ParseIP(ip); pip != nil {
+					peerDHTPort = dhtPort
+					peerDHTPortUpdates++
+					addDHTNode(d, pip, dhtPort)
 				}
 			}
 		}
