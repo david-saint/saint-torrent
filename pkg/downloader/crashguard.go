@@ -459,7 +459,12 @@ func attributedCrashes(crashDir string, sinceNano int64) map[string]crashFile {
 	return crashes
 }
 
-// writeRunningSentinel atomically writes this process's sentinel.
+// writeRunningSentinel atomically writes this process's sentinel. It is not
+// synced: EnablePersistence writes it before restoring anything, so the syncs
+// would delay every startup, and the sentinel only has to outlive a crash of
+// this process, which the page cache does. After a power loss it is missing
+// (no crash is counted) or unparseable (an unclean exit is), and a power loss
+// is an unclean exit anyway.
 func writeRunningSentinel(path string, startedAt time.Time, stable bool) error {
 	data, err := json.Marshal(runningSentinel{
 		PID:       os.Getpid(),
@@ -470,7 +475,7 @@ func writeRunningSentinel(path string, startedAt time.Time, stable bool) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(path, data)
+	return replaceFileNoSync(path, data)
 }
 
 // startRunningSentinel marks this run as live in stateDir, after the

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1918,6 +1920,67 @@ func TestRunningSentinelLifecycle(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(stateDir, crashStateName)); err == nil && !strings.Contains(string(data), `"unattributed_streak":0`) {
 		t.Fatalf("crash state %s, want no crash counted", data)
+	}
+}
+
+// TestRunningSentinelIsNotSynced: EnablePersistence writes the sentinel before
+// it restores anything, and syncing it and its directory added about half a
+// millisecond to every Linux startup (more on macOS, where File.Sync is
+// F_FULLFSYNC). It only has to outlive a crash of this process, which the page
+// cache does, so neither the first write nor the stable rewrite is synced,
+// while session.json and crash-state.json still are.
+func TestRunningSentinelIsNotSynced(t *testing.T) {
+	saved := sentinelStableAfter
+	sentinelStableAfter = 10 * time.Millisecond
+	t.Cleanup(func() { sentinelStableAfter = saved })
+	var (
+		mu     sync.Mutex
+		synced []string
+	)
+	hook := func(destPath string) {
+		mu.Lock()
+		synced = append(synced, destPath)
+		mu.Unlock()
+	}
+	fileSyncHook.Store(&hook)
+	t.Cleanup(func() { fileSyncHook.Store(nil) })
+	stateDir := filepath.Join(t.TempDir(), "config")
+	sentinelPath := filepath.Join(stateDir, sentinelName)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sentinel, _ := readRunningSentinel(stateDir); sentinel.Stable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sentinel was never marked stable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if info, err := os.Stat(sentinelPath); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
+		t.Fatalf("sentinel %v (%v), want a file readable by the owner only", info, err)
+	}
+	if err := mgr.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	sawSessionJSON := false
+	for _, path := range synced {
+		if path == sentinelPath {
+			t.Fatalf("the running sentinel was synced (synced: %q)", synced)
+		}
+		if filepath.Base(path) == "session.json" {
+			sawSessionJSON = true
+		}
+	}
+	if !sawSessionJSON {
+		t.Fatalf("session.json was not synced (synced: %q)", synced)
 	}
 }
 

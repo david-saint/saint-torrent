@@ -1226,8 +1226,26 @@ func atomicWriteState(stateDir string, state PersistedState) error {
 // cached .torrent files carry private-tracker passkeys and session.json lists
 // every torrent. The temporary file comes from os.CreateTemp (a fresh random
 // name opened O_EXCL with mode 0600) next to destPath, so the write never goes
-// through a name or symlink someone else planted.
+// through a name or symlink someone else planted. The file and its directory
+// are synced, so the new contents survive a power loss.
 func atomicWriteFile(destPath string, data []byte) error {
+	return replaceFile(destPath, data, true)
+}
+
+// replaceFileNoSync is atomicWriteFile without the file and directory syncs:
+// the new contents survive the process dying, since the page cache outlives
+// it, but not necessarily a power loss. It is for files that only need to
+// outlive this process, where the syncs would cost startup milliseconds (tens
+// of them on macOS, where File.Sync is F_FULLFSYNC).
+func replaceFileNoSync(destPath string, data []byte) error {
+	return replaceFile(destPath, data, false)
+}
+
+// fileSyncHook, when set, is called with the destination of each file
+// replaceFile syncs. Tests use it to see which writes are durable.
+var fileSyncHook atomic.Pointer[func(destPath string)]
+
+func replaceFile(destPath string, data []byte, durable bool) error {
 	f, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".tmp-*")
 	if err != nil {
 		return err
@@ -1244,8 +1262,13 @@ func atomicWriteFile(destPath string, data []byte) error {
 	if _, err := f.Write(data); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
+	if durable {
+		if hook := fileSyncHook.Load(); hook != nil {
+			(*hook)(destPath)
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -1256,10 +1279,12 @@ func atomicWriteFile(destPath string, data []byte) error {
 	}
 	renamed = true
 
-	parentDir := filepath.Dir(destPath)
-	if dir, err := os.Open(parentDir); err == nil {
-		_ = dir.Sync()
-		dir.Close()
+	if durable {
+		parentDir := filepath.Dir(destPath)
+		if dir, err := os.Open(parentDir); err == nil {
+			_ = dir.Sync()
+			dir.Close()
+		}
 	}
 
 	return nil
