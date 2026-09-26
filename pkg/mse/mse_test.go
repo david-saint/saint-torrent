@@ -2,11 +2,13 @@ package mse
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"errors"
 	"io"
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -277,8 +279,272 @@ func TestParsePolicy(t *testing.T) {
 	}
 }
 
-func singleSecret(skey []byte) SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		callback(skey)
+// recordingConn records the size of every Write, which is how the handshake
+// is cut into segments on the wire (peer conns run with TCP_NODELAY).
+type recordingConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes []int
+}
+
+func (c *recordingConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes = append(c.writes, len(p))
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *recordingConn) writeSizes() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.writes...)
+}
+
+// TestReceiverWaitsForInitiatorKey checks that the receiver sends nothing
+// until the initiator's public key has arrived. Sending Yb first let a single
+// spoofed uTP packet make us send (and retransmit) 96+ bytes to its forged
+// source.
+func TestReceiverWaitsForInitiatorKey(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := Receive(serverConn, singleSecret(bytes.Repeat([]byte{0x44}, 20)), SelectRC4)
+		done <- err
+	}()
+	_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, err := clientConn.Read(make([]byte, keyLen))
+	var ne net.Error
+	if n != 0 || !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("receiver sent %d bytes (err=%v) before the initiator sent anything", n, err)
 	}
+	_ = clientConn.Close()
+	if err := <-done; err == nil {
+		t.Fatal("Receive succeeded on a closed conn")
+	}
+}
+
+// TestHandshakeFlightsAreCoalesced checks that each side's handshake leaves in
+// two writes: its key with its pad, then everything after the key exchange.
+// Separate writes put an exact 96-byte segment at the start of every stream,
+// which undoes the length obfuscation the pads exist for, and over uTP each
+// write waits for its own acks.
+func TestHandshakeFlightsAreCoalesced(t *testing.T) {
+	clientPipe, serverPipe := net.Pipe()
+	defer clientPipe.Close()
+	defer serverPipe.Close()
+	_ = clientPipe.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverPipe.SetDeadline(time.Now().Add(2 * time.Second))
+	client := &recordingConn{Conn: clientPipe}
+	server := &recordingConn{Conn: serverPipe}
+
+	skey := bytes.Repeat([]byte{0x55}, 20)
+	errs := make(chan error, 2)
+	go func() {
+		_, _, err := Initiate(client, skey, []byte("initial"), CryptoMethodRC4)
+		errs <- err
+	}()
+	go func() {
+		_, _, err := Receive(server, singleSecret(skey), SelectRC4)
+		errs <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+	}
+	for name, c := range map[string]*recordingConn{"initiator": client, "receiver": server} {
+		sizes := c.writeSizes()
+		if len(sizes) != 2 {
+			t.Fatalf("%s wrote the handshake in %d writes %v, want 2", name, len(sizes), sizes)
+		}
+		if sizes[0] < keyLen || sizes[0] > keyLen+maxPadLen {
+			t.Fatalf("%s first write is %d bytes, want its key and pad (%d-%d)", name, sizes[0], keyLen, keyLen+maxPadLen)
+		}
+	}
+}
+
+// rogueReceive plays the receiver side of a handshake for skey but answers
+// crypto_select with whatever answer says, as a malicious peer could.
+func rogueReceive(conn net.Conn, skey []byte, answer CryptoMethod) error {
+	h := &handshaker{conn: conn, out: newAsyncWriter(conn), skey: skey}
+	defer h.out.close()
+	var ya [keyLen]byte
+	if _, err := io.ReadFull(conn, ya[:]); err != nil {
+		return err
+	}
+	x, yb, err := newKeyPair()
+	if err != nil {
+		return err
+	}
+	if err := h.deriveSecret(x, ya[:]); err != nil {
+		return err
+	}
+	if err := h.postPadded(yb); err != nil {
+		return err
+	}
+	if err := readUntil(io.LimitReader(conn, maxPadLen+sha1.Size), hash(req1, h.s[:])); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(conn, make([]byte, sha1.Size)); err != nil {
+		return err
+	}
+	readCipher, err := h.newCipher(true)
+	if err != nil {
+		return err
+	}
+	cr := &cipherReader{c: readCipher, r: conn}
+	if _, err := io.ReadFull(cr, make([]byte, len(vc)+4)); err != nil {
+		return err
+	}
+	padLen, err := readUint16(cr)
+	if err != nil {
+		return err
+	}
+	if err := discardHandshakePad(cr, padLen); err != nil {
+		return err
+	}
+	iaLen, err := readUint16(cr)
+	if err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(cr, make([]byte, iaLen)); err != nil {
+		return err
+	}
+	writeCipher, err := h.newCipher(false)
+	if err != nil {
+		return err
+	}
+	frame := buildCryptoFrame(answer, nil, false)
+	writeCipher.XORKeyStream(frame, frame)
+	return h.out.post(frame)
+}
+
+// TestInitiateRejectsMultiBitCryptoSelect reproduces a receiver answering
+// crypto_select with both bits of a plaintext|RC4 offer. That passed the old
+// subset check, wrapConn found no single method and returned nil, and
+// Initiate handed back a nil *Conn with a nil error, which panics on first
+// use as a net.Conn.
+func TestInitiateRejectsMultiBitCryptoSelect(t *testing.T) {
+	for _, answer := range []CryptoMethod{CryptoMethodPlaintext | CryptoMethodRC4, 4, 0} {
+		clientConn, serverConn := net.Pipe()
+		_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+		skey := bytes.Repeat([]byte{0x66}, 20)
+		rogue := make(chan error, 1)
+		go func() {
+			rogue <- rogueReceive(serverConn, skey, answer)
+		}()
+		conn, res, err := Initiate(clientConn, skey, nil, CryptoMethodPlaintext|CryptoMethodRC4)
+		if !errors.Is(err, ErrNoCryptoMethod) || conn != nil {
+			t.Fatalf("crypto_select %x: Initiate returned conn=%v method=%x err=%v, want ErrNoCryptoMethod and no conn", answer, conn, res.Method, err)
+		}
+		if err := <-rogue; err != nil {
+			t.Fatalf("rogue receiver: %v", err)
+		}
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}
+}
+
+// TestReceiveRejectsMultiBitSelection checks that a selector returning more
+// than one method is refused before anything is sent.
+func TestReceiveRejectsMultiBitSelection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	skey := bytes.Repeat([]byte{0x77}, 20)
+	go func() {
+		_, _, _ = Initiate(clientConn, skey, nil, CryptoMethodPlaintext|CryptoMethodRC4)
+	}()
+	echo := func(provided CryptoMethod) CryptoMethod { return provided }
+	conn, _, err := Receive(serverConn, singleSecret(skey), echo)
+	if !errors.Is(err, ErrNoCryptoMethod) || conn != nil {
+		t.Fatalf("Receive returned conn=%v err=%v, want ErrNoCryptoMethod and no conn", conn, err)
+	}
+}
+
+func TestWrapConnRejectsUnknownMethod(t *testing.T) {
+	h := &handshaker{}
+	for _, m := range []CryptoMethod{0, CryptoMethodPlaintext | CryptoMethodRC4, 4} {
+		if conn, err := h.wrapConn(m, nil, nil, nil); conn != nil || !errors.Is(err, ErrNoCryptoMethod) {
+			t.Fatalf("wrapConn(%x) = %v, %v; want nil and ErrNoCryptoMethod", m, conn, err)
+		}
+	}
+}
+
+func manySecrets(n int) [][]byte {
+	skeys := make([][]byte, n)
+	for i := range skeys {
+		sum := sha1.Sum([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		skeys[i] = sum[:]
+	}
+	return skeys
+}
+
+// TestReceiveMatchesSecretKeyWithOneLookup checks that the receiver finds the
+// initiator's torrent among many with a single lookup of the obfuscated
+// hash. It used to hash every managed info hash per handshake (about 3 ms at
+// 10k torrents), which a peer could trigger at almost no cost of its own.
+func TestReceiveMatchesSecretKeyWithOneLookup(t *testing.T) {
+	skeys := manySecrets(10000)
+	index := SecretKeys(skeys...)
+	var mu sync.Mutex
+	lookups := 0
+	counted := func(obfuscated [sha1.Size]byte) ([]byte, bool) {
+		mu.Lock()
+		lookups++
+		mu.Unlock()
+		return index(obfuscated)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	want := skeys[7777]
+	errs := make(chan error, 1)
+	go func() {
+		_, _, err := Initiate(clientConn, want, nil, CryptoMethodRC4)
+		errs <- err
+	}()
+	_, res, err := Receive(serverConn, counted, SelectRC4)
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("Initiate: %v", err)
+	}
+	if !bytes.Equal(res.SecretKey, want) {
+		t.Fatalf("matched secret %x, want %x", res.SecretKey, want)
+	}
+	if lookups != 1 {
+		t.Fatalf("receiver did %d lookups, want 1", lookups)
+	}
+}
+
+// BenchmarkMatchSecretKey measures matching an inbound handshake against 10k
+// torrents, the per-handshake cost a seedbox pays for every inbound
+// encrypted connection.
+func BenchmarkMatchSecretKey(b *testing.B) {
+	skeys := manySecrets(10000)
+	h := &handshaker{skeys: SecretKeys(skeys...)}
+	copy(h.s[:], bytes.Repeat([]byte{0x5a}, keyLen))
+	got := hash(req2, skeys[9999])
+	xorInPlace(got, got, hash(req3, h.s[:]))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := h.matchSecretKey(got); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func singleSecret(skey []byte) SecretKeyLookup {
+	return SecretKeys(skey)
 }

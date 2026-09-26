@@ -74,9 +74,29 @@ func ParsePolicy(s string) (Policy, error) {
 	}
 }
 
-// SecretKeyIter visits acceptable torrent info hashes for a receiver. Returning
-// false from callback stops iteration.
-type SecretKeyIter func(callback func(skey []byte) bool)
+// SecretKeyLookup resolves the obfuscated form in which an initiator names
+// its torrent, HASH('req2', SKEY) (see ObfuscatedHash), to SKEY, normally the
+// info hash. It reports false when no acceptable torrent matches.
+type SecretKeyLookup func(obfuscated [sha1.Size]byte) (skey []byte, ok bool)
+
+// ObfuscatedHash returns HASH('req2', skey), the form in which an initiator
+// names its torrent. A receiver precomputes it once per torrent, so matching
+// a handshake is one lookup rather than a hash of every torrent it serves.
+func ObfuscatedHash(skey []byte) [sha1.Size]byte {
+	return sha1.Sum(append(append([]byte(nil), req2...), skey...))
+}
+
+// SecretKeys returns a lookup over a fixed set of secret keys.
+func SecretKeys(skeys ...[]byte) SecretKeyLookup {
+	byHash := make(map[[sha1.Size]byte][]byte, len(skeys))
+	for _, skey := range skeys {
+		byHash[ObfuscatedHash(skey)] = append([]byte(nil), skey...)
+	}
+	return func(obfuscated [sha1.Size]byte) ([]byte, bool) {
+		skey, ok := byHash[obfuscated]
+		return skey, ok
+	}
+}
 
 // Result describes a completed MSE handshake.
 type Result struct {
@@ -255,7 +275,7 @@ type handshaker struct {
 	out   *asyncWriter
 	s     [keyLen]byte
 	skey  []byte
-	skeys SecretKeyIter
+	skeys SecretKeyLookup
 }
 
 // Initiate performs the outgoing MSE handshake using skey, normally the torrent
@@ -286,9 +306,9 @@ func Initiate(conn net.Conn, skey []byte, initialPayload []byte, methods CryptoM
 // Receive performs the incoming MSE handshake. selectMethod chooses one method
 // from the initiator-provided bitmask and must return either CryptoMethodRC4,
 // CryptoMethodPlaintext, or 0 to reject the peer.
-func Receive(conn net.Conn, skeys SecretKeyIter, selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
+func Receive(conn net.Conn, skeys SecretKeyLookup, selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
 	if skeys == nil {
-		return nil, Result{}, errors.New("mse: nil secret-key iterator")
+		return nil, Result{}, errors.New("mse: nil secret-key lookup")
 	}
 	if selectMethod == nil {
 		selectMethod = SelectRC4
@@ -320,32 +340,40 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	if len(initialPayload) > math.MaxUint16 {
 		return nil, Result{}, errors.New("mse: initial payload too large")
 	}
-	if err := h.establishSecret(); err != nil {
+	x, ya, err := newKeyPair()
+	if err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.postRandomPad(); err != nil {
+	// Ya and PadA leave as one write: the pad exists to hide the fixed
+	// 96-byte key length, which a lone 96-byte first segment gives away.
+	if err := h.postPadded(ya); err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.out.post(hash(req1, h.s[:])); err != nil {
-		return nil, Result{}, err
+	var yb [keyLen]byte
+	if _, err := io.ReadFull(h.conn, yb[:]); err != nil {
+		return nil, Result{}, fmt.Errorf("mse: read public key: %w", err)
 	}
-	req2Hash := hash(req2, h.skey)
-	req3Hash := hash(req3, h.s[:])
-	xorInPlace(req2Hash, req2Hash, req3Hash)
-	if err := h.out.post(req2Hash); err != nil {
+	if err := h.deriveSecret(x, yb[:]); err != nil {
 		return nil, Result{}, err
 	}
 
+	// HASH('req1', S), HASH('req2', SKEY) xor HASH('req3', S) and
+	// ENCRYPT(VC, crypto_provide, len(PadC), PadC, len(IA), IA) also leave
+	// as one write, as libtorrent sends them; over uTP each write otherwise
+	// costs its own round of acks.
 	writeCipher, err := h.newCipher(true)
 	if err != nil {
 		return nil, Result{}, err
 	}
-	var encrypted bytes.Buffer
-	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildCryptoFrame(methods, initialPayload, true)); err != nil {
-		return nil, Result{}, err
-	}
-	if err := h.out.post(encrypted.Bytes()); err != nil {
+	req2Hash := hash(req2, h.skey)
+	xorInPlace(req2Hash, req2Hash, hash(req3, h.s[:]))
+	frame := buildCryptoFrame(methods, initialPayload, true)
+	flight := make([]byte, 0, 2*sha1.Size+len(frame))
+	flight = append(flight, hash(req1, h.s[:])...)
+	flight = append(flight, req2Hash...)
+	flight = append(flight, frame...)
+	writeCipher.XORKeyStream(flight[2*sha1.Size:], flight[2*sha1.Size:])
+	if err := h.out.post(flight); err != nil {
 		return nil, Result{}, err
 	}
 
@@ -371,19 +399,36 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	if err := discardHandshakePad(cr, padLen); err != nil {
 		return nil, Result{}, err
 	}
-	selected := CryptoMethod(method) & methods
-	if selected == 0 || selected != CryptoMethod(method) {
+	// crypto_select must name exactly one method, and one we offered.
+	selected := CryptoMethod(method)
+	if !singleMethod(selected) || selected&methods == 0 {
 		return nil, Result{}, fmt.Errorf("%w: receiver selected %x from offered %x", ErrNoCryptoMethod, method, methods)
 	}
 
-	return h.wrapConn(selected, nil, readCipher, writeCipher), Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
+	conn, err := h.wrapConn(selected, nil, readCipher, writeCipher)
+	if err != nil {
+		return nil, Result{}, err
+	}
+	return conn, Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
 }
 
 func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
-	if err := h.establishSecret(); err != nil {
+	// Nothing is sent until the initiator's key has arrived, as the spec and
+	// libtorrent order it. Answering first would let one spoofed uTP packet
+	// make us send, and retransmit, Yb to its forged source.
+	var ya [keyLen]byte
+	if _, err := io.ReadFull(h.conn, ya[:]); err != nil {
+		return nil, Result{}, fmt.Errorf("mse: read public key: %w", err)
+	}
+	x, yb, err := newKeyPair()
+	if err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.postRandomPad(); err != nil {
+	if err := h.deriveSecret(x, ya[:]); err != nil {
+		return nil, Result{}, err
+	}
+	// Yb and PadB leave as one write, for the same reason as Ya and PadA.
+	if err := h.postPadded(yb); err != nil {
 		return nil, Result{}, err
 	}
 	if err := readUntil(io.LimitReader(h.conn, maxPadLen+sha1.Size), hash(req1, h.s[:])); err != nil {
@@ -433,7 +478,7 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	}
 
 	selected := selectMethod(CryptoMethod(provided))
-	if selected == 0 || CryptoMethod(provided)&selected == 0 {
+	if !singleMethod(selected) || CryptoMethod(provided)&selected == 0 {
 		return nil, Result{}, fmt.Errorf("%w: initiator offered %x", ErrNoCryptoMethod, provided)
 	}
 
@@ -441,32 +486,40 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	if err != nil {
 		return nil, Result{}, err
 	}
-	var encrypted bytes.Buffer
-	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildCryptoFrame(selected, nil, false)); err != nil {
-		return nil, Result{}, err
-	}
-	if err := h.out.post(encrypted.Bytes()); err != nil {
+	frame := buildCryptoFrame(selected, nil, false)
+	writeCipher.XORKeyStream(frame, frame)
+	if err := h.out.post(frame); err != nil {
 		return nil, Result{}, err
 	}
 
-	return h.wrapConn(selected, initialPayload, readCipher, writeCipher), Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
+	conn, err := h.wrapConn(selected, initialPayload, readCipher, writeCipher)
+	if err != nil {
+		return nil, Result{}, err
+	}
+	return conn, Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
 }
 
-func (h *handshaker) establishSecret() error {
+// singleMethod reports whether m is exactly one method we can run. The spec
+// requires crypto_select to name one, and anything else has no stream mode.
+func singleMethod(m CryptoMethod) bool {
+	return m == CryptoMethodPlaintext || m == CryptoMethodRC4
+}
+
+// newKeyPair returns a fresh DH private key and its public key, left-padded to
+// keyLen bytes.
+func newKeyPair() (*big.Int, []byte, error) {
 	x, err := randomPrivate()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	y := new(big.Int).Exp(dhGenerator, x, dhPrime)
-	if err := h.out.post(leftPad(y.Bytes(), keyLen)); err != nil {
-		return err
-	}
-	var peerYBytes [keyLen]byte
-	if _, err := io.ReadFull(h.conn, peerYBytes[:]); err != nil {
-		return fmt.Errorf("mse: read public key: %w", err)
-	}
-	peerY := new(big.Int).SetBytes(peerYBytes[:])
+	return x, leftPad(y.Bytes(), keyLen), nil
+}
+
+// deriveSecret checks the peer's public key and sets S from it and our
+// private key x.
+func (h *handshaker) deriveSecret(x *big.Int, peerKey []byte) error {
+	peerY := new(big.Int).SetBytes(peerKey)
 	if !validPeerPublicKey(peerY) {
 		return errors.New("mse: invalid peer public key")
 	}
@@ -479,34 +532,31 @@ func validPeerPublicKey(peerY *big.Int) bool {
 	return peerY.Cmp(dhMinPeerKey) >= 0 && peerY.Cmp(dhMaxPeerKey) < 0
 }
 
-func (h *handshaker) postRandomPad() error {
+// postPadded posts key followed by 0-512 random pad bytes as one write.
+func (h *handshaker) postPadded(key []byte) error {
 	n, err := randomPadLen()
 	if err != nil {
 		return err
 	}
-	pad := make([]byte, n)
-	if _, err := io.ReadFull(rand.Reader, pad); err != nil {
+	b := make([]byte, len(key)+n)
+	copy(b, key)
+	if _, err := io.ReadFull(rand.Reader, b[len(key):]); err != nil {
 		return err
 	}
-	return h.out.post(pad)
+	return h.out.post(b)
 }
 
+// matchSecretKey resolves the initiator's HASH('req2', SKEY) xor
+// HASH('req3', S). Undoing the xor leaves the obfuscated hash, so the match
+// costs one hash and one lookup however many torrents the receiver serves.
 func (h *handshaker) matchSecretKey(got []byte) error {
-	expectedReq3 := hash(req3, h.s[:])
-	var match []byte
-	h.skeys(func(skey []byte) bool {
-		req2Hash := hash(req2, skey)
-		xorInPlace(req2Hash, req2Hash, expectedReq3)
-		if bytes.Equal(req2Hash, got) {
-			match = append([]byte(nil), skey...)
-			return false
-		}
-		return true
-	})
-	if match == nil {
+	var obfuscated [sha1.Size]byte
+	xorInPlace(obfuscated[:], got, hash(req3, h.s[:]))
+	skey, ok := h.skeys(obfuscated)
+	if !ok {
 		return ErrNoSecretKeyMatch
 	}
-	h.skey = match
+	h.skey = append([]byte(nil), skey...)
 	return nil
 }
 
@@ -524,22 +574,25 @@ func (h *handshaker) newCipher(initiatorToReceiver bool) (*rc4.Cipher, error) {
 	return c, nil
 }
 
-func (h *handshaker) wrapConn(method CryptoMethod, initialPayload []byte, readCipher, writeCipher *rc4.Cipher) *Conn {
+// wrapConn returns an error rather than a nil *Conn for anything but a single
+// known method: a nil *Conn stored in a net.Conn is a non-nil interface that
+// panics on first use.
+func (h *handshaker) wrapConn(method CryptoMethod, initialPayload []byte, readCipher, writeCipher *rc4.Cipher) (*Conn, error) {
 	switch method {
 	case CryptoMethodRC4:
 		r := io.Reader(&cipherReader{c: readCipher, r: h.conn})
 		if len(initialPayload) > 0 {
 			r = io.MultiReader(bytes.NewReader(initialPayload), r)
 		}
-		return &Conn{Conn: h.conn, r: r, w: &cipherWriter{c: writeCipher, w: h.conn}}
+		return &Conn{Conn: h.conn, r: r, w: &cipherWriter{c: writeCipher, w: h.conn}}, nil
 	case CryptoMethodPlaintext:
 		r := io.Reader(h.conn)
 		if len(initialPayload) > 0 {
 			r = io.MultiReader(bytes.NewReader(initialPayload), r)
 		}
-		return &Conn{Conn: h.conn, r: r, w: h.conn}
+		return &Conn{Conn: h.conn, r: r, w: h.conn}, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("%w: cannot run method %x", ErrNoCryptoMethod, method)
 	}
 }
 

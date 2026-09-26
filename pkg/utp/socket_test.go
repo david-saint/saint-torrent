@@ -127,6 +127,27 @@ func TestOutboundConnectionIDsMatchBEP29(t *testing.T) {
 			return
 		}
 
+		// The dialer completes the handshake with a STATE of its own. As in
+		// libutp, the SYN consumed its seq_nr, the STATE carries the next one
+		// without consuming it, and serverSeq-1 acks the SYN-ACK: its seq_nr
+		// is the first DATA seq_nr the acceptor will send.
+		n, _, err = rawPeer.ReadFromUDP(buf)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		ackOfSynAck, err := parsePacket(buf[:n])
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if ackOfSynAck.typ != packetTypeState || ackOfSynAck.connID != syn.connID+1 ||
+			ackOfSynAck.seqNr != syn.seqNr+1 || ackOfSynAck.ackNr != serverSeq-1 {
+			serverDone <- fmt.Errorf("handshake ACK type=%d connID=%d seq=%d ack=%d, want STATE connID=%d seq=%d ack=%d",
+				ackOfSynAck.typ, ackOfSynAck.connID, ackOfSynAck.seqNr, ackOfSynAck.ackNr, syn.connID+1, syn.seqNr+1, serverSeq-1)
+			return
+		}
+
 		n, _, err = rawPeer.ReadFromUDP(buf)
 		if err != nil {
 			serverDone <- err
@@ -143,6 +164,10 @@ func TestOutboundConnectionIDsMatchBEP29(t *testing.T) {
 		}
 		if data.connID != syn.connID+1 {
 			serverDone <- fmt.Errorf("DATA connID = %d, want SYN connID+1 %d", data.connID, syn.connID+1)
+			return
+		}
+		if data.seqNr != syn.seqNr+1 || data.ackNr != serverSeq-1 {
+			serverDone <- fmt.Errorf("first DATA seq=%d ack=%d, want seq=%d ack=%d", data.seqNr, data.ackNr, syn.seqNr+1, serverSeq-1)
 			return
 		}
 		if string(data.payload) != "x" {
@@ -212,23 +237,23 @@ func TestInboundConnectionIDsMatchBEP29(t *testing.T) {
 		t.Fatalf("unexpected STATE: type=%d connID=%d ack=%d", state.typ, state.connID, state.ackNr)
 	}
 
-	accepted, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	defer accepted.Close()
-
 	data := packet{
 		typ:       packetTypeData,
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     state.seqNr,
+		ackNr:     state.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
 		t.Fatalf("send DATA: %v", err)
 	}
+
+	accepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	defer accepted.Close()
 
 	got := make([]byte, len(data.payload))
 	_ = accepted.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -270,6 +295,18 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse STATE: %v", err)
 	}
+	// The first DATA acknowledges the SYN-ACK and completes the handshake.
+	first := packet{
+		typ:       packetTypeData,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     state.seqNr - 1,
+		payload:   []byte("a"),
+	}
+	if _, err := rawClient.WriteToUDP(first.marshal(), target); err != nil {
+		t.Fatalf("send first DATA: %v", err)
+	}
 	accepted, err := ln.Accept()
 	if err != nil {
 		t.Fatalf("accept: %v", err)
@@ -280,8 +317,8 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 		typ:       packetTypeFin,
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     syn.seqNr + 2,
-		ackNr:     state.seqNr,
+		seqNr:     syn.seqNr + 3,
+		ackNr:     state.seqNr - 1,
 	}
 	if _, err := rawClient.WriteToUDP(fin.marshal(), target); err != nil {
 		t.Fatalf("send FIN: %v", err)
@@ -290,8 +327,8 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 		typ:       packetTypeData,
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     syn.seqNr + 1,
-		ackNr:     state.seqNr,
+		seqNr:     syn.seqNr + 2,
+		ackNr:     state.seqNr - 1,
 		payload:   []byte("z"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -299,12 +336,12 @@ func TestOutOfOrderFINIsAppliedAfterMissingData(t *testing.T) {
 	}
 
 	_ = accepted.SetReadDeadline(time.Now().Add(2 * time.Second))
-	got := make([]byte, 1)
+	got := make([]byte, 2)
 	if _, err := io.ReadFull(accepted, got); err != nil {
 		t.Fatalf("read payload: %v", err)
 	}
-	if string(got) != "z" {
-		t.Fatalf("payload = %q, want z", got)
+	if string(got) != "az" {
+		t.Fatalf("payload = %q, want az", got)
 	}
 	if n, err := accepted.Read(got); err != io.EOF || n != 0 {
 		t.Fatalf("second read got n=%d err=%v, want EOF", n, err)
@@ -481,7 +518,7 @@ func TestListenerCloseClosesQueuedConns(t *testing.T) {
 
 	// A conn accepted into the queue but never handed to a caller must be
 	// closed by Listener.Close rather than lingering with its receive buffer.
-	queued := newInboundConn(s, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}, 4242, 1)
+	queued := newInboundConn(s, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 65000}, 4242, 1, 100)
 	if !ln.enqueue(queued) {
 		t.Fatal("failed to enqueue conn")
 	}
@@ -596,6 +633,10 @@ func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
 			handshakeCh <- handshake{err: err}
 			return
 		}
+		if err := readHandshakeAck(rawPeer, buf); err != nil {
+			handshakeCh <- handshake{err: err}
+			return
+		}
 		handshakeCh <- handshake{syn: syn, addr: addr}
 	}()
 
@@ -615,11 +656,7 @@ func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
 
 	conn.mu.Lock()
 	localSeq, remoteSeq := conn.localSeq, conn.remoteSeq
-	accepted := conn.accepted
 	conn.mu.Unlock()
-	if accepted {
-		t.Fatal("outbound conn was marked accepted by the handshake")
-	}
 
 	acceptCh := make(chan net.Conn, 1)
 	go func() {
@@ -661,13 +698,9 @@ func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
 
 	conn.mu.Lock()
 	gotLocal, gotRemote := conn.localSeq, conn.remoteSeq
-	gotAccepted := conn.accepted
 	conn.mu.Unlock()
 	if gotLocal != localSeq || gotRemote != remoteSeq {
 		t.Fatalf("sequence state after colliding SYN: localSeq %d->%d remoteSeq %d->%d", localSeq, gotLocal, remoteSeq, gotRemote)
-	}
-	if gotAccepted {
-		t.Fatal("colliding SYN marked the outbound conn accepted")
 	}
 
 	// The refused SYN must not have registered anything: the socket still
@@ -726,7 +759,7 @@ func TestCollidingSynDoesNotHijackOutboundConn(t *testing.T) {
 		typ:       packetTypeData,
 		connID:    hs.syn.connID,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     peerSeq + 1,
+		seqNr:     peerSeq, // the SYN-ACK seq_nr is the first DATA seq_nr
 		ackNr:     data.seqNr,
 		payload:   []byte("pong"),
 	}
@@ -785,43 +818,31 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 	if first.ackNr != syn.seqNr {
 		t.Fatalf("first STATE ack = %d, want %d", first.ackNr, syn.seqNr)
 	}
-	// The conn is queued but not yet handed to a caller. A retransmit arriving
-	// in that window must be answered with the same STATE by the same Conn:
-	// no reset (readState rejects any other packet type), no second accept,
-	// no second localSeq increment.
+	// The conn is still half-open. A retransmit arriving in that window must
+	// be answered with the identical SYN-ACK: no reset (readState rejects any
+	// other packet type), no fresh sequence number, no conn handed out.
 	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
-		t.Fatalf("resend SYN before accept: %v", err)
+		t.Fatalf("resend SYN while half-open: %v", err)
 	}
-	queued := readState("STATE for SYN retransmit before accept")
+	queued := readState("STATE for SYN retransmit while half-open")
 	if queued.seqNr != first.seqNr || queued.ackNr != first.ackNr {
-		t.Fatalf("STATE for retransmit before accept seq=%d ack=%d, want seq=%d ack=%d", queued.seqNr, queued.ackNr, first.seqNr, first.ackNr)
+		t.Fatalf("STATE for retransmit while half-open seq=%d ack=%d, want seq=%d ack=%d", queued.seqNr, queued.ackNr, first.seqNr, first.ackNr)
 	}
 
-	accepted, err := ln.Accept()
-	if err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	defer accepted.Close()
-
-	// Now the same retransmit against an already-accepted conn.
-	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
-		t.Fatalf("resend SYN: %v", err)
-	}
-	second := readState("STATE for SYN retransmit")
-	if second.seqNr != first.seqNr || second.ackNr != first.ackNr {
-		t.Fatalf("STATE for retransmit seq=%d ack=%d, want seq=%d ack=%d", second.seqNr, second.ackNr, first.seqNr, first.ackNr)
-	}
-
-	acceptCh := make(chan net.Conn, 1)
+	acceptCh := make(chan net.Conn, 2)
 	go func() {
-		if c, err := ln.Accept(); err == nil {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
 			acceptCh <- c
 		}
 	}()
 	select {
 	case <-acceptCh:
-		t.Fatal("SYN retransmit produced a second accepted conn")
-	case <-time.After(200 * time.Millisecond):
+		t.Fatal("half-open conn was handed to Accept before its SYN-ACK was acknowledged")
+	case <-time.After(100 * time.Millisecond):
 	}
 
 	data := packet{
@@ -829,12 +850,20 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
 		t.Fatalf("send DATA: %v", err)
 	}
+	var accepted net.Conn
+	select {
+	case accepted = <-acceptCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("acknowledging DATA did not hand the conn to Accept")
+	}
+	defer accepted.Close()
+
 	got := make([]byte, len(data.payload))
 	_ = accepted.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, err := io.ReadFull(accepted, got); err != nil {
@@ -847,7 +876,8 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 		t.Fatalf("DATA ack = %d, want %d", ack.ackNr, data.seqNr)
 	}
 
-	// A late SYN retransmit arriving after data must not rewind remoteSeq.
+	// A late SYN retransmit arriving after data is re-acked by the promoted
+	// conn, must not rewind remoteSeq and must not produce a second conn.
 	if _, err := rawClient.WriteToUDP(syn.marshal(), target); err != nil {
 		t.Fatalf("resend SYN after data: %v", err)
 	}
@@ -855,13 +885,18 @@ func TestSynRetransmitReusesPendingInboundConn(t *testing.T) {
 	if third.seqNr != first.seqNr || third.ackNr != data.seqNr {
 		t.Fatalf("late retransmit STATE seq=%d ack=%d, want seq=%d ack=%d", third.seqNr, third.ackNr, first.seqNr, data.seqNr)
 	}
+	select {
+	case <-acceptCh:
+		t.Fatal("SYN retransmit produced a second accepted conn")
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	more := packet{
 		typ:       packetTypeData,
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 2,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("world"),
 	}
 	if _, err := rawClient.WriteToUDP(more.marshal(), target); err != nil {
@@ -916,24 +951,23 @@ func TestSynRetransmitAfterListenerCloseKeepsInboundConn(t *testing.T) {
 	if first.typ != packetTypeState || first.connID != syn.connID || first.ackNr != syn.seqNr {
 		t.Fatalf("first reply: type=%d connID=%d ack=%d, want STATE connID=%d ack=%d", first.typ, first.connID, first.ackNr, syn.connID, syn.seqNr)
 	}
+	// A bare STATE acknowledging the SYN-ACK completes the handshake.
+	handshakeAck := packet{
+		typ:       packetTypeState,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     first.seqNr - 1,
+	}
+	if _, err := rawClient.WriteToUDP(handshakeAck.marshal(), target); err != nil {
+		t.Fatalf("send handshake ACK: %v", err)
+	}
 
 	accepted, err := ln.Accept()
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 	defer accepted.Close()
-
-	// markAccepted runs in the read loop just after the conn is queued, so
-	// Accept can return before the flag is set. Wait for it so the retransmit
-	// below exercises the routing change and not that race.
-	inbound := accepted.(*Conn)
-	deadline := time.Now().Add(2 * time.Second)
-	for !inbound.isAccepted() {
-		if time.Now().After(deadline) {
-			t.Fatal("accepted conn was never marked accepted")
-		}
-		time.Sleep(time.Millisecond)
-	}
 
 	// TorrentManager.Close closes the uTP listener while sessions still hold
 	// the conns it handed out. A SYN retransmit arriving after that must still
@@ -962,7 +996,7 @@ func TestSynRetransmitAfterListenerCloseKeepsInboundConn(t *testing.T) {
 		connID:    syn.connID + 1,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     syn.seqNr + 1,
-		ackNr:     first.seqNr,
+		ackNr:     first.seqNr - 1,
 		payload:   []byte("after-close"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -1032,6 +1066,10 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 			handshakeCh <- handshake{err: err}
 			return
 		}
+		if err := readHandshakeAck(rawPeer, buf); err != nil {
+			handshakeCh <- handshake{err: err}
+			return
+		}
 		handshakeCh <- handshake{syn: syn, addr: addr}
 	}()
 
@@ -1051,11 +1089,7 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 
 	conn.mu.Lock()
 	localSeq, remoteSeq := conn.localSeq, conn.remoteSeq
-	accepted := conn.accepted
 	conn.mu.Unlock()
-	if accepted {
-		t.Fatal("outbound conn was marked accepted by the handshake")
-	}
 
 	syn := packet{
 		typ:       packetTypeSyn,
@@ -1079,6 +1113,16 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 	if reply.typ != packetTypeState || reply.connID != syn.connID || reply.ackNr != syn.seqNr {
 		t.Fatalf("reply to SYN: type=%d connID=%d ack=%d, want STATE connID=%d ack=%d", reply.typ, reply.connID, reply.ackNr, syn.connID, syn.seqNr)
 	}
+	handshakeAck := packet{
+		typ:       packetTypeState,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     reply.seqNr - 1,
+	}
+	if _, err := rawPeer.WriteToUDP(handshakeAck.marshal(), hs.addr); err != nil {
+		t.Fatalf("send handshake ACK: %v", err)
+	}
 
 	inbound, err := ln.Accept()
 	if err != nil {
@@ -1095,13 +1139,9 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 
 	conn.mu.Lock()
 	gotLocal, gotRemote := conn.localSeq, conn.remoteSeq
-	gotAccepted := conn.accepted
 	conn.mu.Unlock()
 	if gotLocal != localSeq || gotRemote != remoteSeq {
 		t.Fatalf("outbound sequence state after SYN: localSeq %d->%d remoteSeq %d->%d", localSeq, gotLocal, remoteSeq, gotRemote)
-	}
-	if gotAccepted {
-		t.Fatal("the SYN marked the outbound conn accepted")
 	}
 
 	writeErr := make(chan error, 1)
@@ -1146,7 +1186,7 @@ func TestSynMatchingOutboundRecvIDOpensNewInboundConn(t *testing.T) {
 		typ:       packetTypeData,
 		connID:    hs.syn.connID,
 		timestamp: uint32(time.Now().UnixMicro()),
-		seqNr:     peerSeq + 1,
+		seqNr:     peerSeq, // the SYN-ACK seq_nr is the first DATA seq_nr
 		ackNr:     data.seqNr,
 		payload:   []byte("pong"),
 	}
@@ -1206,6 +1246,7 @@ func TestSynMatchingInboundRecvIDOpensSecondInboundConn(t *testing.T) {
 		t.Fatalf("send first SYN: %v", err)
 	}
 	firstState := readState("STATE for first SYN", firstSyn.connID)
+	sendHandshakeAck(t, rawClient, target, firstSyn, firstState)
 
 	acceptedA, err := ln.Accept()
 	if err != nil {
@@ -1225,6 +1266,7 @@ func TestSynMatchingInboundRecvIDOpensSecondInboundConn(t *testing.T) {
 	if secondState.ackNr != secondSyn.seqNr {
 		t.Fatalf("second STATE ack = %d, want %d", secondState.ackNr, secondSyn.seqNr)
 	}
+	sendHandshakeAck(t, rawClient, target, secondSyn, secondState)
 
 	acceptedB, err := ln.Accept()
 	if err != nil {
@@ -1245,7 +1287,7 @@ func TestSynMatchingInboundRecvIDOpensSecondInboundConn(t *testing.T) {
 		connID:    connA.recvID,
 		timestamp: uint32(time.Now().UnixMicro()),
 		seqNr:     firstSyn.seqNr + 1,
-		ackNr:     firstState.seqNr,
+		ackNr:     firstState.seqNr - 1,
 		payload:   []byte("hello"),
 	}
 	if _, err := rawClient.WriteToUDP(data.marshal(), target); err != nil {
@@ -1258,5 +1300,38 @@ func TestSynMatchingInboundRecvIDOpensSecondInboundConn(t *testing.T) {
 	}
 	if !bytes.Equal(got, data.payload) {
 		t.Fatalf("first conn payload = %q, want %q", got, data.payload)
+	}
+}
+
+// readHandshakeAck reads the STATE a dialer sends once its SYN is
+// acknowledged, the third leg of the uTP handshake.
+func readHandshakeAck(conn *net.UDPConn, buf []byte) error {
+	n, _, err := conn.ReadFromUDP(buf)
+	if err != nil {
+		return err
+	}
+	p, err := parsePacket(buf[:n])
+	if err != nil {
+		return err
+	}
+	if p.typ != packetTypeState {
+		return fmt.Errorf("handshake ACK type = %d, want STATE", p.typ)
+	}
+	return nil
+}
+
+// sendHandshakeAck completes a raw inbound handshake: a bare STATE that
+// acknowledges synAck is what promotes the half-open conn to Accept.
+func sendHandshakeAck(t *testing.T, conn *net.UDPConn, target *net.UDPAddr, syn, synAck packet) {
+	t.Helper()
+	ack := packet{
+		typ:       packetTypeState,
+		connID:    syn.connID + 1,
+		timestamp: uint32(time.Now().UnixMicro()),
+		seqNr:     syn.seqNr + 1,
+		ackNr:     synAck.seqNr - 1,
+	}
+	if _, err := conn.WriteToUDP(ack.marshal(), target); err != nil {
+		t.Fatalf("send handshake ACK: %v", err)
 	}
 }
