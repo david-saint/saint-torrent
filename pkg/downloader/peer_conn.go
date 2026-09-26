@@ -316,12 +316,20 @@ func underlyingTCPConn(conn net.Conn) *net.TCPConn {
 	return nil
 }
 
+// markPeerAttemptFailed records a failed dial to peerAddr. An inbound
+// connection can hold the same key meanwhile: a uTP peer sends from its
+// listen port, so a connection it opened while our dial to it was in flight
+// is keyed like the dial. The failure then only stamps LastAttempt, leaving
+// the live connection active (visible to the choker, stats and dial gating)
+// and the peer's failure count alone.
 func (s *Session) markPeerAttemptFailed(peerAddr string) {
 	s.mu.Lock()
 	if ps, ok := s.Peers[peerAddr]; ok {
-		ps.Active = false
 		ps.LastAttempt = time.Now()
-		ps.noteDialFailed()
+		if _, live := s.activePeers[peerAddr]; !live {
+			ps.Active = false
+			ps.noteDialFailed()
+		}
 	}
 	s.mu.Unlock()
 }
