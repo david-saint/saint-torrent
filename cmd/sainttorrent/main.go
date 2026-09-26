@@ -1148,15 +1148,66 @@ func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
 	}
 }
 
+// magnetPrefix is the only magnet form accepted; torrent.ParseMagnet requires
+// this exact lowercase spelling.
+const magnetPrefix = "magnet:?"
+
+// maxTorrentFileSize bounds a .torrent read from disk. It is far above real
+// torrents (libtorrent's default limit is 10 MB) and stops a path such as
+// /dev/zero from growing the heap until the process is killed.
+const maxTorrentFileSize = 64 << 20
+
+// urlScheme returns the lowercased RFC 3986 scheme of item, or "" for a plain
+// path. A scheme needs at least two characters so Windows drive letters
+// (C:\x.torrent) stay paths.
+func urlScheme(item string) string {
+	for i := 0; i < len(item); i++ {
+		c := item[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		case c == ':' && i >= 2:
+			return strings.ToLower(item[:i])
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
+// canonicalItem classifies a torrent source from the command line, the IPC
+// socket or the add prompt. A magnet link comes back with its scheme
+// lowercased; a plain path is returned as is. Any other URL is rejected,
+// including an opaque "magnet:x/../../dev/zero": the macOS launcher forwards
+// whatever a web page links to, and reading that as a relative path (which
+// filepath.Abs would clean to /dev/zero) would let a page pick a local file.
+func canonicalItem(item string) (canonical string, isMagnet bool, err error) {
+	switch urlScheme(item) {
+	case "":
+		return item, false, nil
+	case "magnet":
+		if len(item) >= len(magnetPrefix) && item[len(magnetPrefix)-1] == '?' {
+			return magnetPrefix + item[len(magnetPrefix):], true, nil
+		}
+		return "", false, fmt.Errorf("invalid magnet link %q: must start with %q", boundText(item, 128), magnetPrefix)
+	default:
+		return "", false, fmt.Errorf("unsupported URL %q: pass a .torrent file path (./name for a name with ':') or a %s link", boundText(item, 128), magnetPrefix)
+	}
+}
+
 func parseItem(item string) (name string, hashHex string, err error) {
-	if strings.HasPrefix(item, "magnet:?") {
+	item, isMagnet, err := canonicalItem(item)
+	if err != nil {
+		return "", "", err
+	}
+	if isMagnet {
 		mag, err := torrent.ParseMagnet(item)
 		if err != nil {
 			return "", "", err
 		}
 		return mag.Name, fmt.Sprintf("%x", mag.InfoHash), nil
 	}
-	data, err := os.ReadFile(item)
+	data, err := readTorrentFile(item)
 	if err != nil {
 		return "", "", err
 	}
@@ -1167,21 +1218,59 @@ func parseItem(item string) (name string, hashHex string, err error) {
 	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
 }
 
-func normalizeForwardedItems(items []string) []string {
+// readTorrentFile reads a .torrent from disk. parseItem can run on the TUI's
+// event loop, so it refuses anything but a regular file (opening a FIFO
+// blocks, and a device such as /dev/zero never ends) and anything larger than
+// maxTorrentFileSize.
+func readTorrentFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	if fi.Size() > maxTorrentFileSize {
+		return nil, fmt.Errorf("%s: torrent file too large (%d bytes, max %d)", path, fi.Size(), maxTorrentFileSize)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxTorrentFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxTorrentFileSize {
+		return nil, fmt.Errorf("%s: torrent file too large (max %d bytes)", path, maxTorrentFileSize)
+	}
+	return data, nil
+}
+
+// normalizeForwardedItems prepares items for a running instance, whose working
+// directory differs: file paths are made absolute and magnet links are
+// canonicalized. Anything with another URL scheme is rejected here rather
+// than cleaned into a path.
+func normalizeForwardedItems(items []string) ([]string, error) {
 	normalized := make([]string, 0, len(items))
 	for _, item := range items {
-		if strings.HasPrefix(item, "magnet:?") {
-			normalized = append(normalized, item)
+		canonical, isMagnet, err := canonicalItem(item)
+		if err != nil {
+			return nil, err
+		}
+		if isMagnet {
+			normalized = append(normalized, canonical)
 			continue
 		}
-		absPath, err := filepath.Abs(item)
+		absPath, err := filepath.Abs(canonical)
 		if err != nil {
-			normalized = append(normalized, item)
+			normalized = append(normalized, canonical)
 			continue
 		}
 		normalized = append(normalized, absPath)
 	}
-	return normalized
+	return normalized, nil
 }
 
 // usageText returns the help message printed for -h/--help.
@@ -1691,7 +1780,11 @@ func main() {
 			os.Exit(0)
 		}
 
-		normalizedItems := normalizeForwardedItems(filesToAdd)
+		normalizedItems, err := normalizeForwardedItems(filesToAdd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", escapeForTerminal(err.Error()))
+			os.Exit(2)
+		}
 
 		var conn net.Conn
 		var connErr error

@@ -6,8 +6,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"sainttorrent/pkg/downloader"
 )
 
 func TestFindTerminalTTY(t *testing.T) {
@@ -58,5 +62,39 @@ func TestPerfReportRefusesSymlinkedTimingLog(t *testing.T) {
 	}
 	if string(data) != "keep\n" {
 		t.Fatalf("timing report was written through the symlink: %q", data)
+	}
+}
+
+// The primary's TUI parses socket-forwarded items inside Update, before any
+// confirmation. A FIFO must be refused at once rather than blocking the event
+// loop in open, and a device such as /dev/zero must not be read until the
+// process runs out of memory.
+func TestForwardedFIFOOrDeviceIsRefusedWithoutReading(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fifo.torrent")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	m := initialModel(mgr, ".", "", nil)
+
+	done := make(chan model, 1)
+	go func() {
+		updated, _ := m.Update(addTorrentMsg{msg: socketMessage{Items: []string{fifo}, Confirm: true}})
+		done <- updated.(model)
+	}()
+	select {
+	case got := <-done:
+		if len(got.pendingItems) != 1 {
+			t.Fatalf("pending items = %d, want 1", len(got.pendingItems))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update blocked opening a forwarded FIFO")
+	}
+
+	for _, item := range []string{fifo, "/dev/zero"} {
+		if _, _, err := parseItem(item); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("parseItem(%q) err = %v; want not a regular file", item, err)
+		}
 	}
 }

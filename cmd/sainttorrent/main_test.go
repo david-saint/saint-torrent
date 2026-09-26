@@ -1389,7 +1389,10 @@ func TestConfirmedForwardDoesNotProbePathsOnTUIEventLoop(t *testing.T) {
 func TestRelativeTorrentPathNormalization(t *testing.T) {
 	files := []string{"magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626", "some/relative/path.torrent"}
 
-	normalized := normalizeForwardedItems(files)
+	normalized, err := normalizeForwardedItems(files)
+	if err != nil {
+		t.Fatalf("normalizeForwardedItems: %v", err)
+	}
 
 	if normalized[0] != files[0] {
 		t.Errorf("magnet link should not be changed, got %s", normalized[0])
@@ -1400,6 +1403,106 @@ func TestRelativeTorrentPathNormalization(t *testing.T) {
 	expectedAbs, _ := filepath.Abs("some/relative/path.torrent")
 	if normalized[1] != expectedAbs {
 		t.Errorf("expected %s, got %s", expectedAbs, normalized[1])
+	}
+}
+
+// The magnet launcher forwards whatever a page links to. An opaque
+// "magnet:x/../.." URL must never be cleaned into an absolute path such as
+// /dev/zero (which the primary would then read on its event loop).
+func TestNormalizeForwardedItemsNeverTurnsURLsIntoPaths(t *testing.T) {
+	for _, item := range []string{
+		"magnet:x/../../../../../../../../../../../../dev/zero",
+		"MAGNET:x/../../../../dev/zero",
+		"magnet:/../../dev/zero",
+		"magnet:",
+		"http://evil.example/x.torrent",
+		"file:///dev/zero",
+		"x-evil:../../../../dev/zero",
+	} {
+		got, err := normalizeForwardedItems([]string{item})
+		if err == nil || got != nil {
+			t.Fatalf("normalizeForwardedItems(%q) = %q, %v; want rejection", item, got, err)
+		}
+	}
+
+	const hash = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
+	got, err := normalizeForwardedItems([]string{"MAGNET:?xt=urn:btih:" + hash, `C:\x.torrent`, "./has:colon.torrent"})
+	if err != nil {
+		t.Fatalf("normalizeForwardedItems: %v", err)
+	}
+	if got[0] != "magnet:?xt=urn:btih:"+hash {
+		t.Fatalf("magnet scheme not canonicalized: %q", got[0])
+	}
+	for _, p := range got[1:] {
+		if !filepath.IsAbs(p) {
+			t.Fatalf("path %q was not made absolute", p)
+		}
+	}
+}
+
+func TestCanonicalItem(t *testing.T) {
+	cases := []struct {
+		item      string
+		canonical string
+		magnet    bool
+		ok        bool
+	}{
+		{"magnet:?xt=urn:btih:x", "magnet:?xt=urn:btih:x", true, true},
+		{"Magnet:?xt=urn:btih:x", "magnet:?xt=urn:btih:x", true, true},
+		{"magnet:x/../dev/zero", "", false, false},
+		{"magnet:", "", false, false},
+		{"https://example.com/a.torrent", "", false, false},
+		{"/abs/path:with-colon.torrent", "/abs/path:with-colon.torrent", false, true},
+		{"relative/a.torrent", "relative/a.torrent", false, true},
+		{`C:\Users\me\a.torrent`, `C:\Users\me\a.torrent`, false, true},
+		{"c:/a.torrent", "c:/a.torrent", false, true},
+		{"1ab:c.torrent", "1ab:c.torrent", false, true},
+	}
+	for _, tc := range cases {
+		canonical, magnet, err := canonicalItem(tc.item)
+		if (err == nil) != tc.ok || canonical != tc.canonical || magnet != tc.magnet {
+			t.Errorf("canonicalItem(%q) = %q, %v, %v; want %q, %v, ok=%v", tc.item, canonical, magnet, err, tc.canonical, tc.magnet, tc.ok)
+		}
+	}
+}
+
+// A forwarded or typed path is read on the TUI event loop, so parseItem must
+// refuse devices and oversized files instead of reading them whole.
+func TestParseItemBoundsTorrentFileReads(t *testing.T) {
+	if _, _, err := parseItem("magnet:x/../../../../../../dev/zero"); err == nil || !strings.Contains(err.Error(), "invalid magnet link") {
+		t.Fatalf("opaque magnet: err = %v; want invalid magnet link", err)
+	}
+
+	big := filepath.Join(t.TempDir(), "big.torrent")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxTorrentFileSize + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("oversized file: err = %v; want too large", err)
+	}
+
+	if _, _, err := parseItem(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory: err = %v; want not a regular file", err)
+	}
+}
+
+// Canonicalizing inside addTorrentWithDownloadPaths lets an upper-case magnet
+// scheme through to the manager, whose parser requires "magnet:?".
+func TestAddTorrentAcceptsUpperCaseMagnetScheme(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	sess, err := addTorrentWithDownloadPaths(mgr, "MAGNET:?xt=urn:btih:642e85596f7a0dd05eefdb78b0ac1736496f8626&dn=Upper", downloadPathOptions{primary: t.TempDir()})
+	if err != nil {
+		t.Fatalf("addTorrentWithDownloadPaths: %v", err)
+	}
+	if sess == nil || mgr.GetSession("642e85596f7a0dd05eefdb78b0ac1736496f8626") == nil {
+		t.Fatal("magnet session was not added")
 	}
 }
 
