@@ -109,9 +109,25 @@ func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []s
 	}
 	keys := pathClaimKeys(baseDir, relPaths)
 
+	sharedWith, err := m.addHolds(infoHash, keys, files, relPaths, baseDir)
+	if err != nil {
+		return nil, err
+	}
+	if sharedWith > 0 && logging.Enabled() {
+		logging.Warn("payload_files_shared",
+			logging.String("info_hash", fmt.Sprintf("%x", infoHash)),
+			logging.String("download_dir", baseDir),
+			logging.Int("files", sharedWith),
+		)
+	}
+	return m.releaseHoldFunc(infoHash, keys), nil
+}
+
+// addHolds records infoHash's claims on keys, all or none, and returns how many
+// of the paths it now shares with another torrent.
+func (m *TorrentManager) addHolds(infoHash [20]byte, keys []pathClaimKey, files []storage.FileInfo, relPaths []string, baseDir string) (sharedWith int, err error) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
-	sharedWith := 0
 	for i, key := range keys {
 		c, ok := m.pathClaims[key]
 		if !ok || m.ownRefsLocked(key, c, infoHash) > 0 {
@@ -122,7 +138,7 @@ func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []s
 			if c.refs > 0 {
 				owner = fmt.Sprintf(" (torrent %x)", c.infoHash)
 			}
-			return nil, fmt.Errorf("%w: %q in %s%s", ErrPathInUse, relPaths[i], baseDir, owner)
+			return 0, fmt.Errorf("%w: %q in %s%s", ErrPathInUse, relPaths[i], baseDir, owner)
 		}
 		if c.refs+c.shared > 0 {
 			sharedWith++
@@ -131,14 +147,7 @@ func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []s
 	for i, key := range keys {
 		m.addHoldLocked(key, infoHash, files[i].Length)
 	}
-	if sharedWith > 0 && logging.Enabled() {
-		logging.Warn("payload_files_shared",
-			logging.String("info_hash", fmt.Sprintf("%x", infoHash)),
-			logging.String("download_dir", baseDir),
-			logging.Int("files", sharedWith),
-		)
-	}
-	return m.releaseHoldFunc(infoHash, keys), nil
+	return sharedWith, nil
 }
 
 // addHoldLocked records one claim by infoHash on key. Caller holds m.claimMu
