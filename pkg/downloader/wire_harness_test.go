@@ -100,6 +100,17 @@ func fastReserved() [8]byte {
 
 func startWirePeer(t *testing.T, sess *Session, port uint16, reserved [8]byte) *wirePeer {
 	t.Helper()
+	return startWirePeerConn(t, sess, port, reserved, false)
+}
+
+// startOutboundWirePeer is startWirePeer for a connection we dialled.
+func startOutboundWirePeer(t *testing.T, sess *Session, port uint16, reserved [8]byte) *wirePeer {
+	t.Helper()
+	return startWirePeerConn(t, sess, port, reserved, true)
+}
+
+func startWirePeerConn(t *testing.T, sess *Session, port uint16, reserved [8]byte, outbound bool) *wirePeer {
+	t.Helper()
 	clientConn, remoteConn := net.Pipe()
 	client := peer.NewClient(clientConn, sess.Torrent.InfoHash, sess.PeerID)
 	w := &wirePeer{
@@ -110,7 +121,7 @@ func startWirePeer(t *testing.T, sess *Session, port uint16, reserved [8]byte) *
 	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	go func() {
-		sess.runPeerMessageLoop(client, clientConn, addr, "127.0.0.1", port, reserved, false)
+		sess.runPeerMessageLoop(client, clientConn, addr, "127.0.0.1", port, reserved, outbound)
 		close(w.done)
 	}()
 	go func() {

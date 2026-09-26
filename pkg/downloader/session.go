@@ -1900,6 +1900,13 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.metadataCompleted = true
 	s.metadataMode = false
 	close(s.metadataCompletedCh)
+	// Wake every connection so it sends its bitfield and interest now (see
+	// runPeerMessageLoop): a seed that has sent all it will before we are
+	// interested would otherwise leave the connection idle until the stall
+	// reaper or the inactivity drop. Notify never blocks.
+	for _, c := range s.activePeers {
+		c.Notify()
+	}
 	s.mu.Unlock()
 
 	if s.OnStateChange != nil {

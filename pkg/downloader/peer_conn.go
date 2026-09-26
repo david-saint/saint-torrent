@@ -2644,6 +2644,48 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
 	// peerInterestScanInterval.
 	var lastInterestScanAt time.Time
+	// initAfterMetadata moves a connection opened before metadata into the
+	// download: it sends our bitfield and interest and replays the
+	// availability and allowed-fast offers the peer sent before the piece count
+	// was known. numPieces is the torrent's piece count.
+	initAfterMetadata := func(numPieces int) {
+		if numPieces > 0 {
+			client.SetBitfieldLimit(numPieces)
+		}
+		sendInitialPeerState()
+
+		// onMetadataDownloaded installs the piece table before it leaves
+		// metadata mode, so a bitfield or have_all handled in between was
+		// applied at its real length already; replacing it with an empty one
+		// would hide the peer's pieces and leak their availability.
+		if len(peerBitfield) != (numPieces+7)/8 {
+			peerBitfield = make([]byte, (numPieces+7)/8)
+		}
+		initializedPeersAndBitfield = true
+
+		// Replay any availability the peer announced before we had metadata
+		// (have_none is the default zero bitfield, so nothing to do). A buffered
+		// bitfield whose length does not fit the real piece count is dropped.
+		if numPieces > 0 {
+			switch {
+			case peerHaveAllPending:
+				markPeerSeed(numPieces)
+			case pendingBitfield != nil && len(pendingBitfield) == (numPieces+7)/8:
+				applyAnnouncedBitfield(pendingBitfield, numPieces)
+			}
+		}
+		peerHaveAllPending = false
+		pendingBitfield = nil
+		for _, idx := range pendingAllowedFast {
+			if idx >= 0 && idx < int64(numPieces) {
+				peerAllowedFast[idx] = struct{}{}
+			}
+		}
+		noPick = false
+		pendingAllowedFast = nil
+		pendingAllowedFastSet = nil
+	}
+
 	// The loop's own guard, deferred last so it is the first to see a panic in
 	// the loop: it ends the process before any cleanup above runs, including
 	// the ones that take s.mu, which the panicking code may still hold.
@@ -2655,10 +2697,25 @@ peerLoop:
 
 		s.mu.RLock()
 		paused := s.paused
+		// A connection opened before metadata switches to the download as soon
+		// as metadata is in, whatever woke the loop: a seed that already sent
+		// have_all and the info dict says nothing more until we are interested,
+		// and keep-alives, ticks and Notify (onMetadataDownloaded wakes every
+		// connection) never reach the per-message switch below.
+		leftMetadata := !initializedPeersAndBitfield && !s.metadataMode
+		piecesAtSwitch := 0
+		if leftMetadata {
+			piecesAtSwitch = len(s.PieceStates)
+		}
 		s.mu.RUnlock()
 		if paused {
 			disconnectReason = "paused"
 			break
+		}
+		if leftMetadata {
+			initAfterMetadata(piecesAtSwitch)
+			dropCompletedElsewhere()
+			scheduleRateRetry(minRetry(pump(), uploadPump()))
 		}
 
 		// Reap an unproductive peer: drop a connection that hasn't delivered a block
@@ -2756,8 +2813,8 @@ peerLoop:
 			if initializedPeersAndBitfield {
 				_ = client.SendQueuedHaves()
 			} else {
-				// Nothing may precede the bitfield, which is sent once metadata
-				// is in and already covers these pieces.
+				// Nothing may precede the bitfield, which is sent at the top of
+				// the loop once metadata is in and already covers these pieces.
 				client.DropQueuedHaves()
 			}
 			continue
@@ -2843,42 +2900,7 @@ peerLoop:
 		}
 
 		if !inMetaNow && !initializedPeersAndBitfield {
-			// Initialize now that metadata is downloaded!
-			if numPiecesNow > 0 {
-				client.SetBitfieldLimit(numPiecesNow)
-			}
-			sendInitialPeerState()
-
-			// onMetadataDownloaded installs the piece table before it leaves
-			// metadata mode, so a bitfield or have_all handled in between was
-			// applied at its real length already; replacing it with an empty one
-			// would hide the peer's pieces and leak their availability.
-			if len(peerBitfield) != (numPiecesNow+7)/8 {
-				peerBitfield = make([]byte, (numPiecesNow+7)/8)
-			}
-			initializedPeersAndBitfield = true
-
-			// Replay any availability the peer announced before we had metadata
-			// (have_none is the default zero bitfield, so nothing to do). A buffered
-			// bitfield whose length does not fit the real piece count is dropped.
-			if numPiecesNow > 0 {
-				switch {
-				case peerHaveAllPending:
-					markPeerSeed(numPiecesNow)
-				case pendingBitfield != nil && len(pendingBitfield) == (numPiecesNow+7)/8:
-					applyAnnouncedBitfield(pendingBitfield, numPiecesNow)
-				}
-			}
-			peerHaveAllPending = false
-			pendingBitfield = nil
-			for _, idx := range pendingAllowedFast {
-				if idx >= 0 && idx < int64(numPiecesNow) {
-					peerAllowedFast[idx] = struct{}{}
-				}
-			}
-			noPick = false
-			pendingAllowedFast = nil
-			pendingAllowedFastSet = nil
+			initAfterMetadata(numPiecesNow)
 		}
 
 		// A peer that never negotiated the fast extension shouldn't be sending its
