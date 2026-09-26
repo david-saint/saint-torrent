@@ -638,6 +638,10 @@ func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 type Listener struct {
 	socket *Socket
 
+	// mu serializes enqueue with Close, so no conn can land in acceptCh
+	// after Close has drained it. It is taken once per promoted inbound
+	// connection, never per packet.
+	mu       sync.Mutex
 	acceptCh chan *Conn
 	closed   chan struct{}
 	once     sync.Once
@@ -655,13 +659,17 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 }
 
+// enqueue hands c to Accept, reporting false when the listener is closed or
+// its queue is full; the caller then owns c and must close it.
 func (l *Listener) enqueue(c *Conn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Checked under mu: a send racing Close could otherwise be chosen after
+	// Close drained the queue, stranding c there with its receive buffer.
 	if l.isClosed() {
 		return false
 	}
 	select {
-	case <-l.closed:
-		return false
 	case l.acceptCh <- c:
 		return true
 	default:
@@ -684,7 +692,12 @@ func (l *Listener) isClosed() bool {
 // released instead of lingering until the whole Socket is closed.
 func (l *Listener) Close() error {
 	l.once.Do(func() {
+		// Once closed is closed under mu no enqueue can add to acceptCh, so
+		// the drain below sees every conn left in it. The conns are closed
+		// outside mu.
+		l.mu.Lock()
 		close(l.closed)
+		l.mu.Unlock()
 		l.socket.mu.Lock()
 		if l.socket.listener == l {
 			l.socket.listener = nil

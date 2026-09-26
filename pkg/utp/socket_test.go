@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1703,5 +1704,58 @@ func TestResetCarryingOurSendIDClosesConn(t *testing.T) {
 				t.Fatalf("RESETs drew a reply of type %d", p.typ)
 			}
 		})
+	}
+}
+
+// TestListenerEnqueueCloseRace runs enqueue against Close. enqueue used to
+// check for a closed listener and then select between the closed channel and
+// the queue, so a send could win after Close had drained the queue and strand
+// the conn there, holding its receive buffer until the socket closed. Every
+// conn must now either be refused, for its caller to close, or be closed by
+// the drain.
+func TestListenerEnqueueCloseRace(t *testing.T) {
+	s := newServerSocket(t)
+	sink := newRawPeer(t, s) // absorbs the FINs of drained conns
+	remote := sink.conn.LocalAddr().(*net.UDPAddr)
+	const (
+		iterations = 2000
+		enqueuers  = 4
+	)
+	for i := 0; i < iterations; i++ {
+		ln := s.Listen()
+		conns := make([]*Conn, enqueuers)
+		queued := make([]bool, enqueuers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for j := range conns {
+			conns[j] = newInboundConn(s, remote, uint16(2*j), 1, 100)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				queued[j] = ln.enqueue(conns[j])
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = ln.Close()
+		}()
+		close(start)
+		wg.Wait()
+
+		if n := len(ln.acceptCh); n != 0 {
+			t.Fatalf("iteration %d: %d conns left in the accept queue after Close", i, n)
+		}
+		for j, c := range conns {
+			if !queued[j] {
+				c.closeWithError(errListenerClosed, false)
+				continue
+			}
+			if c.errIfClosed() == nil {
+				t.Fatalf("iteration %d: conn enqueued around Close was left open", i)
+			}
+		}
 	}
 }
