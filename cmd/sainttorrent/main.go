@@ -2112,6 +2112,14 @@ func main() {
 		writeHeadlessStartupMessages(os.Stderr, startupInfos, startupWarns)
 		waitForShutdownSignal()
 	} else {
+		// Closing the terminal window quits like q does (see notifyHangup).
+		hangup := make(chan os.Signal, 1)
+		if notifyHangup(hangup) {
+			go func() {
+				<-hangup
+				p.Quit()
+			}()
+		}
 		if _, err := p.Run(); err != nil {
 			if errors.Is(err, tea.ErrProgramPanic) {
 				// Bubble Tea recovered the panic, printed it and restored the
@@ -2208,8 +2216,29 @@ func redirectStdLog() {
 func waitForShutdownSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	hangup := make(chan os.Signal, 1)
+	notifyHangup(hangup)
+	select {
+	case <-sigCh:
+	case <-hangup:
+	}
 	signal.Stop(sigCh)
+}
+
+// notifyHangup relays SIGHUP to ch for the rest of the run and reports whether
+// it does. Closing the terminal window hangs saintTorrent up, and Go's default
+// for SIGHUP is to exit at once: the session state goes unsaved and the running
+// sentinel stays behind, so the next start takes the close for a crash, and two
+// in a row restore every torrent paused. The caller shuts down cleanly on the
+// first SIGHUP; later ones land in the full channel and are dropped instead of
+// killing the shutdown. A SIGHUP ignored at startup (nohup) stays ignored,
+// which Notify would undo.
+func notifyHangup(ch chan<- os.Signal) bool {
+	if signal.Ignored(syscall.SIGHUP) {
+		return false
+	}
+	signal.Notify(ch, syscall.SIGHUP)
+	return true
 }
 
 // tuiStartupLine joins startup warnings and infos into the TUI's single

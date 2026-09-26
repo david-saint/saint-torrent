@@ -312,11 +312,13 @@ not exit cleanly, and:
   startup line names its info-hash, and `--start-paused` loads it paused and
   quarantined.
 - A crash no torrent is blamed for (the terminal UI, the DHT, a fatal runtime
-  error, or the process being killed, which includes closing its terminal
-  window) in the first 10 minutes of a run is counted. After two such crashes
-  in a row, every torrent is restored paused, and the startup line says
-  `saintTorrent stopped unexpectedly twice in a row; all torrents were restored
-  paused`. A clean exit, or a run that lasted 10 minutes, resets the count.
+  error, or the process being killed outright by `SIGKILL`, the OOM killer or
+  a power cut) in the first 10 minutes of a run is counted. After two such crashes in a row, every torrent is
+  restored paused, and the startup line says `saintTorrent stopped
+  unexpectedly twice in a row; all torrents were restored paused`. A clean
+  exit, or a run that lasted 10 minutes, resets the count. Quitting with `q`,
+  `Ctrl+C`, `SIGTERM`, or closing the terminal window (`SIGHUP`) is a clean
+  exit.
 
 Start with `--start-paused` to restore every torrent paused regardless, for
 example to get past a crash loop and resume torrents one at a time.
