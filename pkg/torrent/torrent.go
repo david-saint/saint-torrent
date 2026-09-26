@@ -66,10 +66,10 @@ func Parse(data []byte) (*Torrent, error) {
 	// 1. Announce / Trackers
 	var announce string
 	if raw, ok := getString(dict, "announce"); ok {
-		announce, _ = normalizeURL(raw, true)
+		announce, _ = normalizeURL(raw, true, MaxTrackerURLLength)
 	}
 
-	trackers := newURLSet(maxTrackers, true)
+	trackers := newURLSet(maxTrackers, true, MaxTrackerURLLength)
 	if announceList, ok := dict["announce-list"].([]interface{}); ok {
 	tiers:
 		for _, tierVal := range announceList {
@@ -90,7 +90,7 @@ func Parse(data []byte) (*Torrent, error) {
 		trackers.list = []string{announce}
 	}
 
-	webSeeds := newURLSet(maxWebSeeds, false)
+	webSeeds := newURLSet(maxWebSeeds, false, MaxWebSeedURLLength)
 	switch v := dict["url-list"].(type) {
 	case string:
 		webSeeds.add(v)

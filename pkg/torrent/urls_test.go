@@ -129,3 +129,56 @@ func TestParseMagnetTrackersNormalizedAndCapped(t *testing.T) {
 		t.Fatalf("Trackers start %q, want the normalized udp tracker then the first http one", ml.Trackers[:2])
 	}
 }
+
+// urlOfLength pads prefix with 'a' to exactly n bytes.
+func urlOfLength(prefix string, n int) string {
+	return prefix + strings.Repeat("a", n-len(prefix))
+}
+
+func trackerURLOfLength(n int) string {
+	return urlOfLength("http://tracker.example/announce?passkey=", n)
+}
+
+// TestParseDropsOverlongURLs (CVE-2008-4434 family): tracker and url-list
+// entries were bounded only by the 100 MiB file cap, so one entry could run
+// to megabytes, stored with the torrent and sent with every announce or range
+// request. Over-long entries are skipped and the rest still parse in order.
+func TestParseDropsOverlongURLs(t *testing.T) {
+	seedAt := func(n int) string { return urlOfLength("http://seed.example/", n) }
+	// Short enough as given, but escaping each 2-byte rune to "%C3%A9"
+	// triples it past the cap.
+	escapesLong := "http://tracker.example/" + strings.Repeat("é", (MaxTrackerURLLength-len("http://tracker.example/"))/2)
+
+	tor := parseWithTopLevel(t, map[string]interface{}{
+		"announce": trackerURLOfLength(MaxTrackerURLLength + 1),
+		"announce-list": []interface{}{
+			[]interface{}{"udp://first.example:1337/announce", trackerURLOfLength(MaxTrackerURLLength + 1)},
+			[]interface{}{trackerURLOfLength(1 << 20), escapesLong, trackerURLOfLength(MaxTrackerURLLength), "http://last.example/announce"},
+		},
+		"url-list": []interface{}{
+			seedAt(MaxWebSeedURLLength + 1),
+			"http://seed-a.example/",
+			seedAt(MaxWebSeedURLLength),
+			seedAt(1 << 20),
+			"http://seed-b.example/",
+		},
+	})
+	if tor.Announce != "" {
+		t.Fatalf("Announce is %d bytes, want the over-long announce dropped", len(tor.Announce))
+	}
+	wantTrackers := []string{"udp://first.example:1337/announce", trackerURLOfLength(MaxTrackerURLLength), "http://last.example/announce"}
+	if !reflect.DeepEqual(tor.Trackers, wantTrackers) {
+		t.Fatalf("kept %d trackers %.80q, want %.80q", len(tor.Trackers), tor.Trackers, wantTrackers)
+	}
+	wantSeeds := []string{"http://seed-a.example/", seedAt(MaxWebSeedURLLength), "http://seed-b.example/"}
+	if !reflect.DeepEqual(tor.WebSeeds, wantSeeds) {
+		t.Fatalf("kept %d web seeds %.80q, want %.80q", len(tor.WebSeeds), tor.WebSeeds, wantSeeds)
+	}
+
+	// A lone announce at the cap is kept and becomes the tracker list.
+	exact := trackerURLOfLength(MaxTrackerURLLength)
+	tor = parseWithTopLevel(t, map[string]interface{}{"announce": exact})
+	if tor.Announce != exact || !reflect.DeepEqual(tor.Trackers, []string{exact}) {
+		t.Fatalf("Announce is %d bytes and Trackers %d entries, want the %d-byte announce kept", len(tor.Announce), len(tor.Trackers), MaxTrackerURLLength)
+	}
+}

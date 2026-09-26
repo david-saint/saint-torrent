@@ -290,10 +290,20 @@ const maxScrapeResponse = 64 * 1024
 // without its own deadline, so an exported call can never hang indefinitely.
 const defaultScrapeTimeout = 30 * time.Second
 
-// ParseAnnounceURL parses a tracker announce URL and checks that it names a
-// host and a supported scheme: http, https or udp, in any letter case (the
-// returned URL's Scheme is lowercase).
+// MaxAnnounceURLLength bounds a tracker URL as configured, like
+// torrent.MaxTrackerURLLength bounds those read from metainfo and magnet
+// links; trackers restored from saved state or added later are checked here
+// too. It does not apply to the request URL BuildTrackerURL derives.
+const MaxAnnounceURLLength = 2048
+
+// ParseAnnounceURL parses a tracker announce URL and checks that it is at
+// most MaxAnnounceURLLength bytes and names a host and a supported scheme:
+// http, https or udp, in any letter case (the returned URL's Scheme is
+// lowercase).
 func ParseAnnounceURL(raw string) (*url.URL, error) {
+	if len(raw) > MaxAnnounceURLLength {
+		return nil, fmt.Errorf("%w: tracker URL is %d bytes, more than the maximum of %d", ErrURLTooLong, len(raw), MaxAnnounceURLLength)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, err

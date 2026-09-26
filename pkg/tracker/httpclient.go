@@ -64,8 +64,16 @@ const (
 	PurposeWebseed
 )
 
+// MaxWebseedURLLength bounds a webseed request URL, the url-list entry with
+// the file's escaped path appended, like torrent.MaxWebSeedURLLength bounds
+// the entry itself. Longer URLs are refused before anything is sent.
+const MaxWebseedURLLength = 4096
+
 // ErrDestinationRefused marks a request refused by the SSRF policy.
 var ErrDestinationRefused = errors.New("destination refused")
+
+// ErrURLTooLong marks a tracker or webseed URL refused for its length.
+var ErrURLTooLong = errors.New("URL too long")
 
 // requestPolicy travels in the request context so the transport and dialer
 // can apply it to every redirect hop.
@@ -112,8 +120,12 @@ func newHTTPClient() *http.Client {
 }
 
 // NewRequest builds a GET for rawURL whose destination policy is derived from
-// rawURL itself. It fails early when rawURL already breaks the policy.
+// rawURL itself. It fails early when rawURL already breaks the policy, or is
+// a webseed URL longer than MaxWebseedURLLength.
 func NewRequest(ctx context.Context, purpose Purpose, rawURL string) (*http.Request, error) {
+	if purpose == PurposeWebseed && len(rawURL) > MaxWebseedURLLength {
+		return nil, fmt.Errorf("%w: webseed URL is %d bytes, more than the maximum of %d", ErrURLTooLong, len(rawURL), MaxWebseedURLLength)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
