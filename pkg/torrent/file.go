@@ -12,19 +12,17 @@ import (
 // whole file into a tree many times its size before unknown keys are dropped.
 const MaxFileSize = 100 << 20
 
-// ReadFile reads a .torrent file of at most MaxFileSize bytes. The size is
-// checked on the open file before anything is read, and the read itself is
-// bounded too, for a file that grows meanwhile or reports no size (a pipe).
+// ReadFile reads a .torrent file of at most MaxFileSize bytes. Only regular
+// files are read: a FIFO, device or directory at path is refused without
+// blocking, since opening a FIFO or reading a device could hang the caller
+// forever. The size is checked on the open file before anything is read, and
+// the read itself is bounded too, for a file that grows meanwhile.
 func ReadFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, info, err := openRegular(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
 	if info.Size() > MaxFileSize {
 		return nil, fileTooLarge(path)
 	}
@@ -36,6 +34,26 @@ func ReadFile(path string) ([]byte, error) {
 		return nil, fileTooLarge(path)
 	}
 	return buf.Bytes(), nil
+}
+
+// openRegular opens path for reading and returns it with its FileInfo, or an
+// error when it is not a regular file. The check runs on the open file, so
+// nothing can be swapped in between it and the read.
+func openRegular(path string) (*os.File, os.FileInfo, error) {
+	f, err := openForRead(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	return f, info, nil
 }
 
 func fileTooLarge(path string) error {

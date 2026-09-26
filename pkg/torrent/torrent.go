@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -65,10 +66,10 @@ func Parse(data []byte) (*Torrent, error) {
 	// 1. Announce / Trackers
 	var announce string
 	if raw, ok := getString(dict, "announce"); ok {
-		announce, _ = normalizeURL(raw, true)
+		announce, _ = normalizeURL(raw, true, MaxTrackerURLLength)
 	}
 
-	trackers := newURLSet(maxTrackers, true)
+	trackers := newURLSet(maxTrackers, true, MaxTrackerURLLength)
 	if announceList, ok := dict["announce-list"].([]interface{}); ok {
 	tiers:
 		for _, tierVal := range announceList {
@@ -89,7 +90,7 @@ func Parse(data []byte) (*Torrent, error) {
 		trackers.list = []string{announce}
 	}
 
-	webSeeds := newURLSet(maxWebSeeds, false)
+	webSeeds := newURLSet(maxWebSeeds, false, MaxWebSeedURLLength)
 	switch v := dict["url-list"].(type) {
 	case string:
 		webSeeds.add(v)
@@ -260,13 +261,18 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 	// Reject paths that differ only in case or Unicode normalization: case- or
 	// normalization-insensitive filesystems would store them as one file.
 	seenPaths := make(map[string]struct{}, len(files))
-	for _, f := range files {
+	keys := make([]string, len(files))
+	for i, f := range files {
 		relPath := filepath.Join(f.Path...)
 		key := pathKey(relPath)
 		if _, dup := seenPaths[key]; dup {
 			return nil, fmt.Errorf("duplicate file path detected in torrent metadata: %q", relPath)
 		}
 		seenPaths[key] = struct{}{}
+		keys[i] = key
+	}
+	if err := checkFileDirCollisions(files, keys); err != nil {
+		return nil, err
 	}
 	pieceHashes := make([][20]byte, numPieces)
 	for i := range pieceHashes {
@@ -282,6 +288,55 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 		InfoBytes:   infoBytes,
 		Private:     private,
 	}, nil
+}
+
+// pathEntry names a file or directory in a torrent's folded path tree: a
+// folded path component inside the directory numbered parent (0 is the root).
+type pathEntry struct {
+	parent int
+	name   string
+}
+
+// checkFileDirCollisions rejects a file whose path is also the directory of
+// another file, as in [a] and [a b]: no filesystem can lay that out.
+// libtorrent renames such a file (within max_duplicate_filenames attempts);
+// here it is refused like a duplicate path. keys are the files' pathKey
+// values, so case and normalization fold exactly as in the duplicate check;
+// folding neither adds nor removes a separator, and sanitized components hold
+// none. Each directory component is hashed once, under its parent's number,
+// so the cost is linear in the path bytes: keying every directory by its
+// whole path would hash and keep O(depth^2) bytes per file, 64 times the
+// metadata for 128-deep paths.
+func checkFileDirCollisions(files []File, keys []string) error {
+	if len(files) < 2 {
+		return nil
+	}
+	sep := string(filepath.Separator)
+	dirs := make(map[pathEntry]int)
+	leaves := make([]pathEntry, len(files))
+	for i, key := range keys {
+		parent, rest := 0, key
+		for {
+			name, tail, ok := strings.Cut(rest, sep)
+			if !ok {
+				break
+			}
+			dir := pathEntry{parent: parent, name: name}
+			id, seen := dirs[dir]
+			if !seen {
+				id = len(dirs) + 1
+				dirs[dir] = id
+			}
+			parent, rest = id, tail
+		}
+		leaves[i] = pathEntry{parent: parent, name: rest}
+	}
+	for i, leaf := range leaves {
+		if _, isDir := dirs[leaf]; isDir {
+			return fmt.Errorf("file path %q is also a directory in torrent metadata", filepath.Join(files[i].Path...))
+		}
+	}
+	return nil
 }
 
 // checkPieceCount rejects a piece count above MaxPieceCount or one that does

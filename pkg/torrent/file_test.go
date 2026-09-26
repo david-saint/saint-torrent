@@ -39,3 +39,29 @@ func TestReadFileReturnsWholeFile(t *testing.T) {
 		t.Fatalf("ReadFile = %q, %v; want the file", got, err)
 	}
 }
+
+// TestReadFileRefusesDirectory: only regular files are read.
+func TestReadFileRefusesDirectory(t *testing.T) {
+	if data, err := ReadFile(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("ReadFile(directory) = %d bytes, %v; want a not-a-regular-file error", len(data), err)
+	}
+}
+
+// TestReadFileFollowsSymlink: users pass symlinked .torrent files, so the
+// regular-file check applies to the link's target.
+func TestReadFileFollowsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	want := []byte("d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:01234567890123456789ee")
+	target := filepath.Join(dir, "real.torrent")
+	if err := os.WriteFile(target, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.torrent")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	got, err := ReadFile(link)
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("ReadFile(symlink) = %q, %v; want the target's contents", got, err)
+	}
+}

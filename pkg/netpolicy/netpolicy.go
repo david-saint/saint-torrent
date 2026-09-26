@@ -1,7 +1,9 @@
 // Package netpolicy classifies network endpoints learned from untrusted
 // sources — trackers, DHT nodes, PEX messages, and URLs inside torrents — so
 // a remote party cannot aim the client's connections at loopback or LAN
-// services (SSRF), or at addresses that can never be a real peer.
+// services (SSRF), or at addresses that can never be a real peer. "LAN" here
+// includes carrier-grade NAT space (100.64.0.0/10), which holds ISP-internal
+// services and Tailscale tailnets and is unreachable from the internet.
 //
 // The rule mirrors libtorrent's ssrf_mitigation: an endpoint may be at most as
 // "local" as whoever told us about it. A loopback tracker may hand out
@@ -25,10 +27,17 @@ const (
 	// ScopeLinkLocal is 169.254.0.0/16 (including cloud metadata
 	// endpoints) and fe80::/10.
 	ScopeLinkLocal
-	// ScopePrivate is RFC 1918 and fc00::/7 unique-local space.
+	// ScopePrivate is RFC 1918, 100.64.0.0/10 carrier-grade NAT (RFC 6598,
+	// also Tailscale's address space), fc00::/7 unique-local and fec0::/10
+	// deprecated site-local space, as libtorrent's is_local counts them.
 	ScopePrivate
 	// ScopeGlobal is everything else.
 	ScopeGlobal
+)
+
+var (
+	cgnatPrefix     = netip.MustParsePrefix("100.64.0.0/10")
+	siteLocalPrefix = netip.MustParsePrefix("fec0::/10")
 )
 
 // Classify returns the scope of a. IPv4-mapped IPv6 addresses are classified
@@ -48,7 +57,7 @@ func Classify(a netip.Addr) Scope {
 		return ScopeLoopback
 	case a.IsLinkLocalUnicast():
 		return ScopeLinkLocal
-	case a.IsPrivate():
+	case a.IsPrivate(), cgnatPrefix.Contains(a), siteLocalPrefix.Contains(a):
 		return ScopePrivate
 	}
 	return ScopeGlobal

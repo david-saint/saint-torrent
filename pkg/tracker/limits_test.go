@@ -10,11 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"sainttorrent/pkg/torrent"
 )
 
 func bencodeString(s string) string { return strconv.Itoa(len(s)) + ":" + s }
@@ -249,6 +252,66 @@ func TestScrapeDispatchesOnParsedScheme(t *testing.T) {
 		if _, err := Scrape(ctx, bad, hash); err == nil || !strings.Contains(err.Error(), "unsupported tracker scheme") {
 			t.Fatalf("Scrape(%q) err = %v, want unsupported scheme", bad, err)
 		}
+	}
+}
+
+// padURL pads prefix with 'a' to exactly n bytes.
+func padURL(prefix string, n int) string {
+	return prefix + strings.Repeat("a", n-len(prefix))
+}
+
+// TestParseAnnounceURLCapsLength (CVE-2008-4434 family): the session's
+// tracker list runs every URL through ParseAnnounceURL, trackers restored
+// from saved state or added later included, so an over-long one is dropped
+// there instead of being sent with every announce.
+func TestParseAnnounceURLCapsLength(t *testing.T) {
+	for _, prefix := range []string{"http://tracker.example/announce?passkey=", "udp://tracker.example:6969/announce?"} {
+		if u, err := ParseAnnounceURL(padURL(prefix, MaxAnnounceURLLength)); err != nil || u.Hostname() != "tracker.example" {
+			t.Fatalf("ParseAnnounceURL(%d-byte %s URL) = %v, want success", MaxAnnounceURLLength, prefix[:3], err)
+		}
+		if _, err := ParseAnnounceURL(padURL(prefix, MaxAnnounceURLLength+1)); !errors.Is(err, ErrURLTooLong) {
+			t.Fatalf("ParseAnnounceURL(%d-byte %s URL) = %v, want ErrURLTooLong", MaxAnnounceURLLength+1, prefix[:3], err)
+		}
+	}
+	if _, err := Scrape(context.Background(), padURL("http://tracker.example/announce?k=", 1<<20)); !errors.Is(err, ErrURLTooLong) {
+		t.Fatalf("Scrape(1 MiB URL) = %v, want ErrURLTooLong", err)
+	}
+
+	// The limit is on the configured URL, not on the announce request built
+	// from it, which adds the info-hash, peer ID and counters.
+	base := padURL("http://tracker.example/announce?passkey=", MaxAnnounceURLLength)
+	reqURL, err := BuildTrackerURL(base, [20]byte{0xff}, [20]byte{0xff}, 6881, 1<<40, 1<<40, 1<<40, true, "started")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqURL) <= MaxAnnounceURLLength {
+		t.Fatalf("announce request is %d bytes, want it past the %d-byte limit for this test", len(reqURL), MaxAnnounceURLLength)
+	}
+	if _, err := NewRequest(context.Background(), PurposeAnnounce, reqURL); err != nil {
+		t.Fatalf("NewRequest(%d-byte announce request) = %v, want success", len(reqURL), err)
+	}
+}
+
+// TestNewRequestCapsWebseedURLLength: a webseed request URL (the url-list
+// entry plus the file's path) longer than MaxWebseedURLLength is refused
+// before anything is sent.
+func TestNewRequestCapsWebseedURLLength(t *testing.T) {
+	if _, err := NewRequest(context.Background(), PurposeWebseed, padURL("https://cdn.example/files/", MaxWebseedURLLength)); err != nil {
+		t.Fatalf("NewRequest(%d-byte webseed URL) = %v, want success", MaxWebseedURLLength, err)
+	}
+	for _, n := range []int{MaxWebseedURLLength + 1, 1 << 20} {
+		if _, err := NewRequest(context.Background(), PurposeWebseed, padURL("https://cdn.example/files/", n)); !errors.Is(err, ErrURLTooLong) {
+			t.Fatalf("NewRequest(%d-byte webseed URL) = %v, want ErrURLTooLong", n, err)
+		}
+	}
+
+	// The longest url-list entry a torrent may carry still reaches a file
+	// whose path is 1,320 bytes of CJK text, 3,960 once escaped: the cap is
+	// on the request, so it must leave room for the path beyond the entry.
+	entry := padURL("https://cdn.example/", torrent.MaxWebSeedURLLength-1) + "/"
+	path := strings.Repeat(url.PathEscape("日本語の長いファイル名"), 40)
+	if _, err := NewRequest(context.Background(), PurposeWebseed, entry+path); err != nil {
+		t.Fatalf("NewRequest(%d-byte entry + %d-byte escaped path) = %v, want success", len(entry), len(path), err)
 	}
 }
 

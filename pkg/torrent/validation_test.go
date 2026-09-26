@@ -206,3 +206,69 @@ func TestParseInfo(t *testing.T) {
 		}
 	}
 }
+
+// multiFileInfo returns a one-piece multi-file info dict named "root" with a
+// one-byte file at each of paths.
+func multiFileInfo(paths ...[]string) map[string]interface{} {
+	files := make([]interface{}, 0, len(paths))
+	for _, p := range paths {
+		comps := make([]interface{}, len(p))
+		for i, c := range p {
+			comps[i] = c
+		}
+		files = append(files, map[string]interface{}{"length": int64(1), "path": comps})
+	}
+	return map[string]interface{}{
+		"name":         "root",
+		"piece length": int64(16384),
+		"pieces":       string(make([]byte, 20)),
+		"files":        files,
+	}
+}
+
+// TestParseRejectsFileThatIsAlsoADirectory (libtorrent@dd04258ef): a torrent
+// listing both "a" and "a/b" was accepted and only failed when storage tried
+// to create one of them, with ENOTDIR or EISDIR. Such metadata is refused at
+// parse time, folding case and normalization like the duplicate check.
+func TestParseRejectsFileThatIsAlsoADirectory(t *testing.T) {
+	deep := make([]string, maxPathDepth-1)
+	for i := range deep {
+		deep[i] = strings.Repeat("d", 200)
+	}
+	with := func(parents []string, last ...string) []string {
+		return append(append([]string(nil), parents...), last...)
+	}
+	for name, paths := range map[string][][]string{
+		"file then directory":     {{"a"}, {"a", "b"}},
+		"directory then file":     {{"a", "b"}, {"a"}},
+		"case folded":             {{"A"}, {"a", "b"}},
+		"normalization folded":    {{"é"}, {"é", "x"}},
+		"intermediate directory":  {{"x", "y", "z"}, {"x", "y"}},
+		"deep shared parents":     {with(deep, "f"), deep},
+		"among unrelated entries": {{"c"}, {"a", "b", "c"}, {"a", "b"}, {"d"}},
+	} {
+		info := multiFileInfo(paths...)
+		if _, err := ParseInfo(marshalInfo(t, info)); err == nil || !strings.Contains(err.Error(), "is also a directory") {
+			t.Errorf("%s: ParseInfo() = %v, want a file/directory collision error", name, err)
+		}
+		if _, err := Parse(marshalTorrent(t, info)); err == nil {
+			t.Errorf("%s: Parse() = nil error, want rejection", name)
+		}
+	}
+
+	for name, paths := range map[string][][]string{
+		"siblings":                    {{"a", "b"}, {"a", "c"}},
+		"same name in another parent": {{"a", "b"}, {"b"}, {"c", "a"}},
+		"name prefix is not a parent": {{"a"}, {"ab", "c"}, {"a.d", "e"}},
+		"deep siblings":               {with(deep, "f"), with(deep, "g")},
+	} {
+		tor, err := ParseInfo(marshalInfo(t, multiFileInfo(paths...)))
+		if err != nil {
+			t.Errorf("%s: ParseInfo() = %v, want success", name, err)
+			continue
+		}
+		if len(tor.Files) != len(paths) {
+			t.Errorf("%s: parsed %d files, want %d", name, len(tor.Files), len(paths))
+		}
+	}
+}

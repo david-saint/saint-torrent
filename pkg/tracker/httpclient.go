@@ -23,9 +23,10 @@ import (
 // libtorrent's ssrf_mitigation:
 //
 //   - A destination may be at most as local as the URL that led to it. A
-//     loopback or private address is reachable only when the request's original
-//     URL named a literal local IP or "localhost", and only through a hop whose
-//     own host is such a literal: a hostname must resolve to a public address.
+//     loopback or private (RFC 1918, carrier-grade NAT, unique-local) address
+//     is reachable only when the request's original URL named a literal local
+//     IP or "localhost", and only through a hop whose own host is such a
+//     literal: a hostname must resolve to a public address.
 //     The check runs on the address actually dialed, so DNS rebinding and
 //     redirects cannot get around it.
 //   - Link-local (including 169.254.169.254 cloud metadata), unspecified,
@@ -64,8 +65,19 @@ const (
 	PurposeWebseed
 )
 
+// MaxWebseedURLLength bounds a webseed request URL, the url-list entry with
+// the file's escaped path appended. Longer URLs are refused before anything
+// is sent. It is twice torrent.MaxWebSeedURLLength, the bound on the entry
+// itself, so even the longest entry leaves 4 KiB for the path, whose
+// non-ASCII bytes triple when escaped; nginx and Apache accept request lines
+// of about this size by default.
+const MaxWebseedURLLength = 8192
+
 // ErrDestinationRefused marks a request refused by the SSRF policy.
 var ErrDestinationRefused = errors.New("destination refused")
+
+// ErrURLTooLong marks a tracker or webseed URL refused for its length.
+var ErrURLTooLong = errors.New("URL too long")
 
 // requestPolicy travels in the request context so the transport and dialer
 // can apply it to every redirect hop.
@@ -112,8 +124,12 @@ func newHTTPClient() *http.Client {
 }
 
 // NewRequest builds a GET for rawURL whose destination policy is derived from
-// rawURL itself. It fails early when rawURL already breaks the policy.
+// rawURL itself. It fails early when rawURL already breaks the policy, or is
+// a webseed URL longer than MaxWebseedURLLength.
 func NewRequest(ctx context.Context, purpose Purpose, rawURL string) (*http.Request, error) {
+	if purpose == PurposeWebseed && len(rawURL) > MaxWebseedURLLength {
+		return nil, fmt.Errorf("%w: webseed URL is %d bytes, more than the maximum of %d", ErrURLTooLong, len(rawURL), MaxWebseedURLLength)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err

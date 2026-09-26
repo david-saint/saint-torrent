@@ -27,7 +27,18 @@ func TestClassify(t *testing.T) {
 		"::ffff:10.1.1.1":  ScopePrivate,
 		"8.8.8.8":          ScopeGlobal,
 		"2001:4860::8888":  ScopeGlobal,
-		"100.64.0.1":       ScopeGlobal,
+		// Carrier-grade NAT (RFC 6598) is private, as in libtorrent's
+		// is_local: it holds ISP-internal services and Tailscale tailnets.
+		"100.64.0.1":        ScopePrivate,
+		"100.100.100.100":   ScopePrivate,
+		"100.127.255.254":   ScopePrivate,
+		"::ffff:100.64.0.1": ScopePrivate,
+		"100.63.255.255":    ScopeGlobal,
+		"100.128.0.0":       ScopeGlobal,
+		// fec0::/10 is deprecated site-local space.
+		"fec0::1": ScopePrivate,
+		"feff::1": ScopePrivate,
+		"febf::1": ScopeLinkLocal,
 	}
 	for s, want := range cases {
 		if got := Classify(netip.MustParseAddr(s)); got != want {
@@ -43,6 +54,7 @@ func TestPeerAllowed(t *testing.T) {
 	public := netip.MustParseAddr("203.0.113.7")
 	lan := netip.MustParseAddr("192.168.1.20")
 	loop := netip.MustParseAddr("127.0.0.1")
+	cgnat := netip.MustParseAddr("100.101.102.103")
 	unknown := netip.Addr{}
 
 	cases := []struct {
@@ -66,6 +78,17 @@ func TestPeerAllowed(t *testing.T) {
 		{"224.0.0.1:6881", loop, false},
 		{"255.255.255.255:6881", loop, false},
 		{"0.0.0.0:6881", loop, false},
+		// A public DHT node, PEX sender or tracker cannot point at CGNAT
+		// space; a LAN or CGNAT source can, as with RFC 1918 addresses.
+		{"100.64.1.2:6881", public, false},
+		{"100.64.1.2:6881", unknown, false},
+		{"100.64.1.2:6881", lan, true},
+		{"100.64.1.2:6881", loop, true},
+		{"100.64.1.2:6881", cgnat, true},
+		{"192.168.1.1:6881", cgnat, true},
+		{"127.0.0.1:6881", cgnat, false},
+		{"[fec0::2]:6881", public, false},
+		{"[fec0::2]:6881", lan, true},
 	}
 	for _, c := range cases {
 		if got := PeerAllowed(netip.MustParseAddrPort(c.peer), c.source); got != c.want {
