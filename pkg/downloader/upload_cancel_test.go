@@ -15,13 +15,13 @@ func pieceBegin(msg *peer.Message) (uint32, uint32) {
 }
 
 // unchokedUploadPeer starts a fast-extension peer on sess and gets it unchoked, with
-// the upload limit set so queued requests are served slowly (about 1 KB/s).
-func unchokedUploadPeer(t *testing.T, sess *Session, port uint16) *wirePeer {
+// the upload limit set to rate bytes/s so queued requests are served slowly.
+func unchokedUploadPeer(t *testing.T, sess *Session, port uint16, rate int64) *wirePeer {
 	t.Helper()
 	w := startWirePeer(t, sess, port, fastReserved())
 	w.send(&peer.Message{ID: peer.MsgInterested})
 	w.expect(peer.MsgUnchoke, 2*time.Second)
-	sess.SetUploadLimit(1000)
+	sess.SetUploadLimit(rate)
 	// Start from an empty bucket however long setup took.
 	sess.UploadLimiter.mu.Lock()
 	sess.UploadLimiter.tokens = 0
@@ -35,10 +35,10 @@ func unchokedUploadPeer(t *testing.T, sess *Session, port uint16) *wirePeer {
 // from disk and sent. It must be dropped (and, under BEP 6, rejected).
 func TestUploadQueueHonoursCancel(t *testing.T) {
 	sess, _ := newSeedingWireTestSession(t, 40, 1024)
-	w := unchokedUploadPeer(t, sess, 6260)
+	w := unchokedUploadPeer(t, sess, 6260, 500)
 
-	w.sendRequest(3, 0, 200)   // served after ~0.2 s of tokens
-	w.sendRequest(3, 200, 200) // would follow ~0.2 s later
+	w.sendRequest(3, 0, 200)   // served after ~0.4 s of tokens
+	w.sendRequest(3, 200, 200) // would follow ~0.4 s later
 	w.send(&peer.Message{ID: peer.MsgCancel, Payload: blockPayload(3, 200, 200)})
 
 	reject := w.expect(peer.MsgRejectRequest, 2*time.Second)
@@ -74,7 +74,7 @@ func TestUploadQueueDroppedOnChoke(t *testing.T) {
 			piece = i
 		}
 	}
-	w := unchokedUploadPeer(t, sess, 6261)
+	w := unchokedUploadPeer(t, sess, 6261, 200) // each queued request waits ~1 s
 
 	w.sendRequest(uint32(piece), 0, 200)
 	w.sendRequest(uint32(piece), 200, 200)

@@ -84,7 +84,11 @@ func TestMetadataServeIsBudgetedAndCounted(t *testing.T) {
 func TestMetadataServeHonoursUploadLimit(t *testing.T) {
 	info := bytes.Repeat([]byte("j"), 2000)
 	sess := newMetadataServingSession(t, info, false)
-	sess.SetUploadLimit(1000) // the bucket starts (nearly) empty and fills at 1 KB/s
+	sess.SetUploadLimit(1000) // fills at 1 KB/s
+	sess.UploadLimiter.mu.Lock()
+	sess.UploadLimiter.tokens = 0 // start empty however long setup took
+	sess.UploadLimiter.lastRefill = time.Now()
+	sess.UploadLimiter.mu.Unlock()
 	w := startWirePeer(t, sess, 6231, fastReserved())
 	w.sendExtended(peer.ExtHandshake, extHandshakePayload(t, 5, 0))
 
