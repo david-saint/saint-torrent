@@ -154,10 +154,12 @@ type statsHandler struct {
 	now     func() time.Time
 
 	mu sync.Mutex
-	// body is never modified once stored; a rebuild replaces it. The last one
-	// stays until then: the size of one response.
-	body []byte
-	at   time.Time
+	// body is never modified once stored; a rebuild replaces it, and expiry
+	// drops it once it is stale, so an idle API does not hold the last response
+	// (every file of every torrent) until the next request.
+	body   []byte
+	at     time.Time
+	expiry *time.Timer
 }
 
 func newStatsHandler(manager *downloader.TorrentManager) *statsHandler {
@@ -193,7 +195,22 @@ func (h *statsHandler) encoded() ([]byte, error) {
 	// Byte for byte what writeJSON's json.Encoder writes.
 	h.body = append(body, '\n')
 	h.at = now
+	if h.expiry == nil {
+		h.expiry = time.AfterFunc(statsCacheTTL, h.dropStale)
+	} else {
+		h.expiry.Reset(statsCacheTTL)
+	}
 	return h.body, nil
+}
+
+// dropStale releases the cached body once encoded would no longer serve it.
+// It judges age by h.now, so it never drops a body a request could still use.
+func (h *statsHandler) dropStale() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if age := h.now().Sub(h.at); age < 0 || age >= statsCacheTTL {
+		h.body = nil
+	}
 }
 
 // guard applies the browser-facing checks the API needs even on loopback. A

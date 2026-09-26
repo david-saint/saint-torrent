@@ -301,6 +301,51 @@ func TestStatsCacheServesOneBuildPerTTL(t *testing.T) {
 	}
 }
 
+// The cached body lists every file of every torrent, so a large library's runs
+// to megabytes. It used to stay in memory from one request until the next,
+// however long the API then sat idle; it is now released once it is stale.
+func TestStatsCacheReleasesStaleBody(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	sess := newHTTPTestSession(t)
+	mgr.AddSession(fmt.Sprintf("%x", sess.Torrent.InfoHash), sess)
+	clock := &fakeStatsClock{now: time.Now()}
+	h := newStatsHandler(mgr)
+	h.now = clock.Now
+	cached := func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.body != nil
+	}
+
+	getStats(t, h)
+	clock.Advance(statsCacheTTL - time.Millisecond)
+	h.dropStale()
+	if !cached() {
+		t.Fatal("a body younger than the TTL was released")
+	}
+	clock.Advance(time.Millisecond)
+	h.dropStale()
+	if cached() {
+		t.Fatal("a stale body was kept")
+	}
+
+	// On the real clock the release runs by itself once the TTL has passed.
+	h = newStatsHandler(mgr)
+	getStats(t, h)
+	deadline := time.Now().Add(5 * time.Second)
+	for cached() {
+		if time.Now().After(deadline) {
+			t.Fatal("stale body still held 5 s after the request")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// And the next request simply builds a fresh one.
+	if body := getStats(t, h).Body.Bytes(); len(body) == 0 || !cached() {
+		t.Fatalf("request after the release: body %d bytes, cached %v", len(body), cached())
+	}
+}
+
 // Requests that arrive while a snapshot is being built wait for it and share
 // its bytes instead of each building their own.
 func TestStatsConcurrentRequestsShareOneBuild(t *testing.T) {
