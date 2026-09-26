@@ -2352,7 +2352,6 @@ peerLoop:
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgInterested:
-			lastActiveAt = time.Now()
 			// A repeat changes nothing, so skip the write lock and the upload-slot
 			// scan of s.Peers: a peer could otherwise hold s.mu for a full map walk
 			// with every 5-byte message.
@@ -2362,6 +2361,7 @@ peerLoop:
 			if alreadyInterested {
 				break
 			}
+			lastActiveAt = time.Now()
 			s.mu.Lock()
 			pState.Interested = true
 			unchokedInterested := 0
@@ -2377,8 +2377,12 @@ peerLoop:
 			syncChoke()
 
 		case peer.MsgNotInterested:
-			lastActiveAt = time.Now()
 			s.mu.Lock()
+			if pState.Interested {
+				// Only a change counts as activity: repeating not-interested
+				// must not keep an idle connection alive.
+				lastActiveAt = time.Now()
+			}
 			pState.Interested = false
 			s.mu.Unlock()
 

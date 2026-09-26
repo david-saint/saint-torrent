@@ -7,9 +7,9 @@ import (
 	"sainttorrent/pkg/peer"
 )
 
-// keepAlive sends keep-alives every interval until stop closes, keeping the
-// connection's read deadline fresh the way an idle slot-holder would.
-func (w *wirePeer) keepAlive(interval time.Duration, stop <-chan struct{}) {
+// keepAlive sends msg (nil: a keep-alive) every interval until stop closes,
+// keeping the connection's read deadline fresh the way an idle slot-holder would.
+func (w *wirePeer) keepAlive(msg *peer.Message, interval time.Duration, stop <-chan struct{}) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -17,7 +17,7 @@ func (w *wirePeer) keepAlive(interval time.Duration, stop <-chan struct{}) {
 			select {
 			case <-ticker.C:
 				_ = w.remote.SetWriteDeadline(time.Now().Add(time.Second))
-				if _, err := w.remote.Write((*peer.Message)(nil).Serialize()); err != nil {
+				if _, err := w.remote.Write(msg.Serialize()); err != nil {
 					return
 				}
 			case <-stop:
@@ -57,7 +57,16 @@ func TestIdleConnectionIsDropped(t *testing.T) {
 		w := startWirePeer(t, settled(sess), 7600, fastReserved())
 		stop := make(chan struct{})
 		defer close(stop)
-		w.keepAlive(50*time.Millisecond, stop)
+		w.keepAlive(nil, 50*time.Millisecond, stop)
+		w.waitClosed(3 * time.Second)
+	})
+
+	t.Run("repeated not interested", func(t *testing.T) {
+		sess, _ := newSeedingWireTestSession(t, 4, 16*1024)
+		w := startWirePeer(t, settled(sess), 7603, fastReserved())
+		stop := make(chan struct{})
+		defer close(stop)
+		w.keepAlive(&peer.Message{ID: peer.MsgNotInterested}, 50*time.Millisecond, stop)
 		w.waitClosed(3 * time.Second)
 	})
 
@@ -67,7 +76,7 @@ func TestIdleConnectionIsDropped(t *testing.T) {
 		w.send(&peer.Message{ID: peer.MsgInterested})
 		stop := make(chan struct{})
 		defer close(stop)
-		w.keepAlive(50*time.Millisecond, stop)
+		w.keepAlive(nil, 50*time.Millisecond, stop)
 		if !w.alive(1500 * time.Millisecond) {
 			t.Fatal("dropped a peer that is interested in our pieces")
 		}
@@ -79,7 +88,7 @@ func TestIdleConnectionIsDropped(t *testing.T) {
 		w.send(&peer.Message{ID: peer.MsgHaveAll}) // but it never unchokes us
 		stop := make(chan struct{})
 		defer close(stop)
-		w.keepAlive(50*time.Millisecond, stop)
+		w.keepAlive(nil, 50*time.Millisecond, stop)
 		if !w.alive(1500 * time.Millisecond) {
 			t.Fatal("dropped a peer that has pieces we want")
 		}
