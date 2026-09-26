@@ -89,11 +89,13 @@ func peerHostKey(ip string) (key string, loopback bool) {
 // The one exception to the peer ID rule is a simultaneous open: we dialled a
 // peer while it dialled us, so the same host holds the same ID in the other
 // direction. Refusing the second connection on both ends would drop both, so
-// each end keeps the connection opened by the side with the lower peer ID (the
-// rule libtorrent applies too) and closes the other; that replacement is not
-// held to the per-host cap. A duplicate from another host, or in the same
-// direction, is always refused, so a peer spoofing an ID cannot evict the
-// connection that owns it.
+// each end keeps the connection opened by the side with the greater peer ID
+// and closes the other; that replacement is not held to the per-host cap. This
+// is libtorrent's peer ID rule ("the peer with greatest peer-id is the one
+// allowed to initiate connections", bt_peer_connection.cpp), so a libtorrent
+// peer that resolves the duplicate by ID closes the same connection we do. A
+// duplicate from another host, or in the same direction, is always refused,
+// so a peer spoofing an ID cannot evict the connection that owns it.
 //
 // A zero peer ID identifies nobody, so it is exempt from the ID checks. Caller
 // holds s.mu.
@@ -117,7 +119,7 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 			if owner.hostKey != hostKey || owner.outbound == outbound {
 				return "duplicate_peer_id"
 			}
-			keepOurOutbound := bytes.Compare(s.PeerID[:], remoteID[:]) < 0
+			keepOurOutbound := bytes.Compare(s.PeerID[:], remoteID[:]) > 0
 			if outbound != keepOurOutbound {
 				return "duplicate_peer_id"
 			}

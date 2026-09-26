@@ -240,8 +240,10 @@ func TestRefusedOutboundConnectionBacksOff(t *testing.T) {
 
 // When we dial a peer while it dials us, both connections carry the same peer ID
 // from the same host. Refusing the second one on both ends dropped both; now each
-// end keeps the connection opened by the side with the lower peer ID, whichever
-// arrived first, and the loser's exit leaves the winner's ID entry in place.
+// end keeps the connection opened by the side with the greater peer ID, whichever
+// arrived first, and the loser's exit leaves the winner's ID entry in place. The
+// survivor is worked out with libtorrent's rule from the remote's side, so a
+// libtorrent peer that resolves the duplicate by ID closes the same connection.
 func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
 	lowID := peerIDFor(1) // "-TT0001-000000000001", below withPeerID's
 	var highID [20]byte
@@ -258,7 +260,13 @@ func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sess := withPeerID(newWireTestSession(t, 4, 16*1024))
-			ourLower := string(sess.PeerID[:]) < string(tc.remoteID[:])
+			// libtorrent keeps a new connection over an existing one with the
+			// same ID iff (pid < our_peer_id) == is_outgoing()
+			// (bt_peer_connection.cpp). On the remote's side pid is our ID,
+			// our_peer_id its own, and our outbound connection is incoming, so
+			// it keeps its own outgoing connection (our inbound one) iff our ID
+			// is the lower.
+			remoteKeepsItsOutgoing := string(sess.PeerID[:]) < string(tc.remoteID[:])
 			const ip = "10.6.6.6"
 			ports := map[bool]uint16{true: 6881, false: 51413} // outbound: listen port; inbound: source port
 			if tc.firstOutbound {
@@ -275,9 +283,10 @@ func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
 			second := startDirectedConnA1(t, sess, ip, ports[secondOutbound], tc.remoteID, secondOutbound)
 			secondAddr := net.JoinHostPort(ip, strconv.Itoa(int(ports[secondOutbound])))
 
-			// The winner is our outbound connection when our ID is the lower one.
+			// We must keep the connection the remote keeps.
+			ourOutboundWins := !remoteKeepsItsOutgoing
 			winner, winnerAddr, loser := second, secondAddr, first
-			if secondOutbound != ourLower {
+			if secondOutbound != ourOutboundWins {
 				winner, winnerAddr, loser = first, firstAddr, second
 			}
 			if winner == second {
@@ -309,15 +318,14 @@ func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
 // the same peer ID from another host, or from the same host in the same
 // direction, is refused, so a peer spoofing an ID cannot evict its owner.
 func TestDuplicatePeerIDFromAnotherHostIsRefused(t *testing.T) {
-	var highID [20]byte
-	copy(highID[:], "-ZZ0001-000000000001") // our outbound would win a tie-break
+	lowID := peerIDFor(1) // below withPeerID's, so our outbound would win a tie-break
 	sess := withPeerID(newWireTestSession(t, 4, 16*1024))
-	owner := startAdmissionConn(t, sess, "10.7.7.7", 51413, highID)
+	owner := startAdmissionConn(t, sess, "10.7.7.7", 51413, lowID)
 	admitted(t, sess, "10.7.7.7:51413", owner.client)
 
 	knownDialedPeerA1(sess, "10.8.8.8", 6881)
-	startDirectedConnA1(t, sess, "10.8.8.8", 6881, highID, true).rejected(t)
-	startAdmissionConn(t, sess, "10.7.7.7", 51414, highID).rejected(t)
+	startDirectedConnA1(t, sess, "10.8.8.8", 6881, lowID, true).rejected(t)
+	startAdmissionConn(t, sess, "10.7.7.7", 51414, lowID).rejected(t)
 
 	select {
 	case <-owner.done:
@@ -326,7 +334,7 @@ func TestDuplicatePeerIDFromAnotherHostIsRefused(t *testing.T) {
 	}
 	sess.mu.RLock()
 	defer sess.mu.RUnlock()
-	if o := sess.admission.peerIDs[highID]; o.addr != "10.7.7.7:51413" {
+	if o := sess.admission.peerIDs[lowID]; o.addr != "10.7.7.7:51413" {
 		t.Fatalf("peer ID owner %+v, want the first connection", o)
 	}
 }
