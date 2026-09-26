@@ -379,12 +379,17 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	if err := discardHandshakePad(cr, padLen); err != nil {
 		return nil, Result{}, err
 	}
-	selected := CryptoMethod(method) & methods
-	if selected == 0 || selected != CryptoMethod(method) {
+	// crypto_select must name exactly one method, and one we offered.
+	selected := CryptoMethod(method)
+	if !singleMethod(selected) || selected&methods == 0 {
 		return nil, Result{}, fmt.Errorf("%w: receiver selected %x from offered %x", ErrNoCryptoMethod, method, methods)
 	}
 
-	return h.wrapConn(selected, nil, readCipher, writeCipher), Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
+	conn, err := h.wrapConn(selected, nil, readCipher, writeCipher)
+	if err != nil {
+		return nil, Result{}, err
+	}
+	return conn, Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
 }
 
 func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
@@ -453,7 +458,7 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	}
 
 	selected := selectMethod(CryptoMethod(provided))
-	if selected == 0 || CryptoMethod(provided)&selected == 0 {
+	if !singleMethod(selected) || CryptoMethod(provided)&selected == 0 {
 		return nil, Result{}, fmt.Errorf("%w: initiator offered %x", ErrNoCryptoMethod, provided)
 	}
 
@@ -467,7 +472,17 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 		return nil, Result{}, err
 	}
 
-	return h.wrapConn(selected, initialPayload, readCipher, writeCipher), Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
+	conn, err := h.wrapConn(selected, initialPayload, readCipher, writeCipher)
+	if err != nil {
+		return nil, Result{}, err
+	}
+	return conn, Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
+}
+
+// singleMethod reports whether m is exactly one method we can run. The spec
+// requires crypto_select to name one, and anything else has no stream mode.
+func singleMethod(m CryptoMethod) bool {
+	return m == CryptoMethodPlaintext || m == CryptoMethodRC4
 }
 
 // newKeyPair returns a fresh DH private key and its public key, left-padded to
@@ -544,22 +559,25 @@ func (h *handshaker) newCipher(initiatorToReceiver bool) (*rc4.Cipher, error) {
 	return c, nil
 }
 
-func (h *handshaker) wrapConn(method CryptoMethod, initialPayload []byte, readCipher, writeCipher *rc4.Cipher) *Conn {
+// wrapConn returns an error rather than a nil *Conn for anything but a single
+// known method: a nil *Conn stored in a net.Conn is a non-nil interface that
+// panics on first use.
+func (h *handshaker) wrapConn(method CryptoMethod, initialPayload []byte, readCipher, writeCipher *rc4.Cipher) (*Conn, error) {
 	switch method {
 	case CryptoMethodRC4:
 		r := io.Reader(&cipherReader{c: readCipher, r: h.conn})
 		if len(initialPayload) > 0 {
 			r = io.MultiReader(bytes.NewReader(initialPayload), r)
 		}
-		return &Conn{Conn: h.conn, r: r, w: &cipherWriter{c: writeCipher, w: h.conn}}
+		return &Conn{Conn: h.conn, r: r, w: &cipherWriter{c: writeCipher, w: h.conn}}, nil
 	case CryptoMethodPlaintext:
 		r := io.Reader(h.conn)
 		if len(initialPayload) > 0 {
 			r = io.MultiReader(bytes.NewReader(initialPayload), r)
 		}
-		return &Conn{Conn: h.conn, r: r, w: h.conn}
+		return &Conn{Conn: h.conn, r: r, w: h.conn}, nil
 	default:
-		return nil
+		return nil, fmt.Errorf("%w: cannot run method %x", ErrNoCryptoMethod, method)
 	}
 }
 

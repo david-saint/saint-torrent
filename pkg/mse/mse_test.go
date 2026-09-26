@@ -2,6 +2,7 @@ package mse
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"errors"
 	"io"
 	"math/big"
@@ -361,6 +362,117 @@ func TestHandshakeFlightsAreCoalesced(t *testing.T) {
 		}
 		if sizes[0] < keyLen || sizes[0] > keyLen+maxPadLen {
 			t.Fatalf("%s first write is %d bytes, want its key and pad (%d-%d)", name, sizes[0], keyLen, keyLen+maxPadLen)
+		}
+	}
+}
+
+// rogueReceive plays the receiver side of a handshake for skey but answers
+// crypto_select with whatever answer says, as a malicious peer could.
+func rogueReceive(conn net.Conn, skey []byte, answer CryptoMethod) error {
+	h := &handshaker{conn: conn, out: newAsyncWriter(conn), skey: skey}
+	defer h.out.close()
+	var ya [keyLen]byte
+	if _, err := io.ReadFull(conn, ya[:]); err != nil {
+		return err
+	}
+	x, yb, err := newKeyPair()
+	if err != nil {
+		return err
+	}
+	if err := h.deriveSecret(x, ya[:]); err != nil {
+		return err
+	}
+	if err := h.postPadded(yb); err != nil {
+		return err
+	}
+	if err := readUntil(io.LimitReader(conn, maxPadLen+sha1.Size), hash(req1, h.s[:])); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(conn, make([]byte, sha1.Size)); err != nil {
+		return err
+	}
+	readCipher, err := h.newCipher(true)
+	if err != nil {
+		return err
+	}
+	cr := &cipherReader{c: readCipher, r: conn}
+	if _, err := io.ReadFull(cr, make([]byte, len(vc)+4)); err != nil {
+		return err
+	}
+	padLen, err := readUint16(cr)
+	if err != nil {
+		return err
+	}
+	if err := discardHandshakePad(cr, padLen); err != nil {
+		return err
+	}
+	iaLen, err := readUint16(cr)
+	if err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(cr, make([]byte, iaLen)); err != nil {
+		return err
+	}
+	writeCipher, err := h.newCipher(false)
+	if err != nil {
+		return err
+	}
+	frame := buildCryptoFrame(answer, nil, false)
+	writeCipher.XORKeyStream(frame, frame)
+	return h.out.post(frame)
+}
+
+// TestInitiateRejectsMultiBitCryptoSelect reproduces a receiver answering
+// crypto_select with both bits of a plaintext|RC4 offer. That passed the old
+// subset check, wrapConn found no single method and returned nil, and
+// Initiate handed back a nil *Conn with a nil error, which panics on first
+// use as a net.Conn.
+func TestInitiateRejectsMultiBitCryptoSelect(t *testing.T) {
+	for _, answer := range []CryptoMethod{CryptoMethodPlaintext | CryptoMethodRC4, 4, 0} {
+		clientConn, serverConn := net.Pipe()
+		_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+		_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+		skey := bytes.Repeat([]byte{0x66}, 20)
+		rogue := make(chan error, 1)
+		go func() {
+			rogue <- rogueReceive(serverConn, skey, answer)
+		}()
+		conn, res, err := Initiate(clientConn, skey, nil, CryptoMethodPlaintext|CryptoMethodRC4)
+		if !errors.Is(err, ErrNoCryptoMethod) || conn != nil {
+			t.Fatalf("crypto_select %x: Initiate returned conn=%v method=%x err=%v, want ErrNoCryptoMethod and no conn", answer, conn, res.Method, err)
+		}
+		if err := <-rogue; err != nil {
+			t.Fatalf("rogue receiver: %v", err)
+		}
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	}
+}
+
+// TestReceiveRejectsMultiBitSelection checks that a selector returning more
+// than one method is refused before anything is sent.
+func TestReceiveRejectsMultiBitSelection(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	_ = clientConn.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverConn.SetDeadline(time.Now().Add(2 * time.Second))
+	skey := bytes.Repeat([]byte{0x77}, 20)
+	go func() {
+		_, _, _ = Initiate(clientConn, skey, nil, CryptoMethodPlaintext|CryptoMethodRC4)
+	}()
+	echo := func(provided CryptoMethod) CryptoMethod { return provided }
+	conn, _, err := Receive(serverConn, singleSecret(skey), echo)
+	if !errors.Is(err, ErrNoCryptoMethod) || conn != nil {
+		t.Fatalf("Receive returned conn=%v err=%v, want ErrNoCryptoMethod and no conn", conn, err)
+	}
+}
+
+func TestWrapConnRejectsUnknownMethod(t *testing.T) {
+	h := &handshaker{}
+	for _, m := range []CryptoMethod{0, CryptoMethodPlaintext | CryptoMethodRC4, 4} {
+		if conn, err := h.wrapConn(m, nil, nil, nil); conn != nil || !errors.Is(err, ErrNoCryptoMethod) {
+			t.Fatalf("wrapConn(%x) = %v, %v; want nil and ErrNoCryptoMethod", m, conn, err)
 		}
 	}
 }
