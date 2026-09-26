@@ -73,9 +73,10 @@ func peerHostKey(ip string) (key string, loopback bool) {
 
 // admitPeerLocked decides whether a connection that completed its handshake may
 // run, and if so counts it; it returns a non-empty reason when it may not. It
-// refuses a connection to ourselves, a second connection to a peer ID we are
-// already connected to, a host over maxConnectionsPerIP, and a second connection
-// under an address key that is already active (its PeerState would be shared).
+// refuses a second connection under an address key that is already active (its
+// PeerState would be shared), a banned host, a connection to ourselves, a second
+// connection to a peer ID we are already connected to, and a host over
+// maxConnectionsPerIP.
 // A zero peer ID identifies nobody, so it is exempt from the ID checks. Caller
 // holds s.mu.
 func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remoteID [20]byte, outbound bool) string {
