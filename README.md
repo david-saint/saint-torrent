@@ -43,6 +43,8 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 ### File Explorer View
 - `esc` - Go back to the Torrent Details view
 - `up`/`down` or `k`/`j` - Scroll through the file list
+- `pgup`/`pgdn` - Page through the file list
+- `home`/`end` - Jump to the first/last file
 - `space` or `p` - Cycle priority for the selected file (`NORMAL` ➔ `HIGH` ➔ `SKIP`)
 - `q` or `Ctrl+C` - Quit
 
@@ -132,6 +134,12 @@ also attempts automatic UPnP IGD or NAT-PMP mapping:
 ./sainttorrent --no-nat          # keep the stable port, disable automatic mapping
 ./sainttorrent --port 0          # explicitly request an ephemeral port
 ```
+
+Inbound peers connect over TCP. The UDP port carries the DHT, but while the TCP
+listener is up saintTorrent refuses inbound uTP connections: peers that try
+uTP first (libtorrent, uTorrent, Transmission) reconnect over TCP at once,
+which is much faster with saintTorrent's current uTP. When forwarding the port
+by hand, forward it for both TCP and UDP.
 
 Peer protocol encryption defaults to `prefer`: saintTorrent tries BitTorrent
 MSE/PE first and falls back to plaintext when a peer does not support it. Use

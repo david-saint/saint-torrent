@@ -1295,7 +1295,8 @@ Options:
       --headless            Run without the TUI
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
-      --no-persist          Do not persist fast-resume state
+      --no-persist          Keep no state: nothing is restored on the next
+                            launch, and crash handling is off
       --start-paused        Restore every torrent paused for this run, including
                             any a crash left unloaded
       --recheck             Fully hash-check restored torrents on this launch

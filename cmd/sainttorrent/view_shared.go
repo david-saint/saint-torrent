@@ -518,7 +518,7 @@ const defaultViewHeight = 24
 func (m model) fileExplorerHelp() string {
 	return renderHelp([][2]string{
 		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"},
-		{"pgup/pgdn", "Page"}, {"q", "Quit"},
+		{"pgup/pgdn", "Page"}, {"home/end", "First/Last"}, {"q", "Quit"},
 	}, helpColumns, m.theme.styles, m.width)
 }
 
