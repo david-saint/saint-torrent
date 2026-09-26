@@ -64,11 +64,13 @@ type TorrentManager struct {
 	// that hash are refused meanwhile so they cannot open files being deleted.
 	removing map[string]chan struct{}
 
-	// pathClaims maps each active torrent's resolved payload paths to that
-	// torrent (see claimPaths). claimMu is a leaf lock: nothing else is taken
-	// while it is held.
-	claimMu    sync.Mutex
-	pathClaims map[pathClaimKey]pathClaim
+	// pathClaims maps each active torrent's resolved payload paths to the
+	// torrents holding them, and sharedClaims holds the cross-seeding ones
+	// (see claimPaths). claimMu is a leaf lock: nothing else is taken while it
+	// is held.
+	claimMu      sync.Mutex
+	pathClaims   map[pathClaimKey]pathClaim
+	sharedClaims map[sharedClaimKey]int32
 }
 
 // SetVerifyOnStartup forces full hashing of the torrents restored on this launch,

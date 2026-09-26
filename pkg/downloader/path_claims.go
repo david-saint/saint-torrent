@@ -7,12 +7,16 @@ import (
 	"path/filepath"
 	"sync"
 
+	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/storage"
 )
 
 // ErrPathInUse reports a torrent whose payload would share an on-disk file with
-// another active torrent. Both would write it and corrupt each other's
-// verified data, and deleting either with its files would delete the other's.
+// another active torrent that declares it with a different length, or with one
+// whose files are being deleted. The second would resize the file and both
+// would overwrite each other's verified data. Torrents declaring the same file
+// with the same length may share it: that is cross-seeding, one payload
+// published under several info-hashes.
 var ErrPathInUse = errors.New("file is already used by another torrent")
 
 // pathClaimKey identifies one resolved payload path. It is a 128-bit hash of
@@ -23,25 +27,23 @@ type pathClaimKey [2]uint64
 // pathClaimSeeds are fixed for the process, so keys are comparable across calls.
 var pathClaimSeeds = [2]maphash.Seed{maphash.MakeSeed(), maphash.MakeSeed()}
 
-// pathClaim is the torrent holding a path and how many of its sessions do: a
-// replaced duplicate add briefly holds the same paths as its successor.
+// pathClaim is who holds one payload path. The first torrent to hold it is
+// recorded inline, so the common unshared path costs one pointer-free map
+// entry. Torrents cross-seeding it are counted in shared and recorded in
+// TorrentManager.sharedClaims. A torrent holds a path more than once while a
+// replaced duplicate add and its successor both do.
 type pathClaim struct {
-	infoHash [20]byte
-	refs     int
+	length   int64    // the declared length every holder agreed on
+	infoHash [20]byte // the first holder, holding it while refs > 0
+	refs     int32    // claims by infoHash
+	shared   int32    // claims by other torrents, in sharedClaims
+	deleting int32    // removals deleting the file; nobody else joins meanwhile
 }
 
-// pathClaimKeys returns the claim keys of relPaths under baseDir. The base is
-// resolved through symlinks so two spellings of one directory collide. The
-// whole path is folded, which can over-report only on a case-sensitive
-// filesystem holding two download directories that differ only in case.
-func pathClaimKeys(baseDir string, relPaths []string) []pathClaimKey {
-	base := resolveClaimBase(baseDir)
-	keys := make([]pathClaimKey, len(relPaths))
-	for i, rel := range relPaths {
-		key := storage.PathKey(filepath.Join(base, rel))
-		keys[i] = pathClaimKey{maphash.String(pathClaimSeeds[0], key), maphash.String(pathClaimSeeds[1], key)}
-	}
-	return keys
+// sharedClaimKey is a cross-seeding torrent's hold on a path.
+type sharedClaimKey struct {
+	key      pathClaimKey
+	infoHash [20]byte
 }
 
 // resolveClaimBase makes baseDir absolute and resolves the symlinks of its
@@ -69,9 +71,37 @@ func resolveClaimBase(baseDir string) string {
 	}
 }
 
+// pathClaimKeys returns the claim keys of relPaths under baseDir. The base is
+// resolved through symlinks so two spellings of one directory collide. The
+// whole path is folded, which can over-report only on a case-sensitive
+// filesystem holding two download directories that differ only in case.
+func pathClaimKeys(baseDir string, relPaths []string) []pathClaimKey {
+	base := resolveClaimBase(baseDir)
+	keys := make([]pathClaimKey, len(relPaths))
+	for i, rel := range relPaths {
+		key := storage.PathKey(filepath.Join(base, rel))
+		keys[i] = pathClaimKey{maphash.String(pathClaimSeeds[0], key), maphash.String(pathClaimSeeds[1], key)}
+	}
+	return keys
+}
+
+// ownRefsLocked returns how many claims infoHash holds on c, the claim at key.
+// Caller holds m.claimMu.
+func (m *TorrentManager) ownRefsLocked(key pathClaimKey, c pathClaim, infoHash [20]byte) int32 {
+	if c.refs > 0 && c.infoHash == infoHash {
+		return c.refs
+	}
+	if c.shared == 0 {
+		return 0
+	}
+	return m.sharedClaims[sharedClaimKey{key, infoHash}]
+}
+
 // claimPaths reserves files under baseDir for infoHash before any storage is
 // built on them. It fails with ErrPathInUse, reserving nothing, when another
-// torrent holds one of the paths. The returned release is idempotent.
+// torrent holds one of the paths with a different length or is deleting it. A
+// path another torrent holds with the same length is shared (cross-seeding)
+// and logged. The returned release is idempotent.
 func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []storage.FileInfo) (func(), error) {
 	relPaths := make([]string, len(files))
 	for i, f := range files {
@@ -81,50 +111,76 @@ func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []s
 
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
+	sharedWith := 0
 	for i, key := range keys {
-		if c, ok := m.pathClaims[key]; ok && c.infoHash != infoHash {
-			return nil, fmt.Errorf("%w: %q in %s (torrent %x)", ErrPathInUse, relPaths[i], baseDir, c.infoHash)
-		}
-	}
-	m.addClaimsLocked(infoHash, keys)
-	return m.releaseFunc(keys), nil
-}
-
-// claimFreePaths reserves, for a deletion, the relPaths under baseDir that no
-// other torrent holds. Those are returned in free and stay reserved until
-// release, so no torrent can be added on them while they are deleted; the
-// others are returned in kept.
-func (m *TorrentManager) claimFreePaths(infoHash [20]byte, baseDir string, relPaths []string) (free, kept []string, release func()) {
-	keys := pathClaimKeys(baseDir, relPaths)
-	freeKeys := make([]pathClaimKey, 0, len(keys))
-
-	m.claimMu.Lock()
-	defer m.claimMu.Unlock()
-	for i, key := range keys {
-		if c, ok := m.pathClaims[key]; ok && c.infoHash != infoHash {
-			kept = append(kept, relPaths[i])
+		c, ok := m.pathClaims[key]
+		if !ok || m.ownRefsLocked(key, c, infoHash) > 0 {
 			continue
 		}
-		free = append(free, relPaths[i])
-		freeKeys = append(freeKeys, key)
+		if c.deleting > 0 || (c.refs+c.shared > 0 && c.length != files[i].Length) {
+			owner := ""
+			if c.refs > 0 {
+				owner = fmt.Sprintf(" (torrent %x)", c.infoHash)
+			}
+			return nil, fmt.Errorf("%w: %q in %s%s", ErrPathInUse, relPaths[i], baseDir, owner)
+		}
+		if c.refs+c.shared > 0 {
+			sharedWith++
+		}
 	}
-	m.addClaimsLocked(infoHash, freeKeys)
-	return free, kept, m.releaseFunc(freeKeys)
+	for i, key := range keys {
+		m.addHoldLocked(key, infoHash, files[i].Length)
+	}
+	if sharedWith > 0 && logging.Enabled() {
+		logging.Warn("payload_files_shared",
+			logging.String("info_hash", fmt.Sprintf("%x", infoHash)),
+			logging.String("download_dir", baseDir),
+			logging.Int("files", sharedWith),
+		)
+	}
+	return m.releaseHoldFunc(infoHash, keys), nil
 }
 
-func (m *TorrentManager) addClaimsLocked(infoHash [20]byte, keys []pathClaimKey) {
+// addHoldLocked records one claim by infoHash on key. Caller holds m.claimMu
+// and has checked that the claim is allowed.
+func (m *TorrentManager) addHoldLocked(key pathClaimKey, infoHash [20]byte, length int64) {
 	if m.pathClaims == nil {
-		m.pathClaims = make(map[pathClaimKey]pathClaim, len(keys))
+		m.pathClaims = make(map[pathClaimKey]pathClaim)
 	}
-	for _, key := range keys {
-		c := m.pathClaims[key]
-		c.infoHash = infoHash
+	c := m.pathClaims[key]
+	switch {
+	case c.refs > 0 && c.infoHash == infoHash:
 		c.refs++
-		m.pathClaims[key] = c
+	case c.shared > 0 && m.sharedClaims[sharedClaimKey{key, infoHash}] > 0:
+		m.sharedClaims[sharedClaimKey{key, infoHash}]++
+		c.shared++
+	case c.refs == 0:
+		// The inline slot is free: take it. Any other holder is a cross-seed
+		// of the same length, so the length stands either way.
+		c.infoHash = infoHash
+		c.refs = 1
+		c.length = length
+	default:
+		if m.sharedClaims == nil {
+			m.sharedClaims = make(map[sharedClaimKey]int32)
+		}
+		m.sharedClaims[sharedClaimKey{key, infoHash}]++
+		c.shared++
 	}
+	m.pathClaims[key] = c
 }
 
-func (m *TorrentManager) releaseFunc(keys []pathClaimKey) func() {
+// storeClaimLocked writes c back, dropping it once nobody holds or deletes
+// the path. Caller holds m.claimMu.
+func (m *TorrentManager) storeClaimLocked(key pathClaimKey, c pathClaim) {
+	if c.refs == 0 && c.shared == 0 && c.deleting == 0 {
+		delete(m.pathClaims, key)
+		return
+	}
+	m.pathClaims[key] = c
+}
+
+func (m *TorrentManager) releaseHoldFunc(infoHash [20]byte, keys []pathClaimKey) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -135,11 +191,57 @@ func (m *TorrentManager) releaseFunc(keys []pathClaimKey) func() {
 				if !ok {
 					continue
 				}
-				if c.refs--; c.refs <= 0 {
-					delete(m.pathClaims, key)
-				} else {
-					m.pathClaims[key] = c
+				if c.refs > 0 && c.infoHash == infoHash {
+					c.refs--
+				} else if hold := (sharedClaimKey{key, infoHash}); c.shared > 0 && m.sharedClaims[hold] > 0 {
+					if m.sharedClaims[hold]--; m.sharedClaims[hold] == 0 {
+						delete(m.sharedClaims, hold)
+					}
+					c.shared--
 				}
+				m.storeClaimLocked(key, c)
+			}
+		})
+	}
+}
+
+// claimFreePaths reserves, for a deletion, the relPaths under baseDir that no
+// torrent but infoHash holds. Those are returned in free and stay reserved
+// until release: no other torrent can be added on them, not even a cross-seed,
+// while they are deleted. The paths another torrent still uses are returned in
+// kept and must not be deleted.
+func (m *TorrentManager) claimFreePaths(infoHash [20]byte, baseDir string, relPaths []string) (free, kept []string, release func()) {
+	keys := pathClaimKeys(baseDir, relPaths)
+	freeKeys := make([]pathClaimKey, 0, len(keys))
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	for i, key := range keys {
+		c := m.pathClaims[key]
+		if c.refs+c.shared > m.ownRefsLocked(key, c, infoHash) {
+			kept = append(kept, relPaths[i])
+			continue
+		}
+		free = append(free, relPaths[i])
+		freeKeys = append(freeKeys, key)
+		c.deleting++
+		if m.pathClaims == nil {
+			m.pathClaims = make(map[pathClaimKey]pathClaim)
+		}
+		m.pathClaims[key] = c
+	}
+	var once sync.Once
+	return free, kept, func() {
+		once.Do(func() {
+			m.claimMu.Lock()
+			defer m.claimMu.Unlock()
+			for _, key := range freeKeys {
+				c, ok := m.pathClaims[key]
+				if !ok {
+					continue
+				}
+				c.deleting--
+				m.storeClaimLocked(key, c)
 			}
 		})
 	}

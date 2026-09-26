@@ -145,7 +145,8 @@ func TestRemoveSessionDeletesFilesOfMetadataCompletedWhileClosing(t *testing.T) 
 // TestRemoveSessionKeepsFilesAnotherTorrentUses: deleting a torrent with its
 // files deleted every path its metadata listed, including one an active
 // torrent owned. Here the removed torrent is an entry that failed to restore
-// because the other torrent had taken its file in the meantime.
+// because the other torrent had taken its file, at another length, in the
+// meantime.
 func TestRemoveSessionKeepsFilesAnotherTorrentUses(t *testing.T) {
 	tempDir := t.TempDir()
 	downloadDir := filepath.Join(tempDir, "dl")
@@ -155,7 +156,7 @@ func TestRemoveSessionKeepsFilesAnotherTorrentUses(t *testing.T) {
 	}
 
 	owner, _ := writeTestTorrent(t, tempDir, "shared.bin", 1000, "owner")
-	stale, staleHash := writeTestTorrent(t, tempDir, "shared.bin", 1000, "stale")
+	stale, staleHash := writeTestTorrent(t, tempDir, "shared.bin", 2000, "stale")
 	staleHex := fmt.Sprintf("%x", staleHash)
 	staleData, err := os.ReadFile(stale)
 	if err != nil {
