@@ -1480,8 +1480,9 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
+	keepAccumulator := false
 	defer func() {
-		if err != nil {
+		if err != nil && !keepAccumulator {
 			// A full assembly that fails the infohash check means the size/blocks we
 			// locked onto were bad — most likely a peer that won the race to advertise
 			// metadata_size handed us a poisoned (but in-range) value. Discard the whole
@@ -1502,13 +1503,26 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return fmt.Errorf("metadata hash mismatch: expected %x, got %x", s.Torrent.InfoHash, hash)
 	}
 
-	// Wrap the info dict in a dummy bencode dictionary
-	wrapped := append([]byte("d4:info"), infoBytes...)
-	wrapped = append(wrapped, 'e')
-
-	parsed, err := torrent.Parse(wrapped)
+	// The hash commits to exactly these bytes, so they must be exactly one info
+	// dictionary. Wrapping them as "d4:info" + infoBytes + "e" accepted trailing
+	// values and kept only the first dict, which no longer matched the magnet's
+	// hash yet was served to peers and cached for restore.
+	parsed, err := torrent.ParseInfo(infoBytes)
 	if err != nil {
-		return fmt.Errorf("failed to parse metadata: %w", err)
+		// Every peer serves these same hash-verified bytes, so fetching them again
+		// cannot succeed. Stop fetching and leave the session in metadata mode,
+		// showing the error, instead of re-downloading up to 16 MiB per new peer.
+		err = fmt.Errorf("failed to parse metadata: %w", err)
+		keepAccumulator = true
+		s.mu.Lock()
+		s.metadataCompleted = true
+		s.metadataBuf = nil
+		s.metadataPieces = nil
+		s.lastErr = err
+		s.statusErr = err
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return err
 	}
 
 	// Initialize storage now that we know the files
