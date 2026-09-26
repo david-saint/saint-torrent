@@ -1472,6 +1472,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// lastActiveAt is when payload last moved either way or the peer's interest
 	// changed; see peerInactivityTimeout.
 	lastActiveAt := time.Now()
+	// lastPumpAt is when pump last ran. The loop runs pump itself once it has not
+	// run for pumpSweepInterval; see the check at the top of the loop.
+	var lastPumpAt time.Time
+	pumpSweepInterval := blockRequestTimeout / 4
 
 	// uploadQueue holds this peer's block requests awaiting upload bandwidth. It is
 	// owned by this peer goroutine and drained FIFO by uploadPump; never touched by
@@ -1562,6 +1566,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		choked := pState.Choked
 		s.mu.RUnlock()
 		now := time.Now()
+		lastPumpAt = now
 		canRequestPiece := func(index int64) bool {
 			if !hasPiece(index) {
 				return false
@@ -2214,11 +2219,12 @@ peerLoop:
 		// redial — reaping it just drops a productive uploader). A recently issued
 		// request also grants a fresh timeout window, which prevents an intentionally
 		// slow limiter wait from making the request look stale before it is sent.
+		loopNow := time.Now()
 		lastUsefulAt := lastProgressAt
 		if lastRequestAt.After(lastUsefulAt) {
 			lastUsefulAt = lastRequestAt
 		}
-		if outbound && !waitingForBandwidth && time.Since(lastUsefulAt) > peerStallTimeout {
+		if outbound && !waitingForBandwidth && loopNow.Sub(lastUsefulAt) > peerStallTimeout {
 			s.mu.RLock()
 			seeding := s.isCompletedLocked()
 			// Background resume verification can hold pieces PieceUnverified, so there
@@ -2234,7 +2240,7 @@ peerLoop:
 						logging.String("name", logName),
 						logging.String("peer", peerAddr),
 						logging.String("direction", direction),
-						logging.Duration("idle", time.Since(lastUsefulAt)),
+						logging.Duration("idle", loopNow.Sub(lastUsefulAt)),
 					)
 				}
 				break
@@ -2243,13 +2249,23 @@ peerLoop:
 
 		// Drop a connection neither side has any use for: an idle peer that only
 		// sends keep-alives would otherwise hold its slot for good.
-		if time.Since(lastActiveAt) > peerInactivityTimeout {
+		if loopNow.Sub(lastActiveAt) > peerInactivityTimeout {
 			if eitherSideInterested() {
 				lastActiveAt = time.Now()
 			} else {
 				disconnectReason = "inactive"
 				break
 			}
+		}
+
+		// The request timeout sweep lives in pump, which runs after every message we
+		// act on, but the many messages we discard (bad lengths, unknown indices,
+		// unsolicited blocks, requests we reject) skip it. Run it here once it is
+		// overdue, or a peer that took our requests could stream only such messages,
+		// never time out, and hold the requested pieces (and their received blocks)
+		// for good; an inbound peer has no stall reaper to fall back on.
+		if len(activeDownloads) > 0 && loopNow.Sub(lastPumpAt) >= pumpSweepInterval {
+			scheduleRateRetry(minRetry(pump(), uploadPump()))
 		}
 
 		var msg *peer.Message

@@ -177,6 +177,42 @@ func TestChokedAllowedFastWithholderIsDropped(t *testing.T) {
 	}
 }
 
+// An inbound peer that takes our requests and withholds the blocks is dropped
+// once the requests run out of retries, which the timeout sweep in pump counts.
+// pump runs after each message the loop acts on, but messages it discards skip
+// it, so a peer streaming only those (here, Haves for pieces that do not exist)
+// used to keep its requests alive, and the pieces behind them claimed, forever.
+func TestWithholderStreamingDiscardedMessagesIsDropped(t *testing.T) {
+	t.Cleanup(swapDuration(&blockRequestTimeout, 100*time.Millisecond))
+	sess := settled(newWireTestSession(t, 8, 32*1024))
+	hello := []*peer.Message{{ID: peer.MsgHaveAll}, {ID: peer.MsgUnchoke}}
+	var streaming sync.Once
+	p := startWithholdingPeer(t, sess, 8104, hello, func(remote net.Conn, _, _ uint32) bool {
+		streaming.Do(func() {
+			go func() {
+				bogus := (&peer.Message{ID: peer.MsgHave, Payload: []byte{0xff, 0xff, 0xff, 0xf0}}).Serialize()
+				stop := time.After(10 * time.Second)
+				for {
+					select {
+					case <-time.After(5 * time.Millisecond):
+						if _, err := remote.Write(bogus); err != nil {
+							return
+						}
+					case <-stop:
+						return
+					}
+				}
+			}()
+		})
+		return false // withhold every block
+	})
+	select {
+	case <-p.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a peer withholding every block kept its connection by streaming discarded messages")
+	}
+}
+
 func swapInt64(p *int64, v int64) func() {
 	old := *p
 	*p = v
