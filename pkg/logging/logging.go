@@ -209,15 +209,11 @@ func New(cfg Config) (*Logger, error) {
 	if cfg.MaxBackups < 0 {
 		return nil, fmt.Errorf("max backups must be non-negative")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
+	f, err := OpenPrivateFile(path)
 	if err != nil {
-		return nil, err
-	}
-	if err := f.Chmod(logFileMode); err != nil {
-		_ = f.Close()
 		return nil, err
 	}
 	stat, err := f.Stat()
@@ -234,6 +230,35 @@ func New(cfg Config) (*Logger, error) {
 		size:         stat.Size(),
 		now:          time.Now,
 	}, nil
+}
+
+// OpenPrivateFile opens path for appending, creating it with mode 0600. It
+// refuses a symlink (on Unix), anything but a regular file, a file owned by
+// another user, and a file with extra hard links, then forces mode 0600. A log
+// path another local user can predict (say, in /tmp) therefore cannot be
+// turned into an append to, and chmod of, one of the victim's own files.
+func OpenPrivateFile(path string) (*os.File, error) {
+	f, err := openNoFollow(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil && !fi.Mode().IsRegular() {
+		err = fmt.Errorf("refusing to log to %s: not a regular file", path)
+	}
+	if err == nil {
+		if ownerErr := checkOwner(fi); ownerErr != nil {
+			err = fmt.Errorf("refusing to log to %s: %w", path, ownerErr)
+		}
+	}
+	if err == nil {
+		err = f.Chmod(logFileMode)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // Enabled reports whether this logger writes level.
@@ -327,12 +352,10 @@ func (l *Logger) rotateLocked() error {
 		}
 	}
 
-	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
+	// The path was just vacated by the rename, so another user could plant a
+	// link there; reopen with the same checks as New.
+	f, err := OpenPrivateFile(l.path)
 	if err != nil {
-		return err
-	}
-	if err := f.Chmod(logFileMode); err != nil {
-		_ = f.Close()
 		return err
 	}
 	l.file = f

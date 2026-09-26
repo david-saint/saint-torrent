@@ -158,15 +158,18 @@ JSON-lines logging to a rotating file with either `SAINTTORRENT_LOG` or
 `--log`:
 
 ```bash
-SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
-./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
+SAINTTORRENT_LOG="$HOME/Library/Logs/sainttorrent/debug.log" ./sainttorrent   # macOS
+./sainttorrent --log ~/.cache/sainttorrent/debug.log --log-level debug        # Linux
 ```
 
-Log levels are `debug`, `info`, `warn`, and `error`. On Unix-like systems logs
-are created owner-readable only, but they can include local paths and peer
-addresses, so keep them in a private location. Rotation defaults to 10 MiB with
-3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`)
-and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
+Log levels are `debug`, `info`, `warn`, and `error`. Logs can include local
+paths, torrent names, and peer addresses, so keep them in a private per-user
+directory rather than a shared one such as `/tmp`. Missing parent directories
+are created owner-only (`0700`). On Unix-like systems the log file is
+owner-readable only, and saintTorrent refuses to open a log path that is a
+symlink, a hard link, or a file owned by another user. Rotation defaults to
+10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for
+example `25mb`) and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
 
 The HTTP stats endpoint is off by default. Enable the read-only JSON API with
 `--http-addr`:

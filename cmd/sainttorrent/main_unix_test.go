@@ -3,8 +3,11 @@
 package main
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFindTerminalTTY(t *testing.T) {
@@ -27,5 +30,33 @@ func TestFindTerminalTTY(t *testing.T) {
 
 	if got := findTerminalTTY(tempFile, []string{tempFile.Name()}); got != "" {
 		t.Fatalf("expected regular file to be rejected, got %q", got)
+	}
+}
+
+// SAINTTORRENT_TIMING_LOG shares the debug log's open: a symlink planted at
+// the configured path must not be followed into another file.
+func TestPerfReportRefusesSymlinkedTimingLog(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "timing.log")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SAINTTORRENT_TIMING_LOG", link)
+	prevEnabled, prevMarks := perfEnabled, perfMarks
+	perfEnabled, perfMarks = true, []perfMark{{label: "test", at: time.Millisecond}}
+	defer func() { perfEnabled, perfMarks = prevEnabled, prevMarks }()
+
+	perfReport(io.Discard)
+
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep\n" {
+		t.Fatalf("timing report was written through the symlink: %q", data)
 	}
 }

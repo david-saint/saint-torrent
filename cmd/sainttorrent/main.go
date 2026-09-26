@@ -95,7 +95,7 @@ func perfReport(w io.Writer) {
 	fmt.Fprintln(w, "── saintTorrent timing ──")
 	writeRows(w)
 	if logPath := os.Getenv("SAINTTORRENT_TIMING_LOG"); logPath != "" {
-		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		if f, err := logging.OpenPrivateFile(logPath); err == nil {
 			fmt.Fprintf(f, "── %s ──\n", time.Now().Format(time.RFC3339))
 			writeRows(f)
 			f.Close()
