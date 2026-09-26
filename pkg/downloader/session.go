@@ -1511,7 +1511,52 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
+	// Initialize storage now that we know the files
+	var fileInfos []storage.FileInfo
+	for _, f := range parsed.Files {
+		fileInfos = append(fileInfos, storage.FileInfo{
+			Path:   filepath.Join(f.Path...),
+			Length: f.Length,
+		})
+	}
+
 	s.mu.Lock()
+	factory := s.storageFactory
+	if factory == nil {
+		factory = storage.NewStorage
+	}
+	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
+	var (
+		st            storage.Storage
+		storageErrors []error
+	)
+	for index, downloadDir := range downloadDirs {
+		// Success is decided by the error alone: a factory that returns a nil
+		// pointer boxed in the interface must never be installed.
+		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
+		if createErr == nil && candidate != nil {
+			st = candidate
+			s.downloadDir = st.BaseDir()
+			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
+			break
+		}
+		if createErr == nil {
+			createErr = errors.New("storage factory returned no storage")
+		}
+		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
+	}
+	if st == nil {
+		// Leave the session exactly as it was before the metadata arrived: no
+		// pieces and no storage, a state every peer and reader path handles. Sizing
+		// PieceStates here would let the first peer Request reach a nil Storage.
+		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
+		s.lastErr = statusErr
+		s.statusErr = statusErr
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return statusErr
+	}
+
 	s.Torrent.PieceLength = parsed.PieceLength
 	s.Torrent.PieceHashes = parsed.PieceHashes
 	s.Torrent.Name = parsed.Name
@@ -1532,41 +1577,6 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		s.PieceStates[i] = PieceEmpty
 	}
 	s.pieceAvailability = make([]int, numPieces)
-
-	// Initialize storage now that we know the files
-	var fileInfos []storage.FileInfo
-	for _, f := range s.Torrent.Files {
-		fileInfos = append(fileInfos, storage.FileInfo{
-			Path:   filepath.Join(f.Path...),
-			Length: f.Length,
-		})
-	}
-	factory := s.storageFactory
-	if factory == nil {
-		factory = storage.NewStorage
-	}
-	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
-	var (
-		st            storage.Storage
-		storageErrors []error
-	)
-	for index, downloadDir := range downloadDirs {
-		st, err = factory(downloadDir, fileInfos, s.Torrent.PieceLength)
-		if err == nil {
-			s.downloadDir = st.BaseDir()
-			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
-			break
-		}
-		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, err))
-	}
-	if st == nil {
-		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
-		s.lastErr = statusErr
-		s.statusErr = statusErr
-		s.broadcastPieceWaitersLocked()
-		s.mu.Unlock()
-		return statusErr
-	}
 	s.Storage = st
 	s.statusErr = nil
 	storageToVerify := st

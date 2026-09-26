@@ -79,14 +79,16 @@ func ParseBackend(name string) (Backend, error) {
 func FactoryForBackend(backend Backend) (Factory, error) {
 	switch backend {
 	case BackendFile:
-		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewFileStorage(baseDir, files, pieceLength)
-		}, nil
+		return NewStorage, nil
 	case BackendMMap:
 		return mmapFactory()
 	case BackendMemory:
 		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewMemStorage(baseDir, files, pieceLength)
+			st, err := NewMemStorage(baseDir, files, pieceLength)
+			if err != nil {
+				return nil, err
+			}
+			return st, nil
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown storage backend %q", backend)
@@ -103,8 +105,16 @@ func NewStorageWithBackend(backend Backend, baseDir string, files []FileInfo, pi
 }
 
 // NewStorage creates the default file-backed storage.
+//
+// Every Factory returns an untyped nil Storage on error. Returning the failed
+// (*FileStorage)(nil) directly would box it into a non-nil interface, and a
+// caller testing st == nil would install it and crash on the first call.
 func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-	return NewFileStorage(baseDir, files, pieceLength)
+	st, err := NewFileStorage(baseDir, files, pieceLength)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // fileLayout holds a file's byte range within the torrent plus a lazily-opened,
