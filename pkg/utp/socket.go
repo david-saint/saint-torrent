@@ -345,13 +345,14 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		listener  *Listener
 		halfOpen  bool
 		sendReset bool
+		resetTo   [2]*Conn
 	)
 	s.mu.Lock()
 	c = s.conns[key]
 	if c == nil {
 		// Only packets for unknown conns get here, so the half-open lookup,
-		// the promotion and the reset budget cost established connections
-		// nothing.
+		// the promotion, the RESET routing and the reset budget cost
+		// established connections nothing.
 		now := time.Now()
 		if h := s.liveHalfOpenLocked(key, now); h != nil {
 			halfOpen = true
@@ -359,7 +360,9 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 				c = s.promoteLocked(h, p.ackNr)
 				listener = s.listener
 			}
-		} else if p.typ != packetTypeReset {
+		} else if p.typ == packetTypeReset {
+			resetTo = s.resetTargetsLocked(addr, p.connID)
+		} else {
 			sendReset = s.allowResetLocked(now)
 		}
 	}
@@ -368,8 +371,15 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	if c == nil {
 		// A packet for a half-open entry that does not acknowledge our
 		// SYN-ACK came from a source that has not shown it receives what we
-		// send, so it is dropped without any reply. Other stray packets get
-		// a RESET while the budget lasts.
+		// send, so it is dropped without any reply. A RESET is never
+		// answered, only handed to the conns it may name, which still check
+		// its ack_nr like any in-band RESET. Other stray packets get a RESET
+		// while the budget lasts.
+		for _, rc := range resetTo {
+			if rc != nil {
+				rc.handlePacket(p)
+			}
+		}
 		if sendReset {
 			s.writeReset(p, addr)
 		}
@@ -466,6 +476,25 @@ func (s *Socket) allowResetLocked(now time.Time) bool {
 	}
 	s.resetsSent++
 	return true
+}
+
+// resetTargetsLocked returns the conns from addr that a RESET carrying id as
+// our send id can belong to. libutp (uTorrent, Transmission) and writeReset
+// alike answer a packet for a connection they do not know with a RESET
+// carrying that packet's connection id, which is our send id rather than the
+// recv id conns are keyed by. The recv id is one below the send id on a conn
+// we dialed and one above on a conn we accepted, so both neighbouring keys are
+// tried, as libutp does. A conn found there is a target only if its send id
+// is id: either key can just as well hold an unrelated conn whose recv id
+// happens to be id±1.
+func (s *Socket) resetTargetsLocked(addr *net.UDPAddr, id uint16) [2]*Conn {
+	var out [2]*Conn
+	for i, recvID := range [2]uint16{id - 1, id + 1} {
+		if c := s.conns[newConnKey(addr, recvID)]; c != nil && c.sendID == id {
+			out[i] = c
+		}
+	}
+	return out
 }
 
 // writeReset answers p, which belongs to no connection we can serve, with a

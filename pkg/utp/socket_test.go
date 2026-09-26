@@ -1596,3 +1596,112 @@ func TestReadErrorBackoffIsBounded(t *testing.T) {
 		t.Fatal("read errors closed the socket")
 	}
 }
+
+// dialRaw dials peer from client, answers the SYN by hand and returns the
+// established conn once its handshake STATE has reached the peer.
+func dialRaw(t *testing.T, client *Socket, peer *rawPeer) *Conn {
+	t.Helper()
+	type dialResult struct {
+		c   *Conn
+		err error
+	}
+	dialed := make(chan dialResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := client.dialContext(ctx, peer.conn.LocalAddr().(*net.UDPAddr))
+		dialed <- dialResult{c, err}
+	}()
+	syn := peer.mustRecv("SYN")
+	if syn.typ != packetTypeSyn {
+		t.Fatalf("first packet type %d, want SYN", syn.typ)
+	}
+	peer.send(packet{typ: packetTypeState, connID: syn.connID, seqNr: 900, ackNr: syn.seqNr})
+	var res dialResult
+	select {
+	case res = <-dialed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dial did not complete")
+	}
+	if res.err != nil {
+		t.Fatalf("dial: %v", res.err)
+	}
+	t.Cleanup(func() { _ = res.c.Close() })
+	for {
+		// SYN retransmits sent before the SYN-ACK arrived are skipped.
+		if p := peer.mustRecv("handshake STATE"); p.typ == packetTypeState {
+			return res.c
+		}
+	}
+}
+
+// TestResetCarryingOurSendIDClosesConn checks that a RESET carrying our send
+// id reaches its conn. libutp (uTorrent, Transmission) answers a packet for a
+// connection it has lost with a RESET that echoes the packet's connection id,
+// our send id, while conns are keyed by recv id, so such RESETs used to be
+// dropped and the dead conn lingered until the peer-wire timeouts. A RESET
+// whose id merely neighbours a conn's recv id without being its send id, or
+// whose ack_nr names nothing we sent, is ignored, and none is answered.
+func TestResetCarryingOurSendIDClosesConn(t *testing.T) {
+	cases := []struct {
+		name string
+		open func(t *testing.T, s *Socket, peer *rawPeer) *Conn
+	}{
+		{"dialed", dialRaw},
+		{"accepted", func(t *testing.T, s *Socket, peer *rawPeer) *Conn {
+			c, _ := acceptRaw(t, s, peer, packet{connID: 8200, seqNr: 300})
+			return c
+		}},
+		// Recv id 0, send id 0xffff: the lookup one above wraps.
+		{"accepted at wrap", func(t *testing.T, s *Socket, peer *rawPeer) *Conn {
+			c, _ := acceptRaw(t, s, peer, packet{connID: 0xffff, seqNr: 300})
+			return c
+		}},
+		// Recv id 0xffff, send id 0: the lookup one below wraps. Registered
+		// by hand because dial picks its ids at random.
+		{"dialed at wrap", func(t *testing.T, s *Socket, peer *rawPeer) *Conn {
+			c := newOutboundConn(s, peer.conn.LocalAddr().(*net.UDPAddr), 0xffff)
+			if err := s.register(c); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			t.Cleanup(func() { c.closeWithError(net.ErrClosed, false) })
+			return c
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newServerSocket(t)
+			peer := newRawPeer(t, s)
+			from := peer.conn.LocalAddr().(*net.UDPAddr)
+			c := tc.open(t, s, peer)
+			c.mu.Lock()
+			ack := c.localSeq // what the RESET for our latest packet acks
+			c.mu.Unlock()
+			// Driven through handleUTPPacket, the read loop's own entry
+			// point, so each RESET has been handled when it returns.
+			reset := func(id, ack uint16) {
+				s.handleUTPPacket(packet{typ: packetTypeReset, connID: id, seqNr: 77, ackNr: ack}.marshal(), from)
+			}
+
+			// sendID±2 puts c's recv id among the ids tried either way.
+			for _, id := range []uint16{c.sendID + 2, c.sendID - 2, c.sendID + 1000} {
+				reset(id, ack)
+			}
+			reset(c.sendID, ack+20000)
+			if err := c.errIfClosed(); err != nil {
+				t.Fatalf("conn closed by a RESET that does not name it: %v", err)
+			}
+
+			reset(c.sendID, ack)
+			if err := c.errIfClosed(); !errors.Is(err, errReset) {
+				t.Fatalf("conn after a RESET carrying its send id: err=%v, want %v", err, errReset)
+			}
+			if conns, _ := socketState(s); conns != 0 {
+				t.Fatalf("%d conns still registered after the RESET", conns)
+			}
+			if p, ok := peer.recv(150 * time.Millisecond); ok {
+				t.Fatalf("RESETs drew a reply of type %d", p.typ)
+			}
+		})
+	}
+}
