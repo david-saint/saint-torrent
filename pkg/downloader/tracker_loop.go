@@ -39,9 +39,13 @@ const (
 	maxTrackersPerHost = 2
 	// trackerAnnounceWorkers bounds one session's concurrent tracker requests.
 	trackerAnnounceWorkers = 16
-	// maxConcurrentTrackerRequests bounds tracker requests in flight across every
-	// session (libtorrent's max_concurrent_http_announces is 50).
-	maxConcurrentTrackerRequests = 50
+	// maxConcurrentTrackerRequests bounds tracker requests (sockets) in flight
+	// across every session. It is well above libtorrent's 50, which counts HTTP
+	// announces only and meets a few active torrents: here every torrent
+	// announces to all its trackers at once, and a dead tracker holds its slot
+	// for the whole timeout, so a budget of 50 made a restart with a dozen
+	// torrents queue their live trackers behind each other's dead ones.
+	maxConcurrentTrackerRequests = 200
 	// trackerLowPeers is the connection count below which a downloading session
 	// re-announces early (trackerEarlyReannounce) instead of waiting out the
 	// tracker's full interval.

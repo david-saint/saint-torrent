@@ -240,9 +240,11 @@ func TestAnnounceFanOutIsBoundedAcrossSessions(t *testing.T) {
 		t.Cleanup(srv.Close)
 		urls = append(urls, srv.URL+"/announce")
 	}
-	// Four sessions could open 4*16 = 64 requests; the process-wide cap wins.
+	// Enough sessions that their pools together exceed the process-wide cap,
+	// which must win.
+	sessions := maxConcurrentTrackerRequests/trackerAnnounceWorkers + 2
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := 0; i < sessions; i++ {
 		sess := newTrackerTestSession(t, fmt.Sprintf("global-%d", i), urls...)
 		wg.Go(sess.announceAndConnect)
 	}
@@ -256,9 +258,42 @@ func TestAnnounceFanOutIsBoundedAcrossSessions(t *testing.T) {
 	if peak > maxConcurrentTrackerRequests {
 		t.Fatalf("%d tracker requests in flight across sessions, want at most %d", peak, maxConcurrentTrackerRequests)
 	}
-	if got := bt.total.Load(); got != int32(4*len(urls)) {
-		t.Fatalf("announced %d times, want %d", got, 4*len(urls))
+	if got := bt.total.Load(); got != int32(sessions*len(urls)) {
+		t.Fatalf("announced %d times, want %d", got, sessions*len(urls))
 	}
+}
+
+// TestSlowTrackersDoNotStallOtherSessions reproduces a restart with several
+// torrents whose lists hold dead trackers (each holds a request slot until it
+// times out). Every session's live tracker must still be asked at once rather
+// than queue behind other sessions' timeouts: the old loop dialed a torrent's
+// first peers within one announce timeout, so a smaller process-wide budget
+// would slow startup.
+func TestSlowTrackersDoNotStallOtherSessions(t *testing.T) {
+	t.Cleanup(swapDuration(&trackerAnnounceTimeout, 5*time.Second))
+	slow := newBlockingTracker()
+	release := sync.OnceFunc(func() { close(slow.release) })
+	t.Cleanup(release)
+	dead := serveTrackers(t, 6, slow.handler) // 12 per session, within its pool
+	var liveHits atomic.Int32
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		liveHits.Add(1)
+		_, _ = w.Write([]byte("d8:intervali1800ee"))
+	}))
+	defer live.Close()
+
+	const sessions = 10
+	var wg sync.WaitGroup
+	for i := 0; i < sessions; i++ {
+		trackers := append(append([]string(nil), dead...), live.URL+"/announce")
+		sess := newTrackerTestSession(t, fmt.Sprintf("restart-%d", i), trackers...)
+		wg.Go(sess.announceAndConnect)
+	}
+	waitFor(t, "every session's live tracker", 2*time.Second, func() bool {
+		return liveHits.Load() == sessions
+	})
+	release()
+	wg.Wait()
 }
 
 // TestAnnounceDialsPeersBeforeSlowTrackerAnswers checks the first peers are
