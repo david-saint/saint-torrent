@@ -1046,11 +1046,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// at session pickGen noPickGen and time noPickAt. pump then skips the picker,
 	// whose scan of the needed pieces under the session write lock costs O(needed)
 	// when the peer has none of them, until pickGen moves, the peer's side changes
-	// (a new piece, an unchoke, an allowed_fast grant, one of our pieces closing;
-	// each clears noPick), or pickRetryInterval passes as a backstop. Without it a
-	// peer that unchoked us but has nothing we need paid that scan for every
-	// message it sent, keep-alives and its own block requests included.
+	// (a new piece, an allowed_fast grant, one of our pieces closing, or an unchoke
+	// when noPickRestricted; each clears noPick), or pickRetryInterval passes as a
+	// backstop. Without it a peer that unchoked us but has nothing we need paid
+	// that scan for every message it sent, keep-alives and its own block requests
+	// included. noPickRestricted marks an empty pick made while the peer choked us
+	// (allowed-fast pieces only) or with pieces it rejected set aside: an unchoke
+	// widens those, so only then does it clear noPick, and a peer flipping choke
+	// and unchoke cannot force a scan per flip.
 	noPick := false
+	noPickRestricted := false
 	var noPickGen uint64
 	var noPickAt time.Time
 
@@ -1691,6 +1696,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				}
 				newDL := openNewPiece(canRequestPiece)
 				if newDL == nil {
+					noPickRestricted = choked || len(peerRejectedPieces) > 0
 					break
 				}
 				activeDownloads = append(activeDownloads, newDL)
@@ -2459,7 +2465,9 @@ peerLoop:
 			// a permanent refusal. Without this a single (often transient) reject
 			// would bar the piece from this peer for the whole connection.
 			clear(peerRejectedPieces)
-			noPick = false
+			if noPickRestricted {
+				noPick = false
+			}
 			pipeline.OnUnchoke(now)
 			publishPipelineSnapshot(now, true)
 

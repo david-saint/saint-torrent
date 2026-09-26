@@ -75,8 +75,39 @@ func TestPeerWithNothingWeNeedIsNotRescannedPerMessage(t *testing.T) {
 		t.Fatalf("200 keep-alives from a peer with nothing we need ran the picker %d times", n)
 	}
 
+	// Flipping choke and unchoke does not force a scan per flip either: the
+	// empty pick was made unchoked, and an unchoke adds nothing to it.
+	before = scans.Load()
+	for i := 0; i < 100; i++ {
+		w.send(&peer.Message{ID: peer.MsgChoke})
+		w.send(&peer.Message{ID: peer.MsgUnchoke})
+	}
+	w.barrier()
+	if n := scans.Load() - before; n > 1 {
+		t.Fatalf("100 choke/unchoke flips ran the picker %d times", n)
+	}
+
 	w.send(&peer.Message{ID: peer.MsgHave, Payload: havePayload(9)})
 	w.expectRequestFor(9, 2*time.Second)
+}
+
+// TestRestrictedEmptyPickIsRedoneOnUnchoke checks the other side of the flip
+// rule: an empty pick that set aside pieces the peer rejected is redone when an
+// unchoke clears the rejections, at once rather than after pickRetryInterval.
+func TestRestrictedEmptyPickIsRedoneOnUnchoke(t *testing.T) {
+	sess := newWireTestSession(t, 1, 2*BlockSize)
+	w := startWirePeer(t, sess, 6252, fastReserved())
+	w.send(&peer.Message{ID: peer.MsgHaveAll})
+	w.send(&peer.Message{ID: peer.MsgUnchoke})
+	w.expectRequestFor(0, 2*time.Second)
+
+	// The peer rejects a block: the piece is dropped and set aside for this
+	// peer, so the next pick finds nothing.
+	w.send(&peer.Message{ID: peer.MsgRejectRequest, Payload: blockPayload(0, 0, BlockSize)})
+	w.barrier()
+
+	w.send(&peer.Message{ID: peer.MsgUnchoke})
+	w.expectRequestFor(0, 2*time.Second)
 }
 
 // TestEmptyPickFollowsSessionChanges checks the empty-pick cache against changes
