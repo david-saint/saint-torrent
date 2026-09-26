@@ -1601,6 +1601,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return false
 	}
 
+	// endgameCopyLimit is how many redundant endgame copies this connection may
+	// hold: what its request window can fill, and at least
+	// minEndgamePiecesPerPeer. pump sets it from the current window.
+	endgameCopyLimit := minEndgamePiecesPerPeer
+
 	// openNewPiece claims the highest-priority, rarest empty wanted piece this peer has
 	// and marks it PieceDownloading. In endgame (no fresh pieces left to claim) it
 	// instead returns a redundant copy of an in-progress piece this peer has, leaving
@@ -1634,7 +1639,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 						copies++
 					}
 				}
-				if copies < maxEndgamePiecesPerPeer {
+				if copies < endgameCopyLimit {
 					bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
 					endgame = true
 				}
@@ -1760,7 +1765,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if s.hasSelectableNeededPieceLocked(canRequestPiece) {
 			return true
 		}
-		if s.endgameActiveLocked() && endgameCopies() < maxEndgamePiecesPerPeer {
+		if s.endgameActiveLocked() && endgameCopies() < endgameCopyLimit {
 			for i := range s.downloadingPieces {
 				if canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
 					return true
@@ -1960,6 +1965,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			pipeline.OnPieceCapLimited(now)
 		}
 		pieceCap := pipeline.ConcurrentPieceCap(avgBlocks, 0)
+		endgameCopyLimit = max(minEndgamePiecesPerPeer, divCeil(window, avgBlocks))
 
 		// Fill the window, opening pieces on demand.
 		for outstanding < window {

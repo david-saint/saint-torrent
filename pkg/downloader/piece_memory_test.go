@@ -112,19 +112,47 @@ func TestOpenPieceBytesPerConnectionAreCapped(t *testing.T) {
 	}
 }
 
-// Endgame copies are whole pieces fetched from block 0; each connection used to
-// take up to 16 of them. Two per connection are enough to finish the tail.
-func TestEndgameCopiesPerConnectionAreCapped(t *testing.T) {
-	sess := settled(newWireTestSession(t, 32, 64*1024))
+// endgameOnlySession is a session whose every piece is claimed by other
+// peers, so a new connection can only take redundant endgame copies.
+func endgameOnlySession(t *testing.T, numPieces int, pieceLen int64) *Session {
+	t.Helper()
+	sess := settled(newWireTestSession(t, numPieces, pieceLen))
 	sess.mu.Lock()
 	for i := range sess.PieceStates {
 		sess.setPieceStateLocked(i, PieceDownloading) // claimed by other peers: endgame
 	}
 	sess.mu.Unlock()
+	return sess
+}
+
+// Endgame copies are whole pieces fetched from block 0. A connection takes as
+// many as its request window can fill: a flat two per connection held a fast
+// peer to two pieces per round trip while slow peers sat on the rest, and made
+// the endgame tail up to 3.4 times slower. It never takes more than its window.
+func TestEndgameCopiesPerConnectionFollowTheWindow(t *testing.T) {
+	const pieceLen = 64 * 1024 // 4 blocks
+	sess := endgameOnlySession(t, 32, pieceLen)
 	hello := []*peer.Message{{ID: peer.MsgHaveAll}, {ID: peer.MsgUnchoke}}
 	p := startWithholdingPeer(t, sess, 8102, hello, nil)
-	if n := p.requestedPieces(t); n != maxEndgamePiecesPerPeer {
-		t.Fatalf("the loop took %d endgame copies on one connection, want %d", n, maxEndgamePiecesPerPeer)
+	// The peer serves nothing, so the window stays at its initial size.
+	windowPieces := divCeil(dynamicPipelineInitialWindowBlocks, pieceLen/BlockSize)
+	if n := p.requestedPieces(t); n <= minEndgamePiecesPerPeer || n > windowPieces {
+		t.Fatalf("the loop took %d endgame copies on one connection, want more than %d and at most the %d its window fills",
+			n, minEndgamePiecesPerPeer, windowPieces)
+	}
+}
+
+// Endgame copies count against a connection's open piece bytes like any open
+// piece, so a withholding peer pins no more memory in endgame than outside it.
+func TestEndgameCopiesPerConnectionAreByteCapped(t *testing.T) {
+	const pieceLen = 64 * 1024 // 4 blocks
+	// Restored by Cleanup, after the peer loop has exited.
+	t.Cleanup(swapInt64(&peerOpenPieceBytesFloor, 4*pieceLen))
+	sess := endgameOnlySession(t, 32, pieceLen)
+	hello := []*peer.Message{{ID: peer.MsgHaveAll}, {ID: peer.MsgUnchoke}}
+	p := startWithholdingPeer(t, sess, 8105, hello, nil)
+	if n := p.requestedPieces(t); n != 4 {
+		t.Fatalf("the loop took %d endgame copies on one connection, want 4 (the byte cap)", n)
 	}
 }
 

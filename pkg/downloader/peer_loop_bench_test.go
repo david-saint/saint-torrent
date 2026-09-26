@@ -3,7 +3,9 @@ package downloader
 import (
 	"crypto/sha1"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,4 +208,162 @@ func BenchmarkPeerLoopUpload(b *testing.B) {
 		sess.Close()
 		b.StartTimer()
 	}
+}
+
+// Endgame benchmarks: slow peers open pieces first, then one fast peer with a
+// fixed latency joins and must finish what the slow peers hold as redundant
+// endgame copies. The time to completion is bound by how many copies the fast
+// connection may have in flight per round trip; a cap below its request window
+// shows up here directly (a flat two copies per connection took 3.4 times as
+// long with 256 KiB pieces).
+
+// BenchmarkPeerLoopEndgame: 32 MiB in 256 KiB pieces, 8 slow peers serving a
+// block every 250 ms, and a fast peer answering each request 25 ms after it
+// arrives.
+func BenchmarkPeerLoopEndgame(b *testing.B) {
+	benchPeerLoopEndgame(b, 256<<10, 128, 8)
+}
+
+// BenchmarkPeerLoopEndgameLargePieces is BenchmarkPeerLoopEndgame with 1 MiB
+// pieces.
+func BenchmarkPeerLoopEndgameLargePieces(b *testing.B) {
+	benchPeerLoopEndgame(b, 1<<20, 32, 8)
+}
+
+// BenchmarkPeerLoopEndgameFastPeerOnly is the control: the fast peer alone,
+// bound only by its window and latency.
+func BenchmarkPeerLoopEndgameFastPeerOnly(b *testing.B) {
+	benchPeerLoopEndgame(b, 256<<10, 128, 0)
+}
+
+const (
+	benchEndgameLatency = 25 * time.Millisecond
+	benchEndgameSlowGap = 250 * time.Millisecond
+)
+
+func benchPeerLoopEndgame(b *testing.B, pieceLen, numPieces, slowPeers int) {
+	data, hashes := benchTorrentData(pieceLen, numPieces)
+	b.SetBytes(int64(len(data)))
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		b.StopTimer()
+		sess := benchSession(b, data, hashes, pieceLen, false)
+		var remotes []net.Conn
+		var dones []chan struct{}
+		b.StartTimer()
+		start := time.Now()
+		for i := 0; i < slowPeers; i++ {
+			ip := fmt.Sprintf("127.0.1.%d", i+1)
+			remote, done := benchRunOutboundLoop(sess, ip, 6881)
+			benchLatencyPeer(remote, data, pieceLen, benchEndgameLatency, benchEndgameSlowGap)
+			remotes = append(remotes, remote)
+			dones = append(dones, done)
+		}
+		time.Sleep(100 * time.Millisecond) // let the slow peers open their pieces
+		remote, done := benchRunOutboundLoop(sess, "127.0.2.1", 6881)
+		benchLatencyPeer(remote, data, pieceLen, benchEndgameLatency, 0)
+		remotes = append(remotes, remote)
+		dones = append(dones, done)
+		for !sess.IsCompleted() {
+			if time.Since(start) > 2*time.Minute {
+				b.Fatal("download did not complete")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		b.StopTimer()
+		for _, r := range remotes {
+			_ = r.Close()
+		}
+		for _, d := range dones {
+			<-d
+		}
+		sess.Close()
+		b.StartTimer()
+	}
+}
+
+// benchRunOutboundLoop runs an outbound, fast-extension connection to ip:port
+// and returns the remote end.
+func benchRunOutboundLoop(sess *Session, ip string, port uint16) (net.Conn, chan struct{}) {
+	var reserved [8]byte
+	peer.EnableFastExtension(&reserved)
+	clientConn, remote := net.Pipe()
+	client := peer.NewClient(clientConn, sess.Torrent.InfoHash, sess.PeerID)
+	done := make(chan struct{})
+	addr := net.JoinHostPort(ip, fmt.Sprint(port))
+	go func() {
+		sess.runPeerMessageLoop(client, clientConn, addr, ip, port, reserved, true)
+		close(done)
+	}()
+	return remote, done
+}
+
+// benchLatencyPeer is a seed on remote that unchokes at once and sends each
+// requested block no earlier than latency after the request arrived and no
+// sooner than gap after the previous block (0: no pacing). Cancelled requests
+// are skipped.
+func benchLatencyPeer(remote net.Conn, data []byte, pieceLen int, latency, gap time.Duration) {
+	type request struct {
+		payload [12]byte
+		at      time.Time
+	}
+	var mu sync.Mutex
+	cancelled := map[[12]byte]bool{}
+	requests := make(chan request, 8192)
+	go func() {
+		defer close(requests)
+		for {
+			msg, err := peer.ParseMessage(remote)
+			if err != nil {
+				return
+			}
+			if msg == nil || len(msg.Payload) < 12 {
+				continue
+			}
+			var key [12]byte
+			copy(key[:], msg.Payload)
+			switch msg.ID {
+			case peer.MsgRequest:
+				requests <- request{payload: key, at: time.Now()}
+			case peer.MsgCancel:
+				mu.Lock()
+				cancelled[key] = true
+				mu.Unlock()
+			}
+		}
+	}()
+	go func() {
+		_, _ = remote.Write((&peer.Message{ID: peer.MsgHaveAll}).Serialize())
+		_, _ = remote.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+		last := time.Now()
+		for r := range requests {
+			mu.Lock()
+			skip := cancelled[r.payload]
+			delete(cancelled, r.payload)
+			mu.Unlock()
+			if skip {
+				continue
+			}
+			if wait := time.Until(r.at.Add(latency)); wait > 0 {
+				time.Sleep(wait)
+			}
+			if gap > 0 {
+				if wait := time.Until(last.Add(gap)); wait > 0 {
+					time.Sleep(wait)
+				}
+				last = time.Now()
+			}
+			index := binary.BigEndian.Uint32(r.payload[0:4])
+			begin := binary.BigEndian.Uint32(r.payload[4:8])
+			length := binary.BigEndian.Uint32(r.payload[8:12])
+			off := int(index)*pieceLen + int(begin)
+			frame := make([]byte, 13, 13+length)
+			binary.BigEndian.PutUint32(frame[0:4], 9+length)
+			frame[4] = byte(peer.MsgPiece)
+			copy(frame[5:13], r.payload[0:8])
+			if _, err := remote.Write(append(frame, data[off:off+int(length)]...)); err != nil {
+				return
+			}
+		}
+	}()
 }

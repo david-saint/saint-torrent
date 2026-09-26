@@ -34,10 +34,13 @@ const (
 	// minOpenPiecesPerPeer pieces may always be open, whatever their size, so the
 	// window can run across a piece boundary.
 	minOpenPiecesPerPeer = 2
-	// maxEndgamePiecesPerPeer bounds the redundant endgame copies one connection
-	// holds: each is a full piece fetched from block 0, and a couple per peer are
-	// enough to finish the tail.
-	maxEndgamePiecesPerPeer = 2
+	// minEndgamePiecesPerPeer redundant endgame copies may always be open on one
+	// connection. Beyond that a connection takes as many as its request window
+	// can fill (see runPeerMessageLoop's endgameCopyLimit): a fast peer then
+	// re-fetches the pieces slow peers still hold a window at a time instead of
+	// two per round trip. Memory stays bounded by the window and by
+	// peerOpenPieceBytesCap, which cover endgame copies like any open piece.
+	minEndgamePiecesPerPeer = 2
 )
 
 // peerOpenPieceBytesCap returns the most piece bytes one connection may have open
