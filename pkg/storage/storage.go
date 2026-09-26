@@ -7,14 +7,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrFileRepaired is returned when a write had to recreate or resize a target
@@ -76,14 +82,16 @@ func ParseBackend(name string) (Backend, error) {
 func FactoryForBackend(backend Backend) (Factory, error) {
 	switch backend {
 	case BackendFile:
-		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewFileStorage(baseDir, files, pieceLength)
-		}, nil
+		return NewStorage, nil
 	case BackendMMap:
 		return mmapFactory()
 	case BackendMemory:
 		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewMemStorage(baseDir, files, pieceLength)
+			st, err := NewMemStorage(baseDir, files, pieceLength)
+			if err != nil {
+				return nil, err
+			}
+			return st, nil
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown storage backend %q", backend)
@@ -100,13 +108,31 @@ func NewStorageWithBackend(backend Backend, baseDir string, files []FileInfo, pi
 }
 
 // NewStorage creates the default file-backed storage.
+//
+// Every Factory returns an untyped nil Storage on error. Returning the failed
+// (*FileStorage)(nil) directly would box it into a non-nil interface, and a
+// caller testing st == nil would install it and crash on the first call.
 func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-	return NewFileStorage(baseDir, files, pieceLength)
+	st, err := NewFileStorage(baseDir, files, pieceLength)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
-// fileLayout holds a file's byte range within the torrent plus a lazily-opened,
-// cached read handle. Paths are validated once and every operation is anchored
-// to downloadRoot, so a later symlink swap cannot redirect payload I/O.
+// fileLayout holds a file's byte range within the torrent plus lazily-opened,
+// cached read and write handles. Paths are validated once and every operation is
+// anchored to downloadRoot, so a later symlink swap cannot redirect payload I/O.
+// The cached handles count against the process-wide fileHandles budget, which
+// closes the least recently used ones once too many are open.
+//
+// A cache hit takes no lock: the handles are published through atomic pointers
+// and set or cleared only under rmu or wmu. Whoever clears one (an eviction, a
+// repair, Close) swaps it out before closing it, and os.File lets an I/O call
+// that has already started finish across a concurrent Close, so an operation
+// only sees a closed handle if it loaded it just before the swap. Its I/O then
+// fails with os.ErrClosed, and it takes a fresh handle and retries (see
+// retryClosedHandle).
 type fileLayout struct {
 	repaired     atomic.Bool
 	path         string // relative path (torrent-declared)
@@ -116,38 +142,98 @@ type fileLayout struct {
 	startOffset  int64
 	endOffset    int64
 
+	// lastUse is the fileHandles clock when a cached handle of this file was last
+	// taken; the budget evicts the files with the oldest stamps first.
+	lastUse atomic.Int64
+	// cached is how many handles this file holds and heldSlot its index in
+	// fileHandles.held while that is nonzero; both are guarded by fileHandles.mu.
+	cached   int
+	heldSlot int
+
 	// readHandle is an O_RDONLY handle opened on first read and reused for every
 	// subsequent block read of this file — eliminating the open/close syscall pair
-	// per 16 KB block on the seed path. Guarded by rmu. Invalidated when a write
-	// recreates/resizes the file so a stale handle to an orphaned inode is dropped.
+	// per 16 KB block on the seed path. Where reads share the write handle
+	// (readsShareWriteHandle), a read only opens it when the file has no cached
+	// write handle. Set and cleared under rmu. Invalidated when a write
+	// recreates/resizes the file so a stale handle to an orphaned inode is dropped,
+	// on eviction, and on Close.
 	rmu        sync.Mutex
-	readHandle *os.File
+	readHandle atomic.Pointer[os.File]
 
 	// writeHandle is an O_RDWR handle opened (and, if the file vanished or was
 	// resized, repaired) on first write and reused for every subsequent block write
 	// of this file — the write-side analogue of readHandle, eliminating the
-	// open/stat/close syscall churn per completed piece on the download path. Guarded
-	// by wmu. Invalidated when a repair recreates/resizes the file or on Close.
+	// open/stat/close syscall churn per completed piece on the download path. Reads
+	// reuse it too where readsShareWriteHandle allows, which keeps a file being
+	// downloaded and verified to one descriptor. Set and cleared under wmu.
+	// Invalidated on eviction and Close.
 	wmu         sync.Mutex
-	writeHandle *os.File
+	writeHandle atomic.Pointer[os.File]
 }
 
-// reader returns the cached O_RDONLY handle, opening it on first use.
-func (f *fileLayout) reader() (*os.File, error) {
-	f.rmu.Lock()
-	defer f.rmu.Unlock()
-	if f.readHandle != nil {
-		return f.readHandle, nil
+// readsShareWriteHandle is whether a read uses a file's cached write handle
+// rather than opening a read handle of its own, which halves the descriptors a
+// file being downloaded and seeded holds. Not on Windows: there every
+// positional read and write through one os.File takes that file's single I/O
+// lock, so a shared handle would queue the upload reads of a file behind its
+// piece writes, where separate handles let them overlap. Windows handles are
+// not scarce, so nothing is lost there. A var so tests can exercise both; treat
+// it as a constant.
+var readsShareWriteHandle = runtime.GOOS != "windows"
+
+// touch stamps f with the budget clock on a cache hit. The clock only moves on
+// opens, so in steady state this is two loads and no store.
+func (f *fileLayout) touch() {
+	if now := fileHandles.clock.Load(); f.lastUse.Load() != now {
+		f.lastUse.Store(now)
 	}
+}
+
+// reader returns a cached handle to read from: the read handle, else the write
+// handle (where readsShareWriteHandle), else a newly opened O_RDONLY one.
+func (f *fileLayout) reader() (*os.File, error) {
+	if h := f.readHandle.Load(); h != nil {
+		f.touch()
+		return h, nil
+	}
+	if readsShareWriteHandle {
+		if h := f.writeHandle.Load(); h != nil {
+			f.touch()
+			return h, nil
+		}
+	}
+
+	f.rmu.Lock()
+	// Another read may have opened the handle while this one waited.
+	if h := f.readHandle.Load(); h != nil {
+		f.rmu.Unlock()
+		return h, nil
+	}
+	if readsShareWriteHandle {
+		if h := f.writeHandle.Load(); h != nil {
+			f.rmu.Unlock()
+			return h, nil
+		}
+	}
+	h, err := f.openReaderLocked()
+	if err != nil {
+		f.rmu.Unlock()
+		return nil, err
+	}
+	f.readHandle.Store(h)
+	evictNow := fileHandles.acquire(f)
+	f.rmu.Unlock()
+	if evictNow {
+		fileHandles.evictOverrun()
+	}
+	return h, nil
+}
+
+func (f *fileLayout) openReaderLocked() (*os.File, error) {
 	if err := f.volumeGuard.validate(); err != nil {
 		return nil, err
 	}
-	h, err := rootOpenNoFollow(f.downloadRoot, f.path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	f.readHandle = h
-	return h, nil
+	return rootOpenNoFollow(f.downloadRoot, f.path, os.O_RDONLY, 0)
 }
 
 // invalidateReader closes and drops the cached read handle.
@@ -157,33 +243,62 @@ func (f *fileLayout) invalidateReader() {
 	f.rmu.Unlock()
 }
 
-func (f *fileLayout) tryInvalidateReader() {
+// tryInvalidateReader closes and drops the cached read handle unless rmu is
+// held, reporting whether it closed one.
+func (f *fileLayout) tryInvalidateReader() bool {
 	if !f.rmu.TryLock() {
-		return
+		return false
 	}
-	f.invalidateReaderLocked()
+	closed := f.invalidateReaderLocked()
 	f.rmu.Unlock()
+	return closed
 }
 
-func (f *fileLayout) invalidateReaderLocked() {
-	if f.readHandle != nil {
-		_ = f.readHandle.Close()
-		f.readHandle = nil
+func (f *fileLayout) invalidateReaderLocked() bool {
+	h := f.readHandle.Swap(nil)
+	if h == nil {
+		return false
 	}
+	_ = h.Close()
+	fileHandles.release(f)
+	return true
 }
 
 // writer returns the cached O_RDWR handle, opening it on first use. The open
-// doubles as the repair check: if the file vanished it is recreated, and if its
-// size drifted it is truncated back to the declared length — either case reports
-// repaired=true and drops the now-stale read handle. Once cached, subsequent
+// doubles as the repair check: if the file vanished it is recreated, and if it
+// is now shorter than the declared length it is grown back — either case reports
+// repaired=true and drops the now-stale read handle. A longer file is left alone
+// for the same reason NewFileStorage never shrinks one. Once cached, subsequent
 // writes reuse the handle, so the open/stat/close syscall churn is paid once per
-// file rather than once per completed piece. Guarded by wmu.
-func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
-	f.wmu.Lock()
-	defer f.wmu.Unlock()
-	if f.writeHandle != nil {
-		return f.writeHandle, false, nil
+// file rather than once per completed piece.
+func (f *fileLayout) writer() (*os.File, bool, error) {
+	if h := f.writeHandle.Load(); h != nil {
+		f.touch()
+		return h, false, nil
 	}
+
+	f.wmu.Lock()
+	if h := f.writeHandle.Load(); h != nil {
+		f.wmu.Unlock()
+		return h, false, nil
+	}
+	h, repaired, err := f.openWriterLocked()
+	if err != nil {
+		f.wmu.Unlock()
+		return nil, false, err
+	}
+	f.writeHandle.Store(h)
+	evictNow := fileHandles.acquire(f)
+	f.wmu.Unlock()
+	if evictNow {
+		fileHandles.evictOverrun()
+	}
+	return h, repaired, nil
+}
+
+// openWriterLocked opens, and if needed repairs, the file for writing. The
+// caller holds wmu.
+func (f *fileLayout) openWriterLocked() (h *os.File, repaired bool, err error) {
 	if err := f.volumeGuard.validate(); err != nil {
 		return nil, false, err
 	}
@@ -210,7 +325,7 @@ func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 		_ = h.Close()
 		return nil, false, statErr
 	}
-	if fi.Size() != f.length {
+	if fi.Size() < f.length {
 		if err := h.Truncate(f.length); err != nil {
 			_ = h.Close()
 			return nil, false, err
@@ -218,8 +333,6 @@ func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 		repaired = true
 		f.invalidateReader()
 	}
-
-	f.writeHandle = h
 	return h, repaired, nil
 }
 
@@ -230,19 +343,62 @@ func (f *fileLayout) invalidateWriter() {
 	f.wmu.Unlock()
 }
 
-func (f *fileLayout) tryInvalidateWriter() {
+// tryInvalidateWriter closes and drops the cached write handle unless wmu is
+// held, reporting whether it closed one.
+func (f *fileLayout) tryInvalidateWriter() bool {
 	if !f.wmu.TryLock() {
-		return
+		return false
 	}
-	f.invalidateWriterLocked()
+	closed := f.invalidateWriterLocked()
 	f.wmu.Unlock()
+	return closed
 }
 
-func (f *fileLayout) invalidateWriterLocked() {
-	if f.writeHandle != nil {
-		_ = f.writeHandle.Close()
-		f.writeHandle = nil
+func (f *fileLayout) invalidateWriterLocked() bool {
+	h := f.writeHandle.Swap(nil)
+	if h == nil {
+		return false
 	}
+	_ = h.Close()
+	fileHandles.release(f)
+	return true
+}
+
+// tryEvict closes f's cached handles for the budget and returns how many it
+// closed. It only try-locks, so it never waits on a file whose handle is being
+// opened; an operation using a handle it closes retries with a fresh one.
+func (f *fileLayout) tryEvict() int {
+	closed := 0
+	if f.tryInvalidateReader() {
+		closed++
+	}
+	if f.tryInvalidateWriter() {
+		closed++
+	}
+	return closed
+}
+
+// maxHandleRetries bounds how often one operation takes a fresh handle after
+// finding its cached one closed under it. Eviction closes the least recently
+// used handles, so one just opened is practically never closed again before
+// the retry uses it.
+const maxHandleRetries = 8
+
+// retryClosedHandle reports whether an I/O error means that the cached handle
+// the operation loaded was closed under it by an eviction or a repair, so the
+// operation should take a fresh handle and try again. Positional reads and
+// writes repeat safely, so a retry cannot shift or duplicate any bytes.
+func (s *FileStorage) retryClosedHandle(err error, attempt int) bool {
+	return attempt < maxHandleRetries && errors.Is(err, os.ErrClosed) && !s.closed.Load()
+}
+
+// ioError wraps an I/O error on a payload file, reporting ErrStorageClosed if
+// Close invalidated the handle under the operation.
+func (s *FileStorage) ioError(op string, file *fileLayout, err error) error {
+	if errors.Is(err, os.ErrClosed) && s.closed.Load() {
+		return ErrStorageClosed
+	}
+	return fmt.Errorf("%s error on file %s: %w", op, file.path, err)
 }
 
 // FileStorage manages the files on disk for a torrent and provides thread-safe
@@ -333,10 +489,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 
 	for _, file := range files {
 		if file.Length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %s has length %d", file.Path, file.Length)
+			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
+		}
+		if err := checkNoTrailingSeparator(file.Path); err != nil {
+			return nil, err
 		}
 		// Reject torrent-declared paths whose top-level component collides with an
 		// internal file we keep alongside the content in the download dir: the DHT
@@ -350,17 +509,17 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 			topComponent = topComponent[:i]
 		}
 		if isReservedStorageName(topComponent) {
-			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
 		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
-		lowerPath := strings.ToLower(filepath.Clean(file.Path))
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected: %s", file.Path)
+		key := pathKey(file.Path)
+		if seenPaths[key] {
+			return nil, fmt.Errorf("duplicate file path detected: %q", file.Path)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = true
 
 		// Verify containment and reject symlinks before opening the same relative
 		// path through the anchored root used for all later operations.
@@ -378,6 +537,12 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
+	}
+	// Piece indexes are ints (pieceCount, per-piece resume state). A count that
+	// does not fit would silently truncate on 32-bit builds, leaving most of
+	// the payload outside every piece; refuse it before touching the disk.
+	if currentOffset > 0 && (currentOffset-1)/pieceLength+1 > int64(math.MaxInt) {
+		return nil, fmt.Errorf("piece count for %d bytes at piece length %d overflows int", currentOffset, pieceLength)
 	}
 
 	createdDirs := map[string]struct{}{".": {}}
@@ -403,6 +568,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	stateFileInfo := make(map[string]os.FileInfo, len(files))
 	initialInfo := make(map[string]os.FileInfo, len(files))
 	trustedIdentity := make(map[string]string, len(files))
+	// openedObjects catches two layouts that open the same file even though
+	// their names differ after folding: 8.3 short names and normalization forms
+	// the fold does not model. Both would keep overwriting one file. Hard links
+	// that already existed are the exception (see sharedObjectAllowed): a dedup
+	// tool leaves them between identical payload files, and refusing them made
+	// such a torrent impossible to restore.
+	openedObjects := make(map[fileObjectKey]openedObject, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -434,7 +606,21 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if created {
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
 		}
-		if fi.Size() != layout.length {
+		if key, links, ok := fileObjectKeyOf(f, fi); ok {
+			opened := openedObject{path: path, length: layout.length, created: created}
+			if first, dup := openedObjects[key]; !dup {
+				openedObjects[key] = opened
+			} else if !sharedObjectAllowed(first, opened, links) {
+				f.Close()
+				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", first.path, path)
+			}
+		}
+		// Grow a short file (sparsely), but never shrink one: a torrent naming a
+		// file that already exists must not destroy its tail before a single piece
+		// has been verified. Block I/O only ever touches [0, length), and the size
+		// mismatch keeps every resume check (LoadState, LoadResumeState and the
+		// checkpoint) from trusting the file, so its pieces are always rehashed.
+		if fi.Size() < layout.length {
 			if err := f.Truncate(layout.length); err != nil {
 				f.Close()
 				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", path, err)
@@ -522,6 +708,15 @@ func (s *FileStorage) PieceLength(pieceIndex int64) int64 {
 	return pieceEnd - pieceStart
 }
 
+// firstFileEndingAfter returns the index of the first file that ends after
+// globalStart. Files are laid out in ascending offset order, so the block paths
+// start there and stop at the first file starting at or past the block's end:
+// O(log files) per block instead of a scan of every file, which a torrent with
+// hundreds of thousands of files turned into milliseconds per 16 KiB request.
+func (s *FileStorage) firstFileEndingAfter(globalStart int64) int {
+	return sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
+}
+
 // ReadBlock reads a block of data from the storage.
 // It returns the number of bytes read, or an error.
 func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
@@ -551,7 +746,10 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(buf))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -561,26 +759,40 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			f, err := file.reader()
-			if err != nil {
-				return 0, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
-			}
-			if s.closed.Load() {
-				file.invalidateReader()
-				return 0, ErrStorageClosed
-			}
-
-			n, err := f.ReadAt(buf[bufOffset:bufOffset+nBytes], fileOffset)
-			if err != nil && err != io.EOF {
-				return 0, fmt.Errorf("read error on file %s: %w", file.path, err)
-			}
-			if int64(n) != nBytes {
-				return 0, fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, nBytes, n)
+			if err := s.readFileAt(file, buf[bufOffset:bufOffset+nBytes], fileOffset); err != nil {
+				return 0, err
 			}
 		}
 	}
 
 	return len(buf), nil
+}
+
+// readFileAt fills buf from one file at fileOffset through its cached handle.
+// The caller holds s.mu, shared or exclusive.
+func (s *FileStorage) readFileAt(file *fileLayout, buf []byte, fileOffset int64) error {
+	for attempt := 0; ; attempt++ {
+		f, err := file.reader()
+		if err != nil {
+			return fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
+		}
+		if s.closed.Load() {
+			file.invalidateReader()
+			return ErrStorageClosed
+		}
+
+		n, err := f.ReadAt(buf, fileOffset)
+		if err != nil && err != io.EOF {
+			if s.retryClosedHandle(err, attempt) {
+				continue
+			}
+			return s.ioError("read", file, err)
+		}
+		if n != len(buf) {
+			return fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, len(buf), n)
+		}
+		return nil
+	}
 }
 
 // WriteBlock writes a block of data to the storage, spanning across files if necessary.
@@ -614,7 +826,10 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -624,33 +839,11 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
-			f, fileRepaired, err := file.writer()
+			fileRepaired, err := s.writeFileAt(file, data[bufOffset:bufOffset+nBytes], fileOffset)
+			repaired = repaired || fileRepaired
 			if err != nil {
-				return fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
+				return err
 			}
-			if fileRepaired {
-				file.repaired.Store(true)
-				repaired = true
-			}
-			if s.closed.Load() {
-				file.invalidateWriter()
-				return ErrStorageClosed
-			}
-
-			n, err := f.WriteAt(data[bufOffset:bufOffset+nBytes], fileOffset)
-			if err != nil {
-				return fmt.Errorf("write error on file %s: %w", file.path, err)
-			}
-			if int64(n) != nBytes {
-				return fmt.Errorf("short write on file %s: expected %d bytes, got %d", file.path, nBytes, n)
-			}
-
-			// Defer the mtime refresh and the flush to the persistence paths: mark the
-			// file dirty rather than paying a stat or fsync syscall on every completed
-			// piece. Both paths are infrequent and off the block path.
-			s.mtMu.Lock()
-			s.dirty[file] |= dirtyMeta | dirtySync
-			s.mtMu.Unlock()
 		}
 	}
 
@@ -658,6 +851,46 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 		return ErrFileRepaired
 	}
 	return nil
+}
+
+// writeFileAt writes data to one file at fileOffset through its cached handle,
+// reporting whether opening that handle had to repair the file. The caller
+// holds s.mu, shared or exclusive.
+func (s *FileStorage) writeFileAt(file *fileLayout, data []byte, fileOffset int64) (repaired bool, err error) {
+	for attempt := 0; ; attempt++ {
+		f, fileRepaired, err := file.writer()
+		if err != nil {
+			return repaired, fmt.Errorf("failed to open file %s for writing: %w", file.path, err)
+		}
+		if fileRepaired {
+			file.repaired.Store(true)
+			repaired = true
+		}
+		if s.closed.Load() {
+			file.invalidateWriter()
+			return repaired, ErrStorageClosed
+		}
+
+		n, err := f.WriteAt(data, fileOffset)
+		if err != nil {
+			if s.retryClosedHandle(err, attempt) {
+				continue
+			}
+			return repaired, s.ioError("write", file, err)
+		}
+		if n != len(data) {
+			return repaired, fmt.Errorf("short write on file %s: expected %d bytes, got %d", file.path, len(data), n)
+		}
+		break
+	}
+
+	// Defer the mtime refresh and the flush to the persistence paths: mark the
+	// file dirty rather than paying a stat or fsync syscall on every completed
+	// piece. Both paths are infrequent and off the block path.
+	s.mtMu.Lock()
+	s.dirty[file] |= dirtyMeta | dirtySync
+	s.mtMu.Unlock()
+	return repaired, nil
 }
 
 // verifyChunkSize bounds the reusable buffer VerifyPiece streams file bytes
@@ -699,43 +932,15 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
-	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
-	for _, file := range s.files[first:] {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
 		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
-
-			f, err := file.reader()
-			if err != nil {
-				return false, fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
-			}
-			if s.closed.Load() {
-				file.invalidateReader()
-				return false, ErrStorageClosed
-			}
-
-			fileOffset := overlapStart - file.startOffset
-			remaining := overlapEnd - overlapStart
-			for remaining > 0 {
-				readLen := int64(len(chunk))
-				if readLen > remaining {
-					readLen = remaining
-				}
-				n, err := f.ReadAt(chunk[:readLen], fileOffset)
-				if err != nil && err != io.EOF {
-					return false, fmt.Errorf("read error on file %s: %w", file.path, err)
-				}
-				if int64(n) != readLen {
-					return false, fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, readLen, n)
-				}
-				if _, err := h.Write(chunk[:readLen]); err != nil {
-					return false, err
-				}
-				fileOffset += readLen
-				remaining -= readLen
+			if err := s.hashFileRange(h, file, overlapStart-file.startOffset, overlapEnd-overlapStart, chunk); err != nil {
+				return false, err
 			}
 		}
 	}
@@ -743,6 +948,44 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	var actualHash [20]byte
 	copy(actualHash[:], h.Sum(nil))
 	return actualHash == expectedHash, nil
+}
+
+// hashFileRange feeds length bytes of one file, starting at fileOffset, to h
+// through its cached handle, reading them chunk by chunk. The caller holds s.mu,
+// shared or exclusive.
+func (s *FileStorage) hashFileRange(h hash.Hash, file *fileLayout, fileOffset, length int64, chunk []byte) error {
+	var f *os.File
+	for attempt := 0; length > 0; {
+		if f == nil {
+			var err error
+			if f, err = file.reader(); err != nil {
+				return fmt.Errorf("failed to open file %s for reading: %w", file.path, err)
+			}
+			if s.closed.Load() {
+				file.invalidateReader()
+				return ErrStorageClosed
+			}
+		}
+		readLen := min(int64(len(chunk)), length)
+		n, err := f.ReadAt(chunk[:readLen], fileOffset)
+		if err != nil && err != io.EOF {
+			if s.retryClosedHandle(err, attempt) {
+				attempt++
+				f = nil
+				continue
+			}
+			return s.ioError("read", file, err)
+		}
+		if int64(n) != readLen {
+			return fmt.Errorf("short read on file %s: expected %d bytes, got %d", file.path, readLen, n)
+		}
+		if _, err := h.Write(chunk[:readLen]); err != nil {
+			return err
+		}
+		fileOffset += readLen
+		length -= readLen
+	}
+	return nil
 }
 
 // Close marks storage closed and releases cached file handles. It is idempotent.
@@ -978,10 +1221,12 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		return "", fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", relPath)
 	}
 
-	// Verify that no component of the path is a symlink
+	// Verify that no component of the path is a symlink, and that every existing
+	// parent is a real directory: Go reports a Windows junction as irregular,
+	// never as a symlink or a directory.
 	current := r.canonicalBase
 	components := strings.Split(rel, string(filepath.Separator))
-	for _, comp := range components {
+	for i, comp := range components {
 		if comp == "" || comp == "." || comp == ".." {
 			continue
 		}
@@ -996,6 +1241,9 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("symlink detected in path component: %s", current)
+		}
+		if i < len(components)-1 && !fi.IsDir() {
+			return "", fmt.Errorf("path component is not a directory: %s", current)
 		}
 	}
 
@@ -1017,11 +1265,93 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 // These names are produced only by our own code (dht.saveNodes writes ".dht_nodes";
 // SaveState writes ".<infohash>.state"), so torrent content must never be allowed
 // to claim them. The check mirrors those literal names rather than importing them,
-// to avoid a storage -> dht import cycle.
+// to avoid a storage -> dht import cycle. It compares folded names with trailing
+// dots and spaces removed: on a case-insensitive filesystem ".DHT_NODES" opens
+// the same file, and Windows drops the trailing characters of ".dht_nodes. ".
 func isReservedStorageName(name string) bool {
+	name = strings.TrimRight(name, ". ")
+	// Every reserved name starts with a dot, which folding leaves alone.
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	name = pathKey(name)
 	if name == ".dht_nodes" {
 		return true
 	}
 	// Per-torrent fast-resume files: a leading dot plus a ".state" suffix.
-	return strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".state")
+	return strings.HasSuffix(name, ".state")
+}
+
+// fileObjectKey names the on-disk object an opened file refers to, the same
+// for every path that reaches it (see fileObjectKeyOf).
+type fileObjectKey struct{ a, b uint64 }
+
+// openedObject records a layout of a NewFileStorage call that opened an on-disk
+// object: its path, its torrent length, and whether that call created the
+// object.
+type openedObject struct {
+	path    string
+	length  int64
+	created bool
+}
+
+// sharedObjectAllowed reports whether a later layout, which opened the same
+// on-disk object as first, may keep it. links is the object's current link
+// count.
+//
+// Only distinct, pre-existing directory entries of one multiply-linked file
+// qualify: the hard links rdfind or jdupes -L leave between identical files,
+// which a torrent restores as they are. A file this call created has a single
+// name, so a second layout reaching it is an alias of that name (case, Unicode
+// normalization or an 8.3 short name) and is refused. So is a pre-existing
+// file with one link, since two names can then only be aliases of one entry,
+// and a pair whose paths fold to one key (duplicate layouts are normally
+// refused earlier; this keeps the check self-contained). An unknown link count
+// of zero is refused too. Identical files have one length, so a pair the
+// torrent gives two lengths is refused as well: growing the file for the
+// longer layout would leave the shorter one's name on a file of the wrong
+// size, which no checkpoint trusts.
+func sharedObjectAllowed(first, later openedObject, links uint64) bool {
+	return !first.created && !later.created && links >= 2 && first.length == later.length &&
+		pathKey(first.path) != pathKey(later.path)
+}
+
+// checkNoTrailingSeparator refuses a layout path ending in a separator. Go's
+// os.Root followed a final symlink for such a path (GO-2026-4970), and the
+// storage relies on os.Root to keep payload I/O inside the download directory.
+// Torrent paths are joined from sanitized components and never end in one, so
+// refusing it keeps that defence independent of the toolchain.
+func checkNoTrailingSeparator(path string) error {
+	if path != "" && os.IsPathSeparator(path[len(path)-1]) {
+		return fmt.Errorf("file path ends in a path separator: %q", path)
+	}
+	return nil
+}
+
+// pathFolder is stateless and safe for concurrent use (see cases.Fold).
+var pathFolder = cases.Fold()
+
+// pathKey is the duplicate-detection key for a relative path, the same one
+// torrent.Parse uses: Unicode NFC over full case folding, so two names that a
+// case- or normalization-insensitive filesystem (APFS, NTFS) stores as one
+// file collide here too.
+func pathKey(p string) string {
+	p = filepath.Clean(p)
+	for i := 0; i < len(p); i++ {
+		if p[i] >= utf8.RuneSelf {
+			return norm.NFC.String(pathFolder.String(norm.NFD.String(p)))
+		}
+	}
+	// ASCII, as nearly every payload path is: both normalization forms leave
+	// it unchanged and full case folding maps only A-Z, so skip the Unicode
+	// tables, which cost about a microsecond per file at every add and restore.
+	return strings.ToLower(p)
+}
+
+// PathKey is the key under which two paths name the same file on a case- or
+// normalization-insensitive filesystem: the cleaned path, fully case-folded,
+// in Unicode NFC. The downloader compares keys of resolved payload paths to
+// keep two torrents from sharing a file.
+func PathKey(p string) string {
+	return pathKey(p)
 }

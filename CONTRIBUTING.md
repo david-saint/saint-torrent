@@ -39,7 +39,7 @@ Feel free to open an issue to discuss new features or improvements. Describe the
 ## Development Setup
 
 ### Local Setup
-Ensure you have Go 1.24+ installed. Clone the repository and run:
+Ensure you have Go 1.26.8+ installed (go.mod pins this floor so every build carries current standard-library security fixes). Clone the repository and run:
 
 ```bash
 go mod download

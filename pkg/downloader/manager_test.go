@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/storage"
@@ -1464,5 +1467,635 @@ func TestAddSessionClosesReplacedSession(t *testing.T) {
 	}
 	if got := mgr.GetSession("090909"); got != newSess {
 		t.Errorf("expected surviving session to be the most recently added one, got %v", got)
+	}
+}
+
+// writeCrashTestSentinel leaves stateDir's running sentinel as a run of
+// another process that never shut down would: a foreign nonce.
+func writeCrashTestSentinel(t *testing.T, stateDir string, startedAt time.Time, stable bool) {
+	t.Helper()
+	data, err := json.Marshal(runningSentinel{PID: 1, Nonce: "another-process", StartedAt: startedAt.Format(time.RFC3339Nano), Stable: stable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, sentinelName), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeCrashTestFile writes a crash file as a guard of that run would have.
+func writeCrashTestFile(t *testing.T, stateDir string, at time.Time, infoHashHex, component string) string {
+	t.Helper()
+	dir := CrashDir(stateDir)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s-%s.txt", at.UnixNano(), infoHashHex, component))
+	if err := os.WriteFile(path, []byte("component: "+component+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// readCrashTestState reads session.json.
+func readCrashTestState(t *testing.T, stateDir string) map[string]PersistedTorrent {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(stateDir, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state PersistedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	entries := make(map[string]PersistedTorrent, len(state.Torrents))
+	for _, entry := range state.Torrents {
+		entries[entry.InfoHashHex] = entry
+	}
+	return entries
+}
+
+// TestCrashAttributedTorrentRestoresQuarantined: after a run that crashed in
+// one torrent's peer loop, that torrent comes back paused and quarantined:
+// "Paused after crash", its error naming the crash file, and no verification,
+// since storage or hashing may be what crashed. A crash file from an earlier
+// run blames nobody. Resuming lifts the quarantine and starts the check.
+func TestCrashAttributedTorrentRestoresQuarantined(t *testing.T) {
+	crashyData, crashyHash := testTorrent(t, "crashy.bin", false)
+	calmData, calmHash := testTorrent(t, "calm.bin", false)
+	crashyHex, calmHex := fmt.Sprintf("%x", crashyHash), fmt.Sprintf("%x", calmHash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{
+		{InfoHashHex: crashyHex, DownloadDir: t.TempDir()},
+		{InfoHashHex: calmHex, DownloadDir: t.TempDir()},
+	}, map[string][]byte{crashyHex: crashyData, calmHex: calmData})
+	startedAt := time.Now().Add(-time.Hour)
+	writeCrashTestSentinel(t, stateDir, startedAt, false)
+	crashPath := writeCrashTestFile(t, stateDir, startedAt.Add(time.Minute), crashyHex, "peer_loop")
+	writeCrashTestFile(t, stateDir, startedAt.Add(-time.Minute), calmHex, "peer_loop") // an older run's
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	warning, err := mgr.EnablePersistence(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, "restored paused") {
+		t.Errorf("warning %q does not report the torrent paused after the crash", warning)
+	}
+	crashy, calm := mgr.GetSession(crashyHex), mgr.GetSession(calmHex)
+	if crashy == nil || calm == nil {
+		t.Fatalf("restored sessions crashy=%v calm=%v, want both", crashy, calm)
+	}
+	if calm.IsPaused() || calm.IsQuarantined() {
+		t.Fatal("a torrent only an earlier run's crash names was paused")
+	}
+	if !crashy.IsPaused() || !crashy.IsQuarantined() {
+		t.Fatalf("crashed torrent paused=%v quarantined=%v, want both", crashy.IsPaused(), crashy.IsQuarantined())
+	}
+	if got := crashy.Status(); got != "Paused after crash" {
+		t.Fatalf("status %q, want Paused after crash", got)
+	}
+	if err := crashy.LastError(); err == nil || !strings.Contains(err.Error(), crashPath) {
+		t.Fatalf("LastError = %v, want the note naming %s", err, crashPath)
+	}
+	if snap := crashy.Snapshot(); snap.Status != "Paused after crash" || snap.LastError == nil || snap.Verification.Active {
+		t.Fatalf("snapshot status %q error %v checking %v, want the quarantine shown and no check", snap.Status, snap.LastError, snap.Verification.Active)
+	}
+
+	crashy.Start()
+	crashy.mu.RLock()
+	verifying, verifyStarted := crashy.verifying, crashy.verifyStarted
+	crashy.mu.RUnlock()
+	if !verifying {
+		t.Fatal("test setup: the restored torrent has nothing to verify")
+	}
+	if verifyStarted {
+		t.Fatal("verification started on a quarantined torrent")
+	}
+
+	crashy.Resume()
+	crashy.mu.RLock()
+	verifyStarted = crashy.verifyStarted
+	crashy.mu.RUnlock()
+	if crashy.IsQuarantined() || crashy.IsPaused() {
+		t.Fatal("Resume left the torrent paused or quarantined")
+	}
+	if got := crashy.Status(); got == "Paused after crash" {
+		t.Fatalf("status %q after Resume", got)
+	}
+	if err := crashy.LastError(); err != nil && strings.Contains(err.Error(), crashPath) {
+		t.Fatalf("LastError still shows the crash after Resume: %v", err)
+	}
+	if !verifyStarted {
+		t.Fatal("Resume did not start the verification the quarantine held back")
+	}
+}
+
+// TestStartOnQuarantinedTorrentResumesIt: the CLI resumes a started, paused
+// torrent with Start (re-adding it does), which lifts a quarantine like
+// Resume and runs the check it held back.
+func TestStartOnQuarantinedTorrentResumesIt(t *testing.T) {
+	data, hash := testTorrent(t, "restart.bin", false)
+	hashHex := fmt.Sprintf("%x", hash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	startedAt := time.Now().Add(-time.Hour)
+	writeCrashTestSentinel(t, stateDir, startedAt, false)
+	writeCrashTestFile(t, stateDir, startedAt.Add(time.Second), hashHex, "piece_write")
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	sess := mgr.GetSession(hashHex)
+	if sess == nil || !sess.IsQuarantined() {
+		t.Fatalf("session %v, want it quarantined", sess)
+	}
+	sess.Start() // starts it, still paused and quarantined
+	if !sess.IsQuarantined() || !sess.IsPaused() {
+		t.Fatal("the first Start lifted the quarantine")
+	}
+	sess.Start() // resumes it
+	sess.mu.RLock()
+	quarantined, paused, verifyStarted := sess.quarantined, sess.paused, sess.verifyStarted
+	sess.mu.RUnlock()
+	if quarantined || paused || !verifyStarted {
+		t.Fatalf("after Start resumed it: quarantined=%v paused=%v verifyStarted=%v, want it running and checked", quarantined, paused, verifyStarted)
+	}
+}
+
+// TestQuarantineSurvivesRestart: the quarantine is persisted and applied on
+// every start, with no new crash, until the user resumes the torrent.
+func TestQuarantineSurvivesRestart(t *testing.T) {
+	data, hash := testTorrent(t, "sticky.bin", false)
+	hashHex := fmt.Sprintf("%x", hash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	startedAt := time.Now().Add(-time.Hour)
+	writeCrashTestSentinel(t, stateDir, startedAt, false)
+	crashPath := writeCrashTestFile(t, stateDir, startedAt.Add(time.Second), hashHex, "verify")
+
+	first := NewTorrentManager()
+	if _, err := first.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	entry := readCrashTestState(t, stateDir)[hashHex]
+	if !entry.Quarantined || !entry.Paused || !strings.Contains(entry.CrashNote, crashPath) {
+		t.Fatalf("persisted entry %+v, want it paused and quarantined with the note", entry)
+	}
+
+	// A clean restart: nothing crashed, the quarantine still holds.
+	second := NewTorrentManager()
+	if _, err := second.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	sess := second.GetSession(hashHex)
+	if sess == nil || !sess.IsQuarantined() || !sess.IsPaused() {
+		t.Fatalf("restored session %v, want it still quarantined", sess)
+	}
+	if err := sess.LastError(); err == nil || !strings.Contains(err.Error(), crashPath) {
+		t.Fatalf("LastError = %v, want the persisted note", err)
+	}
+	sess.Resume()
+	second.Close()
+	entry = readCrashTestState(t, stateDir)[hashHex]
+	if entry.Quarantined || entry.CrashNote != "" || entry.Paused {
+		t.Fatalf("persisted entry %+v after Resume, want the quarantine gone", entry)
+	}
+
+	third := NewTorrentManager()
+	defer third.Close()
+	if _, err := third.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if sess := third.GetSession(hashHex); sess == nil || sess.IsQuarantined() || sess.IsPaused() {
+		t.Fatalf("session after a resumed quarantine = %v, want it restored running", sess)
+	}
+}
+
+// TestRestoreCrashLeavesTorrentUnloaded: a torrent that crashed saintTorrent
+// while it was being restored would crash it again while parsing it or
+// building its storage, so it is not loaded; it stays in session.json and a
+// warning points at --start-paused, which loads it paused and quarantined.
+// The warning leads with that remedy and the name session.json kept, since
+// the TUI cuts it to one line, and restore-failures.log records the crash file.
+func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
+	data, hash := testTorrent(t, "poison.bin", false)
+	hashHex := fmt.Sprintf("%x", hash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir(), Name: "Poison"}}, map[string][]byte{hashHex: data})
+	startedAt := time.Now().Add(-time.Hour)
+	writeCrashTestSentinel(t, stateDir, startedAt, false)
+	crashPath := writeCrashTestFile(t, stateDir, startedAt.Add(time.Second), hashHex, crashComponentRestore)
+
+	for round := 0; round < 2; round++ { // the crash, then a clean start with no new one
+		mgr := NewTorrentManager()
+		warning, err := mgr.EnablePersistence(stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sess := mgr.GetSession(hashHex); sess != nil {
+			t.Fatalf("round %d: a torrent that crashed while restoring was loaded", round)
+		}
+		if !strings.HasPrefix(warning, `Start with --start-paused to load "Poison", which crashed saintTorrent while loading`) ||
+			!strings.Contains(warning, CrashDir(stateDir)) {
+			t.Fatalf("round %d: warning %q does not lead with --start-paused and the torrent's name, and point at the crash directory", round, warning)
+		}
+		mgr.Close()
+		entry, ok := readCrashTestState(t, stateDir)[hashHex]
+		if !ok || !entry.Quarantined || entry.CrashComponent != crashComponentRestore || entry.Name != "Poison" {
+			t.Fatalf("round %d: persisted entry %+v (present %v), want it kept, named and quarantined", round, entry, ok)
+		}
+		logData, err := os.ReadFile(filepath.Join(stateDir, "restore-failures.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lines := strings.Count(string(logData), crashPath); lines != round+1 || !strings.Contains(string(logData), "infohash="+hashHex) {
+			t.Fatalf("round %d: restore-failures.log %q, want a line per start naming the torrent and its crash file", round, logData)
+		}
+	}
+
+	mgr := NewTorrentManager()
+	mgr.SetStartPaused(true)
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	sess := mgr.GetSession(hashHex)
+	if sess == nil {
+		t.Fatal("--start-paused did not load the quarantined torrent")
+	}
+	if !sess.IsPaused() || !sess.IsQuarantined() || sess.Status() != "Paused after crash" {
+		t.Fatalf("loaded torrent paused=%v quarantined=%v status %q, want paused after crash", sess.IsPaused(), sess.IsQuarantined(), sess.Status())
+	}
+	mgr.Close()
+	// Loaded once, it is an ordinary quarantined torrent from then on, saved
+	// under the name it now has.
+	entry := readCrashTestState(t, stateDir)[hashHex]
+	if !entry.Quarantined || entry.CrashComponent != "" || entry.Name != "poison.bin" {
+		t.Fatalf("persisted entry %+v, want it quarantined but no longer held unloaded, and named", entry)
+	}
+	again := NewTorrentManager()
+	defer again.Close()
+	if _, err := again.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if sess := again.GetSession(hashHex); sess == nil || !sess.IsQuarantined() {
+		t.Fatalf("session = %v, want it loaded and still quarantined", sess)
+	}
+}
+
+// TestUnloadedNoticeNamesWithoutParsing: an unloaded torrent is named from
+// session.json alone, never by parsing its cached .torrent or magnet URI
+// (either may be what crashed): the saved name, bounded, or a short hash.
+// Several are listed in one notice that still leads with the remedy.
+func TestUnloadedNoticeNamesWithoutParsing(t *testing.T) {
+	hash := strings.Repeat("ab", 20)
+	if got := unloadedDisplayName(PersistedTorrent{InfoHashHex: hash, MagnetURI: "magnet:?xt=urn:btih:" + hash + "&dn=from-magnet"}); got != hash[:12] {
+		t.Fatalf("name without a saved one = %q, want the short hash", got)
+	}
+	long := strings.Repeat("é", 200)
+	if got := unloadedDisplayName(PersistedTorrent{InfoHashHex: hash, Name: long}); utf8.RuneCountInString(got) != 80 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("long name shown as %q, want it cut to 80 runes", got)
+	}
+	notice := unloadedNotice([]string{"a", "b"}, "/state/crash")
+	if !strings.HasPrefix(notice, `Start with --start-paused to load 2 torrents`) || !strings.Contains(notice, `"a", "b"`) {
+		t.Fatalf("notice for two torrents = %q", notice)
+	}
+}
+
+// TestStartPausedRestoresEverythingPaused: --start-paused restores every
+// torrent paused for that run only. session.json keeps each torrent's own
+// pause state, so the next start restores it as it was: a running torrent
+// running, one the user paused still paused. Pausing an auto-paused torrent
+// explicitly makes the pause the user's, and it is kept.
+func TestStartPausedRestoresEverythingPaused(t *testing.T) {
+	runningData, runningHash := testTorrent(t, "startpaused.bin", false)
+	userData, userHash := testTorrent(t, "userpaused.bin", false)
+	keptData, keptHash := testTorrent(t, "keptpaused.bin", false)
+	running, user, kept := fmt.Sprintf("%x", runningHash), fmt.Sprintf("%x", userHash), fmt.Sprintf("%x", keptHash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{
+		{InfoHashHex: running, DownloadDir: t.TempDir()},
+		{InfoHashHex: user, DownloadDir: t.TempDir(), Paused: true},
+		{InfoHashHex: kept, DownloadDir: t.TempDir()},
+	}, map[string][]byte{running: runningData, user: userData, kept: keptData})
+
+	mgr := NewTorrentManager()
+	mgr.SetStartPaused(true)
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, hashHex := range []string{running, user, kept} {
+		if sess := mgr.GetSession(hashHex); sess == nil || !sess.IsPaused() || sess.IsQuarantined() {
+			t.Fatalf("session %s = %v, want it restored paused and not quarantined", hashHex, sess)
+		}
+	}
+	mgr.GetSession(kept).Pause() // the user pauses it too
+	mgr.Close()
+	state := readCrashTestState(t, stateDir)
+	if state[running].Paused || !state[user].Paused || !state[kept].Paused {
+		t.Fatalf("persisted paused = %v, %v, %v; want false (its own state), true (the user's), true (paused again by the user)",
+			state[running].Paused, state[user].Paused, state[kept].Paused)
+	}
+
+	again := NewTorrentManager()
+	defer again.Close()
+	if _, err := again.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if sess := again.GetSession(running); sess == nil || sess.IsPaused() {
+		t.Fatalf("session %v on a normal start after --start-paused, want it restored running", sess)
+	}
+	if sess := again.GetSession(user); sess == nil || !sess.IsPaused() {
+		t.Fatalf("session %v on a normal start, want the user's pause kept", sess)
+	}
+}
+
+// TestTwoUnexplainedCrashesRestoreEverythingPaused: runs that die without a
+// crash blamed on any torrent (a fatal runtime error, a crash in the DHT, a
+// kill) are counted; after two in a row every torrent restores paused, not
+// quarantined, and a warning says why.
+func TestTwoUnexplainedCrashesRestoreEverythingPaused(t *testing.T) {
+	data, hash := testTorrent(t, "streak.bin", false)
+	hashHex := fmt.Sprintf("%x", hash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	// An unattributed crash file does not blame the torrent.
+	writeCrashTestFile(t, stateDir, time.Now(), unattributedCrash, "tui")
+
+	for round := 1; round <= 2; round++ {
+		writeCrashTestSentinel(t, stateDir, time.Now().Add(-time.Hour), false)
+		mgr := NewTorrentManager()
+		warning, err := mgr.EnablePersistence(stateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sess := mgr.GetSession(hashHex)
+		if sess == nil {
+			t.Fatal("torrent not restored")
+		}
+		wantPaused := round == 2
+		if sess.IsPaused() != wantPaused || sess.IsQuarantined() {
+			t.Fatalf("round %d: paused=%v quarantined=%v, want paused=%v and not quarantined", round, sess.IsPaused(), sess.IsQuarantined(), wantPaused)
+		}
+		if got := strings.Contains(warning, "stopped unexpectedly twice in a row"); got != wantPaused {
+			t.Fatalf("round %d: warning %q", round, warning)
+		}
+		mgr.Close()
+	}
+	// The pause was this run's alone: session.json keeps the torrent as the
+	// user left it.
+	if entry := readCrashTestState(t, stateDir)[hashHex]; entry.Paused || entry.Quarantined {
+		t.Fatalf("persisted entry %+v, want it neither paused nor quarantined", entry)
+	}
+
+	// A clean exit (the Close above) resets the streak, and the torrent comes
+	// back running.
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	warning, err := mgr.EnablePersistence(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess := mgr.GetSession(hashHex); sess == nil || sess.IsPaused() || warning != "" {
+		t.Fatalf("session %v (warning %q) after a clean exit from safe mode, want it restored running", sess, warning)
+	}
+	stateData, err := os.ReadFile(filepath.Join(stateDir, crashStateName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state crashState
+	if err := json.Unmarshal(stateData, &state); err != nil || state.UnattributedStreak != 0 {
+		t.Fatalf("crash state %s (%v) after a clean exit, want the streak reset", stateData, err)
+	}
+}
+
+// TestStableSentinelResetsCrashStreak: a run that lasted past the stable mark
+// and then died (SIGKILL, power loss) is not a crash loop.
+func TestStableSentinelResetsCrashStreak(t *testing.T) {
+	data, hash := testTorrent(t, "stable.bin", false)
+	hashHex := fmt.Sprintf("%x", hash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	if err := os.WriteFile(filepath.Join(stateDir, crashStateName), []byte(`{"unattributed_streak":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeCrashTestSentinel(t, stateDir, time.Now().Add(-time.Hour), true)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	warning, err := mgr.EnablePersistence(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess := mgr.GetSession(hashHex); sess == nil || sess.IsPaused() {
+		t.Fatalf("session %v after a stable run died, want it restored running (warning %q)", sess, warning)
+	}
+	stateData, err := os.ReadFile(filepath.Join(stateDir, crashStateName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state crashState
+	if err := json.Unmarshal(stateData, &state); err != nil || state.UnattributedStreak != 0 {
+		t.Fatalf("crash state %s (%v), want the streak reset by the stable run", stateData, err)
+	}
+}
+
+// TestRunningSentinelLifecycle: EnablePersistence marks the run live, the
+// stable timer marks it stable, Close removes the sentinel unless
+// MarkUncleanExit was called, and a sentinel this process wrote does not make
+// a reopen of the same state directory look like a crash.
+func TestRunningSentinelLifecycle(t *testing.T) {
+	saved := sentinelStableAfter
+	sentinelStableAfter = 20 * time.Millisecond
+	t.Cleanup(func() { sentinelStableAfter = saved })
+	stateDir := filepath.Join(t.TempDir(), "config")
+	sentinelPath := filepath.Join(stateDir, sentinelName)
+
+	mgr := NewTorrentManager()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	sentinel, found := readRunningSentinel(stateDir)
+	if !found || sentinel.Nonce != processNonce || sentinel.PID != os.Getpid() {
+		t.Fatalf("sentinel %+v (found %v), want this process's", sentinel, found)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, sentinel.StartedAt); err != nil {
+		t.Fatalf("sentinel start %q: %v", sentinel.StartedAt, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sentinel, _ := readRunningSentinel(stateDir); sentinel.Stable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sentinel was never marked stable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mgr.Close()
+	if _, err := os.Stat(sentinelPath); !os.IsNotExist(err) {
+		t.Fatalf("sentinel after a clean Close: %v, want it removed", err)
+	}
+
+	sentinelStableAfter = saved
+	unclean := NewTorrentManager()
+	if _, err := unclean.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	unclean.MarkUncleanExit()
+	unclean.Close()
+	if _, err := os.Stat(sentinelPath); err != nil {
+		t.Fatalf("sentinel after MarkUncleanExit: %v, want it kept", err)
+	}
+
+	// Same process, same nonce: a clean reopen, not a crash.
+	if run := classifyPreviousRun(stateDir, CrashDir(stateDir)); run.pauseAll || len(run.crashes) != 0 {
+		t.Fatalf("reopen in the same process classified as %+v, want clean", run)
+	}
+	if data, err := os.ReadFile(filepath.Join(stateDir, crashStateName)); err == nil && !strings.Contains(string(data), `"unattributed_streak":0`) {
+		t.Fatalf("crash state %s, want no crash counted", data)
+	}
+}
+
+// TestRunningSentinelIsNotSynced: EnablePersistence writes the sentinel before
+// it restores anything, and syncing it and its directory added about half a
+// millisecond to every Linux startup (more on macOS, where File.Sync is
+// F_FULLFSYNC). It only has to outlive a crash of this process, which the page
+// cache does, so neither the first write nor the stable rewrite is synced,
+// while session.json and crash-state.json still are.
+func TestRunningSentinelIsNotSynced(t *testing.T) {
+	saved := sentinelStableAfter
+	sentinelStableAfter = 10 * time.Millisecond
+	t.Cleanup(func() { sentinelStableAfter = saved })
+	var (
+		mu     sync.Mutex
+		synced []string
+	)
+	hook := func(destPath string) {
+		mu.Lock()
+		synced = append(synced, destPath)
+		mu.Unlock()
+	}
+	fileSyncHook.Store(&hook)
+	t.Cleanup(func() { fileSyncHook.Store(nil) })
+	stateDir := filepath.Join(t.TempDir(), "config")
+	sentinelPath := filepath.Join(stateDir, sentinelName)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sentinel, _ := readRunningSentinel(stateDir); sentinel.Stable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sentinel was never marked stable")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if info, err := os.Stat(sentinelPath); err != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0600) {
+		t.Fatalf("sentinel %v (%v), want a file readable by the owner only", info, err)
+	}
+	if err := mgr.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	sawSessionJSON := false
+	for _, path := range synced {
+		if path == sentinelPath {
+			t.Fatalf("the running sentinel was synced (synced: %q)", synced)
+		}
+		if filepath.Base(path) == "session.json" {
+			sawSessionJSON = true
+		}
+	}
+	if !sawSessionJSON {
+		t.Fatalf("session.json was not synced (synced: %q)", synced)
+	}
+}
+
+// TestEnablePersistenceRemovesStaleTempFiles: a crash between creating a
+// temporary state file and renaming it leaves it behind; the next start
+// removes those, and only those.
+func TestEnablePersistenceRemovesStaleTempFiles(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "config")
+	torrentsDir := filepath.Join(stateDir, "torrents")
+	if err := os.MkdirAll(torrentsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path string) string {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	stale := []string{
+		write(filepath.Join(stateDir, ".session.json.tmp-123")),
+		write(filepath.Join(stateDir, ".running.tmp-4")),
+		write(filepath.Join(stateDir, ".crash-state.json.tmp-5")),
+		write(filepath.Join(torrentsDir, "."+strings.Repeat("ab", 20)+".torrent.tmp-678")),
+	}
+	kept := []string{
+		write(filepath.Join(stateDir, "notes.tmp-1")),
+		write(filepath.Join(stateDir, ".other.tmp-1")),
+		write(filepath.Join(torrentsDir, strings.Repeat("cd", 20)+".torrent")),
+	}
+	dirNamedLikeTemp := filepath.Join(stateDir, ".session.json.tmp-dir")
+	if err := os.Mkdir(dirNamedLikeTemp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	kept = append(kept, dirNamedLikeTemp)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range stale {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("stale temporary file %s survived: %v", filepath.Base(path), err)
+		}
+	}
+	for _, path := range kept {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("%s was removed: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+// TestRemoveSessionReportsKeptFilesAsErrFilesKept: removing one of two
+// cross-seeds with its files keeps the file the other uses. That is not a
+// failed removal, so it is reported as ErrFilesKept rather than as an error
+// among others.
+func TestRemoveSessionReportsKeptFilesAsErrFilesKept(t *testing.T) {
+	downloadDir := t.TempDir()
+	torrentDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	first, firstHash := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "one")
+	cross, _ := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "two")
+	if _, err := mgr.AddTorrentFile(first, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AddTorrentFile(cross, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+	err := mgr.RemoveSession(fmt.Sprintf("%x", firstHash), true)
+	if !errors.Is(err, ErrFilesKept) {
+		t.Fatalf("RemoveSession = %v, want ErrFilesKept", err)
+	}
+	var kept *FilesKeptError
+	if !errors.As(err, &kept) || kept.Kept != 1 || kept.Example != "shared.bin" {
+		t.Fatalf("RemoveSession = %#v, want one kept file, shared.bin", err)
+	}
+	if strings.Contains(err.Error(), "removal completed with errors") {
+		t.Fatalf("kept files reported as a failed removal: %v", err)
+	}
+	if mgr.GetSession(fmt.Sprintf("%x", firstHash)) != nil {
+		t.Fatal("the session was not removed")
+	}
+	if _, err := os.Stat(filepath.Join(downloadDir, "shared.bin")); err != nil {
+		t.Fatalf("the shared file was deleted: %v", err)
 	}
 }

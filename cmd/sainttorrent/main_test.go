@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
+	"sainttorrent/pkg/torrent"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -45,12 +47,12 @@ func TestGetSpaceActionHelp(t *testing.T) {
 
 func TestParseCLIArgsNetworkingDefaultsAndOverrides(t *testing.T) {
 	defaults := parseCLIArgs(nil)
-	if defaults.listenPort != defaultPeerPort || defaults.httpAddr != "" || defaults.headless || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
+	if defaults.listenPort != defaultPeerPort || defaults.httpAddr != "" || defaults.httpAllowRemote || defaults.headless || !defaults.natEnabled || defaults.encryption != mse.PolicyPrefer || defaults.storage != storage.BackendFile || defaults.err != nil {
 		t.Fatalf("unexpected networking defaults: %+v", defaults)
 	}
 
-	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn", "--fallback-dir", "/fallback/one", "--fallback-dir", "/fallback/two"})
-	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
+	overrides := parseCLIArgs([]string{"--port", "52000", "--http-addr", "127.0.0.1:16666", "--http-allow-remote", "--headless", "--no-nat", "--encryption", "require", "--storage", "mmap", "--log", "/tmp/sainttorrent.log", "--log-level", "warn", "--fallback-dir", "/fallback/one", "--fallback-dir", "/fallback/two"})
+	if overrides.listenPort != 52000 || overrides.httpAddr != "127.0.0.1:16666" || !overrides.httpAllowRemote || !overrides.headless || overrides.natEnabled || overrides.encryption != mse.PolicyRequire || overrides.storage != storage.BackendMMap || overrides.err != nil {
 		t.Fatalf("unexpected networking overrides: %+v", overrides)
 	}
 	if overrides.logPath != "/tmp/sainttorrent.log" || !overrides.logLevelSet || overrides.logLevel != logging.LevelWarn {
@@ -119,7 +121,7 @@ func TestParseCLIArgsHelpAndVersion(t *testing.T) {
 
 func TestUsageTextMentionsKeyFlags(t *testing.T) {
 	usage := usageText()
-	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage"} {
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage text missing %q", want)
 		}
@@ -283,6 +285,113 @@ func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
 	}
 	if !strings.Contains(got, "Warning: "+warning+"\n") {
 		t.Fatalf("warning message missing warning prefix: %q", got)
+	}
+}
+
+// TestLeadStartupWarnings: the exposed-API warning, then the persistence one,
+// come before the rest, and empty ones are dropped.
+func TestLeadStartupWarnings(t *testing.T) {
+	got := leadStartupWarnings("exposed", "crash", []string{"dht", "nat"})
+	if want := []string{"exposed", "crash", "dht", "nat"}; !slices.Equal(got, want) {
+		t.Fatalf("leadStartupWarnings = %q, want %q", got, want)
+	}
+	if got := leadStartupWarnings("", "", []string{"dht"}); !slices.Equal(got, []string{"dht"}) {
+		t.Fatalf("leadStartupWarnings with no lead = %q", got)
+	}
+}
+
+// TestUnloadedTorrentNoticeShowsRemedyInTUI: a torrent that crashed
+// saintTorrent while being restored is not loaded, so the TUI's startup line is
+// the only place it shows. That line is cut to the terminal width, and the
+// notice used to lead with the crash-file path and end with --start-paused, so
+// the remedy never showed at any width, nor did the torrent's name, and other
+// warnings came first.
+func TestUnloadedTorrentNoticeShowsRemedyInTUI(t *testing.T) {
+	configDir := t.TempDir()
+	hashHex := fmt.Sprintf("%x", [20]byte{0xab, 0xcd})
+	state, err := json.Marshal(downloader.PersistedState{Version: 1, Torrents: []downloader.PersistedTorrent{
+		{InfoHashHex: hashHex, DownloadDir: t.TempDir(), Name: "Poison Torrent"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "session.json"), state, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// What a run that crashed while restoring the torrent leaves behind: its
+	// running sentinel and a restore crash file blaming the torrent.
+	startedAt := time.Now().Add(-time.Hour)
+	sentinel := fmt.Sprintf(`{"pid":1,"nonce":"another-process","started_at":%q,"stable":false}`, startedAt.Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(configDir, "running"), []byte(sentinel), 0600); err != nil {
+		t.Fatal(err)
+	}
+	crashDir := downloader.CrashDir(configDir)
+	if err := os.MkdirAll(crashDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	crashFile := filepath.Join(crashDir, fmt.Sprintf("%d-%s-restore.txt", startedAt.Add(time.Second).UnixNano(), hashHex))
+	if err := os.WriteFile(crashFile, []byte("component: restore\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := downloader.NewTorrentManager()
+	t.Cleanup(mgr.Close)
+	warning, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.GetSession(hashHex) != nil {
+		t.Fatal("the torrent that crashed while restoring was loaded")
+	}
+	line := tuiStartupLine([]string{"HTTP stats endpoint: http://127.0.0.1:16666/stats"},
+		leadStartupWarnings("", warning, []string{"DHT unavailable: " + strings.Repeat("x", 80)}))
+	for _, th := range themes {
+		for _, width := range []int{80, 120, 200} {
+			m := initialModel(mgr, ".", line, nil)
+			m.theme = th
+			um, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+			out := um.View()
+			if !strings.Contains(out, "--start-paused") || !strings.Contains(out, `"Poison Torrent"`) {
+				t.Fatalf("theme=%s width=%d: the startup line does not show --start-paused and the torrent's name:\n%s", th.name, width, out)
+			}
+		}
+	}
+	// The crash file the line leaves out is in restore-failures.log.
+	logData, err := os.ReadFile(filepath.Join(configDir, "restore-failures.log"))
+	if err != nil || !strings.Contains(string(logData), crashFile) || !strings.Contains(string(logData), hashHex) {
+		t.Fatalf("restore-failures.log %q (%v), want the torrent and its crash file", logData, err)
+	}
+}
+
+// In TUI mode the stats endpoint address (and the warning for a network-
+// reachable bind) must reach the startup line, not only headless stderr.
+func TestTUIStartupLineIncludesInfos(t *testing.T) {
+	const endpoint = "HTTP stats endpoint: http://0.0.0.0:16666/stats"
+	const warning = "HTTP stats API on 0.0.0.0:16666 is reachable from the network without authentication"
+	got := tuiStartupLine([]string{endpoint}, []string{warning})
+	if got != warning+"; "+endpoint {
+		t.Fatalf("startup line = %q", got)
+	}
+	if got := tuiStartupLine(nil, nil); got != "" {
+		t.Fatalf("empty startup line = %q", got)
+	}
+}
+
+// A LAN host can put escape sequences into malformed SSDP replies, which
+// goupnp logs through the standard logger; nothing may reach stderr.
+func TestRedirectStdLogKeepsDependencyLogsOffTheTerminal(t *testing.T) {
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+
+	redirectStdLog()
+	if log.Writer() != logging.StdLogWriter() {
+		t.Fatalf("standard logger writes to %T; want the debug-log writer", log.Writer())
+	}
+	if log.Writer() == io.Writer(os.Stderr) {
+		t.Fatal("standard logger still writes to stderr")
 	}
 }
 
@@ -1356,7 +1465,10 @@ func TestConfirmedForwardDoesNotProbePathsOnTUIEventLoop(t *testing.T) {
 func TestRelativeTorrentPathNormalization(t *testing.T) {
 	files := []string{"magnet:?xt=urn:btih:542e85596f7a0dd05eefdb78b0ac1736496f8626", "some/relative/path.torrent"}
 
-	normalized := normalizeForwardedItems(files)
+	normalized, err := normalizeForwardedItems(files)
+	if err != nil {
+		t.Fatalf("normalizeForwardedItems: %v", err)
+	}
 
 	if normalized[0] != files[0] {
 		t.Errorf("magnet link should not be changed, got %s", normalized[0])
@@ -1367,6 +1479,107 @@ func TestRelativeTorrentPathNormalization(t *testing.T) {
 	expectedAbs, _ := filepath.Abs("some/relative/path.torrent")
 	if normalized[1] != expectedAbs {
 		t.Errorf("expected %s, got %s", expectedAbs, normalized[1])
+	}
+}
+
+// The magnet launcher forwards whatever a page links to. An opaque
+// "magnet:x/../.." URL must never be cleaned into an absolute path such as
+// /dev/zero (which the primary would then read on its event loop).
+func TestNormalizeForwardedItemsNeverTurnsURLsIntoPaths(t *testing.T) {
+	for _, item := range []string{
+		"magnet:x/../../../../../../../../../../../../dev/zero",
+		"MAGNET:x/../../../../dev/zero",
+		"magnet:/../../dev/zero",
+		"magnet:",
+		"http://evil.example/x.torrent",
+		"file:///dev/zero",
+		"x-evil:../../../../dev/zero",
+	} {
+		got, err := normalizeForwardedItems([]string{item})
+		if err == nil || got != nil {
+			t.Fatalf("normalizeForwardedItems(%q) = %q, %v; want rejection", item, got, err)
+		}
+	}
+
+	const hash = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
+	got, err := normalizeForwardedItems([]string{"MAGNET:?xt=urn:btih:" + hash, `C:\x.torrent`, "./has:colon.torrent"})
+	if err != nil {
+		t.Fatalf("normalizeForwardedItems: %v", err)
+	}
+	if got[0] != "magnet:?xt=urn:btih:"+hash {
+		t.Fatalf("magnet scheme not canonicalized: %q", got[0])
+	}
+	for _, p := range got[1:] {
+		if !filepath.IsAbs(p) {
+			t.Fatalf("path %q was not made absolute", p)
+		}
+	}
+}
+
+func TestCanonicalItem(t *testing.T) {
+	cases := []struct {
+		item      string
+		canonical string
+		magnet    bool
+		ok        bool
+	}{
+		{"magnet:?xt=urn:btih:x", "magnet:?xt=urn:btih:x", true, true},
+		{"Magnet:?xt=urn:btih:x", "magnet:?xt=urn:btih:x", true, true},
+		{"magnet:x/../dev/zero", "", false, false},
+		{"magnet:", "", false, false},
+		{"https://example.com/a.torrent", "", false, false},
+		{"/abs/path:with-colon.torrent", "/abs/path:with-colon.torrent", false, true},
+		{"relative/a.torrent", "relative/a.torrent", false, true},
+		{`C:\Users\me\a.torrent`, `C:\Users\me\a.torrent`, false, true},
+		{"c:/a.torrent", "c:/a.torrent", false, true},
+		{"1ab:c.torrent", "1ab:c.torrent", false, true},
+	}
+	for _, tc := range cases {
+		canonical, magnet, err := canonicalItem(tc.item)
+		if (err == nil) != tc.ok || canonical != tc.canonical || magnet != tc.magnet {
+			t.Errorf("canonicalItem(%q) = %q, %v, %v; want %q, %v, ok=%v", tc.item, canonical, magnet, err, tc.canonical, tc.magnet, tc.ok)
+		}
+	}
+}
+
+// A forwarded or typed path is read on the TUI event loop, so parseItem must
+// refuse devices and oversized files instead of reading them whole.
+func TestParseItemBoundsTorrentFileReads(t *testing.T) {
+	if _, _, err := parseItem("magnet:x/../../../../../../dev/zero"); err == nil || !strings.Contains(err.Error(), "invalid magnet link") {
+		t.Fatalf("opaque magnet: err = %v; want invalid magnet link", err)
+	}
+
+	big := filepath.Join(t.TempDir(), "big.torrent")
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same bound as the manager's (torrent.MaxFileSize).
+	if err := f.Truncate(torrent.MaxFileSize + 1); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "larger than the maximum") {
+		t.Fatalf("oversized file: err = %v; want larger than the maximum", err)
+	}
+
+	if _, _, err := parseItem(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory: err = %v; want not a regular file", err)
+	}
+}
+
+// Canonicalizing inside addTorrentWithDownloadPaths lets an upper-case magnet
+// scheme through to the manager, whose parser requires "magnet:?".
+func TestAddTorrentAcceptsUpperCaseMagnetScheme(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	sess, err := addTorrentWithDownloadPaths(mgr, "MAGNET:?xt=urn:btih:642e85596f7a0dd05eefdb78b0ac1736496f8626&dn=Upper", downloadPathOptions{primary: t.TempDir()})
+	if err != nil {
+		t.Fatalf("addTorrentWithDownloadPaths: %v", err)
+	}
+	if sess == nil || mgr.GetSession("642e85596f7a0dd05eefdb78b0ac1736496f8626") == nil {
+		t.Fatal("magnet session was not added")
 	}
 }
 
@@ -1509,5 +1722,77 @@ func TestLockErrors(t *testing.T) {
 	}
 	if errors.Is(err3, errLockContention) {
 		t.Error("expected fatal error to not be errLockContention")
+	}
+}
+
+// TestParseCLIArgsStartPaused: --start-paused restores every torrent paused
+// after a crash loop; it is off by default and listed in --help.
+func TestParseCLIArgsStartPaused(t *testing.T) {
+	if parseCLIArgs(nil).startPaused {
+		t.Fatal("startPaused set by default")
+	}
+	opts := parseCLIArgs([]string{"--start-paused", "-d", "/tmp/x"})
+	if !opts.startPaused || opts.err != nil || opts.downloadDir != "/tmp/x" {
+		t.Fatalf("parseCLIArgs(--start-paused) = %+v, want startPaused and the other flags intact", opts)
+	}
+	if !strings.Contains(usageText(), "--start-paused") {
+		t.Fatal("usage text does not list --start-paused")
+	}
+}
+
+// TestParseCLIArgsHTTPAllowHost: --http-allow-host is repeatable, and a value
+// that is not a bare host name is refused at startup rather than never
+// matching a request.
+func TestParseCLIArgsHTTPAllowHost(t *testing.T) {
+	opts := parseCLIArgs([]string{"--http-addr", "0.0.0.0:16666", "--http-allow-remote",
+		"--http-allow-host", "nas.lan", "--http-allow-host", "sainttorrent"})
+	if opts.err != nil || !slices.Equal(opts.httpAllowHosts, []string{"nas.lan", "sainttorrent"}) || !opts.httpAllowRemote {
+		t.Fatalf("parseCLIArgs = %+v (err %v), want both allowed hosts", opts.httpAllowHosts, opts.err)
+	}
+	for _, args := range [][]string{
+		{"--http-allow-host"},
+		{"--http-allow-host", "http://nas.lan:16666"},
+		{"--http-allow-host", "*.lan"},
+	} {
+		if opts := parseCLIArgs(args); opts.err == nil {
+			t.Fatalf("parseCLIArgs(%q) accepted it", args)
+		}
+	}
+	if !strings.Contains(usageText(), "--http-allow-host") {
+		t.Fatal("usage text does not list --http-allow-host")
+	}
+}
+
+// TestDeleteKeepingCrossSeedFilesIsNotAnError: a removal that kept files a
+// cross-seed still uses went through, so the TUI shows it as a note and
+// returns to the list instead of showing a deletion error.
+func TestDeleteKeepingCrossSeedFilesIsNotAnError(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	m := initialModel(mgr, ".", "", nil)
+	const infoHashHex = "642e85596f7a0dd05eefdb78b0ac1736496f8626"
+	m.viewMode = viewDeleteConfirm
+	m.deleteTargetHash = infoHashHex
+	m.deleteInProgress = true
+
+	updated, _ := m.Update(deleteFinishedMsg{
+		infoHashHex: infoHashHex,
+		err:         &downloader.FilesKeptError{Kept: 1, Example: "shared.bin"},
+	})
+	m = updated.(model)
+	if m.deleteErr != nil || m.viewMode != viewList || m.deleteInProgress {
+		t.Fatalf("after a removal that kept files: deleteErr=%v view=%v inProgress=%v, want the list and no error", m.deleteErr, m.viewMode, m.deleteInProgress)
+	}
+	if !strings.Contains(m.flash, "kept 1 file(s)") {
+		t.Fatalf("flash %q does not mention the kept file", m.flash)
+	}
+
+	// A real failure still stops on the error.
+	m.viewMode = viewDeleteConfirm
+	m.deleteInProgress = true
+	updated, _ = m.Update(deleteFinishedMsg{infoHashHex: infoHashHex, err: errors.New("disk on fire")})
+	m = updated.(model)
+	if m.deleteErr == nil || m.viewMode != viewDeleteConfirm {
+		t.Fatalf("after a failed removal: deleteErr=%v view=%v, want the error shown", m.deleteErr, m.viewMode)
 	}
 }

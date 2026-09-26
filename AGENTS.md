@@ -15,7 +15,15 @@ Run, in this order:
 3. `go build ./...`
 4. `go test -race ./...`
 
-CI additionally runs golangci-lint and a linux/386 build+test (`GOARCH=386 CGO_ENABLED=0` — keep 64-bit atomic fields properly aligned; see `pkg/downloader/atomic_alignment_test.go`).
+CI runs steps 1–4 on Linux, macOS and Windows (gofmt on the first two; `GOOS=windows go vet ./...` and `GOOS=darwin go vet ./...` catch most platform breaks locally), and additionally runs:
+
+- golangci-lint (v2.14.0): `golangci-lint run ./...`
+- a linux/386 build+test: `GOARCH=386 CGO_ENABLED=0 go build ./... && GOARCH=386 CGO_ENABLED=0 go test ./...` — keep 64-bit atomic fields properly aligned; see `pkg/downloader/atomic_alignment_test.go`.
+- a build-only cross-build for targets with no hosted runner, where a file-name GOOS suffix or a syscall symbol missing on one platform breaks only that target: `for goos in openbsd freebsd netbsd illumos solaris; do GOOS=$goos GOARCH=amd64 CGO_ENABLED=0 go build ./...; done`
+- govulncheck: `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`
+- benchmark smoke tests: `go test -run '^$' -bench 'BenchmarkColdStartup|BenchmarkShutdown|BenchmarkResumeVerification' -benchtime=1x -benchmem ./pkg/downloader`
+
+CI also runs weekly on `main`, so a newly published Go or standard-library advisory fails govulncheck without any push.
 
 Enable the repo pre-commit hook once per clone so steps 1–2 run automatically:
 

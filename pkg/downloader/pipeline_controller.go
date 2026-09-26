@@ -19,6 +19,36 @@ const (
 	maxConcurrentPiecesPerPeer         = 2048
 )
 
+// A connection keeps every received block of a piece in memory until the whole
+// piece is in, and the outstanding-request budgets above are released as each
+// block arrives. So the pieces a connection may have open at once are also bounded
+// by their total size, peerOpenPieceBytesCap: without it a peer that withholds one
+// block of each piece pins minConcurrentPiecesPerPeer whole pieces (256 MiB with
+// 16 MiB pieces). Up to 4 MiB pieces the piece-count cap binds first, so this only
+// changes torrents with larger pieces, where two or more open pieces still cover
+// the largest request window. peerOpenPieceBytesFloor is a var so tests can shrink
+// it; treat it as a constant.
+var peerOpenPieceBytesFloor = int64(64 << 20)
+
+const (
+	// minOpenPiecesPerPeer pieces may always be open, whatever their size, so the
+	// window can run across a piece boundary.
+	minOpenPiecesPerPeer = 2
+	// minEndgamePiecesPerPeer redundant endgame copies may always be open on one
+	// connection. Beyond that a connection takes as many as its request window
+	// can fill (see runPeerMessageLoop's endgameCopyLimit): a fast peer then
+	// re-fetches the pieces slow peers still hold a window at a time instead of
+	// two per round trip. Memory stays bounded by the window and by
+	// peerOpenPieceBytesCap, which cover endgame copies like any open piece.
+	minEndgamePiecesPerPeer = 2
+)
+
+// peerOpenPieceBytesCap returns the most piece bytes one connection may have open
+// for a torrent with pieces of pieceLen bytes.
+func peerOpenPieceBytesCap(pieceLen int64) int64 {
+	return max(2*pieceLen, peerOpenPieceBytesFloor)
+}
+
 type pipelineByteBudget struct {
 	limit     atomic.Int64
 	used      atomic.Int64
@@ -299,6 +329,22 @@ func normalizePeerPipelineConfig(cfg peerPipelineConfig) peerPipelineConfig {
 		cfg.MaxConcurrentPieces = minConcurrentPiecesPerPeer
 	}
 	return cfg
+}
+
+// LimitWindowBlocks caps this peer's request window at n outstanding blocks, for
+// a peer that advertised a request queue (BEP 10 reqq) smaller than our maximum:
+// requests past its queue are rejected or silently dropped, costing a whole piece
+// or a 20 s timeout each. Values at or above the current maximum change nothing.
+func (p *peerPipelineController) LimitWindowBlocks(n int) {
+	if n <= 0 || n >= p.cfg.MaxWindowBlocks {
+		return
+	}
+	p.cfg.MaxWindowBlocks = n
+	p.cfg.MinWindowBlocks = min(p.cfg.MinWindowBlocks, n)
+	p.cfg.InitialWindowBlocks = min(p.cfg.InitialWindowBlocks, n)
+	p.cfg.StartupProbeCeilingBlocks = min(p.cfg.StartupProbeCeilingBlocks, n)
+	p.windowBlocks = min(p.windowBlocks, n)
+	p.targetWindowBlocks = min(p.targetWindowBlocks, n)
 }
 
 func (p *peerPipelineController) WindowBlocks(now time.Time) int {

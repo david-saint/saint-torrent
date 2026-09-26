@@ -1,12 +1,14 @@
 package dht
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -59,9 +61,9 @@ func TestCompactNodes(t *testing.T) {
 		t.Fatalf("expected compacted length to be 26, got %d", len(compacted))
 	}
 
-	parsed := parseCompactNodes(compacted)
-	if len(parsed) != 1 {
-		t.Fatalf("expected 1 parsed node, got %d", len(parsed))
+	parsed, ok := parseCompactNodes(compacted)
+	if !ok || len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed node, got %d (ok %v)", len(parsed), ok)
 	}
 
 	if parsed[0].ID != id1 {
@@ -70,6 +72,26 @@ func TestCompactNodes(t *testing.T) {
 
 	if !parsed[0].Addr.IP.Equal(addr1.IP) || parsed[0].Addr.Port != addr1.Port {
 		t.Errorf("parsed address mismatch: expected %s, got %s", addr1, parsed[0].Addr)
+	}
+}
+
+// TestParseCompactNodesIsStrict verifies a ragged node list is rejected whole
+// and all-zero IDs are skipped (jech/dht).
+func TestParseCompactNodesIsStrict(t *testing.T) {
+	good := compactNodes([]Node{{ID: sha1.Sum([]byte("node1")), Addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881}}})
+	zero := compactNodes([]Node{{Addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}}})
+
+	for _, ragged := range []string{good + "x", good[:25], good + good[:13]} {
+		if nodes, ok := parseCompactNodes(ragged); ok || nodes != nil {
+			t.Fatalf("a %d-byte node list was accepted: %d nodes", len(ragged), len(nodes))
+		}
+	}
+	nodes, ok := parseCompactNodes(zero + good + zero)
+	if !ok || len(nodes) != 1 || !nodes[0].Addr.IP.Equal(net.ParseIP("198.51.100.1")) {
+		t.Fatalf("zero-ID entries were not skipped: %v (ok %v)", nodes, ok)
+	}
+	if nodes, ok := parseCompactNodes(""); !ok || len(nodes) != 0 {
+		t.Fatalf("an empty node list was rejected")
 	}
 }
 
@@ -98,13 +120,23 @@ func TestDHTPersistence(t *testing.T) {
 	}
 	defer dht2.Close()
 
-	if dht2.nodeID != dht1.nodeID {
-		t.Errorf("node ID was not persisted across runs: %x vs %x", dht1.nodeID, dht2.nodeID)
+	// The node ID must not survive a restart: it would link sessions across
+	// networks. The saved contacts are still reused to bootstrap.
+	if dht2.nodeID == dht1.nodeID {
+		t.Errorf("node ID %x was reused across runs", dht1.nodeID)
 	}
 
 	closer := dht2.getCloserNodes(id1, 1)
 	if len(closer) != 1 || closer[0].ID != id1 {
 		t.Errorf("routing table nodes were not persisted successfully")
+	}
+
+	data, err := os.ReadFile(filepath.Join(tempDir, ".dht_nodes"))
+	if err != nil {
+		t.Fatalf("failed to read saved nodes: %v", err)
+	}
+	if bytes.Contains(data, []byte("node_id")) {
+		t.Error("the node ID was written to disk")
 	}
 }
 
@@ -261,7 +293,7 @@ func TestDHTAnnouncePeerValidatesPort(t *testing.T) {
 	}
 	args["port"] = int64(70000)
 	d.handleQuery("tx", "announce_peer", args, addr)
-	if peers := d.getPeersForInfoHash(infoHash); len(peers) != 0 {
+	if peers := d.getPeersForInfoHash(infoHash, nil); len(peers) != 0 {
 		t.Fatalf("expected invalid port announce to be ignored, got %d peers", len(peers))
 	}
 
@@ -271,7 +303,7 @@ func TestDHTAnnouncePeerValidatesPort(t *testing.T) {
 	}
 	args["port"] = int64(51413)
 	d.handleQuery("tx", "announce_peer", args, addr)
-	peers := d.getPeersForInfoHash(infoHash)
+	peers := d.getPeersForInfoHash(infoHash, nil)
 	if len(peers) != 1 {
 		t.Fatalf("expected valid announce to register peer, got %d", len(peers))
 	}
@@ -393,10 +425,12 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 	go func() {
 		defer close(queriesCh)
 
+		// Serve until the lookup announces, or until it has been quiet for
+		// a while: a fixed total window flaked on loaded CI machines.
+		const quiet = 2 * time.Second
 		buf := make([]byte, 2048)
-		deadline := time.Now().Add(700 * time.Millisecond)
 		for {
-			_ = server.SetReadDeadline(deadline)
+			_ = server.SetReadDeadline(time.Now().Add(quiet))
 			n, addr, err := server.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -450,6 +484,9 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 				return
 			}
 			_, _ = server.WriteToUDP(payload, addr)
+			if query == "announce_peer" {
+				return
+			}
 		}
 	}()
 
@@ -465,7 +502,7 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 			queries = append(queries, query)
 		case err := <-errCh:
 			t.Fatalf("test DHT node failed: %v", err)
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("timed out waiting for DHT lookup queries")
 		}
 	}

@@ -13,6 +13,38 @@ import (
 const (
 	dhtQueueSize    = 1024
 	acceptQueueSize = 128
+
+	// maxHalfOpen bounds the inbound connections whose SYN we have answered
+	// but whose initiator has not yet acknowledged our SYN-ACK. A genuine
+	// entry lives for about one round trip, so this absorbs any real burst of
+	// incoming connections, while a SYN flood can hold no more than this many
+	// small entries. The oldest entry is evicted to make room, so a flood has
+	// to outpace real round trips to crowd out a genuine initiator.
+	maxHalfOpen = 256
+	// halfOpenTimeout forgets a half-open entry whose initiator never
+	// acknowledged our SYN-ACK. Expiry is silent: no FIN or RESET goes to a
+	// source that has not proven it can receive them.
+	halfOpenTimeout = 10 * time.Second
+
+	// maxResetsPerSecond caps the RESETs sent for packets that belong to no
+	// connection. Each answers a packet from an unverified source one for
+	// one, so without a cap a spoofing sender can bounce any volume off us
+	// toward a third party; a peer that really lost its connection learns
+	// from the first few, or from its own timeout.
+	maxResetsPerSecond = 64
+
+	// maxDHTDatagram is the most of a non-uTP datagram handed to the DHT: its
+	// read loop (pkg/dht) reads into a 4096-byte buffer and never sees the
+	// rest, so copying more only costs the shared read loop a 64 KiB copy per
+	// junk datagram and lets the DHT queue pin up to 64 MiB.
+	maxDHTDatagram = 4096
+
+	// readErrorBackoffMin and readErrorBackoffMax bound the pause after a
+	// failed read of the shared socket (see readLoop): the first failure
+	// waits the minimum, each consecutive one doubles it up to the maximum,
+	// and a successful read starts over.
+	readErrorBackoffMin = 10 * time.Millisecond
+	readErrorBackoffMax = 250 * time.Millisecond
 )
 
 var errListenerClosed = errors.New("utp: listener closed")
@@ -53,11 +85,32 @@ func newConnKey(addr *net.UDPAddr, id uint16) connKey {
 // through DHTConn so the DHT and uTP can share one UDP port.
 type Socket struct {
 	conn *net.UDPConn
+	// readFrom reads the next datagram for readLoop. It is conn.ReadFromUDP;
+	// tests substitute it to inject read errors.
+	readFrom func([]byte) (int, *net.UDPAddr, error)
 
 	mu       sync.Mutex
 	conns    map[connKey]*Conn
 	listener *Listener
 	closed   bool
+
+	// halfOpen holds answered inbound SYNs until the initiator acknowledges
+	// the SYN-ACK (see halfOpenConn). halfOpenRing records insertion order so
+	// the oldest entry is evicted in O(1) when the table is full; a slot may
+	// hold an entry already promoted or expired, which the map check skips.
+	halfOpen     map[connKey]*halfOpenConn
+	halfOpenRing [maxHalfOpen]*halfOpenConn
+	halfOpenNext int
+
+	// resetWindow and resetsSent budget unsolicited RESETs per second (see
+	// maxResetsPerSecond).
+	resetWindow time.Time
+	resetsSent  int
+
+	// refuseIncoming turns away new inbound connections (see
+	// SetRefuseIncoming). It is read only for SYNs and for packets that would
+	// complete a half-open handshake, never for established traffic.
+	refuseIncoming atomic.Bool
 
 	// bufPool hands out scratch buffers for packet marshaling so writePacket
 	// does not allocate a fresh header+payload slice per send. sync.Pool keeps
@@ -88,17 +141,26 @@ func NewSocket(listenPort int) (*Socket, error) {
 func NewSocketFromUDP(conn *net.UDPConn) *Socket {
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
+	s := newSocket(conn, conn.ReadFromUDP)
+	go s.readLoop()
+	return s
+}
+
+// newSocket builds a Socket around conn that reads through readFrom, without
+// starting its read loop.
+func newSocket(conn *net.UDPConn, readFrom func([]byte) (int, *net.UDPAddr, error)) *Socket {
 	s := &Socket{
-		conn:  conn,
-		conns: make(map[connKey]*Conn),
-		done:  make(chan struct{}),
+		conn:     conn,
+		readFrom: readFrom,
+		conns:    make(map[connKey]*Conn),
+		halfOpen: make(map[connKey]*halfOpenConn),
+		done:     make(chan struct{}),
 	}
 	s.bufPool.New = func() any {
 		b := make([]byte, 0, headerSize+maxPayloadSize)
 		return &b
 	}
 	s.dhtConn = newPacketConn(s)
-	go s.readLoop()
 	return s
 }
 
@@ -124,6 +186,30 @@ func (s *Socket) Listen() *Listener {
 	}
 	s.listener = l
 	return l
+}
+
+// SetRefuseIncoming sets whether s turns away new inbound connections. While
+// refuse is true, a SYN that would open one is answered with a RESET instead
+// of a SYN-ACK, and an initiator whose SYN was answered before refusal began
+// is reset when it acknowledges the SYN-ACK, so nothing new reaches the
+// listener. Established and already accepted connections, and connections
+// this socket dials, are unaffected.
+//
+// A BitTorrent client that also listens on TCP sets it to keep peers off
+// this uTP, whose writes wait for every packet to be acknowledged (see
+// Conn.Write) and so move about one block per round trip. libtorrent (and so
+// qBittorrent and Deluge), uTorrent and Transmission dial uTP first, take a
+// RESET answering their SYN as a failed connect, and connect again over TCP
+// at once. The cost is a peer that can reach us over UDP but not TCP.
+//
+// The RESET answering a refused SYN is sent whatever the unsolicited-RESET
+// budget (maxResetsPerSecond) says. It stands in for the SYN-ACK an accepting
+// socket sends every SYN unbudgeted, and is no larger than the SYN it
+// answers, so it hands a spoofing sender nothing the SYN-ACK would not;
+// budgeting it would let a burst of stray packets leave a real initiator to
+// time out before it falls back to TCP.
+func (s *Socket) SetRefuseIncoming(refuse bool) {
+	s.refuseIncoming.Store(refuse)
 }
 
 // DialContext opens a uTP connection to addr, which must be host:port.
@@ -203,17 +289,17 @@ func (s *Socket) writePacket(p packet, addr *net.UDPAddr) error {
 
 func (s *Socket) readLoop() {
 	buf := make([]byte, 64*1024)
+	var backoff time.Duration
 	for {
-		n, addr, err := s.conn.ReadFromUDP(buf)
+		n, addr, err := s.readFrom(buf)
 		if err != nil {
-			select {
-			case <-s.done:
-				return
-			default:
-				s.Close()
+			backoff = nextReadErrorBackoff(backoff)
+			if !s.pauseAfterReadError(err, backoff) {
 				return
 			}
+			continue
 		}
+		backoff = 0
 		if IsPacket(buf[:n]) {
 			// handleUTPPacket runs synchronously in this goroutine and the
 			// Conn copies any payload it retains (into readBuf or the pending
@@ -222,10 +308,50 @@ func (s *Socket) readLoop() {
 			continue
 		}
 		// The DHT path hands the datagram to another goroutine via a channel,
-		// so it must own a copy that outlives the next ReadFromUDP.
-		data := append([]byte(nil), buf[:n]...)
+		// so it must own a copy that outlives the next ReadFromUDP. Only the
+		// part the DHT will ever read is copied.
+		data := append([]byte(nil), buf[:min(n, maxDHTDatagram)]...)
 		s.dhtConn.deliver(udpPacket{data: data, addr: cloneUDPAddr(addr)})
 	}
+}
+
+// pauseAfterReadError handles a failed read of the shared socket and reports
+// whether readLoop should read again. Only a closed socket ends the loop. The
+// socket carries every uTP conn and the DHT, and other read errors (ENOBUFS
+// or ENOMEM under memory pressure, an ICMP error some platforms surface on
+// the next read) are transient, so giving up on one would disable uTP and the
+// DHT until restart. Those wait out backoff instead, so a persistent error
+// cannot spin the loop; Close cuts the wait short.
+func (s *Socket) pauseAfterReadError(err error, backoff time.Duration) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	if errors.Is(err, net.ErrClosed) {
+		// The UDP socket was closed without Close, which owns it: nothing
+		// more can arrive, so release the conns, the listener and the DHT
+		// view instead of leaving them waiting on a dead socket.
+		_ = s.Close()
+		return false
+	}
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// nextReadErrorBackoff returns the pause after a failed read given the pause
+// after the previous consecutive failure, zero if there was none.
+func nextReadErrorBackoff(prev time.Duration) time.Duration {
+	if prev < readErrorBackoffMin {
+		return readErrorBackoffMin
+	}
+	return min(2*prev, readErrorBackoffMax)
 }
 
 func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
@@ -237,72 +363,295 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	// A SYN carries the initiator's recv_id, so our side of that connection is
 	// keyed one higher; every other packet is keyed by its own connection id.
 	key := newConnKey(addr, p.connID)
-	isSyn := p.typ == packetTypeSyn
-	if isSyn {
+	if p.typ == packetTypeSyn {
 		key.id++
+		s.handleSyn(p, key, addr)
+		return
 	}
 
 	var (
-		c        *Conn
-		listener *Listener
+		c         *Conn
+		listener  *Listener
+		halfOpen  bool
+		sendReset bool
+		resetTo   [2]*Conn
+		refused   *halfOpenConn
 	)
 	s.mu.Lock()
-	if isSyn {
-		listener = s.listener
-		if !s.closed {
-			// The existing conn is consulted before the listener: an inbound
-			// conn parked at this key owns the connection the SYN belongs to
-			// whether or not the listener is still open. TorrentManager.Close
-			// closes the listener ahead of the sessions still using conns it
-			// handed out, and Listener.Close clears Socket.listener without
-			// unregistering accepted conns, so answering a retransmit with a
-			// RESET here would carry the initiator's connID and tear down a
-			// live inbound stream.
-			switch existing := s.conns[key]; {
-			case existing != nil && existing.inbound:
-				// SYN retransmit for a conn we already created.
-				c = existing
-			case existing == nil && listener != nil && !listener.isClosed():
-				c = newInboundConn(s, cloneUDPAddr(addr), p.connID, p.seqNr)
-				s.conns[key] = c
+	c = s.conns[key]
+	if c == nil {
+		// Only packets for unknown conns get here, so the half-open lookup,
+		// the promotion, the RESET routing and the reset budget cost
+		// established connections nothing.
+		now := time.Now()
+		if h := s.liveHalfOpenLocked(key, now); h != nil {
+			halfOpen = true
+			if h.acknowledgedBy(p) {
+				if s.refuseIncoming.Load() {
+					// Refusal began after the SYN-ACK went out (see
+					// SetRefuseIncoming).
+					delete(s.halfOpen, h.key)
+					refused = h
+				} else {
+					c = s.promoteLocked(h, p.ackNr)
+					listener = s.listener
+				}
 			}
-			// Any other conn at this key (an outbound conn whose recv_id
-			// collides) is left untouched and the SYN is refused below.
+		} else if p.typ == packetTypeReset {
+			resetTo = s.resetTargetsLocked(addr, p.connID)
+		} else {
+			sendReset = s.allowResetLocked(now)
 		}
-	} else {
-		c = s.conns[key]
 	}
 	s.mu.Unlock()
 
 	if c == nil {
-		if p.typ != packetTypeReset {
-			_ = s.writePacket(packet{
-				typ:       packetTypeReset,
-				connID:    p.connID,
-				timestamp: s.nowMicros(),
-				seqNr:     p.ackNr,
-				ackNr:     p.seqNr,
-			}, addr)
+		// A packet for a half-open entry that does not acknowledge our
+		// SYN-ACK came from a source that has not shown it receives what we
+		// send, so it is dropped without any reply. A RESET is never
+		// answered, only handed to the conns it may name, which still check
+		// its ack_nr like any in-band RESET. Other stray packets get a RESET
+		// while the budget lasts.
+		for _, rc := range resetTo {
+			if rc != nil {
+				rc.handlePacket(p)
+			}
+		}
+		switch {
+		case refused != nil:
+			// The sender proved it receives what we send, so no budget is
+			// spent. The RESET carries the SYN's connection id, which the
+			// initiator's conn is keyed by, and acks the last seq_nr the
+			// initiator sent: a STATE carries the next one without sending
+			// it, and libtorrent ignores a RESET acking a seq_nr it has not
+			// sent yet.
+			answered := p
+			if answered.typ == packetTypeState {
+				answered.seqNr--
+			}
+			s.writeReset(refused.connID, answered, addr)
+		case sendReset:
+			s.writeReset(p.connID, p, addr)
 		}
 		return
 	}
 
-	if !isSyn {
-		c.handlePacket(p)
-		return
-	}
-
-	wasAccepted := c.isAccepted()
 	c.handlePacket(p)
-	if !wasAccepted {
-		// listener can be nil here: a reused inbound conn is routed without
-		// consulting the listener, so it may already have been cleared.
+	if halfOpen {
+		// The promoting packet was processed first, so a payload it carries
+		// (the BitTorrent handshake or MSE key) is readable by the time the
+		// conn is handed out. listener can be nil or closed: the entry may
+		// have outlived it.
 		if listener == nil || !listener.enqueue(c) {
 			c.closeWithError(errListenerClosed, true)
-		} else {
-			c.markAccepted()
 		}
 	}
+}
+
+// handleSyn answers an inbound SYN. A retransmit for a conn already promoted
+// is re-acked by that Conn. Otherwise the SYN is only recorded in the
+// half-open table and answered with a SYN-ACK: no Conn exists and nothing
+// reaches the listener until the initiator acknowledges it, so a spoofed SYN
+// buys one table slot and one 20-byte STATE, never a writable connection. A
+// socket refusing incoming connections (SetRefuseIncoming) answers with a
+// RESET instead and records nothing.
+func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
+	now := time.Now()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	// The existing conn is consulted before the listener: an inbound conn
+	// parked at this key owns the connection the SYN belongs to whether or not
+	// the listener is still open. TorrentManager.Close closes the listener
+	// ahead of the sessions still using conns it handed out, and
+	// Listener.Close clears Socket.listener without unregistering accepted
+	// conns, so answering a retransmit with a RESET here would carry the
+	// initiator's connID and tear down a live inbound stream.
+	if existing := s.conns[key]; existing != nil {
+		if existing.inbound {
+			s.mu.Unlock()
+			existing.handlePacket(p)
+			return
+		}
+		// An outbound conn whose recv_id collides with this key is left
+		// untouched and the SYN is refused.
+		sendReset := s.allowResetLocked(now)
+		s.mu.Unlock()
+		if sendReset {
+			s.writeReset(p.connID, p, addr)
+		}
+		return
+	}
+	h := s.liveHalfOpenLocked(key, now)
+	if s.listener != nil && s.refuseIncoming.Load() {
+		// Refused (see SetRefuseIncoming): a RESET goes out in place of the
+		// SYN-ACK, outside the budget, and a half-open entry this SYN
+		// retransmits for is dropped.
+		if h != nil {
+			delete(s.halfOpen, key)
+		}
+		s.mu.Unlock()
+		s.writeReset(p.connID, p, addr)
+		return
+	}
+	if h == nil || h.synSeq != p.seqNr {
+		// A new connection. A SYN with a different seq_nr at a live entry's
+		// key is a fresh attempt that reuses the connection id, so it
+		// replaces the entry rather than being answered with a SYN-ACK that
+		// acks the wrong SYN.
+		if s.listener == nil || s.listener.isClosed() {
+			sendReset := s.allowResetLocked(now)
+			s.mu.Unlock()
+			if sendReset {
+				s.writeReset(p.connID, p, addr)
+			}
+			return
+		}
+		h = &halfOpenConn{
+			key:     key,
+			addr:    cloneUDPAddr(addr),
+			connID:  p.connID,
+			synSeq:  p.seqNr,
+			seq:     randomUint16(),
+			created: now,
+		}
+		s.addHalfOpenLocked(h)
+	}
+	// A retransmit of the same SYN gets the identical SYN-ACK again, in case
+	// the first one was lost.
+	h.timestampDiff = s.nowMicros() - p.timestamp
+	reply := h.synAck(s.nowMicros())
+	s.mu.Unlock()
+	_ = s.writePacket(reply, addr)
+}
+
+// allowResetLocked spends one unit of the unsolicited-RESET budget, reporting
+// false once the current second's budget is used up.
+func (s *Socket) allowResetLocked(now time.Time) bool {
+	if now.Sub(s.resetWindow) >= time.Second {
+		s.resetWindow = now
+		s.resetsSent = 0
+	}
+	if s.resetsSent >= maxResetsPerSecond {
+		return false
+	}
+	s.resetsSent++
+	return true
+}
+
+// resetTargetsLocked returns the conns from addr that a RESET carrying id as
+// our send id can belong to. libutp (uTorrent, Transmission) and writeReset
+// alike answer a packet for a connection they do not know with a RESET
+// carrying that packet's connection id, which is our send id rather than the
+// recv id conns are keyed by. The recv id is one below the send id on a conn
+// we dialed and one above on a conn we accepted, so both neighbouring keys are
+// tried, as libutp does. A conn found there is a target only if its send id
+// is id: either key can just as well hold an unrelated conn whose recv id
+// happens to be id±1.
+func (s *Socket) resetTargetsLocked(addr *net.UDPAddr, id uint16) [2]*Conn {
+	var out [2]*Conn
+	for i, recvID := range [2]uint16{id - 1, id + 1} {
+		if c := s.conns[newConnKey(addr, recvID)]; c != nil && c.sendID == id {
+			out[i] = c
+		}
+	}
+	return out
+}
+
+// writeReset answers p, which belongs to no connection we can serve, with a
+// RESET carrying connID: p's own connection id, or the SYN's for a packet
+// that would have completed a refused handshake. Callers spend the budget
+// first (allowResetLocked) where one applies.
+func (s *Socket) writeReset(connID uint16, p packet, addr *net.UDPAddr) {
+	_ = s.writePacket(packet{
+		typ:       packetTypeReset,
+		connID:    connID,
+		timestamp: s.nowMicros(),
+		seqNr:     p.ackNr,
+		ackNr:     p.seqNr,
+	}, addr)
+}
+
+// halfOpenConn is an inbound connection whose SYN we answered but whose
+// initiator has not yet shown that it receives our packets. It carries only
+// what the SYN-ACK and the promoted Conn need.
+type halfOpenConn struct {
+	key           connKey
+	addr          *net.UDPAddr
+	connID        uint16 // the SYN's connection id, our send id
+	synSeq        uint16
+	seq           uint16 // our SYN-ACK's random seq_nr
+	timestampDiff uint32
+	created       time.Time
+}
+
+func (h *halfOpenConn) synAck(now uint32) packet {
+	return packet{
+		typ:           packetTypeState,
+		connID:        h.connID,
+		timestamp:     now,
+		timestampDiff: h.timestampDiff,
+		wndSize:       receiveWindowSize,
+		seqNr:         h.seq,
+		ackNr:         h.synSeq,
+	}
+}
+
+// acknowledgedBy reports whether p proves its sender received our SYN-ACK:
+// only a host that saw the random seq_nr we sent to addr can ack it. libutp and
+// libtorrent initiators ack seq-1, because a SYN-ACK's seq_nr is the next seq
+// the acceptor will send; earlier saintTorrent releases ack seq itself. Only
+// DATA and STATE complete the handshake, as in libutp.
+func (h *halfOpenConn) acknowledgedBy(p packet) bool {
+	if p.typ != packetTypeData && p.typ != packetTypeState {
+		return false
+	}
+	return p.ackNr == h.seq-1 || p.ackNr == h.seq
+}
+
+// liveHalfOpenLocked returns the half-open entry for key, forgetting it once
+// it has expired.
+func (s *Socket) liveHalfOpenLocked(key connKey, now time.Time) *halfOpenConn {
+	h := s.halfOpen[key]
+	if h != nil && now.Sub(h.created) >= halfOpenTimeout {
+		delete(s.halfOpen, key)
+		return nil
+	}
+	return h
+}
+
+// addHalfOpenLocked records h, evicting the oldest entry when the table is
+// full. Every live entry occupies exactly one ring slot, so the table never
+// holds more than maxHalfOpen entries.
+func (s *Socket) addHalfOpenLocked(h *halfOpenConn) {
+	if old := s.halfOpenRing[s.halfOpenNext]; old != nil && s.halfOpen[old.key] == old {
+		delete(s.halfOpen, old.key)
+	}
+	s.halfOpenRing[s.halfOpenNext] = h
+	s.halfOpenNext = (s.halfOpenNext + 1) % maxHalfOpen
+	s.halfOpen[h.key] = h
+}
+
+// promoteLocked turns a half-open entry whose SYN-ACK was acknowledged by ack
+// into an established Conn registered for routing.
+func (s *Socket) promoteLocked(h *halfOpenConn, ack uint16) *Conn {
+	delete(s.halfOpen, h.key)
+	if s.closed {
+		return nil
+	}
+	// Our first DATA goes where the initiator expects it: at the SYN-ACK's
+	// seq_nr for a libutp-style initiator (ack seq-1), one past it for an
+	// earlier saintTorrent initiator, which treated the SYN-ACK as consuming
+	// its seq_nr (ack seq).
+	localSeq := h.seq
+	if ack == h.seq {
+		localSeq++
+	}
+	c := newInboundConn(s, h.addr, h.connID, h.synSeq, localSeq)
+	s.conns[h.key] = c
+	return c
 }
 
 // Close closes the shared UDP socket and every active uTP connection. The DHT
@@ -317,6 +666,8 @@ func (s *Socket) Close() error {
 			conns = append(conns, c)
 		}
 		s.conns = make(map[connKey]*Conn)
+		clear(s.halfOpen)
+		s.halfOpenRing = [maxHalfOpen]*halfOpenConn{}
 		listener = s.listener
 		s.listener = nil
 		close(s.done)
@@ -352,6 +703,10 @@ func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 type Listener struct {
 	socket *Socket
 
+	// mu serializes enqueue with Close, so no conn can land in acceptCh
+	// after Close has drained it. It is taken once per promoted inbound
+	// connection, never per packet.
+	mu       sync.Mutex
 	acceptCh chan *Conn
 	closed   chan struct{}
 	once     sync.Once
@@ -369,13 +724,17 @@ func (l *Listener) Accept() (net.Conn, error) {
 	}
 }
 
+// enqueue hands c to Accept, reporting false when the listener is closed or
+// its queue is full; the caller then owns c and must close it.
 func (l *Listener) enqueue(c *Conn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Checked under mu: a send racing Close could otherwise be chosen after
+	// Close drained the queue, stranding c there with its receive buffer.
 	if l.isClosed() {
 		return false
 	}
 	select {
-	case <-l.closed:
-		return false
 	case l.acceptCh <- c:
 		return true
 	default:
@@ -398,7 +757,12 @@ func (l *Listener) isClosed() bool {
 // released instead of lingering until the whole Socket is closed.
 func (l *Listener) Close() error {
 	l.once.Do(func() {
+		// Once closed is closed under mu no enqueue can add to acceptCh, so
+		// the drain below sees every conn left in it. The conns are closed
+		// outside mu.
+		l.mu.Lock()
 		close(l.closed)
+		l.mu.Unlock()
 		l.socket.mu.Lock()
 		if l.socket.listener == l {
 			l.socket.listener = nil

@@ -51,10 +51,20 @@ func ParseMagnet(uri string) (*MagnetLink, error) {
 		return nil, fmt.Errorf("invalid magnet URI: %w", err)
 	}
 
+	// A link can carry any number of tr= values, and every announce contacts
+	// each tracker at once: keep only valid, unique ones of at most
+	// MaxTrackerURLLength bytes, up to maxTrackers.
+	trackers := newURLSet(maxTrackers, true, MaxTrackerURLLength)
+	for _, tr := range params["tr"] {
+		if !trackers.add(tr) {
+			break
+		}
+	}
+
 	return &MagnetLink{
 		InfoHash: infoHash,
-		Name:     params.Get("dn"),
-		Trackers: params["tr"],
+		Name:     sanitizeName(params.Get("dn")),
+		Trackers: trackers.list,
 	}, nil
 }
 

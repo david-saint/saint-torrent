@@ -2,9 +2,11 @@ package downloader
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
+	"sainttorrent/pkg/netpolicy"
 	"sainttorrent/pkg/peer"
 )
 
@@ -12,8 +14,71 @@ var pexInterval = 60 * time.Second
 
 const pexDeltaLimit = 50
 
+// pexIngestLimit is how many added peers of one ut_pex message we act on. BEP 11
+// allows 50 per message (we send at most pexDeltaLimit), so the rest of a longer
+// list is ignored rather than dialed.
+const pexIngestLimit = 50
+
+// pexMaxPortsPerIP is how many ports of one IP a ut_pex message may have us
+// dial. BEP 11 advises ignoring an IP listed with many ports: a sender could
+// otherwise aim all pexIngestLimit dials of every message at one host's ports.
+// Two leaves room for two clients behind one NAT.
+const pexMaxPortsPerIP = 2
+
+// pexDiscoverPeer hands a PEX-learned address to the session; tests swap it to
+// see the dial candidates without dialing. It is set in init because a direct
+// initializer would form a cycle (the peer loop calls handlePEXMessage).
+var pexDiscoverPeer func(s *Session, addr string)
+
+func init() {
+	pexDiscoverPeer = (*Session).AddPeerFromDiscovery
+}
+
+// maxPEXPerInterval is how many ut_pex messages one connection may send within
+// one pexInterval; the next one inside it drops the connection. libtorrent
+// keeps the arrival times of the last six (ut_pex.cpp) and drops a peer on its
+// seventh within a minute, so no client that works with it is dropped here.
+// Honest clients send one a minute or less often, but we time a message when
+// the loop reads it, and messages that queued while the loop was stalled (on
+// disk backpressure, say) are read back to back.
+const maxPEXPerInterval = 6
+
+// pexRateLimiter decides, per connection, which ut_pex messages we act on. It
+// is owned by the connection's message loop.
+type pexRateLimiter struct {
+	recent   [maxPEXPerInterval]time.Time // when the last messages arrived, oldest first
+	lastUsed time.Time                    // when we last acted on one
+}
+
+// admit reports, for a ut_pex message arriving at now, whether to decode and act
+// on it (use) and whether to drop the sender instead (flood). A message sooner
+// than half of pexInterval after the last one used is ignored undecoded, so a
+// peer cannot make us dial at the rate it sends. Only a sender over the
+// libtorrent rate is dropped: a lifetime count of early messages would also
+// catch an honest peer whose messages our loop happened to read back to back
+// (after a stall on disk backpressure, say), or that sends every 20-30 s.
+func (l *pexRateLimiter) admit(now time.Time) (use, flood bool) {
+	if !l.recent[0].IsZero() && now.Sub(l.recent[0]) < pexInterval {
+		return false, true
+	}
+	copy(l.recent[:], l.recent[1:])
+	l.recent[len(l.recent)-1] = now
+	if !l.lastUsed.IsZero() && now.Sub(l.lastUsed) < pexInterval/2 {
+		return false, false
+	}
+	l.lastUsed = now
+	return true, false
+}
+
 func (s *Session) pexEnabledLocked() bool {
 	return s.Torrent != nil && !s.Torrent.Private
+}
+
+// pexAdvertiseAllowedLocked reports whether we may send our peers to others. A
+// magnet still fetching metadata does not know its BEP 27 private flag, so until
+// it does it only takes PEX in: advertising could leak a private swarm.
+func (s *Session) pexAdvertiseAllowedLocked() bool {
+	return s.pexEnabledLocked() && !s.metadataMode
 }
 
 func (s *Session) pexEnabled() bool {
@@ -22,9 +87,14 @@ func (s *Session) pexEnabled() bool {
 	return s.pexEnabledLocked()
 }
 
+// extensionHandshakeMapLocked returns the BEP 10 extensions we advertise. A magnet
+// still fetching needs ut_metadata to download the info dict (its private flag is
+// not known yet), but once metadata is known a private torrent stops offering it,
+// so its info dict is never handed to peers outside its tracker's swarm (BEP 27).
 func (s *Session) extensionHandshakeMapLocked() map[string]int {
-	extensions := map[string]int{
-		peer.ExtNameMetadata: peer.LocalMetadataExtID,
+	extensions := make(map[string]int, 2)
+	if s.metadataMode || s.Torrent == nil || !s.Torrent.Private {
+		extensions[peer.ExtNameMetadata] = peer.LocalMetadataExtID
 	}
 	if s.pexEnabledLocked() {
 		extensions[peer.ExtNamePEX] = peer.LocalPEXExtID
@@ -32,27 +102,48 @@ func (s *Session) extensionHandshakeMapLocked() map[string]int {
 	return extensions
 }
 
-func (s *Session) handlePEXMessage(fromAddr string, msg *peer.PEXMessage) {
+// handlePEXMessage acts on the peers a ut_pex message from fromAddr (at fromIP)
+// added. A sender may only point us at addresses as local as its own
+// (netpolicy): a public peer cannot aim our dials at loopback or LAN services,
+// nor anyone at multicast or broadcast addresses. Nor may it list one IP with
+// more than pexMaxPortsPerIP ports.
+func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage) {
 	if msg == nil || !s.pexEnabled() {
 		return
 	}
-	for _, p := range msg.Added {
-		if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
+	source, _ := netip.ParseAddr(fromIP)
+	added := msg.Added
+	if len(added) > pexIngestLimit {
+		added = added[:pexIngestLimit]
+	}
+	var portsPerIP map[netip.Addr]uint8 // only a list of 2+ can repeat an IP
+	if len(added) > 1 {
+		portsPerIP = make(map[netip.Addr]uint8, len(added))
+	}
+	for _, p := range added {
+		ap, ok := peerAddrPort(p.IP, p.Port)
+		if !ok || !netpolicy.PeerAllowed(ap, source) {
 			continue
 		}
 		addr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 		if addr == fromAddr {
 			continue
 		}
-		s.AddPeerFromDiscovery(addr)
+		if portsPerIP != nil {
+			if portsPerIP[ap.Addr()] >= pexMaxPortsPerIP {
+				continue
+			}
+			portsPerIP[ap.Addr()]++
+		}
+		pexDiscoverPeer(s, addr)
 	}
 }
 
 func (s *Session) buildPEXDelta(excludeAddr string, advertised map[string]struct{}) (*peer.PEXMessage, map[string]struct{}, bool) {
-	if !s.pexEnabled() {
+	current, ok := s.pexSnapshot(excludeAddr)
+	if !ok {
 		return nil, advertised, false
 	}
-	current := s.pexSnapshot(excludeAddr)
 	next := make(map[string]struct{}, len(advertised)+len(current))
 	for addr := range advertised {
 		next[addr] = struct{}{}
@@ -93,12 +184,14 @@ func (s *Session) buildPEXDelta(excludeAddr string, advertised map[string]struct
 	return msg, next, true
 }
 
-func (s *Session) pexSnapshot(excludeAddr string) map[string]peer.PEXPeer {
+// pexSnapshot returns the peers we may advertise to excludeAddr; ok is false
+// when we may not advertise any.
+func (s *Session) pexSnapshot(excludeAddr string) (map[string]peer.PEXPeer, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.pexEnabledLocked() {
-		return nil
+	if !s.pexAdvertiseAllowedLocked() {
+		return nil, false
 	}
 
 	peers := make(map[string]peer.PEXPeer)
@@ -112,7 +205,7 @@ func (s *Session) pexSnapshot(excludeAddr string) map[string]peer.PEXPeer {
 		}
 		peers[net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))] = p
 	}
-	return peers
+	return peers, true
 }
 
 func pexPeerFromState(ps *PeerState) (peer.PEXPeer, bool) {

@@ -92,14 +92,18 @@ type pieceWriteJob struct {
 	data  []byte
 	// pieceBuf, when non-nil, is the pooled buffer backing data. The worker returns
 	// it to the session's piece-buffer pool once the piece is hashed and written, so
-	// the per-piece assembly allocation becomes buffer reuse. Nil for jobs whose
-	// data is not pooled (e.g. the webseed path allocates its own buffer).
+	// the per-piece assembly allocation becomes buffer reuse. Peer and webseed
+	// pieces are both assembled into buffers from getPieceBuf; it is nil only when
+	// data is not pooled (tests that build jobs by hand).
 	pieceBuf *[]byte
 	// conn is the connection of the peer that supplied the piece. If the assembled
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
 	// disconnect-on-corruption.
-	conn                    net.Conn
+	conn net.Conn
+	// source identifies that connection for hash-failure strikes against its host
+	// (see strikePieceSourceLocked); nil for webseed pieces.
+	source                  *pieceSource
 	result                  chan<- pieceWriteResult
 	recoverableStorageError bool
 }
@@ -128,10 +132,12 @@ func (job pieceWriteJob) sendResult(status pieceWriteStatus, err error) {
 	}
 }
 
-// pieceWriteQueueDepth bounds how many completed-piece buffers can be queued for the
-// write pool. Each entry holds a full piece, so this caps the pool's memory; once
-// full, submitting applies backpressure to the peer goroutine, which is the intended
-// bound (a peer can't outrun the disk without limit).
+// pieceWriteQueueDepth bounds how many completed-piece buffers wait in the channel
+// for the write pool. Once it is full, submitting blocks the peer goroutine, which
+// stops reading its socket, so disk backpressure reaches the peer. That does not
+// cap memory by itself: each peer goroutine blocked on the send still holds its
+// assembled piece (plus its open pieces, see peerOpenPieceBytesCap), so completed
+// pieces in flight are bounded by queue + workers + blocked connections, not by 8.
 const pieceWriteQueueDepth = 8
 
 // ensurePieceWritePool lazily starts the background hash/write workers. Idempotent.
@@ -146,6 +152,7 @@ func (s *Session) ensurePieceWritePool() {
 }
 
 func (s *Session) pieceWriteWorker() {
+	defer s.crashGuard("piece_write")()
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -173,7 +180,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	// is deleting. Also drop a piece already completed by another peer (#8 endgame
 	// produces redundant copies) so we don't re-write storage or re-announce Have.
 	s.mu.RLock()
-	closed := s.closed
+	closed := s.closing || s.closed
 	alreadyDone := job.index >= 0 && job.index < int64(len(s.PieceStates)) &&
 		s.PieceStates[job.index] == PieceCompleted
 	s.mu.RUnlock()
@@ -189,6 +196,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
+		// Closing the connection alone let the peer reconnect at once and do it
+		// again; a repeat offender is banned, and its other connections go too.
+		banned := s.strikePieceSourceLocked(job.source, time.Now())
+		if banned {
+			s.closeHostConnsLocked(job.source.host)
+		}
 		s.mu.Unlock()
 		if job.conn != nil {
 			_ = job.conn.Close()
@@ -197,6 +210,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			logging.Int64("piece", job.index),
 			logging.Err(verifyErr),
 		)
+		if banned {
+			s.logSessionEvent(logging.LevelWarn, "peer_banned",
+				logging.String("host", job.source.host),
+				logging.Duration("duration", peerBanDuration),
+			)
+		}
 		job.sendResult(pieceWriteHashFailed, verifyErr)
 		return
 	}
@@ -246,8 +265,42 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 // loadResumeState restores durable verified pieces immediately. Legacy hints and
 // pieces overlapping changed files remain unavailable until background hashing.
 func (s *Session) loadResumeState() {
+	s.mu.RLock()
+	st := s.Storage
+	hasPieces := len(s.Torrent.PieceHashes) > 0
+	s.mu.RUnlock()
+	if st == nil || !hasPieces {
+		return
+	}
+	resume, err := readResumeState(st, s.Torrent.InfoHash)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.Storage != st {
+		return
+	}
+	s.applyResumeStateLocked(resume, err)
+}
+
+// readResumeState reads the checkpoint of the torrent with this info hash from
+// st. It opens the .state file and every payload file, so callers run it
+// without s.mu: under the lock it stalled every peer loop and the UI for as
+// long as that took.
+func readResumeState(st storage.Storage, infoHash [20]byte) (storage.ResumeState, error) {
+	hash := fmt.Sprintf("%x", infoHash)
+	var resume storage.ResumeState
+	var err error
+	if checkpoint, ok := st.(storage.ResumeStorage); ok {
+		resume, err = checkpoint.LoadResumeState(hash)
+	} else {
+		resume.Recheck, err = st.LoadState(hash)
+	}
+	return resume, err
+}
+
+// applyResumeStateLocked installs what readResumeState read from s.Storage:
+// verified pieces become available at once, the rest wait for background
+// hashing. Caller holds s.mu.
+func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) {
 	if s.Storage == nil || len(s.Torrent.PieceHashes) == 0 {
 		return
 	}
@@ -257,14 +310,6 @@ func (s *Session) loadResumeState() {
 	s.verifyCheckedBytes = 0
 	s.verifyTotalBytes = 0
 	s.verifyStartTime = time.Time{}
-	hash := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	var resume storage.ResumeState
-	var err error
-	if checkpoint, ok := s.Storage.(storage.ResumeStorage); ok {
-		resume, err = checkpoint.LoadResumeState(hash)
-	} else {
-		resume.Recheck, err = s.Storage.LoadState(hash)
-	}
 	if err != nil {
 		s.verifyFullScan = true
 	} else {
@@ -309,9 +354,11 @@ func (s *Session) loadResumeState() {
 
 // maybeStartVerification launches the background verification goroutine exactly once.
 // Idempotent; safe to call from Start() for both restored and freshly added torrents.
+// A quarantined session is not verified until it is resumed: reading its storage or
+// hashing its pieces may be what crashed the last run.
 func (s *Session) maybeStartVerification() {
 	s.mu.Lock()
-	if !s.verifying || s.verifyStarted || s.closed {
+	if !s.verifying || s.verifyStarted || s.closed || s.quarantined {
 		s.mu.Unlock()
 		return
 	}
@@ -375,6 +422,7 @@ func (s *Session) acquireVerifySlot(ctx context.Context) (release func(), ok boo
 // becomes PieceCompleted (now advertisable and seedable); on failure it returns to
 // PieceEmpty so the downloader re-fetches it.
 func (s *Session) verifyResume(ctx context.Context) {
+	defer s.crashGuard("verify")()
 	if s.runVerification(ctx) {
 		s.finishVerify()
 	}
@@ -440,6 +488,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		s.mu.Unlock()
 		release()
 	}()
+	defer s.crashGuard("verify")() // after the s.mu-taking cleanup above
 
 	for _, idx := range toCheck {
 		select {
@@ -518,7 +567,7 @@ func (s *Session) finishVerify() {
 	s.verifyFullScan = false
 	// Skip the state write if the session is closing so a late finish can't resurrect a
 	// .state file that RemoveSession is deleting.
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 
@@ -576,6 +625,7 @@ func (s *Session) WaitVerified() {
 // and flushing it to disk periodically.
 func (s *Session) statePersistLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("state_persist")()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -690,7 +740,10 @@ func (s *Session) completionStatsLocked() completionStats {
 	return s.stats
 }
 
-// recomputeStatsLocked fully recalculates completion stats from scratch and caches them.
+// recomputeStatsLocked fully recalculates completion stats from scratch and caches
+// them. It rebuilds the cached wanted ranges too, and walks the pieces and the
+// ranges together (both are in offset order), so it costs O(files + pieces) where
+// a per-piece scan of every range cost O(files x pieces).
 func (s *Session) recomputeStatsLocked() {
 	if s.Storage == nil || s.Torrent == nil {
 		s.stats = completionStats{}
@@ -698,21 +751,26 @@ func (s *Session) recomputeStatsLocked() {
 	}
 	var stats completionStats
 	stats.totalBytes = s.Storage.TotalSize()
-	ranges := s.wantedStatsRangesLocked()
+	s.invalidateStatsRangesLocked()
+	ranges := s.statsRangesLocked()
 
 	for _, r := range ranges {
-		if r.end > r.start {
-			stats.wantedBytes += r.end - r.start
-		}
+		stats.wantedBytes += r.end - r.start
 	}
 
+	pieceLenValue := s.Storage.PieceLengthValue()
+	first := 0 // the first range that ends after the current piece starts
 	for i, state := range s.PieceStates {
 		pieceLen := s.Storage.PieceLength(int64(i))
 		if state == PieceCompleted {
 			stats.completedTotalBytes += pieceLen
 		}
 
-		wantedOverlap := s.pieceWantedOverlapLocked(i, ranges)
+		pieceStart := int64(i) * pieceLenValue
+		for first < len(ranges) && ranges[first].end <= pieceStart {
+			first++
+		}
+		wantedOverlap := overlapFrom(ranges, first, pieceStart, pieceStart+pieceLen)
 		if wantedOverlap > 0 {
 			stats.wantedPieces++
 			if state == PieceCompleted {
@@ -726,7 +784,8 @@ func (s *Session) recomputeStatsLocked() {
 
 // wantedStatsRangesLocked returns the wanted byte ranges used for completion stats,
 // synthesizing a whole-storage range for legacy single-file torrents whose metadata
-// carries no file list. Caller holds s.mu.
+// carries no file list. The ranges are sorted by offset and do not overlap. Caller
+// holds s.mu.
 func (s *Session) wantedStatsRangesLocked() []byteRange {
 	if s.Storage == nil || s.Torrent == nil {
 		return nil
@@ -738,32 +797,70 @@ func (s *Session) wantedStatsRangesLocked() []byteRange {
 	return ranges
 }
 
+// statsRangesLocked returns the cached wanted ranges (see wantedStatsRangesLocked),
+// rebuilding them if a change invalidated them. Caller holds s.mu for writing.
+func (s *Session) statsRangesLocked() []byteRange {
+	if !s.statsRangesValid {
+		s.statsRanges = s.wantedStatsRangesLocked()
+		s.statsRangesValid = true
+	}
+	return s.statsRanges
+}
+
+// invalidateStatsRangesLocked drops the cached wanted ranges. Call it on every
+// change to the file priorities, the file list or the storage. Caller holds s.mu
+// for writing.
+func (s *Session) invalidateStatsRangesLocked() {
+	s.statsRanges = nil
+	s.statsRangesValid = false
+}
+
 // pieceWantedOverlapLocked returns the number of bytes the given piece overlaps with the
-// wanted ranges. Ranges are passed in (see wantedStatsRangesLocked) so bulk recomputes
-// build them once instead of per piece. Caller holds s.mu.
+// wanted ranges, which must be sorted and non-overlapping (see wantedStatsRangesLocked):
+// a binary search finds the first range that can overlap the piece, so the cost is
+// O(log files) plus the ranges the piece actually overlaps. Caller holds s.mu.
 func (s *Session) pieceWantedOverlapLocked(idx int, ranges []byteRange) int64 {
 	pieceStart := int64(idx) * s.Storage.PieceLengthValue()
 	pieceEnd := pieceStart + s.Storage.PieceLength(int64(idx))
-	wantedOverlap := int64(0)
-	for _, r := range ranges {
-		overlapStart := maxInt64(pieceStart, r.start)
-		overlapEnd := minInt64(pieceEnd, r.end)
-		if overlapEnd > overlapStart {
-			wantedOverlap += overlapEnd - overlapStart
+	// Ranges do not overlap, so their ends are sorted too: find the first one
+	// that ends after the piece starts.
+	lo, hi := 0, len(ranges)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if ranges[mid].end <= pieceStart {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return wantedOverlap
+	return overlapFrom(ranges, lo, pieceStart, pieceEnd)
+}
+
+// overlapFrom sums the overlap of [start, end) with ranges[first:], stopping at the
+// first range that starts at or after end. ranges must be sorted and non-overlapping.
+func overlapFrom(ranges []byteRange, first int, start, end int64) int64 {
+	var overlap int64
+	for i := first; i < len(ranges) && ranges[i].start < end; i++ {
+		overlapStart := maxInt64(start, ranges[i].start)
+		overlapEnd := minInt64(end, ranges[i].end)
+		if overlapEnd > overlapStart {
+			overlap += overlapEnd - overlapStart
+		}
+	}
+	return overlap
 }
 
 // updateStatsOnPieceCompleteLocked incrementally updates the cached completion stats when
-// a single piece transitions to PieceCompleted. Caller holds s.mu.
+// a single piece transitions to PieceCompleted. It runs under the session write lock
+// on every piece completion, so it uses the cached wanted ranges and allocates
+// nothing. Caller holds s.mu.
 func (s *Session) updateStatsOnPieceCompleteLocked(idx int) {
 	if s.Storage == nil {
 		return
 	}
 	pieceLen := s.Storage.PieceLength(int64(idx))
 	s.stats.completedTotalBytes += pieceLen
-	wantedOverlap := s.pieceWantedOverlapLocked(idx, s.wantedStatsRangesLocked())
+	wantedOverlap := s.pieceWantedOverlapLocked(idx, s.statsRangesLocked())
 	if wantedOverlap > 0 {
 		s.stats.completedWantedBytes += wantedOverlap
 		s.stats.completedWantedPieces++
@@ -818,7 +915,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	// Skip the resume persist if the session is closing so a late piece write (the
 	// async pool is not awaited by Close) cannot recreate a .state file a remove is
 	// deleting — mirroring finishVerify.
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 
@@ -855,7 +952,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	s.lastErr = nil
 	s.statusErr = nil
 	s.signalPieceWaitersLocked(index)
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 

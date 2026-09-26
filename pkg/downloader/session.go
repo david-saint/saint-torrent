@@ -3,10 +3,12 @@ package downloader
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +83,16 @@ type PeerState struct {
 	// WebSeed marks a synthetic HTTP source entry. It is kept out of peer-wire
 	// choking and upload stats because no BitTorrent peer exists behind it.
 	WebSeed bool
+	// Source records who supplied this address, so a magnet whose metadata
+	// turns out private can drop what DHT and PEX gave it (BEP 27).
+	Source PeerSource
+	// FailCount counts connection attempts that failed in a row; past
+	// maxPeerFailCount the peer is rarely redialed.
+	FailCount uint8
+	// seenAt is when DHT, PEX or a tracker last listed the address. An entry
+	// recorded while every outbound slot was busy has no LastAttempt yet, and
+	// prunePeersLocked ages it by this instead of evicting it first.
+	seenAt time.Time
 
 	WindowBlocks         int
 	TargetWindowBlocks   int
@@ -143,6 +155,11 @@ type Session struct {
 	// every lookup. Guarded by s.mu.
 	fileStartOffsets  []int64
 	downloadingPieces map[int]struct{}
+	// pickGen advances (under s.mu) whenever a piece may have become pickable: it
+	// joined the needed set, the set was rebuilt, or the set emptied (endgame
+	// begins). A peer loop whose last pick found nothing skips the picker until it
+	// moves (see pump); it is read without s.mu.
+	pickGen atomic.Uint64
 	// pieceAvailability[i] counts how many currently-connected peers advertise piece
 	// i (via bitfield/Have, decremented on disconnect). The picker prefers rarer
 	// pieces (#7, rarest-first) so the swarm keeps more pieces fetchable. Same length
@@ -150,6 +167,7 @@ type Session struct {
 	pieceAvailability []int
 	Peers             map[string]*PeerState
 	activePeers       map[string]*peer.Client // for sending Have messages
+	admission         peerAdmission           // connection admission and bans; see peer_admission.go
 	pipelineBudget    *pipelineByteBudget
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
@@ -174,10 +192,23 @@ type Session struct {
 	stateDirty bool
 	closing    bool
 	stats      completionStats
-	flushMu    sync.Mutex
+	// statsRanges caches wantedStatsRangesLocked (sorted, non-overlapping) so a
+	// piece completion finds its wanted bytes with a binary search instead of
+	// rebuilding every file's range under s.mu. statsRangesValid is cleared by
+	// every change to the file priorities, the file list or the storage (see
+	// invalidateStatsRangesLocked); statsRangesLocked rebuilds it on next use.
+	statsRanges      []byteRange
+	statsRangesValid bool
+	flushMu          sync.Mutex
 	// stateFlushCh wakes the persistence goroutine so a pause checkpoints promptly
 	// without running the flush (and its file syncs) on the caller's goroutine.
 	stateFlushCh chan struct{}
+
+	// infoHashHex is the info-hash in hex, fixed at creation so a crash guard
+	// can name the torrent without taking s.mu. crash is the manager's crash
+	// recorder (nil without persistence); see crashGuard.
+	infoHashHex string
+	crash       atomic.Pointer[crashRecorder]
 
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
@@ -214,6 +245,21 @@ type Session struct {
 	trackerEvents      []string // Queue of pending tracker events
 	completedAnnounced bool
 	stoppedAnnounced   bool
+
+	// quarantined marks a torrent restored paused because the last run crashed
+	// in its code (see classifyPreviousRun). Its status is "Paused after
+	// crash", LastError is quarantineErr (quarantineNote as an error), and it
+	// is not verified: storage or verification may be what crashed. Resuming
+	// clears it. Guarded by mu.
+	quarantined    bool
+	quarantineNote string
+	quarantineErr  error
+	// autoPaused marks a pause this start applied on its own, to every
+	// torrent (--start-paused, or two unexplained crashes in a row), rather
+	// than the user: session.json keeps the torrent's own pause state, so the
+	// next start restores it as it was. Pause makes it the user's; Resume
+	// clears it. Guarded by mu.
+	autoPaused bool
 
 	// Background verification of legacy hints and changed files. Durable pieces
 	// whose metadata still matches are restored immediately.
@@ -257,16 +303,82 @@ type Session struct {
 	optimisticTimer *time.Ticker
 
 	// Metadata exchange state
-	metadataSize         int
-	metadataBuf          []byte
-	metadataPieces       []bool
-	metadataCompleted    bool
-	metadataMode         bool
-	metadataCompletedCh  chan struct{}
+	metadataSize        int
+	metadataBuf         []byte
+	metadataPieces      []bool
+	metadataCompleted   bool
+	metadataMode        bool
+	metadataEpoch       uint64    // advances whenever the accumulator is discarded; peers re-request
+	metadataProgressAt  time.Time // when the accumulator was last sized or took a block
+	metadataCompletedCh chan struct{}
+	// Blame for failed ut_metadata assemblies (see noteMetadataRoundFailedLocked).
+	// metadataFrom is the admission host key that supplied each accepted block
+	// (parallel to metadataPieces; "" for loopback, which is never blamed).
+	// metadataSizedBy, metadataSizedAt and metadataRoundBlocks describe the
+	// current round: who sized the accumulator, when, and how many blocks it has
+	// taken since, which is how a round fed too slowly is told from a live one.
+	// metadataResetAt is when the last failed round was discarded. After a failed
+	// round several hosts fed, metadataSolo makes every later round come from a
+	// single connection, metadataOwner (since metadataOwnedAt), so the next
+	// failure has exactly one supplier. metadataSuspects holds the hosts that
+	// sized or fed a failed round (see maxMetadataSuspects), and
+	// metadataFailStreak and metadataNextRoundAt back off new rounds after
+	// consecutive failures. All guarded by mu.
+	metadataFrom         []string
+	metadataSizedBy      string
+	metadataSizedAt      time.Time
+	metadataRoundBlocks  int
+	metadataResetAt      time.Time
+	metadataSolo         bool
+	metadataOwner        *peer.Client
+	metadataOwnedAt      time.Time
+	metadataSuspects     map[string]time.Time
+	metadataFailStreak   int
+	metadataNextRoundAt  time.Time
 	DHT                  *dht.DHT
 	downloadDir          string
 	fallbackDownloadDirs []string
 	storageFactory       storage.Factory
+
+	// metadataInitDone is set while onMetadataDownloaded builds storage without
+	// s.mu and is closed once the result is published; Close waits on it.
+	metadataInitDone chan struct{}
+	// verifiedMetadata keeps hash-verified info bytes whose storage could not
+	// be built, and metadataRetryTimer retries the build from them after
+	// metadataRetryDelay, so the swarm is never asked for them again.
+	verifiedMetadata   []byte
+	metadataRetryTimer *time.Timer
+	metadataRetryDelay time.Duration
+	// claimPaths reserves the payload paths with the manager before storage is
+	// built on them (nil for a standalone session); releaseClaims gives the
+	// reservation back and is called by the manager, never by Close.
+	claimPaths    func(infoHash [20]byte, baseDir string, files []storage.FileInfo) (release func(), err error)
+	releaseClaims func()
+	// migratePaths moves payload files an older version wrote under their
+	// pre-sanitizer names to the current ones once the paths are claimed (nil
+	// for a standalone session; see TorrentManager.migrateLegacyPaths).
+	migratePaths func(infoHash [20]byte, baseDir string, files []torrent.File) (moved int)
+}
+
+// errSessionClosing reports work refused or abandoned because the session is
+// shutting down.
+var errSessionClosing = errors.New("session is closing")
+
+// Backoff for rebuilding storage from verified metadata after a failed build:
+// the files belong to another torrent, or the volume is missing or full.
+const (
+	metadataStorageRetryMin = 30 * time.Second
+	metadataStorageRetryMax = 10 * time.Minute
+)
+
+// isNilStorage reports whether st is nil, including a nil pointer boxed in the
+// interface, which a factory must never hand back as a usable Storage.
+func isNilStorage(st storage.Storage) bool {
+	if st == nil {
+		return true
+	}
+	v := reflect.ValueOf(st)
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // NewSession creates a new download session for a torrent.
@@ -294,6 +406,7 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 	}
 
 	sess := &Session{
+		infoHashHex:         hex.EncodeToString(tor.InfoHash[:]),
 		verifyOnStartup:     verifyOnStartup,
 		Torrent:             tor,
 		Storage:             st,
@@ -337,10 +450,23 @@ func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
 	return s.Torrent == nil || !s.Torrent.Private
 }
 
+// maxPieceBufLen bounds one piece-assembly buffer. torrent.Parse already refuses
+// longer pieces; this keeps a Session built from any other Torrent or Storage
+// from panicking in make() (a length past int on 32-bit builds) or aborting the
+// process with an out-of-memory no recover can catch.
+const maxPieceBufLen = torrent.MaxPieceLength
+
 // getPieceBuf borrows a piece-assembly buffer sliced to exactly length. Buffers
 // are allocated at the standard piece length so every piece but the last reuses
 // them directly; putPieceBuf (from the write worker) returns them afterward.
 func (s *Session) getPieceBuf(length int64) *[]byte {
+	if length < 0 || length > maxPieceBufLen {
+		// Not allocatable as one buffer. An empty one fails the caller's
+		// assembly check, which returns the piece to the picker instead of
+		// crashing the peer goroutine and with it the whole process.
+		empty := []byte{}
+		return &empty
+	}
 	if v := s.pieceBufPool.Get(); v != nil {
 		bp := v.(*[]byte)
 		if int64(cap(*bp)) >= length {
@@ -352,7 +478,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 	// individual piece) so the buffer is reusable for subsequent full pieces.
 	n := length
 	if s.Storage != nil {
-		if std := s.Storage.PieceLengthValue(); std > n {
+		if std := s.Storage.PieceLengthValue(); std > n && std <= maxPieceBufLen {
 			n = std
 		}
 	}
@@ -364,7 +490,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 // putPieceBuf returns a piece-assembly buffer to the pool, restored to full
 // capacity so the next borrow can slice it to any piece length.
 func (s *Session) putPieceBuf(bp *[]byte) {
-	if bp == nil {
+	if bp == nil || cap(*bp) == 0 {
 		return
 	}
 	*bp = (*bp)[:cap(*bp)]
@@ -469,8 +595,14 @@ func (s *Session) Start() {
 	}
 	if s.started {
 		wasPaused := s.paused
+		wasQuarantined := false
 		if wasPaused {
 			s.paused = false
+			s.autoPaused = false
+			// Resuming is the user's go-ahead for a quarantined torrent too.
+			wasQuarantined = s.clearQuarantineLocked()
+			// Wake pause-state waiters (webseeds, the DHT loop) as Resume does.
+			s.renewPauseStateChLocked()
 			s.queueTrackerEventLocked("started")
 			for _, pState := range s.Peers {
 				if !pState.Active {
@@ -493,6 +625,9 @@ func (s *Session) Start() {
 			select {
 			case s.resumeCh <- struct{}{}:
 			default:
+			}
+			if wasQuarantined {
+				s.maybeStartVerification()
 			}
 		}
 		return
@@ -568,7 +703,10 @@ func (s *Session) Start() {
 	}
 	for _, seed := range webseeds {
 		seed := seed
-		go s.webseedLoop(seed)
+		go func() {
+			defer s.crashGuard("webseed")()
+			s.webseedLoop(seed)
+		}()
 	}
 	if logging.Enabled() {
 		s.mu.RLock()
@@ -586,7 +724,8 @@ func (s *Session) Start() {
 		)
 	}
 
-	// Kick off background fast-resume verification (no-op if nothing to verify).
+	// Kick off background fast-resume verification (no-op if nothing to verify,
+	// or while the session is quarantined).
 	s.maybeStartVerification()
 }
 
@@ -615,6 +754,13 @@ func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closing = true
+		// Storage being built for metadata was admitted before closing was set;
+		// nothing new is admitted after it, and no retry is armed after it.
+		metadataInit := s.metadataInitDone
+		if s.metadataRetryTimer != nil {
+			s.metadataRetryTimer.Stop()
+			s.metadataRetryTimer = nil
+		}
 		// Shutdown is the last chance to record what has been downloaded. The
 		// periodic hint flush clears stateDirty, so re-arm it when there is
 		// anything to checkpoint.
@@ -639,6 +785,12 @@ func (s *Session) Close() {
 		}
 		if s.cancel != nil {
 			s.cancel()
+		}
+		// Let that storage be published so it is closed below and RemoveSession
+		// sees the files it created. The build never takes s.mu or lifecycleMu
+		// before signalling, so this wait cannot deadlock.
+		if metadataInit != nil {
+			<-metadataInit
 		}
 		// The peer loops are cancelled and their connections gone, so nothing can
 		// touch the files behind the checkpoint.
@@ -688,6 +840,7 @@ func (s *Session) Close() {
 
 func (s *Session) speedMonitorLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("speed_monitor")()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -819,6 +972,9 @@ func (s *Session) IsPaused() bool {
 func (s *Session) LastError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.quarantined {
+		return s.quarantineErr
+	}
 	if s.statusErr != nil {
 		return s.statusErr
 	}
@@ -886,6 +1042,10 @@ func (s *Session) IsCompleted() bool {
 }
 
 func (s *Session) statusLocked() string {
+	if s.quarantined {
+		// Paused, and never checking: verification waits for a resume.
+		return statusPausedAfterCrash
+	}
 	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
 		if s.verifyQueued {
 			return "Queued"
@@ -912,7 +1072,11 @@ func (s *Session) statusLocked() string {
 	return "Downloading"
 }
 
-// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
+// statusPausedAfterCrash is the status of a quarantined session.
+const statusPausedAfterCrash = "Paused after crash"
+
+// Status returns the current status text (Downloading, Seeding, Paused,
+// Paused after crash, Stopped, or Error).
 func (s *Session) Status() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1016,7 +1180,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	// same condition statusLocked uses. The opportunistic full scan of a freshly
 	// added torrent runs alongside a normal download, so surfacing it would replace
 	// real transfer progress with disk-scan progress for the length of the scan.
-	checking := s.verifying && !s.verifyFullScan
+	checking := s.verifying && !s.verifyFullScan && !s.quarantined
 	snap.Verification = VerificationSnapshot{Active: checking, Queued: checking && s.verifyQueued, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
 	if checking && !s.verifyStartTime.IsZero() {
 		elapsed := time.Since(s.verifyStartTime).Seconds()
@@ -1038,7 +1202,9 @@ func (s *Session) Snapshot() SessionSnapshot {
 		}
 	}
 	// Mirror LastError()'s precedence exactly.
-	if s.statusErr != nil {
+	if s.quarantined {
+		snap.LastError = s.quarantineErr
+	} else if s.statusErr != nil {
 		snap.LastError = s.statusErr
 	} else if s.lastErr == nil {
 		snap.LastError = s.lastTrackerErr
@@ -1177,7 +1343,14 @@ func (s *Session) IsMetadataMode() bool {
 func (s *Session) Pause() {
 	s.mu.Lock()
 	if s.paused {
+		// A pause this start applied on its own becomes the user's, and is
+		// persisted from now on.
+		madeUsers := s.autoPaused
+		s.autoPaused = false
 		s.mu.Unlock()
+		if madeUsers && s.OnStateChange != nil {
+			s.OnStateChange()
+		}
 		return
 	}
 	s.paused = true
@@ -1232,6 +1405,8 @@ func (s *Session) Resume() {
 		return
 	}
 	s.paused = false
+	s.autoPaused = false
+	wasQuarantined := s.clearQuarantineLocked()
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("started")
 	for _, pState := range s.Peers {
@@ -1256,10 +1431,40 @@ func (s *Session) Resume() {
 	default:
 		// Already signaled
 	}
+	// The check a quarantine held back runs now.
+	if wasQuarantined {
+		s.maybeStartVerification()
+	}
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()
 	}
+}
+
+// setQuarantinedLocked quarantines a paused session with note (see
+// Session.quarantined). Caller holds s.mu.
+func (s *Session) setQuarantinedLocked(note string) {
+	s.quarantined = true
+	s.quarantineNote = note
+	s.quarantineErr = errors.New(note)
+}
+
+// clearQuarantineLocked lifts a quarantine and reports whether there was one.
+// Caller holds s.mu.
+func (s *Session) clearQuarantineLocked() bool {
+	was := s.quarantined
+	s.quarantined = false
+	s.quarantineNote = ""
+	s.quarantineErr = nil
+	return was
+}
+
+// IsQuarantined reports whether the session was restored paused after a crash
+// attributed to it and has not been resumed since.
+func (s *Session) IsQuarantined() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quarantined
 }
 
 // SetFilePriority sets the download priority for a specific file.
@@ -1286,6 +1491,7 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 		return false
 	}
 	s.filePriorities[fileIndex] = priority
+	s.invalidateStatsRangesLocked()
 	s.onFilePriorityChangedLocked()
 	return true
 }
@@ -1303,6 +1509,9 @@ func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
 			}
 		}
 	}
+	if changed {
+		s.invalidateStatsRangesLocked()
+	}
 	return changed
 }
 
@@ -1316,14 +1525,22 @@ func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
 	return false
 }
 
-// resetFilePrioritiesLocked allocates a fresh PriorityNormal-filled slice of size numFiles,
-// overlays any valid priority values from s.pendingFilePriorities, and clears the pending slice.
-// Caller holds s.mu.
-func (s *Session) resetFilePrioritiesLocked(numFiles int) {
-	s.filePriorities = make([]FilePriority, numFiles)
-	for i := range s.filePriorities {
-		s.filePriorities[i] = PriorityNormal
+// newFilePriorities returns a PriorityNormal-filled slice for numFiles files. It
+// is built before s.mu is taken, so a many-file torrent never allocates under it.
+func newFilePriorities(numFiles int) []FilePriority {
+	priorities := make([]FilePriority, numFiles)
+	for i := range priorities {
+		priorities[i] = PriorityNormal
 	}
+	return priorities
+}
+
+// installFilePrioritiesLocked installs priorities (from newFilePriorities),
+// overlays any valid priority values from s.pendingFilePriorities, and clears
+// the pending slice. Caller holds s.mu.
+func (s *Session) installFilePrioritiesLocked(priorities []FilePriority) {
+	s.filePriorities = priorities
+	s.invalidateStatsRangesLocked()
 	if len(s.pendingFilePriorities) > 0 {
 		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
@@ -1480,8 +1697,10 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
+	keepAccumulator := false
+	hashMismatch := false
 	defer func() {
-		if err != nil {
+		if err != nil && !keepAccumulator {
 			// A full assembly that fails the infohash check means the size/blocks we
 			// locked onto were bad — most likely a peer that won the race to advertise
 			// metadata_size handed us a poisoned (but in-range) value. Discard the whole
@@ -1489,107 +1708,440 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			// the next peer's advertised size can take over instead of every honest peer
 			// being rejected forever by the size-mismatch guard.
 			s.mu.Lock()
+			if hashMismatch {
+				s.noteMetadataRoundFailedLocked(time.Now())
+			}
 			s.metadataCompleted = false
 			s.metadataSize = 0
 			s.metadataBuf = nil
 			s.metadataPieces = nil
+			s.metadataFrom = nil
+			s.metadataSizedBy = ""
+			s.metadataOwner = nil
+			s.metadataRoundBlocks = 0
+			s.metadataEpoch++
 			s.mu.Unlock()
 		}
 	}()
 
 	hash := sha1.Sum(infoBytes)
 	if hash != s.Torrent.InfoHash {
+		hashMismatch = true
 		return fmt.Errorf("metadata hash mismatch: expected %x, got %x", s.Torrent.InfoHash, hash)
 	}
 
-	// Wrap the info dict in a dummy bencode dictionary
-	wrapped := append([]byte("d4:info"), infoBytes...)
-	wrapped = append(wrapped, 'e')
-
-	parsed, err := torrent.Parse(wrapped)
+	// The hash commits to exactly these bytes, so they must be exactly one info
+	// dictionary. Wrapping them as "d4:info" + infoBytes + "e" accepted trailing
+	// values and kept only the first dict, which no longer matched the magnet's
+	// hash yet was served to peers and cached for restore.
+	parsed, err := torrent.ParseInfo(infoBytes)
 	if err != nil {
-		return fmt.Errorf("failed to parse metadata: %w", err)
+		// Every peer serves these same hash-verified bytes, so fetching them again
+		// cannot succeed. Stop fetching and leave the session in metadata mode,
+		// showing the error, instead of re-downloading up to 16 MiB per new peer.
+		err = fmt.Errorf("failed to parse metadata: %w", err)
+		keepAccumulator = true
+		s.mu.Lock()
+		s.metadataCompleted = true
+		// metadataSize and metadataPieces stay: a handshake handler that sized
+		// its request loop from them before this point still indexes them.
+		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
+		s.lastErr = err
+		s.statusErr = err
+		s.closeActivePeersLocked() // the session is metadata-stalled now
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return err
+	}
+
+	// Build everything the session will publish before taking s.mu: a torrent
+	// can declare millions of pieces and hundreds of thousands of files.
+	fileInfos := make([]storage.FileInfo, len(parsed.Files))
+	for i, f := range parsed.Files {
+		fileInfos[i] = storage.FileInfo{
+			Path:   filepath.Join(f.Path...),
+			Length: f.Length,
+		}
+	}
+	numPieces := len(parsed.PieceHashes)
+	pieceStates := make([]PieceState, numPieces) // all PieceEmpty
+	pieceAvailability := make([]int, numPieces)
+	priorities := newFilePriorities(len(parsed.Files))
+
+	s.mu.Lock()
+	// A closing session must not start creating files: Close may already have
+	// taken the storage it will close.
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	if !s.metadataMode || s.Storage != nil || s.metadataInitDone != nil {
+		s.mu.Unlock()
+		// Not this call's metadata to discard: another call owns it.
+		keepAccumulator = true
+		return errors.New("metadata is already being applied")
+	}
+	factory := s.storageFactory
+	if factory == nil {
+		factory = storage.NewStorage
+	}
+	claimPaths := s.claimPaths
+	migratePaths := s.migratePaths
+	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
+	// Close waits on initDone, so the storage built below is either published
+	// before Close takes the session's storage or never built at all.
+	initDone := make(chan struct{})
+	s.metadataInitDone = initDone
+	s.mu.Unlock()
+
+	// The factory creates, sizes and stats every file, so it runs without s.mu:
+	// under the lock it froze every peer loop and the UI for as long as that took.
+	var (
+		st            storage.Storage
+		chosen        int
+		releaseClaims func()
+		storageErrors []error
+	)
+	for index, downloadDir := range downloadDirs {
+		// Reserve the payload paths before the factory creates or extends a
+		// file another torrent may be using.
+		var release func()
+		if claimPaths != nil {
+			var claimErr error
+			if release, claimErr = claimPaths(s.Torrent.InfoHash, downloadDir, fileInfos); claimErr != nil {
+				storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, claimErr))
+				continue
+			}
+		}
+		if migratePaths != nil {
+			migratePaths(s.Torrent.InfoHash, downloadDir, parsed.Files)
+		}
+		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
+		// Success is decided by the error alone, and a nil pointer boxed in the
+		// interface is refused: installing one crashed the first storage call.
+		if createErr == nil && !isNilStorage(candidate) {
+			st, chosen, releaseClaims = candidate, index, release
+			break
+		}
+		if release != nil {
+			release()
+		}
+		if createErr == nil {
+			createErr = errors.New("storage factory returned no storage")
+		}
+		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
+	}
+	// Read any checkpoint while the storage is still private to this call: it
+	// opens every payload file, which under s.mu stalled the peer loops too.
+	var (
+		resume    storage.ResumeState
+		resumeErr error
+	)
+	if st != nil {
+		resume, resumeErr = readResumeState(st, s.Torrent.InfoHash)
 	}
 
 	s.mu.Lock()
+	s.metadataInitDone = nil
+	close(initDone)
+	if st == nil {
+		// Leave the session exactly as it was before the metadata arrived: no
+		// pieces and no storage, a state every peer and reader path handles. Sizing
+		// PieceStates here would let the first peer Request reach a nil Storage.
+		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
+		s.lastErr = statusErr
+		s.statusErr = statusErr
+		// The bytes are verified and every peer serves the same ones. Discarding
+		// them made each new peer re-send the whole metadata only to fail again,
+		// for as long as the files stayed taken or the volume missing. Keep them,
+		// stop fetching, and retry the build from them on a backoff.
+		keepAccumulator = true
+		s.metadataCompleted = true
+		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
+		s.verifiedMetadata = infoBytes
+		s.scheduleMetadataStorageRetryLocked()
+		s.closeActivePeersLocked() // the session is metadata-stalled now
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return statusErr
+	}
+	if s.closed {
+		// Unreachable while Close waits on initDone; never leak the storage.
+		s.mu.Unlock()
+		_ = st.Close()
+		if releaseClaims != nil {
+			releaseClaims()
+		}
+		return errSessionClosing
+	}
+
+	// Publish the torrent, its storage and its piece state in one step. A
+	// closing session still takes them: Close is waiting to close this storage,
+	// and RemoveSession reads the file list only after Close returns.
+	s.downloadDir = st.BaseDir()
+	if chosen > 0 {
+		// Otherwise keep the live list, which may have gained entries meanwhile.
+		s.fallbackDownloadDirs = append([]string(nil), downloadDirs[chosen+1:]...)
+	}
 	s.Torrent.PieceLength = parsed.PieceLength
 	s.Torrent.PieceHashes = parsed.PieceHashes
 	s.Torrent.Name = parsed.Name
 	s.Torrent.Files = parsed.Files
 	s.Torrent.InfoBytes = parsed.InfoBytes
 	s.Torrent.Private = parsed.Private
+	s.purgeDiscoveryPeersLocked()
 	if parsed.Private {
 		s.DHT = nil
 	}
-
-	// Reinitialize priorities
-	s.resetFilePrioritiesLocked(len(s.Torrent.Files))
-
-	// Reinitialize piece states
-	numPieces := len(s.Torrent.PieceHashes)
-	s.PieceStates = make([]PieceState, numPieces)
-	for i := range s.PieceStates {
-		s.PieceStates[i] = PieceEmpty
-	}
-	s.pieceAvailability = make([]int, numPieces)
-
-	// Initialize storage now that we know the files
-	var fileInfos []storage.FileInfo
-	for _, f := range s.Torrent.Files {
-		fileInfos = append(fileInfos, storage.FileInfo{
-			Path:   filepath.Join(f.Path...),
-			Length: f.Length,
-		})
-	}
-	factory := s.storageFactory
-	if factory == nil {
-		factory = storage.NewStorage
-	}
-	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
-	var (
-		st            storage.Storage
-		storageErrors []error
-	)
-	for index, downloadDir := range downloadDirs {
-		st, err = factory(downloadDir, fileInfos, s.Torrent.PieceLength)
-		if err == nil {
-			s.downloadDir = st.BaseDir()
-			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
-			break
-		}
-		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, err))
-	}
-	if st == nil {
-		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
-		s.lastErr = statusErr
-		s.statusErr = statusErr
-		s.broadcastPieceWaitersLocked()
-		s.mu.Unlock()
-		return statusErr
-	}
+	s.installFilePrioritiesLocked(priorities)
+	s.PieceStates = pieceStates
+	s.pieceAvailability = pieceAvailability
 	s.Storage = st
+	s.invalidateStatsRangesLocked() // new file list and storage
+	s.releaseClaims = releaseClaims
 	s.statusErr = nil
+	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and
+	// any bytes kept for a retry are no longer needed.
+	s.metadataBuf = nil
+	s.clearMetadataBlameLocked()
+	s.verifiedMetadata = nil
+	s.metadataRetryDelay = 0
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+		s.metadataRetryTimer = nil
+	}
+	closing := s.closing
 	storageToVerify := st
 	s.mu.Unlock()
-
-	// Load any fast-resume hint and verify in the background (metadata just arrived, so
-	// most pieces are not on disk yet; verification stays off the hot path).
-	s.loadResumeState()
-	s.maybeStartVerification()
+	if closing {
+		return errSessionClosing
+	}
 
 	s.mu.Lock()
 	if s.Storage != storageToVerify {
 		s.mu.Unlock()
 		return fmt.Errorf("storage changed while completing metadata")
 	}
+	// Install the fast-resume state read above; verification runs in the
+	// background (metadata just arrived, so most pieces are not on disk yet and
+	// hashing stays off the hot path).
+	s.applyResumeStateLocked(resume, resumeErr)
 	s.metadataCompleted = true
 	s.metadataMode = false
 	close(s.metadataCompletedCh)
+	// Wake every connection so it sends its bitfield and interest now (see
+	// runPeerMessageLoop): a seed that has sent all it will before we are
+	// interested would otherwise leave the connection idle until the stall
+	// reaper or the inactivity drop. Notify never blocks.
+	for _, c := range s.activePeers {
+		c.Notify()
+	}
 	s.mu.Unlock()
+	s.maybeStartVerification()
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()
 	}
 
 	return nil
+}
+
+// scheduleMetadataStorageRetryLocked arms the retry of a failed storage build
+// from s.verifiedMetadata, doubling the delay each time up to
+// metadataStorageRetryMax. Close stops the timer; nothing is armed once it has
+// started. Caller holds s.mu.
+func (s *Session) scheduleMetadataStorageRetryLocked() {
+	if s.closing || s.closed {
+		return
+	}
+	switch {
+	case s.metadataRetryDelay <= 0:
+		s.metadataRetryDelay = metadataStorageRetryMin
+	case s.metadataRetryDelay < metadataStorageRetryMax:
+		s.metadataRetryDelay = min(2*s.metadataRetryDelay, metadataStorageRetryMax)
+	}
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+	}
+	s.metadataRetryTimer = time.AfterFunc(s.metadataRetryDelay, s.retryMetadataStorage)
+}
+
+// retryMetadataStorage builds storage again from the metadata a failed build
+// kept. It runs on the retry timer; onMetadataDownloaded re-checks the session
+// under s.mu and arms the next retry if the build fails again.
+func (s *Session) retryMetadataStorage() {
+	defer s.crashGuard("metadata_retry")()
+	s.mu.Lock()
+	infoBytes := s.verifiedMetadata
+	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed
+	s.mu.Unlock()
+	if ready && s.onMetadataDownloaded(infoBytes) == nil {
+		// The session dropped and refused every peer while metadata-stalled:
+		// let maintenance dial the known ones again at once.
+		s.mu.Lock()
+		for _, ps := range s.Peers {
+			if !ps.Active && !ps.Dialing {
+				ps.LastAttempt = time.Time{}
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// metadataStalledLocked reports whether a magnet has its info dict but cannot
+// use it: it failed to parse, or storage could not be built from it (a retry
+// is armed). Peers are of no use until that changes, so the session dials
+// none, drops the ones it has and refuses new ones, instead of holding shared
+// outbound slots with connections that sit idle. Caller holds s.mu (read or
+// write).
+func (s *Session) metadataStalledLocked() bool {
+	return s.metadataMode && s.metadataCompleted && s.statusErr != nil
+}
+
+// closeActivePeersLocked closes every active peer connection; each loop's
+// disconnect handler then releases it. Caller holds s.mu.
+func (s *Session) closeActivePeersLocked() {
+	for _, client := range s.activePeers {
+		if client.Conn != nil {
+			_ = client.Conn.Close()
+		}
+	}
+}
+
+// maxMetadataSuspects bounds the hosts remembered for sizing or feeding a failed
+// ut_metadata assembly; metadataSuspectTTL is how long one is remembered.
+const (
+	maxMetadataSuspects = 64
+	metadataSuspectTTL  = time.Hour
+)
+
+// Backoff between fetch rounds after consecutive failed assemblies: from the
+// second failure in a row, metadataRoundBackoffBase doubling up to
+// metadataRoundBackoffMax. Vars so tests can shorten them; treat them as
+// constants.
+var (
+	metadataRoundBackoffBase = 2 * time.Second
+	metadataRoundBackoffMax  = time.Minute
+)
+
+// noteMetadataRoundFailedLocked blames a ut_metadata assembly that failed the
+// infohash check, before the accumulator is discarded. A round fed entirely by
+// one host proves that host lied: it is banned and its connections closed. A
+// round fed by several cannot be pinned on one of them, so the contributors
+// become suspects and later rounds run solo (one connection feeds a whole
+// round), which makes the next failure attributable. The host that sized the
+// round is a suspect too, as a bogus metadata_size fails whoever supplies the
+// blocks. Suspects wait before they may size or own a new round (see
+// requestMetadataBlocks), and failures in a row back off new rounds. Loopback
+// ("") is never blamed. Caller holds s.mu.
+func (s *Session) noteMetadataRoundFailedLocked(now time.Time) {
+	// Blocks are attributed only for a whole assembly; one discarded part-way
+	// (a round replaced in the meantime) has no complete supplier list.
+	complete := len(s.metadataPieces) > 0 && len(s.metadataFrom) == len(s.metadataPieces)
+	for _, have := range s.metadataPieces {
+		if !have {
+			complete = false
+			break
+		}
+	}
+	if complete {
+		hosts := make(map[string]struct{}, 4)
+		for _, host := range s.metadataFrom {
+			hosts[host] = struct{}{}
+		}
+		for host := range hosts {
+			s.addMetadataSuspectLocked(host, now)
+		}
+		if len(hosts) == 1 {
+			if host := s.metadataFrom[0]; host != "" {
+				s.banHostLocked(host, now)
+				s.closeHostConnsLocked(host)
+			}
+		} else {
+			s.metadataSolo = true
+		}
+	}
+	s.addMetadataSuspectLocked(s.metadataSizedBy, now)
+	s.metadataFailStreak++
+	if s.metadataFailStreak >= 2 {
+		s.metadataNextRoundAt = now.Add(metadataRoundBackoff(s.metadataFailStreak))
+	}
+	s.metadataResetAt = now
+}
+
+// metadataRoundBackoff is the pause before a new fetch round after streak
+// failed assemblies in a row (streak >= 2).
+func metadataRoundBackoff(streak int) time.Duration {
+	d := metadataRoundBackoffBase
+	for i := 2; i < streak && d < metadataRoundBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, metadataRoundBackoffMax)
+}
+
+// clearMetadataBlameLocked forgets the blame state once the fetched info dict
+// passed the infohash check: nobody lied about it. Caller holds s.mu.
+func (s *Session) clearMetadataBlameLocked() {
+	s.metadataFrom = nil
+	s.metadataSolo = false
+	s.metadataOwner = nil
+	s.metadataSuspects = nil
+	s.metadataFailStreak = 0
+	s.metadataNextRoundAt = time.Time{}
+}
+
+// addMetadataSuspectLocked records host as a suspect of a failed assembly. The
+// set holds at most maxMetadataSuspects hosts: expired entries go first, then
+// the one recorded longest ago. Caller holds s.mu.
+func (s *Session) addMetadataSuspectLocked(host string, now time.Time) {
+	if host == "" {
+		return
+	}
+	if _, known := s.metadataSuspects[host]; !known && len(s.metadataSuspects) >= maxMetadataSuspects {
+		var oldestHost string
+		var oldest time.Time
+		for h, at := range s.metadataSuspects {
+			if now.Sub(at) >= metadataSuspectTTL {
+				delete(s.metadataSuspects, h)
+				continue
+			}
+			if oldestHost == "" || at.Before(oldest) {
+				oldestHost, oldest = h, at
+			}
+		}
+		if len(s.metadataSuspects) >= maxMetadataSuspects {
+			delete(s.metadataSuspects, oldestHost)
+		}
+	}
+	if s.metadataSuspects == nil {
+		s.metadataSuspects = make(map[string]time.Time)
+	}
+	s.metadataSuspects[host] = now
+}
+
+// metadataSuspectLocked reports whether host sized or fed a failed assembly
+// within metadataSuspectTTL. Caller holds s.mu (read or write).
+func (s *Session) metadataSuspectLocked(host string, now time.Time) bool {
+	if host == "" {
+		return false
+	}
+	at, ok := s.metadataSuspects[host]
+	return ok && now.Sub(at) < metadataSuspectTTL
+}
+
+// metadataFeedSlow reports whether a ut_metadata feed that began at since, has
+// taken blocks blocks and last took one at lastBlock has become too slow to
+// wait on: nothing for metadataSizeStallTimeout, or, after a first
+// metadataSizeStallTimeout of grace, fewer than one block per
+// metadataMinBlockPeriod on average. Honest peers deliver a whole info dict in
+// seconds, so only a feed dripping blocks to hold on to the round fails this.
+func metadataFeedSlow(now, since, lastBlock time.Time, blocks int) bool {
+	if now.Sub(lastBlock) >= metadataSizeStallTimeout {
+		return true
+	}
+	elapsed := now.Sub(since)
+	return elapsed >= metadataSizeStallTimeout &&
+		time.Duration(blocks)*metadataMinBlockPeriod < elapsed-metadataSizeStallTimeout
 }

@@ -153,8 +153,8 @@ func TestEndToEndDownload(t *testing.T) {
 	defer trackerServer.Close()
 
 	// Update Torrent with mock tracker URL
-	tor.Announce = trackerServer.URL
-	tor.Trackers = []string{trackerServer.URL}
+	tor.Announce = trackerServer.URL + "/announce"
+	tor.Trackers = []string{trackerServer.URL + "/announce"}
 
 	// 4. Initialize Local Temporary Storage
 	tempDir, err := os.MkdirTemp("", "sainttorrent_integration_test")
@@ -299,8 +299,8 @@ func TestEndToEndDownloadFallsBackToUTP(t *testing.T) {
 		_, _ = w.Write(bencoded)
 	}))
 	defer trackerServer.Close()
-	tor.Announce = trackerServer.URL
-	tor.Trackers = []string{trackerServer.URL}
+	tor.Announce = trackerServer.URL + "/announce"
+	tor.Trackers = []string{trackerServer.URL + "/announce"}
 
 	tempDir := t.TempDir()
 	st, err := storage.NewStorage(tempDir, []storage.FileInfo{{

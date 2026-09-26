@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"syscall"
 	"time"
 )
 
@@ -86,6 +87,13 @@ func ensureUDPDeadline(ctx context.Context) (context.Context, context.CancelFunc
 // starts a watchdog that closes the connection when ctx is cancelled. The
 // returned cleanup func stops the watchdog and closes the connection; callers
 // must defer it. It is shared by UDPAnnounce and UDPScrape.
+//
+// The dial applies the destination rules of HTTPClient: a literal address
+// (or "localhost") is judged as the request's own origin, and a tracker named
+// by a hostname may resolve to a public or private (LAN, carrier-grade NAT,
+// unique-local) address. A UDP tracker's path is not sent, so the loopback
+// path rule cannot vouch for it: a loopback UDP tracker must be written as
+// 127.0.0.1, [::1] or localhost.
 func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) {
 	u, err := url.Parse(announceURL)
 	if err != nil {
@@ -99,7 +107,10 @@ func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) 
 		return nil, nil, fmt.Errorf("invalid host %q: %w", host, err)
 	}
 
-	dialer := net.Dialer{Timeout: 15 * time.Second}
+	dialer := net.Dialer{
+		Timeout:        15 * time.Second,
+		ControlContext: udpDialControl(u.Hostname()),
+	}
 	conn, err := dialer.DialContext(ctx, "udp", host)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dialing UDP %s: %w", host, err)
@@ -119,6 +130,15 @@ func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) 
 		_ = conn.Close()
 	}
 	return conn, cleanup, nil
+}
+
+// udpDialControl is the destination check for a UDP tracker whose URL names
+// host (see udpDial).
+func udpDialControl(host string) func(context.Context, string, string, syscall.RawConn) error {
+	if _, literal := literalAddr(host); literal {
+		return DestinationControl(localAddr(host))
+	}
+	return controlAllowing(reachPrivate.allows)
 }
 
 // udpRoundTrip writes req on conn and waits for a single response, retrying
@@ -198,7 +218,7 @@ func udpRoundTrip(ctx context.Context, conn net.Conn, req []byte, txnID, expecte
 				return nil, fmt.Errorf("%s response too short: %d bytes", opName, nRead)
 			}
 			if respAction == actionError {
-				return nil, fmt.Errorf("tracker error: %s", string(buf[8:nRead]))
+				return nil, fmt.Errorf("tracker error: %s", trackerMessage(string(buf[8:nRead])))
 			}
 			if respAction != expectedAction {
 				return nil, fmt.Errorf("unexpected %s response action: %d", opName, respAction)
@@ -350,7 +370,14 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 	if err != nil {
 		return nil, err
 	}
-	return parseUDPAnnounceResponse(resp)
+	return parseUDPAnnounceResponse(resp, udpOverIPv6(conn))
+}
+
+// udpOverIPv6 reports whether conn talks to its tracker over IPv6, which per
+// BEP 15 makes the announce response carry 18-byte IPv6 peer entries.
+func udpOverIPv6(conn net.Conn) bool {
+	ua, ok := conn.RemoteAddr().(*net.UDPAddr)
+	return ok && ua.IP.To4() == nil
 }
 
 // parseUDPAnnounceResponse parses a raw UDP announce response into a
@@ -361,34 +388,28 @@ func udpAnnounceRequest(ctx context.Context, conn net.Conn, connectionID uint64,
 //	[8..12]  interval
 //	[12..16] leechers
 //	[16..20] seeders
-//	[20..]   peers (6 bytes each: 4 IP + 2 port)
-func parseUDPAnnounceResponse(data []byte) (*TrackerResponse, error) {
+//	[20..]   peers (6 bytes each: 4 IP + 2 port; 18 bytes each over IPv6)
+func parseUDPAnnounceResponse(data []byte, ipv6 bool) (*TrackerResponse, error) {
 	if len(data) < udpAnnounceResponseMinSize {
 		return nil, fmt.Errorf("announce response too short: %d bytes", len(data))
 	}
 
-	interval := int(binary.BigEndian.Uint32(data[8:12]))
-	leechers := int(binary.BigEndian.Uint32(data[12:16]))
-	seeders := int(binary.BigEndian.Uint32(data[16:20]))
+	interval := clampCount(int64(binary.BigEndian.Uint32(data[8:12])))
+	leechers := clampCount(int64(binary.BigEndian.Uint32(data[12:16])))
+	seeders := clampCount(int64(binary.BigEndian.Uint32(data[16:20])))
 
-	peerData := data[20:]
-	if len(peerData)%6 != 0 {
-		return nil, fmt.Errorf("peer data length %d is not a multiple of 6", len(peerData))
+	ipLen := 4
+	if ipv6 {
+		ipLen = 16
 	}
-
-	numPeers := len(peerData) / 6
-	peers := make([]Peer, 0, numPeers)
-	for i := 0; i < numPeers; i++ {
-		offset := i * 6
-		ip := make(net.IP, 4)
-		copy(ip, peerData[offset:offset+4])
-		port := binary.BigEndian.Uint16(peerData[offset+4 : offset+6])
-		peers = append(peers, Peer{IP: ip, Port: port})
+	peerData := data[20:]
+	if len(peerData)%(ipLen+2) != 0 {
+		return nil, fmt.Errorf("peer data length %d is not a multiple of %d", len(peerData), ipLen+2)
 	}
 
 	return &TrackerResponse{
 		Interval:   interval,
-		Peers:      peers,
+		Peers:      compactPeers(string(peerData), ipLen, MaxResponsePeers),
 		Complete:   seeders,
 		Incomplete: leechers,
 	}, nil

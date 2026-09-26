@@ -30,7 +30,7 @@ type sessionRow struct {
 
 	verification  downloader.VerificationSnapshot
 	infoHashHex   string
-	name          string // sanitized once per tick, not per row per frame
+	name          string // bounded and sanitized once per tick, not per row per frame
 	totalSize     int64
 	percent       float64
 	status        string
@@ -42,7 +42,7 @@ type sessionRow struct {
 	transferSpeed float64
 	eta           string
 	uploadedBytes int64
-	lastErrText   string
+	lastErrText   string // bounded and sanitized once per tick, like name
 }
 
 // detailSnapshot is the snapshot backing the detail view for the selected
@@ -76,6 +76,7 @@ type detailSig struct {
 // without the view re-locking the session every frame.
 type filesSnapshot struct {
 	valid      bool
+	session    *downloader.Session
 	name       string
 	files      []torrent.File
 	priorities []downloader.FilePriority
@@ -88,7 +89,7 @@ func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) ses
 		verification:  snap.Verification,
 		session:       s,
 		infoHashHex:   fmt.Sprintf("%x", snap.InfoHash),
-		name:          sanitizeText(snap.Name),
+		name:          displayText(snap.Name),
 		totalSize:     snap.TotalSize,
 		percent:       snap.Percent,
 		status:        snap.Status,
@@ -105,7 +106,7 @@ func rowFromSnapshot(s *downloader.Session, snap downloader.SessionSnapshot) ses
 	}
 	row.eta = rowETA(row)
 	if snap.LastError != nil {
-		row.lastErrText = snap.LastError.Error()
+		row.lastErrText = displayText(snap.LastError.Error())
 	}
 	return row
 }
@@ -234,10 +235,23 @@ func (m *model) buildFilesSnapshot() {
 	}
 	m.files = filesSnapshot{
 		valid:      true,
-		name:       sanitizeText(s.Name()),
+		session:    s,
+		name:       displayText(s.Name()),
 		files:      s.Files(),
 		priorities: s.GetFilePriorities(),
 	}
+}
+
+// refreshFilesSnapshot is the per-tick refresh: it rebuilds only when the
+// selected session or its file list changed. Priorities change only through
+// the toggle key, which rebuilds explicitly, so re-copying an O(files) slice
+// under the session lock twice a second bought nothing.
+func (m *model) refreshFilesSnapshot() {
+	if s, ok := m.selectedSession(); ok && m.files.valid && m.files.session == s &&
+		len(s.Files()) == len(m.files.files) {
+		return
+	}
+	m.buildFilesSnapshot()
 }
 
 // filesData returns the current files snapshot, falling back to a fresh live
@@ -253,7 +267,7 @@ func (m *model) filesData() filesSnapshot {
 	}
 	return filesSnapshot{
 		valid:      true,
-		name:       sanitizeText(s.Name()),
+		name:       displayText(s.Name()),
 		files:      s.Files(),
 		priorities: s.GetFilePriorities(),
 	}

@@ -4,17 +4,45 @@ package torrent
 import (
 	"crypto/sha1"
 	"fmt"
-	"math"
 	"path/filepath"
 	"strings"
 
 	"sainttorrent/pkg/bencode"
 )
 
+// Metainfo limits. Each sits well above what real torrent creators emit, so no
+// legitimate swarm is refused, yet low enough that the buffers and per-piece
+// state sized from metainfo stay allocatable on every platform, 32-bit
+// included. All comparisons are done in int64 so GOARCH=386 behaves like amd64.
+const (
+	// MaxPieceLength bounds "piece length". Piece buffers (assembly, web seeds)
+	// are allocated at this size; creators top out at 16-256 MiB.
+	MaxPieceLength = 256 << 20
+	// MaxTotalLength bounds each file and the torrent's total size, matching
+	// libtorrent's max_file_offset.
+	MaxTotalLength int64 = 1 << 48
+	// MaxPieceCount bounds the number of pieces, which sizes the per-torrent
+	// piece state and every peer's bitfield.
+	MaxPieceCount = 1 << 22
+	// MaxFileCount bounds the number of files. Storage creates, stats and
+	// tracks every file up front, so an info dictionary of millions of empty
+	// entries would pin that much work and memory; the largest real datasets
+	// hold a few hundred thousand files.
+	MaxFileCount = 1 << 20
+)
+
+// maxPathDepth bounds the number of path components one file may declare.
+const maxPathDepth = 128
+
 // File represents an individual file and its size in a multi-file torrent.
 type File struct {
 	Length int64
 	Path   []string
+	// LegacyPath is where versions before the current name sanitizer laid the
+	// file out, set only when that differs from Path (see
+	// legacyPathComponent). The downloader moves a file it finds there to
+	// Path, so upgrading does not orphan it and download it again.
+	LegacyPath []string
 }
 
 // Torrent represents the metadata extracted from a torrent file.
@@ -25,7 +53,7 @@ type Torrent struct {
 	InfoHash    [20]byte
 	PieceLength int64
 	PieceHashes [][20]byte
-	Name        string
+	Name        string // Display name, sanitized like a file name and at most 255 bytes
 	Files       []File
 	InfoBytes   []byte // Raw bencoded info dictionary
 	Private     bool   // BEP 27 private torrents must use trackers only
@@ -33,6 +61,11 @@ type Torrent struct {
 
 // Parse decodes a bencoded torrent file, calculates the info hash, and returns a Torrent struct.
 func Parse(data []byte) (*Torrent, error) {
+	// The outer dictionary is decoded like libtorrent's: a repeated key keeps
+	// its first value, as FindRawValue does, so a .torrent whose editor
+	// appended a second "comment" or "announce" still loads. Those keys are not
+	// hashed. The info dictionary, which is, is decoded strictly by ParseInfo
+	// from the exact bytes the info-hash commits to.
 	val, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal torrent bencode: %w", err)
@@ -44,15 +77,21 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// 1. Announce / Trackers
-	announce, _ := getString(dict, "announce")
+	var announce string
+	if raw, ok := getString(dict, "announce"); ok {
+		announce, _ = normalizeURL(raw, true, MaxTrackerURLLength)
+	}
 
-	var trackers []string
+	trackers := newURLSet(maxTrackers, true, MaxTrackerURLLength)
 	if announceList, ok := dict["announce-list"].([]interface{}); ok {
+	tiers:
 		for _, tierVal := range announceList {
 			if tier, ok := tierVal.([]interface{}); ok {
 				for _, trackerVal := range tier {
-					if trackerStr, ok := trackerVal.(string); ok && trackerStr != "" {
-						trackers = append(trackers, trackerStr)
+					if trackerStr, ok := trackerVal.(string); ok {
+						if !trackers.add(trackerStr) {
+							break tiers
+						}
 					}
 				}
 			}
@@ -60,30 +99,65 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// Fallback to announce if no trackers were extracted from announce-list
-	if len(trackers) == 0 && announce != "" {
-		trackers = []string{announce}
+	if len(trackers.list) == 0 && announce != "" {
+		trackers.list = []string{announce}
 	}
 
-	webSeeds := getStringList(dict, "url-list")
+	webSeeds := newURLSet(maxWebSeeds, false, MaxWebSeedURLLength)
+	switch v := dict["url-list"].(type) {
+	case string:
+		webSeeds.add(v)
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok && !webSeeds.add(s) {
+				break
+			}
+		}
+	}
 
 	// 2. Info Dictionary
 	infoVal, ok := dict["info"]
 	if !ok {
 		return nil, fmt.Errorf("missing info dictionary")
 	}
-	info, ok := infoVal.(map[string]interface{})
-	if !ok {
+	if _, ok := infoVal.(map[string]interface{}); !ok {
 		return nil, fmt.Errorf("invalid info field type")
 	}
 
-	// 3. Info Hash Calculation (using exact raw bencoded bytes)
-	bencodedInfo, err := bencode.FindRawValue(data, "info")
+	// 3. Decode the info fields from the exact bytes that are hashed, so the
+	// info-hash always commits to the content that gets downloaded. A second
+	// "info" is refused: a reader keeping the last copy would hash and
+	// download another torrent from the same file.
+	bencodedInfo, err := bencode.FindUniqueRawValue(data, "info")
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract raw info dictionary: %w", err)
 	}
-	infoHash := sha1.Sum(bencodedInfo)
+	tor, err := ParseInfo(bencodedInfo)
+	if err != nil {
+		return nil, err
+	}
+	tor.Announce = announce
+	tor.Trackers = trackers.list
+	tor.WebSeeds = webSeeds.list
+	return tor, nil
+}
 
-	// 4. Extract standard Info fields
+// ParseInfo parses a bare info dictionary, such as metadata fetched with
+// ut_metadata (BEP 9). infoBytes must be exactly one bencoded dictionary with
+// nothing after it. The info-hash is the SHA-1 of exactly those bytes, and the
+// returned Torrent keeps infoBytes as its InfoBytes, so the caller must not
+// modify the slice afterwards. Trackers and web seeds live outside the info
+// dictionary and are left empty.
+func ParseInfo(infoBytes []byte) (*Torrent, error) {
+	val, err := bencode.UnmarshalStrict(infoBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal info dictionary: %w", err)
+	}
+	info, ok := val.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("info is not a bencoded dictionary")
+	}
+
 	name, ok := getString(info, "name")
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid name in info dict")
@@ -96,30 +170,30 @@ func Parse(data []byte) (*Torrent, error) {
 	if pieceLength <= 0 {
 		return nil, fmt.Errorf("piece length must be positive, got %d", pieceLength)
 	}
+	if pieceLength > MaxPieceLength {
+		return nil, fmt.Errorf("piece length %d exceeds the maximum of %d", pieceLength, MaxPieceLength)
+	}
 
 	piecesStr, ok := getString(info, "pieces")
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid pieces in info dict")
 	}
-	piecesBytes := []byte(piecesStr)
-	if len(piecesBytes)%20 != 0 {
-		return nil, fmt.Errorf("pieces length must be a multiple of 20, got %d", len(piecesBytes))
+	if len(piecesStr)%20 != 0 {
+		return nil, fmt.Errorf("pieces length must be a multiple of 20, got %d", len(piecesStr))
 	}
-	numPieces := len(piecesBytes) / 20
+	numPieces := len(piecesStr) / 20
 	if numPieces == 0 {
 		return nil, fmt.Errorf("torrent must contain at least one piece hash")
 	}
-	pieceHashes := make([][20]byte, numPieces)
-	for i := 0; i < numPieces; i++ {
-		copy(pieceHashes[i][:], piecesBytes[i*20:(i+1)*20])
-	}
 
+	// Any nonzero value marks the torrent private, as in libtorrent: treating
+	// a non-standard value as public would leak it to DHT and PEX.
 	private := false
 	if privateFlag, ok := getInt64(info, "private"); ok {
-		private = privateFlag == 1
+		private = privateFlag != 0
 	}
 
-	// 5. Files list (handling single-file vs multi-file)
+	// Files list (handling single-file vs multi-file)
 	var files []File
 	var totalLength int64
 	if filesVal, ok := info["files"]; ok {
@@ -131,7 +205,11 @@ func Parse(data []byte) (*Torrent, error) {
 		if len(filesSlice) == 0 {
 			return nil, fmt.Errorf("files list cannot be empty")
 		}
+		if err := checkFileCount(len(filesSlice)); err != nil {
+			return nil, err
+		}
 		cleanName := sanitizePathComponent(name)
+		legacyName, legacyRoot := legacyComponent(name, cleanName)
 		for _, fVal := range filesSlice {
 			fMap, ok := fVal.(map[string]interface{})
 			if !ok {
@@ -141,19 +219,24 @@ func Parse(data []byte) (*Torrent, error) {
 			if !ok {
 				return nil, fmt.Errorf("missing or invalid length in files list entry")
 			}
-			if length < 0 {
-				return nil, fmt.Errorf("file length cannot be negative: %d", length)
+			if err := checkFileLength(length); err != nil {
+				return nil, err
 			}
-			if totalLength > math.MaxInt64-length {
-				return nil, fmt.Errorf("total file length overflows int64")
+			// Both terms are at most MaxTotalLength, so the sum cannot overflow.
+			if totalLength > MaxTotalLength-length {
+				return nil, fmt.Errorf("torrent total length exceeds the maximum of %d", MaxTotalLength)
 			}
 			totalLength += length
 			pathSlice, ok := fMap["path"].([]interface{})
 			if !ok {
 				return nil, fmt.Errorf("missing or invalid path in files list entry")
 			}
+			if len(pathSlice) > maxPathDepth {
+				return nil, fmt.Errorf("file path has %d components, more than the maximum of %d", len(pathSlice), maxPathDepth)
+			}
 			path := make([]string, 0, len(pathSlice)+1)
 			path = append(path, cleanName) // root under sanitized torrent name
+			legacyDiffers := legacyRoot
 			for _, pVal := range pathSlice {
 				pStr, ok := pVal.(string)
 				if !ok {
@@ -163,14 +246,21 @@ func Parse(data []byte) (*Torrent, error) {
 				if cleanedComp != "" {
 					path = append(path, cleanedComp)
 				}
+				if _, differs := legacyComponent(pStr, cleanedComp); differs {
+					legacyDiffers = true
+				}
 			}
 			if len(path) == 1 { // Only contains the torrent name, no actual files
 				path = append(path, "unknown_file")
 			}
-			files = append(files, File{
+			file := File{
 				Length: length,
 				Path:   path,
-			})
+			}
+			if legacyDiffers {
+				file.LegacyPath = legacyFilePath(legacyName, pathSlice)
+			}
+			files = append(files, file)
 		}
 	} else {
 		// Single-file mode
@@ -178,63 +268,140 @@ func Parse(data []byte) (*Torrent, error) {
 		if !ok {
 			return nil, fmt.Errorf("missing or invalid length in single-file mode")
 		}
-		if length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %d", length)
+		if err := checkFileLength(length); err != nil {
+			return nil, err
 		}
 		totalLength = length
+		cleanName := sanitizePathComponent(name)
 		files = []File{
 			{
 				Length: length,
-				Path:   []string{sanitizePathComponent(name)},
+				Path:   []string{cleanName},
 			},
+		}
+		if legacyName, differs := legacyComponent(name, cleanName); differs && len(legacyName) <= maxLegacyComponentBytes {
+			files[0].LegacyPath = []string{legacyName}
 		}
 	}
 	if totalLength <= 0 {
 		return nil, fmt.Errorf("torrent total length must be positive")
 	}
-	expectedPieces := int((totalLength-1)/pieceLength + 1)
-	if numPieces != expectedPieces {
-		return nil, fmt.Errorf("piece hash count mismatch: got %d, expected %d", numPieces, expectedPieces)
+	if err := checkPieceCount(numPieces, pieceLength, totalLength); err != nil {
+		return nil, err
 	}
-	// Check for case-insensitive duplicate paths
-	seenPaths := make(map[string]bool)
-	for _, f := range files {
+	// Reject paths that differ only in case or Unicode normalization: case- or
+	// normalization-insensitive filesystems would store them as one file.
+	seenPaths := make(map[string]struct{}, len(files))
+	keys := make([]string, len(files))
+	for i, f := range files {
 		relPath := filepath.Join(f.Path...)
-		lowerPath := strings.ToLower(filepath.Clean(relPath))
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected in torrent metadata: %s", relPath)
+		key := pathKey(relPath)
+		if _, dup := seenPaths[key]; dup {
+			return nil, fmt.Errorf("duplicate file path detected in torrent metadata: %q", relPath)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = struct{}{}
+		keys[i] = key
+	}
+	if err := checkFileDirCollisions(files, keys); err != nil {
+		return nil, err
+	}
+	pieceHashes := make([][20]byte, numPieces)
+	for i := range pieceHashes {
+		copy(pieceHashes[i][:], piecesStr[i*20:])
 	}
 
 	return &Torrent{
-		Announce:    announce,
-		Trackers:    trackers,
-		WebSeeds:    webSeeds,
-		InfoHash:    infoHash,
+		InfoHash:    sha1.Sum(infoBytes),
 		PieceLength: pieceLength,
 		PieceHashes: pieceHashes,
-		Name:        name,
+		Name:        sanitizeName(name),
 		Files:       files,
-		InfoBytes:   bencodedInfo,
+		InfoBytes:   infoBytes,
 		Private:     private,
 	}, nil
 }
 
-func sanitizePathComponent(p string) string {
-	// Clean up any path separators or relative directory navigation
-	p = filepath.Clean(p)
-	// Remove any leading/trailing slash or backslash
-	p = strings.Trim(p, "/\\")
-	// If it contains ".." or is empty, sanitize to prevent traversal
-	if p == ".." || p == "." || p == "" {
-		return "safe_name"
+// pathEntry names a file or directory in a torrent's folded path tree: a
+// folded path component inside the directory numbered parent (0 is the root).
+type pathEntry struct {
+	parent int
+	name   string
+}
+
+// checkFileDirCollisions rejects a file whose path is also the directory of
+// another file, as in [a] and [a b]: no filesystem can lay that out.
+// libtorrent renames such a file (within max_duplicate_filenames attempts);
+// here it is refused like a duplicate path. keys are the files' pathKey
+// values, so case and normalization fold exactly as in the duplicate check;
+// folding neither adds nor removes a separator, and sanitized components hold
+// none. Each directory component is hashed once, under its parent's number,
+// so the cost is linear in the path bytes: keying every directory by its
+// whole path would hash and keep O(depth^2) bytes per file, 64 times the
+// metadata for 128-deep paths.
+func checkFileDirCollisions(files []File, keys []string) error {
+	if len(files) < 2 {
+		return nil
 	}
-	// Replace path separators to prevent breaking out
-	p = strings.ReplaceAll(p, "/", "_")
-	p = strings.ReplaceAll(p, "\\", "_")
-	p = strings.ReplaceAll(p, "..", "_")
-	return p
+	sep := string(filepath.Separator)
+	dirs := make(map[pathEntry]int)
+	leaves := make([]pathEntry, len(files))
+	for i, key := range keys {
+		parent, rest := 0, key
+		for {
+			name, tail, ok := strings.Cut(rest, sep)
+			if !ok {
+				break
+			}
+			dir := pathEntry{parent: parent, name: name}
+			id, seen := dirs[dir]
+			if !seen {
+				id = len(dirs) + 1
+				dirs[dir] = id
+			}
+			parent, rest = id, tail
+		}
+		leaves[i] = pathEntry{parent: parent, name: rest}
+	}
+	for i, leaf := range leaves {
+		if _, isDir := dirs[leaf]; isDir {
+			return fmt.Errorf("file path %q is also a directory in torrent metadata", filepath.Join(files[i].Path...))
+		}
+	}
+	return nil
+}
+
+// checkPieceCount rejects a piece count above MaxPieceCount or one that does
+// not match the declared lengths. The comparison stays in int64: converting to
+// int first truncates on 32-bit builds and let one hash "cover" terabytes of
+// data that would never be verified.
+func checkPieceCount(numPieces int, pieceLength, totalLength int64) error {
+	if numPieces > MaxPieceCount {
+		return fmt.Errorf("torrent has %d pieces, more than the maximum of %d", numPieces, MaxPieceCount)
+	}
+	expectedPieces := (totalLength-1)/pieceLength + 1
+	if int64(numPieces) != expectedPieces {
+		return fmt.Errorf("piece hash count mismatch: got %d, expected %d", numPieces, expectedPieces)
+	}
+	return nil
+}
+
+// checkFileCount rejects a files list longer than MaxFileCount.
+func checkFileCount(n int) error {
+	if n > MaxFileCount {
+		return fmt.Errorf("torrent has %d files, more than the maximum of %d", n, MaxFileCount)
+	}
+	return nil
+}
+
+// checkFileLength rejects a negative or implausibly large file length.
+func checkFileLength(length int64) error {
+	if length < 0 {
+		return fmt.Errorf("file length cannot be negative: %d", length)
+	}
+	if length > MaxTotalLength {
+		return fmt.Errorf("file length %d exceeds the maximum of %d", length, MaxTotalLength)
+	}
+	return nil
 }
 
 func getString(m map[string]interface{}, key string) (string, bool) {
@@ -244,34 +411,6 @@ func getString(m map[string]interface{}, key string) (string, bool) {
 	}
 	s, ok := v.(string)
 	return s, ok
-}
-
-func getStringList(m map[string]interface{}, key string) []string {
-	v, ok := m[key]
-	if !ok {
-		return nil
-	}
-	add := func(dst []string, s string) []string {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return dst
-		}
-		return append(dst, s)
-	}
-	switch val := v.(type) {
-	case string:
-		return add(nil, val)
-	case []interface{}:
-		out := make([]string, 0, len(val))
-		for _, item := range val {
-			if s, ok := item.(string); ok {
-				out = add(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func getInt64(m map[string]interface{}, key string) (int64, bool) {

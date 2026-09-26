@@ -3,6 +3,7 @@ package downloader
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +15,8 @@ import (
 )
 
 const peerHandshakeTimeout = 10 * time.Second
+
+var errPlaintextRefused = errors.New("plaintext peer refused: encryption is required")
 
 type bufferedConn struct {
 	net.Conn
@@ -73,29 +76,85 @@ func (c *bufferedConn) UnderlyingConn() net.Conn {
 	return c.Conn
 }
 
-func secretKeyIter(secrets ...[20]byte) mse.SecretKeyIter {
-	return func(callback func([]byte) bool) {
-		for i := range secrets {
-			if !callback(secrets[i][:]) {
-				return
-			}
-		}
+// secretKeyIndex indexes the managed torrents by the obfuscated info hash an
+// MSE initiator sends (mse.ObfuscatedHash), so an inbound handshake finds its
+// torrent with one map lookup instead of hashing every managed info hash.
+// It has its own lock rather than being a copy-on-write snapshot: a lookup
+// still never waits on TorrentManager.mu, and adding or removing a torrent
+// stays O(1) instead of cloning the whole index, which made restoring N
+// torrents at startup O(N²) under the manager lock.
+type secretKeyIndex struct {
+	mu     sync.RWMutex
+	byHash map[[sha1.Size]byte]secretKeyEntry
+}
+
+type secretKeyEntry struct {
+	infoHash [20]byte
+	refs     int // sessions sharing this info hash
+}
+
+func (x *secretKeyIndex) add(infoHash [20]byte) {
+	key := mse.ObfuscatedHash(infoHash[:])
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.byHash == nil {
+		x.byHash = make(map[[sha1.Size]byte]secretKeyEntry)
+	}
+	e := x.byHash[key]
+	e.infoHash = infoHash
+	e.refs++
+	x.byHash[key] = e
+}
+
+func (x *secretKeyIndex) remove(infoHash [20]byte) {
+	key := mse.ObfuscatedHash(infoHash[:])
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	e, ok := x.byHash[key]
+	switch {
+	case !ok:
+	case e.refs > 1:
+		e.refs--
+		x.byHash[key] = e
+	default:
+		delete(x.byHash, key)
 	}
 }
 
-func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.SecretKeyIter) (net.Conn, mse.Result, bool, error) {
+func (x *secretKeyIndex) clear() {
+	x.mu.Lock()
+	x.byHash = nil
+	x.mu.Unlock()
+}
+
+// lookup is an mse.SecretKeyLookup over the index.
+func (x *secretKeyIndex) lookup(obfuscated [sha1.Size]byte) ([]byte, bool) {
+	x.mu.RLock()
+	e, ok := x.byHash[obfuscated]
+	x.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return e.infoHash[:], true
+}
+
+func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.SecretKeyLookup) (net.Conn, mse.Result, bool, error) {
 	buffered := newBufferedConn(conn)
 	if policy == mse.PolicyDisable {
 		return buffered, mse.Result{}, false, nil
 	}
-	if policy == mse.PolicyPrefer {
-		prefix, err := buffered.Peek(mse.PlaintextHandshakePrefixLen())
-		if err != nil {
-			return nil, mse.Result{}, false, err
+	// A plaintext handshake is served under prefer and refused at once
+	// otherwise: the MSE receiver waits for a 96-byte key a plaintext peer
+	// never sends, so it would sit in a handshake slot until the deadline.
+	prefix, err := buffered.Peek(mse.PlaintextHandshakePrefixLen())
+	if err != nil {
+		return nil, mse.Result{}, false, err
+	}
+	if mse.LooksLikePlaintextHandshake(prefix) {
+		if policy != mse.PolicyPrefer {
+			return nil, mse.Result{}, false, errPlaintextRefused
 		}
-		if mse.LooksLikePlaintextHandshake(prefix) {
-			return buffered, mse.Result{}, false, nil
-		}
+		return buffered, mse.Result{}, false, nil
 	}
 
 	wrapped, res, err := mse.Receive(buffered, secrets, mse.SelectRC4)
@@ -105,13 +164,17 @@ func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.Sec
 	return wrapped, res, true, nil
 }
 
-func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, monitor *monitoredPeerConn) (net.Conn, error) {
+// negotiateOutgoingPeerConn runs the MSE handshake on conn (over transport) as
+// the encryption policy asks. After a failed MSE handshake the prefer policy
+// falls back to plaintext on a new connection from redial; the transport of
+// the connection returned is returned with it.
+func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, transport string, monitor *monitoredPeerConn, redial func(string) (net.Conn, string, error)) (net.Conn, string, error) {
 	s.mu.RLock()
 	policy := s.EncryptionPolicy
 	infoHash := s.Torrent.InfoHash
 	s.mu.RUnlock()
 	if policy == mse.PolicyDisable {
-		return conn, nil
+		return conn, transport, nil
 	}
 
 	wrapped, _, err := mse.Initiate(conn, infoHash[:], nil, mse.CryptoMethodRC4)
@@ -119,19 +182,19 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, moni
 		if monitor != nil {
 			monitor.set(wrapped)
 		}
-		return wrapped, nil
+		return wrapped, transport, nil
 	}
 	_ = conn.Close()
 	if monitor != nil {
 		monitor.set(nil)
 	}
 	if policy == mse.PolicyRequire {
-		return nil, fmt.Errorf("mse handshake failed: %w", err)
+		return nil, transport, fmt.Errorf("mse handshake failed: %w", err)
 	}
 
-	fallback, dialErr := s.dialPeer(peerAddr)
+	fallback, fallbackTransport, dialErr := redial(peerAddr)
 	if dialErr != nil {
-		return nil, errors.Join(
+		return nil, transport, errors.Join(
 			fmt.Errorf("mse handshake failed: %w", err),
 			fmt.Errorf("plaintext fallback dial failed: %w", dialErr),
 		)
@@ -142,9 +205,9 @@ func (s *Session) negotiateOutgoingPeerConn(peerAddr string, conn net.Conn, moni
 	}
 	if ctxErr := s.ctx.Err(); ctxErr != nil {
 		_ = fallback.Close()
-		return nil, ctxErr
+		return nil, fallbackTransport, ctxErr
 	}
-	return fallback, nil
+	return fallback, fallbackTransport, nil
 }
 
 func (s *Session) parseIncomingHandshake(conn net.Conn) (net.Conn, *peer.Handshake, error) {
@@ -153,7 +216,7 @@ func (s *Session) parseIncomingHandshake(conn net.Conn) (net.Conn, *peer.Handsha
 	infoHash := s.Torrent.InfoHash
 	s.mu.RUnlock()
 
-	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(infoHash))
+	wrapped, res, encrypted, err := negotiateIncomingPeerConn(conn, policy, mse.SecretKeys(infoHash[:]))
 	if err != nil {
 		return nil, nil, err
 	}

@@ -199,7 +199,7 @@ func BenchmarkShutdown(b *testing.B) {
 					numTorrents:     n,
 					bytesPerTorrent: 1 << 20,
 					pieceLength:     1 << 18,
-					trackerURL:      srv.URL,
+					trackerURL:      srv.URL + "/announce",
 				})
 				mgr := NewTorrentManager()
 				if _, err := mgr.EnablePersistence(lib.stateDir); err != nil {

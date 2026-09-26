@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -35,18 +36,40 @@ const MaxMetadataSize = 16 * 1024 * 1024
 
 const maxMetadataPieces = MaxMetadataSize / MetadataBlockSize
 
+// Size caps for BEP 10 sub-messages, checked before any bencode decode. The reader
+// admits an extended message of up to MaxExtHandshakeSize (see messageLengthRules),
+// and decoding a payload of tiny containers builds a tree ~50x its size, so each
+// control message gets its own limit. Real extension handshakes are well under
+// 1 KiB, and a ut_metadata data message is a small dict plus at most one 16 KiB
+// block (libtorrent drops anything over 17 KiB too).
+const (
+	MaxExtHandshakeSize    = 64 * 1024
+	MaxMetadataMessageSize = MetadataBlockSize + 1024
+)
+
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
-// the total metadata size, and an optional client identifier.
+// the total metadata size, an optional client identifier, the optional
+// number of outstanding requests the sender is willing to queue, and the
+// optional port the sender listens on.
 type ExtensionHandshake struct {
 	Extensions   map[string]int // m dict: extension name -> message ID
 	MetadataSize int            // metadata_size field
 	ClientName   string         // v field (optional)
+	RequestQueue int            // reqq field (optional; 0 when absent or invalid)
+	ListenPort   uint16         // p field (optional; 0 when absent or invalid)
 }
+
+// maxRequestQueue caps a parsed reqq value; real clients advertise a few hundred
+// to a few thousand.
+const maxRequestQueue = 1 << 20
 
 // ParseExtensionHandshake parses a BEP 10 extension handshake from bencoded data.
 // The input must be a bencoded dictionary containing at least an "m" key.
 func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
+	if len(data) > MaxExtHandshakeSize {
+		return nil, fmt.Errorf("extension handshake too large: %d bytes", len(data))
+	}
 	decoded, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode extension handshake: %w", err)
@@ -103,6 +126,22 @@ func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
 		hs.ClientName = v
 	}
 
+	// reqq is advisory, so a malformed value is ignored rather than failing the
+	// whole handshake.
+	if rVal, exists := dict["reqq"]; exists {
+		if reqq, ok := rVal.(int64); ok && reqq > 0 {
+			hs.RequestQueue = int(min(reqq, maxRequestQueue))
+		}
+	}
+
+	// p, the sender's listen port, is advisory too: an out-of-range value is
+	// ignored.
+	if pVal, exists := dict["p"]; exists {
+		if p, ok := pVal.(int64); ok && p > 0 && p <= 65535 {
+			hs.ListenPort = uint16(p)
+		}
+	}
+
 	return hs, nil
 }
 
@@ -118,8 +157,14 @@ func SerializeExtensionHandshake(utMetadataID int, metadataSize int) ([]byte, er
 // SerializeExtensionHandshakeWithExtensions creates the bencoded extension
 // handshake payload for an arbitrary BEP 10 extension map.
 func SerializeExtensionHandshakeWithExtensions(extensions map[string]int, metadataSize int) ([]byte, error) {
-	mDict := make(map[string]interface{}, len(extensions))
-	for name, id := range extensions {
+	return (&ExtensionHandshake{Extensions: extensions, MetadataSize: metadataSize}).Serialize()
+}
+
+// Serialize creates the bencoded extension handshake payload. Zero-valued
+// optional fields are left out.
+func (hs *ExtensionHandshake) Serialize() ([]byte, error) {
+	mDict := make(map[string]interface{}, len(hs.Extensions))
+	for name, id := range hs.Extensions {
 		if name == "" {
 			return nil, errors.New("extension name cannot be empty")
 		}
@@ -134,8 +179,17 @@ func SerializeExtensionHandshakeWithExtensions(extensions map[string]int, metada
 	payload := map[string]interface{}{
 		"m": mDict,
 	}
-	if metadataSize > 0 {
-		payload["metadata_size"] = metadataSize
+	if hs.MetadataSize > 0 {
+		payload["metadata_size"] = hs.MetadataSize
+	}
+	if hs.ClientName != "" {
+		payload["v"] = hs.ClientName
+	}
+	if hs.RequestQueue > 0 {
+		payload["reqq"] = hs.RequestQueue
+	}
+	if hs.ListenPort > 0 {
+		payload["p"] = int(hs.ListenPort)
 	}
 
 	data, err := bencode.Marshal(payload)
@@ -162,6 +216,9 @@ type MetadataMessage struct {
 func ParseMetadataMessage(data []byte) (*MetadataMessage, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty metadata message")
+	}
+	if len(data) > MaxMetadataMessageSize {
+		return nil, fmt.Errorf("metadata message too large: %d bytes", len(data))
 	}
 
 	// Find the end of the bencoded dictionary so we can separate the
@@ -278,6 +335,15 @@ func (c *Client) SendExtHandshakeWithExtensions(extensions map[string]int, metad
 	return c.sendExtendedPayload(ExtHandshake, payload)
 }
 
+// SendExtensionHandshake sends a BEP 10 extension handshake built from hs.
+func (c *Client) SendExtensionHandshake(hs *ExtensionHandshake) error {
+	payload, err := hs.Serialize()
+	if err != nil {
+		return err
+	}
+	return c.sendExtendedPayload(ExtHandshake, payload)
+}
+
 func (c *Client) sendExtendedPayload(extMsgID byte, payload []byte) error {
 	// Extension message payload: [ext_msg_id (1 byte)][bencoded payload]
 	msgPayload := make([]byte, 1+len(payload))
@@ -320,7 +386,9 @@ func bencodedDictSpan(data []byte) (int, error) {
 	return bencode.ValueSpan(data)
 }
 
-// SendMetadataData sends a BEP 9 metadata piece message.
+// SendMetadataData sends a BEP 9 metadata piece message. Like SendPiece it frames
+// the message straight into the write buffer, so the up-to-16 KiB block is not
+// copied into a payload and then again by Message.Serialize.
 func (c *Client) SendMetadataData(extMsgID byte, piece int, totalSize int, data []byte) error {
 	payloadDict := map[string]interface{}{
 		"msg_type":   MetadataData,
@@ -332,15 +400,22 @@ func (c *Client) SendMetadataData(extMsgID byte, piece int, totalSize int, data 
 		return err
 	}
 
-	msgPayload := make([]byte, 1+len(dictBytes)+len(data))
-	msgPayload[0] = extMsgID
-	copy(msgPayload[1:], dictBytes)
-	copy(msgPayload[1+len(dictBytes):], data)
+	// 4-byte length prefix + message ID + extended message ID.
+	var hdr [6]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(2+len(dictBytes)+len(data)))
+	hdr[4] = byte(MsgExtended)
+	hdr[5] = extMsgID
 
-	return c.SendMessage(&Message{
-		ID:      MsgExtended,
-		Payload: msgPayload,
-	})
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.wrote = true
+	c.armWriteDeadlineLocked()
+	for _, part := range [][]byte{hdr[:], dictBytes, data} {
+		if _, err := c.w.Write(part); err != nil {
+			return c.writeFailedLocked(err)
+		}
+	}
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // SendMetadataReject sends a BEP 9 metadata reject message.

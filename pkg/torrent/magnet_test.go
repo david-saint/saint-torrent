@@ -3,6 +3,8 @@ package torrent
 import (
 	"encoding/base32"
 	"encoding/hex"
+	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -109,6 +111,31 @@ func TestParseMagnet_URLEncodedTrackers(t *testing.T) {
 	}
 	if ml.Trackers[0] != tracker {
 		t.Errorf("tracker = %q, want %q", ml.Trackers[0], tracker)
+	}
+}
+
+// TestParseMagnet_DropsOverlongTrackers: a tr= value longer than
+// MaxTrackerURLLength is skipped, and the trackers after it are still kept in
+// order.
+func TestParseMagnet_DropsOverlongTrackers(t *testing.T) {
+	exact := trackerURLOfLength(MaxTrackerURLLength)
+	uri := "magnet:?xt=urn:btih:" + testHashHex
+	for _, tr := range []string{
+		"udp://first.example:1337/announce",
+		trackerURLOfLength(MaxTrackerURLLength + 1),
+		trackerURLOfLength(64 << 10),
+		exact,
+		"http://last.example/announce",
+	} {
+		uri += "&tr=" + url.QueryEscape(tr)
+	}
+	ml, err := ParseMagnet(uri)
+	if err != nil {
+		t.Fatalf("ParseMagnet() = %v", err)
+	}
+	want := []string{"udp://first.example:1337/announce", exact, "http://last.example/announce"}
+	if !reflect.DeepEqual(ml.Trackers, want) {
+		t.Fatalf("kept %d trackers %.80q, want %.80q", len(ml.Trackers), ml.Trackers, want)
 	}
 }
 

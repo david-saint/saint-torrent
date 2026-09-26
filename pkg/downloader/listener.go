@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -14,6 +15,14 @@ import (
 // StartPeerListener starts the manager-wide BitTorrent TCP listener. All
 // managed sessions share this socket and are selected by the incoming
 // handshake's info-hash.
+//
+// While it runs, the shared uTP socket (StartDHT) refuses inbound
+// connections (utp.Socket.SetRefuseIncoming). Our uTP writes wait for every
+// packet's ack, about one block per round trip, while libtorrent, uTorrent
+// and Transmission dial uTP first and would otherwise stay on it for the
+// whole connection: refused, they reconnect over TCP at once. Without a TCP
+// listener inbound uTP is accepted, and outbound dials still fall back to uTP
+// when TCP fails (see dialPeer).
 func (m *TorrentManager) StartPeerListener(port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -53,6 +62,9 @@ func (m *TorrentManager) StartPeerListener(port uint16) error {
 		sess.mu.RUnlock()
 	}
 	m.peerListener = listener
+	if m.utpSocket != nil {
+		m.utpSocket.SetRefuseIncoming(true)
+	}
 	m.peerListenPort = uint16(actualPort)
 	m.advertisedPeerPort = uint16(actualPort)
 	m.natStatus.ListenPort = uint16(actualPort)
@@ -130,39 +142,77 @@ func (m *TorrentManager) acceptLoop(listener net.Listener, current func() bool) 
 	}
 }
 
+const (
+	// maxInboundHandshakes caps inbound connections that have not yet
+	// completed a BitTorrent handshake for a torrent we serve. They draw from
+	// this budget instead of globalInboundSlots, so connections that stall
+	// before the handshake (or never send a byte) cannot hold the slots of
+	// established peers; a real handshake takes a few round trips, so 256 in
+	// flight is far more than legitimate arrivals need.
+	maxInboundHandshakes = 256
+	// maxInboundHandshakesPerSource is the share of that budget one source
+	// may hold once more than half of it is in use (see admitHandshakeSource).
+	// It is generous enough for several peers behind one CGNAT address.
+	maxInboundHandshakesPerSource = 8
+	// maxInboundHandshakesPer56 and maxInboundHandshakesPer48 are the shares
+	// of an IPv6 source's /56 and /48 (see handshakeBlocks), ample for the
+	// several hosts of one home or office.
+	maxInboundHandshakesPer56 = 16
+	maxInboundHandshakesPer48 = 32
+)
+
+// ipv6HandshakeShares lists the blocks an IPv6 source is counted under, with
+// the share of the budget each may hold (see handshakeBlocks).
+var ipv6HandshakeShares = [...]struct {
+	bits  int
+	limit int
+}{
+	{64, maxInboundHandshakesPerSource},
+	{56, maxInboundHandshakesPer56},
+	{48, maxInboundHandshakesPer48},
+}
+
+// handshakeBlock is one address block a pre-handshake connection is counted
+// under, and the share of the budget the block may hold.
+type handshakeBlock struct {
+	prefix netip.Prefix
+	limit  int
+}
+
 func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	defer m.wg.Done()
 	defer conn.Close()
 
+	// With every established slot taken the peer could not be served anyway,
+	// so it is turned away before its handshake costs anything.
+	if len(m.globalInboundSlots) == cap(m.globalInboundSlots) {
+		return
+	}
+	select {
+	case m.inboundHandshakeSlots <- struct{}{}:
+	default:
+		return
+	}
+	src, hasSrc := handshakeSource(conn.RemoteAddr())
+	if hasSrc && !m.admitHandshakeSource(src) {
+		<-m.inboundHandshakeSlots
+		return
+	}
+	conn, handshake, sess := m.readRoutedHandshake(conn)
+	if hasSrc {
+		m.releaseHandshakeSource(src)
+	}
+	<-m.inboundHandshakeSlots
+	if sess == nil {
+		return
+	}
+
+	// Only a peer that named one of our torrents takes an established slot,
+	// held for the life of the connection.
 	select {
 	case m.globalInboundSlots <- struct{}{}:
 		defer func() { <-m.globalInboundSlots }()
 	default:
-		return
-	}
-
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	m.mu.RLock()
-	policy := m.encryptionPolicy
-	secrets := m.secretKeys
-	m.mu.RUnlock()
-
-	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, secretKeyIter(secrets...))
-	if err != nil {
-		return
-	}
-	handshake, err := peer.ParseHandshake(conn)
-	if err != nil {
-		return
-	}
-	if encrypted && !bytes.Equal(mseResult.SecretKey, handshake.InfoHash[:]) {
-		return
-	}
-
-	m.mu.RLock()
-	sess := m.sessions[fmt.Sprintf("%x", handshake.InfoHash)]
-	m.mu.RUnlock()
-	if sess == nil {
 		return
 	}
 
@@ -173,6 +223,121 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		)
 	}
 	sess.handleRoutedIncomingConnection(conn, handshake)
+}
+
+// handshakeSource returns the address a pre-handshake connection is counted
+// under: the remote IPv4 address, or the /64 of an IPv6 one, since one IPv6
+// host is routinely handed a whole /64 to pick source addresses from.
+func handshakeSource(addr net.Addr) (netip.Addr, bool) {
+	var ip netip.Addr
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip = a.AddrPort().Addr()
+	case *net.UDPAddr:
+		ip = a.AddrPort().Addr()
+	default:
+		return netip.Addr{}, false
+	}
+	ip = ip.Unmap().WithZone("")
+	if ip.Is6() {
+		prefix, err := ip.Prefix(64)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		ip = prefix.Addr()
+	}
+	return ip, ip.IsValid()
+}
+
+// handshakeBlocks returns the blocks a pre-handshake connection from src (see
+// handshakeSource) is counted under: an IPv4 host alone, holding
+// maxInboundHandshakesPerSource, or an IPv6 source's /64, /56 and /48, each
+// holding its share from ipv6HandshakeShares. ISPs routinely delegate a /56 or
+// a /48 to one subscriber, and tunnel brokers give a /48 away, so counting the
+// /64 alone let one subscriber hold the whole budget with 17 of its /64s. With
+// the /48 capped as well, one subscriber holds no more than one IPv4 host can.
+func handshakeBlocks(src netip.Addr) (blocks [len(ipv6HandshakeShares)]handshakeBlock, n int) {
+	if !src.Is6() {
+		blocks[0] = handshakeBlock{prefix: netip.PrefixFrom(src, src.BitLen()), limit: maxInboundHandshakesPerSource}
+		return blocks, 1
+	}
+	for i, share := range ipv6HandshakeShares {
+		// Prefix fails only for an invalid address or length, and src is a
+		// valid IPv6 address here.
+		prefix, _ := src.Prefix(share.bits)
+		blocks[i] = handshakeBlock{prefix: prefix, limit: share.limit}
+	}
+	return blocks, len(ipv6HandshakeShares)
+}
+
+// admitHandshakeSource counts one more pre-handshake connection from src. The
+// caller already holds a handshake slot. While fewer than half the budget's
+// handshakes are in flight any source is admitted, so a burst from one
+// address (a cross-seeding box dialing us for many torrents at once) is not
+// slowed; past that, a source any of whose blocks (handshakeBlocks) holds its
+// share is turned away. One host or subscriber holding idle sockets can then
+// take half the budget, not all of it, and the rest stays open to every other
+// peer.
+func (m *TorrentManager) admitHandshakeSource(src netip.Addr) bool {
+	blocks, n := handshakeBlocks(src)
+	m.handshakeSourcesMu.Lock()
+	defer m.handshakeSourcesMu.Unlock()
+	if m.sourcedHandshakes >= maxInboundHandshakes/2 {
+		for _, b := range blocks[:n] {
+			if m.handshakeSources[b.prefix] >= b.limit {
+				return false
+			}
+		}
+	}
+	for _, b := range blocks[:n] {
+		m.handshakeSources[b.prefix]++
+	}
+	m.sourcedHandshakes++
+	return true
+}
+
+func (m *TorrentManager) releaseHandshakeSource(src netip.Addr) {
+	blocks, n := handshakeBlocks(src)
+	m.handshakeSourcesMu.Lock()
+	defer m.handshakeSourcesMu.Unlock()
+	m.sourcedHandshakes--
+	for _, b := range blocks[:n] {
+		if c := m.handshakeSources[b.prefix]; c > 1 {
+			m.handshakeSources[b.prefix] = c - 1
+		} else {
+			delete(m.handshakeSources, b.prefix)
+		}
+	}
+}
+
+// readRoutedHandshake negotiates MSE and reads the BitTorrent handshake under
+// peerHandshakeTimeout, returning the session it names, or a nil session if
+// the peer fails to complete it or names a torrent we do not serve.
+func (m *TorrentManager) readRoutedHandshake(conn net.Conn) (net.Conn, *peer.Handshake, *Session) {
+	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
+	m.mu.RLock()
+	policy := m.encryptionPolicy
+	m.mu.RUnlock()
+
+	conn, mseResult, encrypted, err := negotiateIncomingPeerConn(conn, policy, m.secretKeys.lookup)
+	if err != nil {
+		return nil, nil, nil
+	}
+	handshake, err := peer.ParseHandshake(conn)
+	if err != nil {
+		return nil, nil, nil
+	}
+	if encrypted && !bytes.Equal(mseResult.SecretKey, handshake.InfoHash[:]) {
+		return nil, nil, nil
+	}
+
+	m.mu.RLock()
+	sess := m.sessions[fmt.Sprintf("%x", handshake.InfoHash)]
+	m.mu.RUnlock()
+	if sess == nil {
+		return nil, nil, nil
+	}
+	return conn, handshake, sess
 }
 
 func (m *TorrentManager) setAdvertisedPeerPort(port uint16) {

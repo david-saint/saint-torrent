@@ -15,6 +15,11 @@ const (
 	PEXFlagUTP       byte = 1 << 2
 
 	MaxPEXPeers = 1000
+
+	// MaxPEXMessageSize caps a ut_pex payload before it is decoded. MaxPEXPeers
+	// IPv6 entries plus their flags come to about 19 KiB, so this leaves ample
+	// headroom while keeping a peer from making us decode a large tree.
+	MaxPEXMessageSize = 64 * 1024
 )
 
 // PEXPeer is one peer endpoint in a BEP 11 Peer Exchange message.
@@ -33,6 +38,9 @@ type PEXMessage struct {
 // ParsePEXMessage parses a ut_pex payload. It supports compact IPv4
 // added/dropped lists plus their IPv6 counterparts (added6/dropped6).
 func ParsePEXMessage(data []byte) (*PEXMessage, error) {
+	if len(data) > MaxPEXMessageSize {
+		return nil, fmt.Errorf("PEX message too large: %d bytes", len(data))
+	}
 	decoded, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode PEX message: %w", err)

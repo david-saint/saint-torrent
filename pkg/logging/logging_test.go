@@ -85,6 +85,56 @@ func TestLoggerCreatesPrivateLogFile(t *testing.T) {
 	}
 }
 
+// TestLoggerWritesToStdStreams: --log /dev/stderr (or /dev/stdout) hands the
+// log to a container runtime or the journal. The no-follow open refused it,
+// since on Linux those paths are symlinks into /proc, and startup failed. They
+// now write to the process's own stream, which is never rotated or closed.
+func TestLoggerWritesToStdStreams(t *testing.T) {
+	for _, name := range []string{"/dev/stderr", "/dev/stdout"} {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stream := &os.Stderr
+		if name == "/dev/stdout" {
+			stream = &os.Stdout
+		}
+		saved := *stream
+		*stream = w
+
+		logger, err := New(Config{Path: name, Level: LevelDebug, MaxSizeBytes: 1, MaxBackups: 1})
+		*stream = saved
+		if err != nil {
+			t.Fatalf("New(%s): %v", name, err)
+		}
+		// Past the size limit: a stream is never rotated.
+		for i := 0; i < 2; i++ {
+			if err := logger.Log(LevelInfo, "stream_event"); err != nil {
+				t.Fatalf("%s: Log: %v", name, err)
+			}
+		}
+		if err := logger.Close(); err != nil {
+			t.Fatalf("%s: Close: %v", name, err)
+		}
+		// Closing the logger leaves the process's stream open.
+		if _, err := w.Write([]byte("after close\n")); err != nil {
+			t.Fatalf("%s: the stream was closed with the logger: %v", name, err)
+		}
+		_ = w.Close()
+		lines := 0
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			if strings.Contains(scanner.Text(), `"event":"stream_event"`) {
+				lines++
+			}
+		}
+		_ = r.Close()
+		if lines != 2 {
+			t.Fatalf("%s: %d events written to the stream, want 2", name, lines)
+		}
+	}
+}
+
 func TestLoggerRotatesFiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "debug.log")
 	logger, err := New(Config{Path: path, Level: LevelDebug, MaxSizeBytes: 240, MaxBackups: 2})

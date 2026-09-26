@@ -29,6 +29,18 @@ const (
 	// stream pauses on an odd packet; it is well under the retransmit timeout
 	// so it never provokes a spurious retransmit.
 	delayedAckTimeout = 5 * time.Millisecond
+
+	// ackNrSlack is how far an ack_nr may trail the highest one seen and
+	// still be believed. libutp and libtorrent allow 3; a little more lets a
+	// FIN or RESET reordered behind a few STATEs through, while a blind
+	// injector still has to hit a window of a few dozen values in 65536.
+	ackNrSlack = 16
+	// maxReorderDistance bounds how far past the next expected seq_nr an
+	// out-of-order packet is buffered. Our sender keeps at most
+	// sendWindowSize/maxPayloadSize (~890) packets in flight and a 1 MiB
+	// window of minimum-MTU packets is ~2000, so no legitimate packet is
+	// dropped while the pending map is capped at 4096 entries per conn.
+	maxReorderDistance = 4096
 )
 
 // ackDisposition tells handlePacket whether and how promptly a received packet
@@ -50,6 +62,13 @@ func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
 // Conn is a BEP 29 uTP stream exposed as a net.Conn.
+//
+// Sequence numbers follow libutp and libtorrent, which BEP 29's pseudo-code
+// does not pin down: localSeq is always the seq_nr the next DATA or FIN will
+// consume (a SYN consumes one too), and a STATE carries localSeq without
+// consuming it. A SYN-ACK's seq_nr is therefore the acceptor's first DATA
+// seq_nr, and the initiator acks seq_nr-1 until that DATA arrives. remoteSeq
+// is the last in-order seq_nr received, which every packet acks.
 type Conn struct {
 	socket *Socket
 	remote *net.UDPAddr
@@ -60,15 +79,16 @@ type Conn struct {
 	// Conn is published to Socket.conns and never mutated afterwards.
 	inbound bool
 
-	mu                sync.Mutex
-	localSeq          uint16
-	remoteSeq         uint16
-	remoteSeqSet      bool
-	stateSent         bool
+	mu        sync.Mutex
+	localSeq  uint16
+	remoteSeq uint16
+	// lastAck is the highest ack_nr the peer has sent, i.e. everything up to
+	// it has been received. Only acks in [lastAck-ackNrSlack, localSeq-1]
+	// can come from a peer that receives our packets (see ackInRangeLocked).
+	lastAck           uint16
 	established       chan struct{}
 	establishedClosed bool
 	establishErr      error
-	accepted          bool
 	pending           map[uint16][]byte
 	pendingBytes      int
 	pendingFin        bool
@@ -92,19 +112,30 @@ type Conn struct {
 }
 
 func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
-	seq := randomUint16()
-	return newConn(socket, remote, baseID+1, baseID, seq, 0, false)
+	// The SYN consumes the random initial seq_nr (see dial) and is not yet
+	// acknowledged.
+	synSeq := randomUint16()
+	c := newConn(socket, remote, baseID+1, baseID, synSeq+1, 0)
+	c.lastAck = synSeq - 1
+	return c
 }
 
-func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
-	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+// newInboundConn builds the Conn for an inbound connection whose initiator has
+// acknowledged our SYN-ACK (see Socket.promoteLocked), so it starts
+// established. synConnID and synSeq come from the initiator's SYN; localSeq is
+// the seq_nr our first DATA will carry.
+func newInboundConn(socket *Socket, remote *net.UDPAddr, synConnID, synSeq, localSeq uint16) *Conn {
+	c := newConn(socket, remote, synConnID, synConnID+1, localSeq, synSeq)
 	c.inbound = true
+	// Nothing of ours needs acking yet: the initiator's first ack is the
+	// localSeq-1 that promoted the conn.
+	c.lastAck = localSeq - 1
 	c.establishedClosed = true
 	close(c.established)
 	return c
 }
 
-func newConn(socket *Socket, remote *net.UDPAddr, sendID, recvID, localSeq, remoteSeq uint16, remoteSeqSet bool) *Conn {
+func newConn(socket *Socket, remote *net.UDPAddr, sendID, recvID, localSeq, remoteSeq uint16) *Conn {
 	return &Conn{
 		socket:           socket,
 		remote:           cloneUDPAddr(remote),
@@ -112,7 +143,6 @@ func newConn(socket *Socket, remote *net.UDPAddr, sendID, recvID, localSeq, remo
 		recvID:           recvID,
 		localSeq:         localSeq,
 		remoteSeq:        remoteSeq,
-		remoteSeqSet:     remoteSeqSet,
 		established:      make(chan struct{}),
 		pending:          make(map[uint16][]byte),
 		waiters:          make(map[uint16]chan struct{}),
@@ -134,7 +164,7 @@ func (c *Conn) dial(ctx context.Context) error {
 			}
 			return err
 		}
-		p := c.packetLocked(packetTypeSyn, c.localSeq, nil)
+		p := c.packetLocked(packetTypeSyn, c.localSeq-1, nil)
 		c.mu.Unlock()
 
 		if err := c.socket.writePacket(p, c.remote); err != nil {
@@ -167,19 +197,40 @@ func (c *Conn) dial(ctx context.Context) error {
 }
 
 func (c *Conn) handlePacket(p packet) {
-	if p.typ != packetTypeSyn {
-		c.mu.Lock()
-		c.processAckLocked(p.ackNr)
-		c.mu.Unlock()
-	}
-
 	switch p.typ {
 	case packetTypeSyn:
 		if c.handleSyn(p) {
 			c.flushAck()
 		}
+		return
+	case packetTypeReset:
+		if c.resetPlausible(p.ackNr) {
+			c.closeWithError(errReset, false)
+		}
+		return
+	}
+
+	// An ack beyond what we sent, or far behind what the peer already acked,
+	// is not from a peer that receives our packets: acting on it would let a
+	// blind injector complete our writes. It is ignored, but in-order payload
+	// on the same packet is still delivered; a FIN with such an ack is dropped
+	// like a RESET would be.
+	c.mu.Lock()
+	ackOK := c.ackInRangeLocked(p.ackNr, c.localSeq-1)
+	if ackOK {
+		c.processAckLocked(p.ackNr)
+	}
+	c.mu.Unlock()
+
+	switch p.typ {
 	case packetTypeState:
-		c.handleState(p)
+		if ackOK && c.handleState(p) {
+			// Complete the handshake at once, like TCP's final ACK: an
+			// acceptor keeps the conn half-open until something acks its
+			// SYN-ACK, so this lets it hand the conn to Accept before our
+			// first write.
+			c.flushAck()
+		}
 	case packetTypeData:
 		switch c.handleData(p) {
 		case ackImmediate:
@@ -188,16 +239,33 @@ func (c *Conn) handlePacket(p packet) {
 			c.scheduleAck()
 		}
 	case packetTypeFin:
-		if c.handleFin(p) {
+		if ackOK && c.handleFin(p) {
 			c.flushAck()
 		}
-	case packetTypeReset:
-		c.closeWithError(errReset, false)
 	}
 }
 
+// ackInRangeLocked reports whether ack lies in [lastAck-ackNrSlack, hi]. The
+// uint16 subtraction keeps the window test correct across wraparound.
+func (c *Conn) ackInRangeLocked(ack, hi uint16) bool {
+	lo := c.lastAck - ackNrSlack
+	return ack-lo <= hi-lo
+}
+
+// resetPlausible reports whether a RESET's ack_nr names a packet we sent. A
+// peer that lost our connection resets it with ack_nr set to the seq_nr of
+// the packet it could not place, which is at most localSeq (the seq_nr our
+// STATEs carry); anything else is a blind guess at the connection id.
+func (c *Conn) resetPlausible(ack uint16) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ackInRangeLocked(ack, c.localSeq)
+}
+
 // handleSyn is meaningful only for an inbound conn; a SYN reaching any other
-// Conn is ignored. It reports whether a STATE ack is owed.
+// Conn is ignored. The first SYN was answered while the connection was still
+// half-open, so one reaching the Conn is a retransmit and only needs a re-ack.
+// It reports whether a STATE ack is owed.
 func (c *Conn) handleSyn(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -205,43 +273,44 @@ func (c *Conn) handleSyn(p packet) bool {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	// Only the first SYN sets sequence state; a retransmit just re-acks.
-	if !c.stateSent {
-		c.remoteSeq = p.seqNr
-		c.remoteSeqSet = true
-		c.stateSent = true
-		c.localSeq++
-	}
 	return true
 }
 
-func (c *Conn) handleState(p packet) {
+// handleState reports whether p was the SYN-ACK that established this
+// outbound conn: only a STATE acking our SYN's own seq_nr is.
+func (c *Conn) handleState(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return
+		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	if !c.establishedClosed {
-		c.remoteSeq = p.seqNr
-		c.remoteSeqSet = true
-		c.localSeq++
-		c.establishedClosed = true
-		close(c.established)
+	if c.establishedClosed || p.ackNr != c.localSeq-1 {
+		return false
 	}
+	// The SYN-ACK's seq_nr is the acceptor's first DATA seq_nr, so
+	// everything before it counts as received.
+	c.remoteSeq = p.seqNr - 1
+	c.establishedClosed = true
+	close(c.established)
+	return true
+}
+
+// inReorderWindowLocked reports whether seq is ahead of the next expected
+// seq_nr by no more than maxReorderDistance.
+func (c *Conn) inReorderWindowLocked(seq uint16) bool {
+	d := seq - c.remoteSeq
+	return d > 1 && d <= maxReorderDistance
 }
 
 func (c *Conn) handleData(p packet) ackDisposition {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	// Until the SYN-ACK arrives there is no stream position to place DATA at.
+	if c.closed || !c.establishedClosed {
 		return ackNone
 	}
 	c.updateTimestampDiffLocked(p)
-	if !c.remoteSeqSet {
-		c.remoteSeq = p.seqNr - 1
-		c.remoteSeqSet = true
-	}
 	next := c.remoteSeq + 1
 	switch {
 	case p.seqNr == next:
@@ -272,6 +341,12 @@ func (c *Conn) handleData(p packet) ackDisposition {
 		c.applyPendingFinLocked()
 		return ackCoalesce
 	case seqLT(next, p.seqNr):
+		if !c.inReorderWindowLocked(p.seqNr) {
+			// Further ahead than any window a real sender keeps in flight:
+			// buffering it would only let a peer grow the pending map with
+			// tiny packets, so it is dropped without an ack.
+			return ackNone
+		}
 		if _, exists := c.pending[p.seqNr]; !exists && c.canBufferLocked(len(p.payload)) {
 			c.pending[p.seqNr] = append([]byte(nil), p.payload...)
 			c.pendingBytes += len(p.payload)
@@ -286,23 +361,31 @@ func (c *Conn) handleData(p packet) ackDisposition {
 	}
 }
 
+// handleFin accepts the FIN at the next expected seq_nr, parks one that is
+// ahead within the reorder window until the gap fills, and re-acks a
+// retransmit of the FIN already applied. Any other seq_nr is no FIN the peer
+// can have sent, so it is dropped rather than ending the stream.
 func (c *Conn) handleFin(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || !c.establishedClosed {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	if !c.remoteSeqSet || p.seqNr == c.remoteSeq+1 || seqLTE(p.seqNr, c.remoteSeq) {
-		if !c.remoteSeqSet || p.seqNr == c.remoteSeq+1 {
-			c.remoteSeq = p.seqNr
-			c.remoteSeqSet = true
-		}
+	switch {
+	case p.seqNr == c.remoteSeq+1:
+		c.remoteSeq = p.seqNr
 		c.remoteClosed = true
 		c.signalReadLocked()
-	} else if !c.pendingFin || seqLT(p.seqNr, c.pendingFinSeq) {
-		c.pendingFin = true
-		c.pendingFinSeq = p.seqNr
+	case p.seqNr == c.remoteSeq && c.remoteClosed:
+		// Our ack of the FIN was lost; the re-ack below replaces it.
+	case c.inReorderWindowLocked(p.seqNr):
+		if !c.pendingFin || seqLT(p.seqNr, c.pendingFinSeq) {
+			c.pendingFin = true
+			c.pendingFinSeq = p.seqNr
+		}
+	default:
+		return false
 	}
 	return true
 }
@@ -328,8 +411,12 @@ func (c *Conn) updateTimestampDiffLocked(p packet) {
 // the cumulative ack. Waiters are assigned in increasing seq order, so instead
 // of scanning the whole map (O(window) per incoming packet) we walk forward
 // from the oldest outstanding seq and touch only the newly-acked entries. The
-// walk is bounded by localSeq so a bogus far-future ack cannot loop.
+// walk is bounded by localSeq so a bogus far-future ack cannot loop. Callers
+// pass only acks that passed ackInRangeLocked.
 func (c *Conn) processAckLocked(ack uint16) {
+	if seqLT(c.lastAck, ack) {
+		c.lastAck = ack
+	}
 	if len(c.waiters) == 0 {
 		return
 	}
@@ -361,6 +448,14 @@ func (c *Conn) packetLocked(typ packetType, seq uint16, payload []byte) packet {
 	}
 }
 
+// statePacketLocked builds a STATE. Like libutp's, it carries the next
+// seq_nr we will send without consuming it: a receiver that has everything
+// we sent sees it as the next expected seq_nr, while one carrying the last
+// consumed seq_nr would be discarded by libutp as an old packet, ack and all.
+func (c *Conn) statePacketLocked() packet {
+	return c.packetLocked(packetTypeState, c.localSeq, nil)
+}
+
 func (c *Conn) packetForSeq(typ packetType, seq uint16, payload []byte) packet {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -388,8 +483,7 @@ func (c *Conn) flushAck() {
 	if c.ackTimer != nil {
 		c.ackTimer.Stop()
 	}
-	seq := c.localSeq - 1
-	p := c.packetLocked(packetTypeState, seq, nil)
+	p := c.statePacketLocked()
 	c.mu.Unlock()
 	_ = c.socket.writePacket(p, c.remote)
 }
@@ -410,8 +504,7 @@ func (c *Conn) scheduleAck() {
 		if c.ackTimer != nil {
 			c.ackTimer.Stop()
 		}
-		seq := c.localSeq - 1
-		p := c.packetLocked(packetTypeState, seq, nil)
+		p := c.statePacketLocked()
 		c.mu.Unlock()
 		_ = c.socket.writePacket(p, c.remote)
 		return
@@ -440,8 +533,7 @@ func (c *Conn) flushDelayedAck() {
 		return
 	}
 	c.unsentAcks = 0
-	seq := c.localSeq - 1
-	p := c.packetLocked(packetTypeState, seq, nil)
+	p := c.statePacketLocked()
 	c.mu.Unlock()
 	_ = c.socket.writePacket(p, c.remote)
 }
@@ -817,18 +909,6 @@ func (c *Conn) closeWithError(err error, sendFin bool) {
 		}
 		c.socket.unregister(c)
 	})
-}
-
-func (c *Conn) isAccepted() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.accepted
-}
-
-func (c *Conn) markAccepted() {
-	c.mu.Lock()
-	c.accepted = true
-	c.mu.Unlock()
 }
 
 func (c *Conn) signalReadLocked() {

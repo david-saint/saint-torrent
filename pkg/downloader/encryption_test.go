@@ -75,7 +75,7 @@ func TestConnectToPeerWithRequiredEncryption(t *testing.T) {
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
-		wrapped, _, err := mse.Receive(conn, secretKeyIter(sess.Torrent.InfoHash), mse.SelectRC4)
+		wrapped, _, err := mse.Receive(conn, mse.SecretKeys(sess.Torrent.InfoHash[:]), mse.SelectRC4)
 		if err != nil {
 			serverDone <- fmt.Errorf("receive MSE: %w", err)
 			return
