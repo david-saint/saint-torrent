@@ -236,3 +236,28 @@ func TestTrackerPeerAllowed(t *testing.T) {
 		t.Error("port 0 was allowed")
 	}
 }
+
+// TestDHTPeerOwnEndpointIsDropped covers DHT nodes echoing our own announce back
+// in get_peers values: our NAT-mapped external address with our advertised port
+// is never dialed.
+func TestDHTPeerOwnEndpointIsDropped(t *testing.T) {
+	m := &TorrentManager{advertisedPeerPort: 6881}
+	if m.isOwnPeerEndpointLocked(net.ParseIP("203.0.113.5"), 6881) {
+		t.Fatal("an endpoint was taken as ours without a known external address")
+	}
+	m.natStatus.ExternalIP = "203.0.113.5"
+	for _, c := range []struct {
+		ip   net.IP
+		port uint16
+		want bool
+	}{
+		{net.ParseIP("203.0.113.5").To4(), 6881, true},
+		{net.ParseIP("::ffff:203.0.113.5"), 6881, true},
+		{net.ParseIP("203.0.113.5"), 6882, false},
+		{net.ParseIP("203.0.113.6"), 6881, false},
+	} {
+		if got := m.isOwnPeerEndpointLocked(c.ip, c.port); got != c.want {
+			t.Errorf("isOwnPeerEndpointLocked(%v, %d) = %v, want %v", c.ip, c.port, got, c.want)
+		}
+	}
+}
