@@ -2,14 +2,12 @@ package downloader
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-netroute"
 	"sainttorrent/pkg/logging"
 )
 
@@ -90,24 +88,8 @@ func (d *natDiscovery) discover(ctx context.Context) (portMapper, error) {
 	return nil, fmt.Errorf("no UPnP IGD or NAT-PMP service on gateway %s: %w", gateway, upnpErr)
 }
 
-// natRouteProbe is a public (TEST-NET-3) destination whose route is the
-// default route. go-netroute refuses to route 0.0.0.0 itself on Linux.
-var natRouteProbe = net.IPv4(203, 0, 113, 1)
-
-func defaultGatewayIPv4() (net.IP, error) {
-	router, err := netroute.New()
-	if err != nil {
-		return nil, err
-	}
-	_, gateway, _, err := router.Route(natRouteProbe)
-	if err != nil {
-		return nil, err
-	}
-	if gateway = gateway.To4(); gateway == nil || gateway.IsUnspecified() {
-		return nil, errors.New("no IPv4 default gateway")
-	}
-	return gateway, nil
-}
+// defaultGatewayIPv4 lives in nat_route_netroute.go, or nat_route_stub.go on
+// platforms go-netroute does not support.
 
 // localAddrToward returns the local address the kernel uses to reach gateway:
 // the address SSDP is sent from and mappings point at. Connecting a UDP socket
