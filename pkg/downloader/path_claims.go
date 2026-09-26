@@ -71,6 +71,28 @@ func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []s
 	return m.releaseFunc(keys), nil
 }
 
+// claimFreePaths reserves, for a deletion, the relPaths under baseDir that no
+// other torrent holds. Those are returned in free and stay reserved until
+// release, so no torrent can be added on them while they are deleted; the
+// others are returned in kept.
+func (m *TorrentManager) claimFreePaths(infoHash [20]byte, baseDir string, relPaths []string) (free, kept []string, release func()) {
+	keys := pathClaimKeys(baseDir, relPaths)
+	freeKeys := make([]pathClaimKey, 0, len(keys))
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	for i, key := range keys {
+		if c, ok := m.pathClaims[key]; ok && c.infoHash != infoHash {
+			kept = append(kept, relPaths[i])
+			continue
+		}
+		free = append(free, relPaths[i])
+		freeKeys = append(freeKeys, key)
+	}
+	m.addClaimsLocked(infoHash, freeKeys)
+	return free, kept, m.releaseFunc(freeKeys)
+}
+
 func (m *TorrentManager) addClaimsLocked(infoHash [20]byte, keys []pathClaimKey) {
 	if m.pathClaims == nil {
 		m.pathClaims = make(map[pathClaimKey]pathClaim, len(keys))
