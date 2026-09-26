@@ -546,3 +546,41 @@ func quarantineNote(crash crashFile) string {
 	return fmt.Sprintf("saintTorrent crashed (%s) while running this torrent, so it was restored paused "+
 		"and is not checked until you resume it. Crash details: %s", crash.component, crash.path)
 }
+
+// removeStaleTempFiles deletes the temporary files atomicWriteFile leaves
+// behind when the process dies between creating one and renaming it into
+// place: .session.json.tmp-*, .running.tmp-* and .crash-state.json.tmp-* in
+// stateDir, and .*.tmp-* in torrentsDir. Only regular files are removed.
+func removeStaleTempFiles(stateDir, torrentsDir string) {
+	stateTemps := []string{
+		"." + "session.json" + ".tmp-",
+		"." + sentinelName + ".tmp-",
+		"." + crashStateName + ".tmp-",
+	}
+	removeMatching := func(dir string, match func(name string) bool) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if !match(e.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	removeMatching(stateDir, func(name string) bool {
+		for _, prefix := range stateTemps {
+			if strings.HasPrefix(name, prefix) {
+				return true
+			}
+		}
+		return false
+	})
+	removeMatching(torrentsDir, func(name string) bool {
+		return strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp-")
+	})
+}

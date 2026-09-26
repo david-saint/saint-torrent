@@ -1887,3 +1887,52 @@ func TestRunningSentinelLifecycle(t *testing.T) {
 		t.Fatalf("crash state %s, want no crash counted", data)
 	}
 }
+
+// TestEnablePersistenceRemovesStaleTempFiles: a crash between creating a
+// temporary state file and renaming it leaves it behind; the next start
+// removes those, and only those.
+func TestEnablePersistenceRemovesStaleTempFiles(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "config")
+	torrentsDir := filepath.Join(stateDir, "torrents")
+	if err := os.MkdirAll(torrentsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path string) string {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	stale := []string{
+		write(filepath.Join(stateDir, ".session.json.tmp-123")),
+		write(filepath.Join(stateDir, ".running.tmp-4")),
+		write(filepath.Join(stateDir, ".crash-state.json.tmp-5")),
+		write(filepath.Join(torrentsDir, "."+strings.Repeat("ab", 20)+".torrent.tmp-678")),
+	}
+	kept := []string{
+		write(filepath.Join(stateDir, "notes.tmp-1")),
+		write(filepath.Join(stateDir, ".other.tmp-1")),
+		write(filepath.Join(torrentsDir, strings.Repeat("cd", 20)+".torrent")),
+	}
+	dirNamedLikeTemp := filepath.Join(stateDir, ".session.json.tmp-dir")
+	if err := os.Mkdir(dirNamedLikeTemp, 0700); err != nil {
+		t.Fatal(err)
+	}
+	kept = append(kept, dirNamedLikeTemp)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range stale {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("stale temporary file %s survived: %v", filepath.Base(path), err)
+		}
+	}
+	for _, path := range kept {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("%s was removed: %v", filepath.Base(path), err)
+		}
+	}
+}

@@ -1271,6 +1271,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 		return "", fmt.Errorf("failed to create persistence directories: %w", err)
 	}
 	_ = os.Chmod(torrentsDir, 0700)
+	// A crash between creating a temporary file and renaming it into place
+	// leaves the temporary file behind.
+	removeStaleTempFiles(stateDir, torrentsDir)
 
 	// Work out what the last run left behind before this one marks itself as
 	// running: the sentinel must be in place before restoring, which can crash
