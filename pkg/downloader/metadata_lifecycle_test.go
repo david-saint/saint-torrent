@@ -269,3 +269,41 @@ func TestPieceCompletingWhileClosingIsDropped(t *testing.T) {
 		t.Fatal("a piece completed while closing re-armed the resume checkpoint")
 	}
 }
+
+// hugePieceStorage reports a piece length no buffer can hold.
+type hugePieceStorage struct{ storage.Storage }
+
+func (hugePieceStorage) PieceLengthValue() int64 { return 1 << 62 }
+
+// TestPieceBufferRefusesUnallocatableLengths: getPieceBuf rounded every buffer
+// up to the storage's piece length, so a one-block piece of a torrent declaring
+// a 2^62-byte piece length died in make() on the peer goroutine, taking the
+// whole process down.
+func TestPieceBufferRefusesUnallocatableLengths(t *testing.T) {
+	sess := &Session{Storage: hugePieceStorage{}}
+	bp := sess.getPieceBuf(BlockSize)
+	if len(*bp) != BlockSize || cap(*bp) != BlockSize {
+		t.Fatalf("buffer len=%d cap=%d, want exactly one block", len(*bp), cap(*bp))
+	}
+	sess.putPieceBuf(bp)
+
+	for _, length := range []int64{-1, torrent.MaxPieceLength + 1, 1 << 62} {
+		if bp := sess.getPieceBuf(length); len(*bp) != 0 {
+			t.Fatalf("getPieceBuf(%d) returned %d bytes, want an empty buffer", length, len(*bp))
+		}
+	}
+}
+
+// BenchmarkPieceBufBorrow measures the per-piece borrow and return on the
+// piece completion path.
+func BenchmarkPieceBufBorrow(b *testing.B) {
+	st, err := storage.NewMemStorage(b.TempDir(), []storage.FileInfo{{Path: "bench.bin", Length: 1 << 20}}, 1<<20)
+	if err != nil {
+		b.Fatal(err)
+	}
+	sess := &Session{Storage: st}
+	b.ReportAllocs()
+	for b.Loop() {
+		sess.putPieceBuf(sess.getPieceBuf(1 << 20))
+	}
+}

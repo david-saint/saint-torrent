@@ -356,10 +356,23 @@ func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
 	return s.Torrent == nil || !s.Torrent.Private
 }
 
+// maxPieceBufLen bounds one piece-assembly buffer. torrent.Parse already refuses
+// longer pieces; this keeps a Session built from any other Torrent or Storage
+// from panicking in make() (a length past int on 32-bit builds) or aborting the
+// process with an out-of-memory no recover can catch.
+const maxPieceBufLen = torrent.MaxPieceLength
+
 // getPieceBuf borrows a piece-assembly buffer sliced to exactly length. Buffers
 // are allocated at the standard piece length so every piece but the last reuses
 // them directly; putPieceBuf (from the write worker) returns them afterward.
 func (s *Session) getPieceBuf(length int64) *[]byte {
+	if length < 0 || length > maxPieceBufLen {
+		// Not allocatable as one buffer. An empty one fails the caller's
+		// assembly check, which returns the piece to the picker instead of
+		// crashing the peer goroutine and with it the whole process.
+		empty := []byte{}
+		return &empty
+	}
 	if v := s.pieceBufPool.Get(); v != nil {
 		bp := v.(*[]byte)
 		if int64(cap(*bp)) >= length {
@@ -371,7 +384,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 	// individual piece) so the buffer is reusable for subsequent full pieces.
 	n := length
 	if s.Storage != nil {
-		if std := s.Storage.PieceLengthValue(); std > n {
+		if std := s.Storage.PieceLengthValue(); std > n && std <= maxPieceBufLen {
 			n = std
 		}
 	}
@@ -383,7 +396,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 // putPieceBuf returns a piece-assembly buffer to the pool, restored to full
 // capacity so the next borrow can slice it to any piece length.
 func (s *Session) putPieceBuf(bp *[]byte) {
-	if bp == nil {
+	if bp == nil || cap(*bp) == 0 {
 		return
 	}
 	*bp = (*bp)[:cap(*bp)]
