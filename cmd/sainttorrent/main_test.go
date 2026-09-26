@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -297,6 +298,24 @@ func TestTUIStartupLineIncludesInfos(t *testing.T) {
 	}
 	if got := tuiStartupLine(nil, nil); got != "" {
 		t.Fatalf("empty startup line = %q", got)
+	}
+}
+
+// A LAN host can put escape sequences into malformed SSDP replies, which
+// goupnp logs through the standard logger; nothing may reach stderr.
+func TestRedirectStdLogKeepsDependencyLogsOffTheTerminal(t *testing.T) {
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+
+	redirectStdLog()
+	if log.Writer() != logging.StdLogWriter() {
+		t.Fatalf("standard logger writes to %T; want the debug-log writer", log.Writer())
+	}
+	if log.Writer() == io.Writer(os.Stderr) {
+		t.Fatal("standard logger still writes to stderr")
 	}
 }
 

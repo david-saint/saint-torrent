@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -1647,6 +1648,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer logging.Close()
+	redirectStdLog()
 
 	downloadPaths := downloadPathOptions{
 		primary:   opts.downloadDir,
@@ -2044,6 +2046,15 @@ func main() {
 		perfReport(os.Stderr)
 		os.Exit(0)
 	}
+}
+
+// redirectStdLog routes the standard library logger into the debug log. It
+// must run before NAT and DHT start: dependencies such as goupnp log raw
+// bytes from LAN replies through it, which would otherwise be written to the
+// terminal under the TUI with any escape sequences intact.
+func redirectStdLog() {
+	log.SetFlags(0) // debug log lines carry their own timestamp
+	log.SetOutput(logging.StdLogWriter())
 }
 
 func waitForShutdownSignal() {
