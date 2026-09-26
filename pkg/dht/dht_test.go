@@ -405,10 +405,12 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 	go func() {
 		defer close(queriesCh)
 
+		// Serve until the lookup announces, or until it has been quiet for
+		// a while: a fixed total window flaked on loaded CI machines.
+		const quiet = 2 * time.Second
 		buf := make([]byte, 2048)
-		deadline := time.Now().Add(700 * time.Millisecond)
 		for {
-			_ = server.SetReadDeadline(deadline)
+			_ = server.SetReadDeadline(time.Now().Add(quiet))
 			n, addr, err := server.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -462,6 +464,9 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 				return
 			}
 			_, _ = server.WriteToUDP(payload, addr)
+			if query == "announce_peer" {
+				return
+			}
 		}
 	}()
 
@@ -477,7 +482,7 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 			queries = append(queries, query)
 		case err := <-errCh:
 			t.Fatalf("test DHT node failed: %v", err)
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("timed out waiting for DHT lookup queries")
 		}
 	}
