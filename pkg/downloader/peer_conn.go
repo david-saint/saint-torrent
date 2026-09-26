@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/logging"
@@ -3275,19 +3276,79 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 	return stats
 }
 
+// DHT lookup cadence (see dhtLoop). Every torrent used to look up 1 s after
+// start and every 30 s after that, seeding or not, so a restart with many
+// torrents sent hundreds of lookups in the same second, again every 30 s in
+// lockstep, and libtorrent nodes' DoS blockers began ignoring us. Vars so tests
+// can shorten them; treat them as constants.
+var (
+	// dhtFirstLookupDelay is how soon a session first looks up its torrent. A
+	// magnet fetching metadata does so right then; any other session adds a
+	// random spread of up to dhtStartupSpreadStep per running DHT loop (at most
+	// dhtStartupSpreadMax), so restored torrents start, and stay, out of phase.
+	dhtFirstLookupDelay  = time.Second
+	dhtStartupSpreadStep = 250 * time.Millisecond
+	dhtStartupSpreadMax  = time.Minute
+	// Intervals between lookups, each jittered by ±20%: while fetching
+	// metadata; while downloading with fewer than dhtWellConnectedPeers
+	// connections; and while seeding or well connected, when the swarm keeps
+	// finding us anyway (libtorrent's dht_announce_interval is 15 minutes).
+	dhtMetadataLookupInterval = 30 * time.Second
+	dhtDownloadLookupInterval = time.Minute
+	dhtIdleLookupInterval     = 15 * time.Minute
+	// dhtResumeLookupDelay is how soon after a resume the next lookup runs,
+	// plus up to as long again at random.
+	dhtResumeLookupDelay = time.Second
+)
+
+// dhtWellConnectedPeers is the connection count from which a downloading
+// session looks up as rarely as a seed.
+const dhtWellConnectedPeers = 50
+
+// dhtLoopsRunning counts the running dhtLoops of every session; it sizes the
+// spread of first lookups.
+var dhtLoopsRunning atomic.Int32
+
+// startDHTLookup starts a get_peers lookup for infoHash, announcing peerPort
+// when announce is set. A var so tests can observe lookups.
+var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, announce bool) {
+	d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: announce})
+}
+
+// dhtLoop looks the torrent up on the DHT on the cadence dhtLookupIntervalLocked
+// picks, and soon after a resume.
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	running := dhtLoopsRunning.Add(1)
+	defer dhtLoopsRunning.Add(-1)
 
-	// Initial lookup
-	select {
-	case <-time.After(1 * time.Second):
-	case <-s.ctx.Done():
-		return
-	}
 	s.mu.RLock()
-	paused := s.paused
+	metadataMode := s.metadataMode
+	s.mu.RUnlock()
+	timer := time.NewTimer(dhtFirstLookupAfter(metadataMode, running))
+	defer timer.Stop()
+	for {
+		_, pauseChanged := s.pauseStateSignal()
+		select {
+		case <-timer.C:
+			timer.Reset(s.dhtLookupTick())
+		case <-pauseChanged:
+			// Lookups are skipped while paused; after a resume the next one runs
+			// soon instead of up to a whole interval later.
+			if paused, _ := s.pauseStateSignal(); !paused {
+				timer.Reset(dhtResumeLookupDelay + randDuration(dhtResumeLookupDelay))
+			}
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// dhtLookupTick runs one lookup unless the session is paused or cannot use
+// peers, and returns the delay until the next tick.
+func (s *Session) dhtLookupTick() time.Duration {
+	s.mu.RLock()
+	interval, skip := s.dhtLookupIntervalLocked()
 	d := s.DHT
 	peerPort := s.Port
 	hasInbound := s.hasInboundListenerLocked()
@@ -3299,32 +3360,50 @@ func (s *Session) dhtLoop() {
 	}
 	s.mu.RUnlock()
 
-	if !paused && d != nil && hasTorrent && hasInbound {
-		d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
+	if !skip && d != nil && hasTorrent && hasInbound {
+		startDHTLookup(d, infoHash, peerPort, allowAnnounce)
 	}
+	return jitterDHTInterval(interval)
+}
 
-	for {
-		select {
-		case <-ticker.C:
-			s.mu.RLock()
-			paused = s.paused || s.metadataStalledLocked()
-			d = s.DHT
-			peerPort = s.Port
-			hasInbound = s.hasInboundListenerLocked()
-			hasTorrent = s.Torrent != nil
-			allowAnnounce = s.allowsDHTAnnounceLocked()
-			if hasTorrent {
-				infoHash = s.Torrent.InfoHash
-			}
-			s.mu.RUnlock()
-
-			if !paused && d != nil && hasTorrent && hasInbound {
-				d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
-			}
-		case <-s.ctx.Done():
-			return
-		}
+// dhtLookupIntervalLocked returns the time from one DHT lookup to the next,
+// and whether to skip lookups for now (paused, or metadata-stalled), in which
+// case it is when to check again. Caller holds s.mu (read or write).
+func (s *Session) dhtLookupIntervalLocked() (interval time.Duration, skip bool) {
+	switch {
+	case s.paused || s.metadataStalledLocked():
+		return dhtMetadataLookupInterval, true
+	case s.metadataMode:
+		return dhtMetadataLookupInterval, false
+	case s.isCompletedLocked() || len(s.activePeers) >= dhtWellConnectedPeers:
+		return dhtIdleLookupInterval, false
+	default:
+		return dhtDownloadLookupInterval, false
 	}
+}
+
+// dhtFirstLookupAfter is the delay before a session's first DHT lookup, with
+// running DHT loops in the process (this one included).
+func dhtFirstLookupAfter(metadataMode bool, running int32) time.Duration {
+	if metadataMode {
+		return dhtFirstLookupDelay
+	}
+	spread := min(time.Duration(max(running, 1))*dhtStartupSpreadStep, dhtStartupSpreadMax)
+	return dhtFirstLookupDelay + randDuration(spread)
+}
+
+// jitterDHTInterval spreads d uniformly over ±20%, so sessions that started
+// together drift apart.
+func jitterDHTInterval(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
+
+// randDuration returns a uniformly random duration in [0, d), or 0 when d <= 0.
+func randDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return rand.N(d)
 }
 
 // AddPeerFromDiscovery adds a peer learned via a decentralized discovery mechanism
