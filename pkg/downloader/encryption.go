@@ -17,6 +17,8 @@ import (
 
 const peerHandshakeTimeout = 10 * time.Second
 
+var errPlaintextRefused = errors.New("plaintext peer refused: encryption is required")
+
 type bufferedConn struct {
 	net.Conn
 	r *bufio.Reader
@@ -131,14 +133,18 @@ func negotiateIncomingPeerConn(conn net.Conn, policy mse.Policy, secrets mse.Sec
 	if policy == mse.PolicyDisable {
 		return buffered, mse.Result{}, false, nil
 	}
-	if policy == mse.PolicyPrefer {
-		prefix, err := buffered.Peek(mse.PlaintextHandshakePrefixLen())
-		if err != nil {
-			return nil, mse.Result{}, false, err
+	// A plaintext handshake is served under prefer and refused at once
+	// otherwise: the MSE receiver waits for a 96-byte key a plaintext peer
+	// never sends, so it would sit in a handshake slot until the deadline.
+	prefix, err := buffered.Peek(mse.PlaintextHandshakePrefixLen())
+	if err != nil {
+		return nil, mse.Result{}, false, err
+	}
+	if mse.LooksLikePlaintextHandshake(prefix) {
+		if policy != mse.PolicyPrefer {
+			return nil, mse.Result{}, false, errPlaintextRefused
 		}
-		if mse.LooksLikePlaintextHandshake(prefix) {
-			return buffered, mse.Result{}, false, nil
-		}
+		return buffered, mse.Result{}, false, nil
 	}
 
 	wrapped, res, err := mse.Receive(buffered, secrets, mse.SelectRC4)

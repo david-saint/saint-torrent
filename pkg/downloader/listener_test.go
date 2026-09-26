@@ -338,6 +338,38 @@ func TestInboundHandshakeBudgetIsBounded(t *testing.T) {
 	handshakeWith(t, port, sess.Torrent.InfoHash)
 }
 
+// TestRequiredEncryptionRefusesPlaintextAtOnce checks that under
+// PolicyRequire a plaintext handshake is refused as soon as it is
+// recognised. The MSE receiver reads the initiator's key first, which a
+// plaintext peer never sends, so the connection used to sit in a handshake
+// slot for the whole peerHandshakeTimeout.
+func TestRequiredEncryptionRefusesPlaintextAtOnce(t *testing.T) {
+	mgr := NewTorrentManager()
+	mgr.SetEncryptionPolicy(mse.PolicyRequire)
+	if err := mgr.StartPeerListener(0); err != nil {
+		t.Fatalf("start shared listener: %v", err)
+	}
+	t.Cleanup(mgr.Close)
+	sess := newEncryptionTestManagedSession(t, mgr, "require-plaintext")
+
+	conn := dialIdle(t, mgr.PeerListenPort())
+	hs := &peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: sess.Torrent.InfoHash, PeerID: [20]byte{5}}
+	if _, err := conn.Write(hs.Serialize()); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+	start := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(peerHandshakeTimeout))
+	if n, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatalf("plaintext handshake was answered with %d bytes under PolicyRequire", n)
+	}
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("plaintext peer was held for %v before being refused", waited)
+	}
+	waitForCondition(t, "the handshake slot to be released", func() bool {
+		return len(mgr.inboundHandshakeSlots) == 0
+	})
+}
+
 func TestManagerSecretKeysSnapshotTracksSessionLifecycle(t *testing.T) {
 	mgr := NewTorrentManager()
 
