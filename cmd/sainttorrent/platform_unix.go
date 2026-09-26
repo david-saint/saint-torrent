@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func acquireLock(lockPath string) (*os.File, error) {
@@ -14,7 +16,8 @@ func acquireLock(lockPath string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open lock file: %w", err)
 	}
-	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	// x/sys/unix, not syscall: the standard library has no Flock on solaris.
+	err = unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	if err != nil {
 		_ = file.Close()
 		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
