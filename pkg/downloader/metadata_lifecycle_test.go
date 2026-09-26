@@ -1,7 +1,9 @@
 package downloader
 
 import (
+	"bytes"
 	"crypto/sha1"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -316,5 +318,97 @@ func BenchmarkPieceBufBorrow(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		sess.putPieceBuf(sess.getPieceBuf(1 << 20))
+	}
+}
+
+// TestMagnetStorageFailureKeepsVerifiedMetadata: a storage failure after the
+// metadata verified discarded the whole accumulator, so every peer that
+// connected afterwards was asked for the full metadata again, only for the
+// build to fail the same way. A magnet whose files another torrent holds
+// (which a restore now falls back to) re-downloaded its metadata from the swarm
+// for as long as it ran. The verified bytes must be kept, fetching stopped, and
+// the build retried from them.
+func TestMagnetStorageFailureKeepsVerifiedMetadata(t *testing.T) {
+	infoBytes := testInfoDict(t, "retry.bin")
+	var unavailable atomic.Bool
+	unavailable.Store(true)
+	var calls atomic.Int32
+	sess := newTestMagnetSession(t, infoBytes, func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		calls.Add(1)
+		if unavailable.Load() {
+			return nil, errors.New("volume not mounted")
+		}
+		return memStorageFactory(dir, files, pieceLength)
+	})
+	// The accumulator as the ut_metadata handler leaves it on completion.
+	sess.mu.Lock()
+	sess.metadataSize = len(infoBytes)
+	sess.metadataBuf = append([]byte(nil), infoBytes...)
+	sess.metadataPieces = []bool{true}
+	sess.mu.Unlock()
+
+	if err := sess.onMetadataDownloaded(infoBytes); err == nil {
+		t.Fatal("metadata was applied although no storage could be built")
+	}
+	sess.mu.RLock()
+	completed, size, pieces := sess.metadataCompleted, sess.metadataSize, len(sess.metadataPieces)
+	kept, retry, status := sess.verifiedMetadata, sess.metadataRetryTimer, sess.statusErr
+	sess.mu.RUnlock()
+	// metadataCompleted is what stops the handshake handler from requesting
+	// the metadata again from each new peer.
+	if !completed || size != len(infoBytes) || pieces != 1 {
+		t.Fatalf("metadataCompleted=%v size=%d pieces=%d, want fetching stopped with the piece map kept", completed, size, pieces)
+	}
+	if !bytes.Equal(kept, infoBytes) || retry == nil || status == nil {
+		t.Fatalf("kept=%d bytes retry=%v status=%v, want the verified bytes kept, a retry armed and the error shown", len(kept), retry != nil, status)
+	}
+
+	// A retry that fails again keeps them and backs off.
+	sess.retryMetadataStorage()
+	sess.mu.RLock()
+	delay := sess.metadataRetryDelay
+	sess.mu.RUnlock()
+	if delay != 2*metadataStorageRetryMin || !sess.IsMetadataMode() {
+		t.Fatalf("retry delay after a second failure = %v (metadata mode %v), want %v", delay, sess.IsMetadataMode(), 2*metadataStorageRetryMin)
+	}
+
+	unavailable.Store(false)
+	sess.retryMetadataStorage()
+	if sess.IsMetadataMode() || sess.TotalSize() != 16 || sess.Status() == "Error" {
+		t.Fatalf("metadataMode=%v size=%d status=%q, want the torrent published once storage is available", sess.IsMetadataMode(), sess.TotalSize(), sess.Status())
+	}
+	sess.mu.RLock()
+	leftover := sess.verifiedMetadata != nil || sess.metadataBuf != nil
+	sess.mu.RUnlock()
+	if leftover {
+		t.Fatal("metadata copies were kept after the torrent was published")
+	}
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("storage factory ran %d times, want 3", n)
+	}
+}
+
+// TestCloseStopsMetadataStorageRetry: a pending retry must neither outlive
+// the session nor build storage on a closed one.
+func TestCloseStopsMetadataStorageRetry(t *testing.T) {
+	infoBytes := testInfoDict(t, "closed-retry.bin")
+	var calls atomic.Int32
+	sess := newTestMagnetSession(t, infoBytes, func(string, []storage.FileInfo, int64) (storage.Storage, error) {
+		calls.Add(1)
+		return nil, errors.New("volume not mounted")
+	})
+	if err := sess.onMetadataDownloaded(infoBytes); err == nil {
+		t.Fatal("metadata was applied although no storage could be built")
+	}
+	sess.Close()
+	sess.mu.RLock()
+	retry := sess.metadataRetryTimer
+	sess.mu.RUnlock()
+	if retry != nil {
+		t.Fatal("Close left the metadata storage retry armed")
+	}
+	sess.retryMetadataStorage()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("storage factory ran %d times, want only the first attempt before Close", n)
 	}
 }

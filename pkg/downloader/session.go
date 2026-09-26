@@ -272,6 +272,12 @@ type Session struct {
 	// metadataInitDone is set while onMetadataDownloaded builds storage without
 	// s.mu and is closed once the result is published; Close waits on it.
 	metadataInitDone chan struct{}
+	// verifiedMetadata keeps hash-verified info bytes whose storage could not
+	// be built, and metadataRetryTimer retries the build from them after
+	// metadataRetryDelay, so the swarm is never asked for them again.
+	verifiedMetadata   []byte
+	metadataRetryTimer *time.Timer
+	metadataRetryDelay time.Duration
 	// claimPaths reserves the payload paths with the manager before storage is
 	// built on them (nil for a standalone session); releaseClaims gives the
 	// reservation back and is called by the manager, never by Close.
@@ -282,6 +288,13 @@ type Session struct {
 // errSessionClosing reports work refused or abandoned because the session is
 // shutting down.
 var errSessionClosing = errors.New("session is closing")
+
+// Backoff for rebuilding storage from verified metadata after a failed build:
+// the files belong to another torrent, or the volume is missing or full.
+const (
+	metadataStorageRetryMin = 30 * time.Second
+	metadataStorageRetryMax = 10 * time.Minute
+)
 
 // isNilStorage reports whether st is nil, including a nil pointer boxed in the
 // interface, which a factory must never hand back as a usable Storage.
@@ -653,8 +666,12 @@ func (s *Session) Close() {
 		s.mu.Lock()
 		s.closing = true
 		// Storage being built for metadata was admitted before closing was set;
-		// nothing new is admitted after it.
+		// nothing new is admitted after it, and no retry is armed after it.
 		metadataInit := s.metadataInitDone
+		if s.metadataRetryTimer != nil {
+			s.metadataRetryTimer.Stop()
+			s.metadataRetryTimer = nil
+		}
 		// Shutdown is the last chance to record what has been downloaded. The
 		// periodic hint flush clears stateDirty, so re-arm it when there is
 		// anything to checkpoint.
@@ -1663,6 +1680,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
 		s.lastErr = statusErr
 		s.statusErr = statusErr
+		// The bytes are verified and every peer serves the same ones. Discarding
+		// them made each new peer re-send the whole metadata only to fail again,
+		// for as long as the files stayed taken or the volume missing. Keep them,
+		// stop fetching, and retry the build from them on a backoff.
+		keepAccumulator = true
+		s.metadataCompleted = true
+		s.metadataBuf = nil
+		s.verifiedMetadata = infoBytes
+		s.scheduleMetadataStorageRetryLocked()
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return statusErr
@@ -1700,6 +1726,11 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.Storage = st
 	s.releaseClaims = releaseClaims
 	s.statusErr = nil
+	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and
+	// any bytes kept for a retry are no longer needed.
+	s.metadataBuf = nil
+	s.verifiedMetadata = nil
+	s.metadataRetryDelay = 0
 	closing := s.closing
 	storageToVerify := st
 	s.mu.Unlock()
@@ -1727,4 +1758,37 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	}
 
 	return nil
+}
+
+// scheduleMetadataStorageRetryLocked arms the retry of a failed storage build
+// from s.verifiedMetadata, doubling the delay each time up to
+// metadataStorageRetryMax. Close stops the timer; nothing is armed once it has
+// started. Caller holds s.mu.
+func (s *Session) scheduleMetadataStorageRetryLocked() {
+	if s.closing || s.closed {
+		return
+	}
+	switch {
+	case s.metadataRetryDelay <= 0:
+		s.metadataRetryDelay = metadataStorageRetryMin
+	case s.metadataRetryDelay < metadataStorageRetryMax:
+		s.metadataRetryDelay = min(2*s.metadataRetryDelay, metadataStorageRetryMax)
+	}
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+	}
+	s.metadataRetryTimer = time.AfterFunc(s.metadataRetryDelay, s.retryMetadataStorage)
+}
+
+// retryMetadataStorage builds storage again from the metadata a failed build
+// kept. It runs on the retry timer; onMetadataDownloaded re-checks the session
+// under s.mu and arms the next retry if the build fails again.
+func (s *Session) retryMetadataStorage() {
+	s.mu.Lock()
+	infoBytes := s.verifiedMetadata
+	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed
+	s.mu.Unlock()
+	if ready {
+		_ = s.onMetadataDownloaded(infoBytes)
+	}
 }
