@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
+	"time"
 )
 
 // peerReadBufferSize is the size of the per-connection read buffer.
@@ -16,6 +17,13 @@ const peerReadBufferSize = 64 * 1024
 // 32 KiB is sized to hold a raised dynamic-pipeline request burst
 // (1024 requests * 17 bytes = 17 KiB) in a single write syscall with headroom.
 const peerWriteBufferSize = 32 * 1024
+
+// peerWriteTimeout bounds how long a write to a peer may go without the socket
+// taking the bytes. A peer that stops reading (a zero TCP window, a uTP endpoint
+// that vanished) would otherwise block the connection's goroutine in a write
+// forever, holding its connection slot. Any peer that reads at all drains one
+// buffered write (at most 32 KiB) long before this.
+const peerWriteTimeout = 90 * time.Second
 
 // Client represents a connection to a BitTorrent peer.
 type Client struct {
@@ -29,6 +37,12 @@ type Client struct {
 	pieceHdrBuf [13]byte      // reusable scratch for SendPiece header framing
 	readLenBuf  [4]byte       // reusable 4-byte length-prefix scratch for ReadMessage
 	DisableDHT  bool          // Disable advertising DHT support in handshake
+
+	// writeTimeout and writeDeadline implement the write timeout (see
+	// peerWriteTimeout); writeDeadline is the deadline last set on Conn. Both are
+	// guarded by writeMu.
+	writeTimeout  time.Duration
+	writeDeadline time.Time
 }
 
 // NewClient initializes a new peer wire client.
@@ -39,11 +53,48 @@ func NewClient(conn net.Conn, infoHash, peerID [20]byte) *Client {
 		PeerID:   peerID,
 		r:        bufio.NewReaderSize(conn, peerReadBufferSize),
 		w:        bufio.NewWriterSize(conn, peerWriteBufferSize),
+
+		writeTimeout: peerWriteTimeout,
 	}
+}
+
+// SetWriteTimeout changes how long a write may make no progress before it fails
+// and the connection is closed (peerWriteTimeout by default). Call it before the
+// connection is in use.
+func (c *Client) SetWriteTimeout(d time.Duration) {
+	c.writeMu.Lock()
+	c.writeTimeout = d
+	c.writeDeadline = time.Time{}
+	c.writeMu.Unlock()
+}
+
+// armWriteDeadlineLocked ensures a write deadline at least half a timeout away
+// before a write that may reach the socket. Moving it only once half the window
+// has passed costs one deadline update per connection every ~45 s instead of one
+// per block. Caller holds writeMu.
+func (c *Client) armWriteDeadlineLocked() {
+	now := time.Now()
+	if c.writeDeadline.Sub(now) >= c.writeTimeout/2 {
+		return
+	}
+	c.writeDeadline = now.Add(c.writeTimeout)
+	_ = c.Conn.SetWriteDeadline(c.writeDeadline)
+}
+
+// writeFailedLocked closes the connection after a failed write. bufio.Writer keeps
+// the error, so the client cannot send again; closing it also ends the reader, so
+// the connection is torn down even when the caller ignores the send error.
+// Caller holds writeMu.
+func (c *Client) writeFailedLocked(err error) error {
+	if err != nil {
+		_ = c.Conn.Close()
+	}
+	return err
 }
 
 // Handshake performs the BitTorrent protocol handshake.
 // It writes our handshake, then reads and parses the peer's handshake response.
+// The caller bounds the exchange with a deadline on Conn.
 func (c *Client) Handshake() (*Handshake, error) {
 	reqHandshake := &Handshake{
 		Pstr:     "BitTorrent protocol",
@@ -56,7 +107,11 @@ func (c *Client) Handshake() (*Handshake, error) {
 	}
 	EnableFastExtension(&reqHandshake.Reserved)
 
+	// The handshake is bounded by the deadline the caller sets for the whole
+	// exchange and clears afterwards, so forget any armed write deadline: the
+	// first write after the handshake arms a fresh one.
 	c.writeMu.Lock()
+	c.writeDeadline = time.Time{}
 	_, err := c.w.Write(reqHandshake.Serialize())
 	if err == nil {
 		err = c.w.Flush()
@@ -77,10 +132,11 @@ func (c *Client) Handshake() (*Handshake, error) {
 func (c *Client) SendMessage(msg *Message) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.armWriteDeadlineLocked()
 	if _, err := c.w.Write(msg.Serialize()); err != nil {
-		return err
+		return c.writeFailedLocked(err)
 	}
-	return c.w.Flush()
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // WriteRequest queues a block request into the write buffer without flushing.
@@ -98,8 +154,13 @@ func (c *Client) WriteRequest(index, begin, length uint32) error {
 	binary.BigEndian.PutUint32(buf[5:9], index)
 	binary.BigEndian.PutUint32(buf[9:13], begin)
 	binary.BigEndian.PutUint32(buf[13:17], length)
+	// Only a write that overflows the buffer reaches the socket; the rest of a
+	// burst skips the deadline check.
+	if c.w.Available() < len(buf) {
+		c.armWriteDeadlineLocked()
+	}
 	_, err := c.w.Write(buf[:])
-	return err
+	return c.writeFailedLocked(err)
 }
 
 // Flush writes any buffered outbound messages (e.g. a batch of queued block
@@ -107,7 +168,12 @@ func (c *Client) WriteRequest(index, begin, length uint32) error {
 func (c *Client) Flush() error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.w.Flush()
+	// The request pump flushes after every message; an empty buffer writes
+	// nothing, so it needs no deadline.
+	if c.w.Buffered() > 0 {
+		c.armWriteDeadlineLocked()
+	}
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // SendKeepAlive sends a keep-alive message (zero-length prefix).
@@ -172,13 +238,14 @@ func (c *Client) SendPiece(index, begin uint32, block []byte) error {
 	buf[4] = byte(MsgPiece)
 	binary.BigEndian.PutUint32(buf[5:9], index)
 	binary.BigEndian.PutUint32(buf[9:13], begin)
+	c.armWriteDeadlineLocked()
 	if _, err := c.w.Write(buf[:]); err != nil {
-		return err
+		return c.writeFailedLocked(err)
 	}
 	if _, err := c.w.Write(block); err != nil {
-		return err
+		return c.writeFailedLocked(err)
 	}
-	return c.w.Flush()
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // SendPort sends a PORT message (id 9, BEP 5) advertising our DHT UDP port so a

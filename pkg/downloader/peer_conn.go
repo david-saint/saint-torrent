@@ -50,8 +50,10 @@ const peerSocketBufferSize = 4 * 1024 * 1024
 
 // maxOutboundPeers bounds how many peers a single session dials concurrently. This is
 // the download engine: it governs throughput on swarms made of many slow peers, so it
-// is set generously (mainline/libtorrent use ~200 per torrent). An attacker cannot
-// occupy these slots — they are only ever filled by peers we chose to connect to.
+// is set generously (mainline/libtorrent use ~200 per torrent). These slots are only
+// filled by peers we chose to dial, but those addresses come from trackers, DHT and
+// PEX, so a hostile endpoint can still hold one: the stall reaper and the peer write
+// timeout (pkg/peer) are what free it again.
 const maxOutboundPeers = 200
 
 // maxInboundPeers bounds how many incoming peer connections a session accepts at once.
@@ -1934,6 +1936,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		for {
 			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			msg, err := client.ReadMessage()
+			if err != nil {
+				// Close before handing the error over: if the loop is blocked in a
+				// write to this peer, that ends the write now instead of when the
+				// write timeout fires.
+				_ = conn.Close()
+			}
 			select {
 			case readCh <- peerReadResult{msg: msg, err: err}:
 			case <-s.ctx.Done():

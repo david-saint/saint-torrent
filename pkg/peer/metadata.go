@@ -395,12 +395,13 @@ func (c *Client) SendMetadataData(extMsgID byte, piece int, totalSize int, data 
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.armWriteDeadlineLocked()
 	for _, part := range [][]byte{hdr[:], dictBytes, data} {
 		if _, err := c.w.Write(part); err != nil {
-			return err
+			return c.writeFailedLocked(err)
 		}
 	}
-	return c.w.Flush()
+	return c.writeFailedLocked(c.w.Flush())
 }
 
 // SendMetadataReject sends a BEP 9 metadata reject message.
