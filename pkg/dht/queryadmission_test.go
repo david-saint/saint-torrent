@@ -173,9 +173,10 @@ func bucketNodes(d *DHT, bucket int) []Node {
 }
 
 // TestAnnouncePeerWithInvalidTokenDoesNotAddSender verifies an unvalidated
-// announce_peer never reaches the routing table, while a valid one still does.
+// announce_peer never reaches the routing table, while a valid one still leads
+// to the sender being admitted once it answers our probe.
 func TestAnnouncePeerWithInvalidTokenDoesNotAddSender(t *testing.T) {
-	d, _ := newFakeDHT(t)
+	d, conn := newFakeDHT(t)
 
 	addr := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 6881}
 	var infoHash [20]byte
@@ -196,11 +197,24 @@ func TestAnnouncePeerWithInvalidTokenDoesNotAddSender(t *testing.T) {
 	if peers := d.getPeersForInfoHash(infoHash); len(peers) != 0 {
 		t.Fatalf("announce_peer with a bad token registered %d peers", len(peers))
 	}
+	if got := conn.queriesTo(addr, "ping"); got != 0 {
+		t.Fatalf("announce_peer with a bad token probed the sender %d times", got)
+	}
 
 	args["token"] = d.generateToken(addr)
 	d.handleQuery("tx", "announce_peer", args, addr)
-	if got := d.NodesCount(); got != 1 {
-		t.Fatalf("announce_peer with a valid token should add the sender, got %d nodes", got)
+	if got := d.NodesCount(); got != 0 {
+		t.Fatalf("a query sender was admitted before answering a probe, got %d nodes", got)
+	}
+	tid := awaitQueryTo(t, conn, addr, "ping")
+	conn.injectPingReply(t, tid, senderID, addr)
+	deadline := time.After(5 * time.Second)
+	for d.NodesCount() != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("announce_peer sender was never admitted after answering, got %d nodes", d.NodesCount())
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 

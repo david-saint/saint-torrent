@@ -67,7 +67,13 @@ type DHT struct {
 	txMu         sync.Mutex
 	txCounter    uint32
 
-	inFlightProbes map[string]struct{} // Track in-flight AddNode queries to endpoints
+	// nodeAddrs and nodeIPs index the buckets under mu: the ID stored at each
+	// endpoint, and how many contacts each IP holds. They make presence and
+	// one-per-IP checks O(1) instead of a scan of every bucket.
+	nodeAddrs map[nodeAddrKey][20]byte
+	nodeIPs   map[[4]byte]int
+
+	inFlightProbes map[nodeAddrKey]struct{} // in-flight probes, keyed by probeKey
 
 	// limiter and started are owned by the read goroutine; started anchors the
 	// monotonic clock the limiter runs on.
@@ -97,6 +103,20 @@ type transaction struct {
 }
 
 const (
+	// bucketSize is K, the contacts kept per routing-table bucket (BEP 5).
+	bucketSize = 8
+	// nodeQuestionableAfter is how long a contact may go unheard before BEP 5
+	// calls it questionable. Only questionable contacts are pinged to make room
+	// for a newcomer; a bucket of fresher contacts discards the newcomer.
+	nodeQuestionableAfter = 15 * time.Minute
+	// maxNodePingFailures is how many consecutive pings a questionable contact
+	// may miss before it is replaced; BEP 5 suggests trying once more.
+	maxNodePingFailures = 2
+	// maxInFlightProbes bounds concurrent pings to unverified endpoints: PORT
+	// messages, unknown query senders and bootstrap referrals.
+	maxInFlightProbes = 100
+	// nodeProbeTimeout bounds each of those probes.
+	nodeProbeTimeout = 5 * time.Second
 	// nodePingTimeout bounds every routing-table liveness ping.
 	nodePingTimeout = 2 * time.Second
 	// maxPendingAddrChanges caps how many node IDs may have an address change
@@ -164,10 +184,12 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 
 	d := &DHT{
 		conn:           conn,
+		nodeAddrs:      make(map[nodeAddrKey][20]byte),
+		nodeIPs:        make(map[[4]byte]int),
 		peers:          newPeerStore(),
 		peerChan:       make(chan DiscoveredPeer, 256),
 		transactions:   make(map[string]transaction),
-		inFlightProbes: make(map[string]struct{}),
+		inFlightProbes: make(map[nodeAddrKey]struct{}),
 		addrChanges:    make(map[[20]byte]struct{}),
 		addrCooldowns:  make(map[addrChangeKey]time.Time),
 		limiter:        newQueryLimiter(),
@@ -359,7 +381,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 
 	switch q {
 	case "ping":
-		d.addNode(senderID, addr)
+		d.noteQuerySender(senderID, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id": string(d.nodeID[:]),
 		}, addr)
@@ -372,7 +394,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		var targetID [20]byte
 		copy(targetID[:], targetStr)
 
-		d.addNode(senderID, addr)
+		d.noteQuerySender(senderID, addr)
 
 		closerNodes := d.getCloserNodes(targetID, 8)
 		d.sendResponse(t, map[string]interface{}{
@@ -388,7 +410,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		var infoHash [20]byte
 		copy(infoHash[:], infoHashStr)
 
-		d.addNode(senderID, addr)
+		d.noteQuerySender(senderID, addr)
 
 		token := d.generateToken(addr)
 		peers := d.getPeersForInfoHash(infoHash)
@@ -438,7 +460,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 			return
 		}
 
-		d.addNode(senderID, addr)
+		d.noteQuerySender(senderID, addr)
 		d.registerPeer(infoHash, addr.IP, actualPort)
 
 		d.sendResponse(t, map[string]interface{}{
@@ -622,11 +644,146 @@ func lessXor(a, b [20]byte) bool {
 	return false
 }
 
+// nodeAddrKey identifies a routing-table endpoint.
+type nodeAddrKey struct {
+	ip   [4]byte
+	port uint16
+}
+
+// endpointKey normalises an IPv4 endpoint, reporting false for anything the
+// IPv4-only routing table cannot hold.
+func endpointKey(ip net.IP, port int) (nodeAddrKey, bool) {
+	ip4 := ip.To4()
+	if ip4 == nil || port <= 0 || port > 65535 {
+		return nodeAddrKey{}, false
+	}
+	k := nodeAddrKey{port: uint16(port)}
+	copy(k.ip[:], ip4)
+	return k, true
+}
+
+func nodeAddrKeyOf(addr *net.UDPAddr) (nodeAddrKey, bool) {
+	if addr == nil {
+		return nodeAddrKey{}, false
+	}
+	return endpointKey(addr.IP, addr.Port)
+}
+
+// udpAddr returns a fresh address for k, so a stored contact never aliases a
+// caller's buffer.
+func (k nodeAddrKey) udpAddr() *net.UDPAddr {
+	return &net.UDPAddr{IP: net.IP(append([]byte(nil), k.ip[:]...)), Port: int(k.port)}
+}
+
+// onePerIP reports whether ip is held to a single routing-table contact, like
+// libtorrent's dht_restrict_routing_ips, so one host cannot fill buckets by
+// claiming many IDs on many ports. Loopback is exempt: it can only be learned
+// from this host, and local test networks run many nodes on 127.0.0.1.
+func onePerIP(ip [4]byte) bool {
+	return ip[0] != 127
+}
+
+// endpointAllowed reports whether we may contact k after source told us about
+// it: per netpolicy, a remote node may only point us at addresses no more local
+// than itself, and never at one that cannot be a unicast peer.
+func endpointAllowed(k nodeAddrKey, source *net.UDPAddr) bool {
+	var src netip.Addr
+	if source != nil {
+		if s4 := source.IP.To4(); s4 != nil {
+			src = netip.AddrFrom4([4]byte(s4))
+		}
+	}
+	return netpolicy.PeerAllowed(netip.AddrPortFrom(netip.AddrFrom4(k.ip), k.port), src)
+}
+
+// questionable reports whether BEP 5 would ping n before letting it keep its
+// slot: it has not been heard from for nodeQuestionableAfter. Contacts loaded
+// from disk carry a zero LastSeen, so they start questionable.
+func questionable(n Node, now time.Time) bool {
+	return now.Sub(n.LastSeen) >= nodeQuestionableAfter
+}
+
+func (b *bucket) indexOf(id [20]byte) int {
+	for i := range b.nodes {
+		if b.nodes[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// appendNodeLocked adds n at the tail of b and indexes it. Callers hold d.mu
+// and have already checked admission.
+func (d *DHT) appendNodeLocked(b *bucket, n Node) {
+	k, ok := nodeAddrKeyOf(n.Addr)
+	if !ok {
+		return
+	}
+	b.nodes = append(b.nodes, n)
+	d.nodeAddrs[k] = n.ID
+	d.nodeIPs[k.ip]++
+}
+
+// removeNodeAtLocked removes b.nodes[i] and its index entries. Callers hold d.mu.
+func (d *DHT) removeNodeAtLocked(b *bucket, i int) {
+	n := b.nodes[i]
+	b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+	d.unindexNodeLocked(n)
+}
+
+func (d *DHT) unindexNodeLocked(n Node) {
+	k, ok := nodeAddrKeyOf(n.Addr)
+	if !ok {
+		return
+	}
+	if d.nodeAddrs[k] == n.ID {
+		delete(d.nodeAddrs, k)
+	}
+	if d.nodeIPs[k.ip] <= 1 {
+		delete(d.nodeIPs, k.ip)
+	} else {
+		d.nodeIPs[k.ip]--
+	}
+}
+
+// removeNodeByIDLocked removes the contact stored under id at k, if any.
+func (d *DHT) removeNodeByIDLocked(id [20]byte, k nodeAddrKey) {
+	b := d.buckets[bucketIndex(d.nodeID, id)]
+	if b == nil {
+		return
+	}
+	if i := b.indexOf(id); i >= 0 {
+		if ik, ok := nodeAddrKeyOf(b.nodes[i].Addr); ok && ik == k {
+			d.removeNodeAtLocked(b, i)
+		}
+	}
+}
+
+// touchLocked records a sighting of b.nodes[i] and moves it to the tail, the
+// most-recently-seen end of the bucket.
+func touchLocked(b *bucket, i int, seen time.Time) {
+	n := b.nodes[i]
+	if seen.After(n.LastSeen) {
+		n.LastSeen = seen
+	}
+	b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+	b.nodes = append(b.nodes, n)
+}
+
+// addNode admits or refreshes a contact that answered one of our own queries
+// from addr with id. That answer, matched to a random transaction ID and to
+// the address we sent to, is the only evidence strong enough to admit a new
+// contact; unsolicited query senders go through noteQuerySender instead.
 func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
+	d.addNodeSeen(id, addr, time.Now())
+}
+
+func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 	if id == d.nodeID {
 		return
 	}
-	if addr.IP.To4() == nil {
+	k, ok := nodeAddrKeyOf(addr)
+	if !ok {
 		return
 	}
 
@@ -637,88 +794,161 @@ func (d *DHT) addNode(id [20]byte, addr *net.UDPAddr) {
 	if d.buckets[idx] == nil {
 		d.buckets[idx] = &bucket{}
 	}
-
 	b := d.buckets[idx]
-	foundIdx := -1
-	for i, n := range b.nodes {
-		if n.ID == id {
-			foundIdx = i
-			break
-		}
-	}
 
-	if foundIdx != -1 {
-		if sameUDPAddr(b.nodes[foundIdx].Addr, addr) {
-			n := b.nodes[foundIdx]
-			n.LastSeen = time.Now()
-			b.nodes = append(b.nodes[:foundIdx], b.nodes[foundIdx+1:]...)
-			b.nodes = append(b.nodes, n)
+	if i := b.indexOf(id); i >= 0 {
+		if sameUDPAddr(b.nodes[i].Addr, addr) {
+			touchLocked(b, i, seen)
 			return
 		}
 		// A claimed address change is never trusted on sight; it is only a candidate.
-		d.considerAddressChange(id, b.nodes[foundIdx].Addr, addr)
-	} else {
-		if len(b.nodes) < 8 {
-			b.nodes = append(b.nodes, Node{
-				ID:       id,
-				Addr:     addr,
-				LastSeen: time.Now(),
-			})
-		} else {
-			if b.pingInProgress {
-				return
-			}
-			b.pingInProgress = true
-			// Asynchronously ping the head node and replace if offline
-			head := b.nodes[0]
-			d.goTracked(func() {
-				defer func() {
-					d.mu.Lock()
-					b2 := d.buckets[idx]
-					if b2 != nil {
-						b2.pingInProgress = false
-					}
-					d.mu.Unlock()
-				}()
-				headNode := head
-				newID := id
-				newAddr := addr
-				ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
-				defer cancel()
-				err := d.pingNode(ctx, headNode.Addr)
-				d.mu.Lock()
-				defer d.mu.Unlock()
-				b2 := d.buckets[idx]
-				if b2 == nil {
-					return
-				}
-				if err != nil {
-					// Evict head and add new
-					for i, n := range b2.nodes {
-						if n.ID == headNode.ID {
-							b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
-							b2.nodes = append(b2.nodes, Node{
-								ID:       newID,
-								Addr:     newAddr,
-								LastSeen: time.Now(),
-							})
-							break
-						}
-					}
-				} else {
-					// Respond, update mtime
-					for i, n := range b2.nodes {
-						if n.ID == headNode.ID {
-							b2.nodes = append(b2.nodes[:i], b2.nodes[i+1:]...)
-							headNode.LastSeen = time.Now()
-							b2.nodes = append(b2.nodes, headNode)
-							break
-						}
-					}
-				}
-			})
+		d.considerAddressChange(id, b.nodes[i].Addr, addr)
+		return
+	}
+
+	// This endpoint answered as id, so another ID stored there is stale.
+	if old, held := d.nodeAddrs[k]; held {
+		d.removeNodeByIDLocked(old, k)
+	}
+	if onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
+		return
+	}
+
+	n := Node{ID: id, Addr: k.udpAddr(), LastSeen: seen}
+	if len(b.nodes) < bucketSize {
+		d.appendNodeLocked(b, n)
+		return
+	}
+	// BEP 5: a bucket full of good contacts simply discards the newcomer; only
+	// a questionable head is challenged, one challenge per bucket at a time.
+	head := b.nodes[0]
+	if b.pingInProgress || !questionable(head, time.Now()) {
+		return
+	}
+	b.pingInProgress = true
+	d.goTracked(func() {
+		d.challengeHead(idx, head, n)
+	})
+}
+
+// challengeHead pings a full bucket's questionable head on behalf of a
+// newcomer. The head keeps its slot if it answers with its own ID. It is
+// replaced after maxNodePingFailures consecutive misses, or at once if its
+// address answers as a different node. d.mu is never held across a ping.
+func (d *DHT) challengeHead(idx int, head, newcomer Node) {
+	defer func() {
+		d.mu.Lock()
+		if b := d.buckets[idx]; b != nil {
+			b.pingInProgress = false
+		}
+		d.mu.Unlock()
+	}()
+
+	failures := 0
+	for failures < maxNodePingFailures {
+		ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
+		gotID, err := d.queryNodeID(ctx, head.Addr)
+		cancel()
+		if d.ctx.Err() != nil {
+			return
+		}
+		switch {
+		case err == nil && gotID == head.ID:
+			d.refreshNode(head.ID, head.Addr)
+			return
+		case err == nil:
+			// Something else owns that address now: the contact is proven wrong.
+			failures = maxNodePingFailures
+		default:
+			failures++
 		}
 	}
+	d.replaceNode(idx, head, newcomer)
+}
+
+// replaceNode evicts old from bucket idx, if it is still stored there and still
+// questionable, and admits newcomer if the table still has room for it.
+func (d *DHT) replaceNode(idx int, old, newcomer Node) {
+	k, ok := nodeAddrKeyOf(newcomer.Addr)
+	if !ok {
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	b := d.buckets[idx]
+	if b == nil {
+		return
+	}
+	if i := b.indexOf(old.ID); i >= 0 && sameUDPAddr(b.nodes[i].Addr, old.Addr) {
+		if !questionable(b.nodes[i], time.Now()) {
+			// Heard from while we pinged, so it keeps its slot.
+			return
+		}
+		d.removeNodeAtLocked(b, i)
+	}
+	// The table may have changed during the pings, so re-check admission.
+	if len(b.nodes) >= bucketSize || b.indexOf(newcomer.ID) >= 0 {
+		return
+	}
+	if _, held := d.nodeAddrs[k]; held {
+		return
+	}
+	if onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
+		return
+	}
+	d.appendNodeLocked(b, newcomer)
+}
+
+// noteQuerySender handles the sender of a well-formed inbound query. Its
+// source address is unverified, since UDP is trivially spoofed, so it may only
+// refresh the contact it already matches. An unknown sender is pinged through
+// the bounded probe path and admitted under whatever ID answers from there.
+func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
+	if id == d.nodeID {
+		return
+	}
+	k, ok := nodeAddrKeyOf(addr)
+	if !ok {
+		return
+	}
+	idx := bucketIndex(d.nodeID, id)
+
+	d.mu.Lock()
+	if b := d.buckets[idx]; b != nil {
+		if i := b.indexOf(id); i >= 0 {
+			if sameUDPAddr(b.nodes[i].Addr, addr) {
+				touchLocked(b, i, time.Now())
+			} else {
+				// A claimed address change is never trusted on sight; it is only a candidate.
+				d.considerAddressChange(id, b.nodes[i].Addr, addr)
+			}
+			d.mu.Unlock()
+			return
+		}
+	}
+	probe := d.mightAdmitLocked(idx, k)
+	d.mu.Unlock()
+
+	if probe {
+		d.probeNode(k)
+	}
+}
+
+// mightAdmitLocked reports whether a verified contact at k with an ID in bucket
+// idx could be admitted, so a probe is only spent when it could matter. An
+// endpoint held by another ID is still probed: its answer settles which ID
+// lives there now.
+func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
+	if _, held := d.nodeAddrs[k]; !held && onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
+		return false
+	}
+	b := d.buckets[idx]
+	if b == nil || len(b.nodes) < bucketSize {
+		return true
+	}
+	return !b.pingInProgress && questionable(b.nodes[0], time.Now())
 }
 
 // considerAddressChange queues a candidate address for a node ID already in the
@@ -942,21 +1172,20 @@ func (d *DHT) dropNode(id [20]byte, addr *net.UDPAddr) {
 	if b == nil {
 		return
 	}
-	for i, n := range b.nodes {
-		if n.ID != id {
-			continue
-		}
-		if !sameUDPAddr(n.Addr, addr) {
-			return
-		}
-		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
-		return
+	if i := b.indexOf(id); i >= 0 && sameUDPAddr(b.nodes[i].Addr, addr) {
+		d.removeNodeAtLocked(b, i)
 	}
 }
 
 // repointNode moves a verified node from oldAddr to newAddr, leaving the entry
-// alone if it no longer points at oldAddr. It reports whether the move applied.
+// alone if it no longer points at oldAddr, or if newAddr is already taken by
+// another contact or would give its IP a second one. It reports whether the
+// move applied.
 func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
+	nk, ok := nodeAddrKeyOf(newAddr)
+	if !ok {
+		return false
+	}
 	idx := bucketIndex(d.nodeID, id)
 
 	d.mu.Lock()
@@ -966,20 +1195,27 @@ func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
 	if b == nil {
 		return false
 	}
-	for i, n := range b.nodes {
-		if n.ID != id {
-			continue
-		}
-		if !sameUDPAddr(n.Addr, oldAddr) {
-			return false
-		}
-		n.Addr = newAddr
-		n.LastSeen = time.Now()
-		b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
-		b.nodes = append(b.nodes, n)
-		return true
+	i := b.indexOf(id)
+	if i < 0 || !sameUDPAddr(b.nodes[i].Addr, oldAddr) {
+		return false
 	}
-	return false
+	if _, held := d.nodeAddrs[nk]; held {
+		return false
+	}
+	others := d.nodeIPs[nk.ip]
+	if cur, valid := nodeAddrKeyOf(b.nodes[i].Addr); valid && cur.ip == nk.ip {
+		others-- // the node itself, moving to another port on the same IP
+	}
+	if onePerIP(nk.ip) && others > 0 {
+		return false
+	}
+
+	n := b.nodes[i]
+	d.removeNodeAtLocked(b, i)
+	n.Addr = nk.udpAddr()
+	n.LastSeen = time.Now()
+	d.appendNodeLocked(b, n)
+	return true
 }
 
 func cloneUDPAddr(a *net.UDPAddr) *net.UDPAddr {
@@ -994,19 +1230,14 @@ func (d *DHT) HasNodeAddress(ip net.IP, port uint16) bool {
 	if d == nil {
 		return false
 	}
+	k, ok := endpointKey(ip, int(port))
+	if !ok {
+		return false
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	for _, b := range d.buckets {
-		if b == nil {
-			continue
-		}
-		for _, n := range b.nodes {
-			if n.Addr != nil && n.Addr.IP.Equal(ip) && n.Addr.Port == int(port) {
-				return true
-			}
-		}
-	}
-	return false
+	_, held := d.nodeAddrs[k]
+	return held
 }
 
 // AddNode ingests a DHT node advertised by a BitTorrent peer via the BEP 5 PORT
@@ -1021,44 +1252,67 @@ func (d *DHT) AddNode(ip net.IP, port uint16) {
 	if d == nil {
 		return
 	}
-	ip4 := ip.To4()
-	if ip4 == nil {
+	k, ok := endpointKey(ip, int(port))
+	if !ok {
 		// Silently ignore IPv6 addresses as the DHT UDP socket is IPv4-bound.
 		return
 	}
-	if port == 0 {
+	if netpolicy.Classify(netip.AddrFrom4(k.ip)) == netpolicy.ScopeInvalid {
 		return
 	}
+	d.probeUnknown(k)
+}
 
-	addr := &net.UDPAddr{IP: append(net.IP(nil), ip4...), Port: int(port)}
-
-	// Skip if the node is already in our routing table
-	if d.HasNodeAddress(ip4, port) {
+// probeUnknown probes k unless the routing table already holds that endpoint
+// or another contact on its IP. Both checks are O(1) map lookups, so a peer
+// repeating PORT messages costs no table scan on its message loop.
+func (d *DHT) probeUnknown(k nodeAddrKey) {
+	d.mu.RLock()
+	_, held := d.nodeAddrs[k]
+	ipTaken := onePerIP(k.ip) && d.nodeIPs[k.ip] > 0
+	d.mu.RUnlock()
+	if held || ipTaken {
 		return
 	}
+	d.probeNode(k)
+}
 
-	addrStr := addr.String()
+// probeKey is the in-flight identity of a probe to k: the IP alone where only
+// one contact per IP can be admitted, so a flood rotating ports on one address
+// still costs at most one probe at a time.
+func probeKey(k nodeAddrKey) nodeAddrKey {
+	if onePerIP(k.ip) {
+		k.port = 0
+	}
+	return k
+}
+
+// probeNode pings k and admits whatever node ID answers from it. Probes are
+// deduplicated per probeKey, capped at maxInFlightProbes, and run on tracked
+// goroutines so callers never block on the network.
+func (d *DHT) probeNode(k nodeAddrKey) {
+	pk := probeKey(k)
 	d.txMu.Lock()
 	if d.inFlightProbes == nil {
-		d.inFlightProbes = make(map[string]struct{})
+		d.inFlightProbes = make(map[nodeAddrKey]struct{})
 	}
 	// Deduplicate: don't spawn multiple queries to the same address concurrently
-	if _, active := d.inFlightProbes[addrStr]; active {
+	if _, active := d.inFlightProbes[pk]; active {
 		d.txMu.Unlock()
 		return
 	}
-	// Rate-limit: bound maximum concurrent unsolicited AddNode probes to 100
-	if len(d.inFlightProbes) >= 100 {
+	if len(d.inFlightProbes) >= maxInFlightProbes {
 		d.txMu.Unlock()
 		return
 	}
-	d.inFlightProbes[addrStr] = struct{}{}
+	d.inFlightProbes[pk] = struct{}{}
 	d.txMu.Unlock()
 
+	addr := k.udpAddr()
 	d.goTracked(func() {
 		defer func() {
 			d.txMu.Lock()
-			delete(d.inFlightProbes, addrStr)
+			delete(d.inFlightProbes, pk)
 			d.txMu.Unlock()
 		}()
 
@@ -1067,7 +1321,7 @@ func (d *DHT) AddNode(ip net.IP, port uint16) {
 			return
 		default:
 		}
-		ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
+		ctx, cancel := context.WithTimeout(d.ctx, nodeProbeTimeout)
 		defer cancel()
 		id, err := d.queryNodeID(ctx, addr)
 		if err != nil {
@@ -1075,11 +1329,6 @@ func (d *DHT) AddNode(ip net.IP, port uint16) {
 		}
 		d.addNode(id, addr)
 	})
-}
-
-func (d *DHT) pingNode(ctx context.Context, addr *net.UDPAddr) error {
-	_, err := d.queryNodeID(ctx, addr)
-	return err
 }
 
 // queryNodeID pings addr and returns the responder's 20-byte Kademlia node ID.
@@ -1305,8 +1554,12 @@ func (d *DHT) bootstrap() {
 			defer cancel()
 			nodes, err := d.findNode(ctx, d.nodeID, targetAddr)
 			if err == nil {
+				// Referrals are only candidates: each is admitted once it
+				// answers a ping of our own, under the ID it answers with.
 				for _, node := range nodes {
-					d.addNode(node.ID, node.Addr)
+					if k, ok := nodeAddrKeyOf(node.Addr); ok && endpointAllowed(k, targetAddr) {
+						d.probeUnknown(k)
+					}
 				}
 			}
 		})
@@ -1580,7 +1833,9 @@ func (d *DHT) loadNodes() {
 
 		addr, err := net.ResolveUDPAddr("udp", addrStr)
 		if err == nil {
-			d.addNode(id, addr)
+			// A zero LastSeen leaves saved contacts questionable, so the first
+			// newcomer to their bucket re-checks them before they can keep it.
+			d.addNodeSeen(id, addr, time.Time{})
 		}
 	}
 }
