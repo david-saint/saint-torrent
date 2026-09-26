@@ -1,9 +1,17 @@
 package peer
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"runtime"
 	"testing"
+	"time"
+
+	"sainttorrent/pkg/torrent"
 )
 
 func TestSerializeMessage(t *testing.T) {
@@ -182,7 +190,7 @@ func TestReadMessageMatchesParseMessage(t *testing.T) {
 	}
 	for i, in := range inputs {
 		want, werr := ParseMessage(bytes.NewReader(in))
-		got, gerr := readMessage(bytes.NewReader(in), make([]byte, 4))
+		got, gerr := readMessage(bufio.NewReader(bytes.NewReader(in)), make([]byte, 4), defaultBitfieldLimit)
 		if (werr == nil) != (gerr == nil) {
 			t.Fatalf("input %d: error mismatch: ParseMessage=%v readMessage=%v", i, werr, gerr)
 		}
@@ -207,7 +215,7 @@ func TestReadMessagePoolsBlockBuffers(t *testing.T) {
 	}
 	in := pieceWire(1, 0, block) // length == maxPooledMessageLen, poolable
 
-	msg, err := readMessage(bytes.NewReader(in), make([]byte, 4))
+	msg, err := readMessage(bufio.NewReader(bytes.NewReader(in)), make([]byte, 4), defaultBitfieldLimit)
 	if err != nil {
 		t.Fatalf("readMessage failed: %v", err)
 	}
@@ -238,19 +246,20 @@ func TestReadMessagePoolsBlockBuffers(t *testing.T) {
 }
 
 // TestReadMessageOversizedNotPooled checks messages larger than the pooled buffer
-// size fall back to a heap allocation with Release as a no-op.
+// size fall back to a heap allocation with Release as a no-op. Only a bitfield
+// or an extended message may be that large.
 func TestReadMessageOversizedNotPooled(t *testing.T) {
-	block := make([]byte, maxPooledMessageLen) // 9-byte header pushes length over the cap
-	in := pieceWire(0, 0, block)
-	msg, err := readMessage(bytes.NewReader(in), make([]byte, 4))
+	bitfield := bytes.Repeat([]byte{0xff}, 2*maxPooledMessageLen)
+	in := (&Message{ID: MsgBitfield, Payload: bitfield}).Serialize()
+	msg, err := readMessage(bufio.NewReader(bytes.NewReader(in)), make([]byte, 4), defaultBitfieldLimit)
 	if err != nil {
 		t.Fatalf("readMessage failed: %v", err)
 	}
 	if msg.pooled != nil {
 		t.Fatal("oversized message must not borrow a pooled buffer")
 	}
-	if len(msg.Payload) != 8+len(block) {
-		t.Fatalf("unexpected payload length %d", len(msg.Payload))
+	if msg.ID != MsgBitfield || !bytes.Equal(msg.Payload, bitfield) {
+		t.Fatalf("unexpected message: id %d, payload length %d", msg.ID, len(msg.Payload))
 	}
 	msg.Release() // no-op, must not panic
 }
@@ -260,7 +269,7 @@ func TestReadMessageOversizedNotPooled(t *testing.T) {
 func TestReadMessageReleaseOnShortReadReclaimsBuffer(t *testing.T) {
 	// Advertise a poolable length but supply fewer payload bytes than promised.
 	in := []byte{0, 0, 0, 10, 7, 1, 2, 3} // length 10, only 3 payload bytes follow
-	if _, err := readMessage(bytes.NewReader(in), make([]byte, 4)); err == nil {
+	if _, err := readMessage(bufio.NewReader(bytes.NewReader(in)), make([]byte, 4), defaultBitfieldLimit); err == nil {
 		t.Fatal("expected a short-read error")
 	}
 	// The borrowed buffer must have been Put back on the error path; draining it
@@ -311,5 +320,241 @@ func TestHandshakeSerializeAndParse(t *testing.T) {
 	}
 	if parsed.PeerID != h.PeerID {
 		t.Errorf("Parsed PeerID = %v, expected %v", parsed.PeerID, h.PeerID)
+	}
+}
+
+// frameA1 returns a frame whose length prefix says length and whose body is the id
+// followed by length-1 payload bytes (a keep-alive for length 0).
+func frameA1(id MessageID, length uint32) []byte {
+	buf := make([]byte, 4+int(length))
+	binary.BigEndian.PutUint32(buf, length)
+	if length > 0 {
+		buf[4] = byte(id)
+	}
+	return buf
+}
+
+func readFrameA1(frame []byte, bitfieldLimit int) (*Message, error) {
+	return readMessage(bufio.NewReader(bytes.NewReader(frame)), make([]byte, 4), bitfieldLimit)
+}
+
+// TestReadMessageFixedSizeLengths checks every fixed-size message: its exact
+// length is read, one byte more or less fails with ErrInvalidMessageLength (for a
+// one-byte message, one less is a keep-alive).
+func TestReadMessageFixedSizeLengths(t *testing.T) {
+	cases := []struct {
+		id     MessageID
+		length uint32
+	}{
+		{MsgChoke, 1}, {MsgUnchoke, 1}, {MsgInterested, 1}, {MsgNotInterested, 1},
+		{MsgHaveAll, 1}, {MsgHaveNone, 1},
+		{MsgHave, 5}, {MsgSuggestPiece, 5}, {MsgAllowedFast, 5},
+		{MsgRequest, 13}, {MsgCancel, 13}, {MsgRejectRequest, 13},
+		{MsgPort, 3},
+	}
+	for _, tc := range cases {
+		msg, err := readFrameA1(frameA1(tc.id, tc.length), defaultBitfieldLimit)
+		if err != nil || msg == nil || msg.ID != tc.id || len(msg.Payload) != int(tc.length)-1 {
+			t.Fatalf("id %d length %d: got %v, %v; want the message", tc.id, tc.length, msg, err)
+		}
+		msg.Release()
+		for _, bad := range []uint32{tc.length - 1, tc.length + 1} {
+			if bad == 0 {
+				continue // a keep-alive
+			}
+			if _, err := readFrameA1(frameA1(tc.id, bad), defaultBitfieldLimit); !errors.Is(err, ErrInvalidMessageLength) {
+				t.Fatalf("id %d length %d: err = %v, want ErrInvalidMessageLength", tc.id, bad, err)
+			}
+		}
+	}
+}
+
+// A piece carries an index, a begin offset and at most one 16 KiB block.
+func TestReadMessagePieceLengths(t *testing.T) {
+	for _, length := range []uint32{8, 9 + maxBlockLength + 1} {
+		if _, err := readFrameA1(frameA1(MsgPiece, length), defaultBitfieldLimit); !errors.Is(err, ErrInvalidMessageLength) {
+			t.Fatalf("piece length %d: err = %v, want ErrInvalidMessageLength", length, err)
+		}
+	}
+	for _, length := range []uint32{9, 9 + maxBlockLength} {
+		msg, err := readFrameA1(frameA1(MsgPiece, length), defaultBitfieldLimit)
+		if err != nil || msg == nil {
+			t.Fatalf("piece length %d: %v", length, err)
+		}
+		msg.Release()
+	}
+	if 9+maxBlockLength != maxPooledMessageLen {
+		t.Fatalf("largest piece (%d) does not fill the pooled buffer (%d)", 9+maxBlockLength, maxPooledMessageLen)
+	}
+}
+
+// touchFailReaderA1 fails the test if the reader ever asks it for bytes.
+type touchFailReaderA1 struct{ t *testing.T }
+
+func (r touchFailReaderA1) Read([]byte) (int, error) {
+	r.t.Error("the payload of a rejected message was read")
+	return 0, io.EOF
+}
+
+// An unknown id may not be larger than a pooled buffer, and the rejection comes
+// from the header alone: no payload byte is read or allocated for.
+func TestReadMessageRejectsLargeUnknownIDBeforeReading(t *testing.T) {
+	header := frameA1(30, maxPooledMessageLen+1)[:5] // prefix + id only
+	r := bufio.NewReader(io.MultiReader(bytes.NewReader(header), touchFailReaderA1{t}))
+	if _, err := readMessage(r, make([]byte, 4), defaultBitfieldLimit); !errors.Is(err, ErrInvalidMessageLength) {
+		t.Fatalf("err = %v, want ErrInvalidMessageLength", err)
+	}
+
+	msg, err := readFrameA1(frameA1(30, maxPooledMessageLen), defaultBitfieldLimit)
+	if err != nil || msg == nil {
+		t.Fatalf("unknown id at the pooled size: %v", err)
+	}
+	msg.Release()
+}
+
+// An extended message holds at most the largest BEP 10 payload we decode.
+func TestReadMessageExtendedLengths(t *testing.T) {
+	msg, err := readFrameA1(frameA1(MsgExtended, 2+MaxExtHandshakeSize), defaultBitfieldLimit)
+	if err != nil || msg == nil || len(msg.Payload) != 1+MaxExtHandshakeSize {
+		t.Fatalf("largest extended message: %v, %v", msg, err)
+	}
+	for _, length := range []uint32{1, 2 + MaxExtHandshakeSize + 1} {
+		if _, err := readFrameA1(frameA1(MsgExtended, length), defaultBitfieldLimit); !errors.Is(err, ErrInvalidMessageLength) {
+			t.Fatalf("extended length %d: err = %v, want ErrInvalidMessageLength", length, err)
+		}
+	}
+}
+
+// pipeClientA1 returns a Client reading from one end of a pipe and the other end.
+func pipeClientA1(t *testing.T) (*Client, net.Conn) {
+	t.Helper()
+	local, remote := net.Pipe()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = remote.Close()
+	})
+	return NewClient(local, [20]byte{}, [20]byte{}), remote
+}
+
+// readBitfieldA1 sends a bitfield of n bytes and returns what the client reads.
+func readBitfieldA1(t *testing.T, c *Client, remote net.Conn, n int) (*Message, error) {
+	t.Helper()
+	frame := (&Message{ID: MsgBitfield, Payload: make([]byte, n)}).Serialize()
+	go func() {
+		_ = remote.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, _ = remote.Write(frame)
+	}()
+	return c.ReadMessage()
+}
+
+// The bitfield limit defaults to the largest bitfield a magnet can need, and
+// SetBitfieldLimit sizes it to the torrent, clamped to what any torrent can need.
+func TestClientBitfieldLimit(t *testing.T) {
+	if defaultBitfieldLimit != 104858 {
+		t.Fatalf("defaultBitfieldLimit = %d, want 104858", defaultBitfieldLimit)
+	}
+	c, remote := pipeClientA1(t)
+	if msg, err := readBitfieldA1(t, c, remote, defaultBitfieldLimit); err != nil || len(msg.Payload) != defaultBitfieldLimit {
+		t.Fatalf("default-limit bitfield: %v", err)
+	}
+	c, remote = pipeClientA1(t)
+	if _, err := readBitfieldA1(t, c, remote, defaultBitfieldLimit+1); !errors.Is(err, ErrInvalidMessageLength) {
+		t.Fatalf("bitfield over the default limit: err = %v, want ErrInvalidMessageLength", err)
+	}
+
+	c, remote = pipeClientA1(t)
+	c.SetBitfieldLimit(torrent.MaxPieceCount) // raise to the largest torrent
+	if msg, err := readBitfieldA1(t, c, remote, maxBitfieldBytes); err != nil || len(msg.Payload) != maxBitfieldBytes {
+		t.Fatalf("largest bitfield after raising the limit: %v", err)
+	}
+
+	c, remote = pipeClientA1(t)
+	c.SetBitfieldLimit(9) // two bytes
+	if msg, err := readBitfieldA1(t, c, remote, 2); err != nil {
+		t.Fatalf("exact bitfield: %v", err)
+	} else {
+		msg.Release()
+	}
+	c, remote = pipeClientA1(t)
+	c.SetBitfieldLimit(9)
+	if _, err := readBitfieldA1(t, c, remote, 3); !errors.Is(err, ErrInvalidMessageLength) {
+		t.Fatalf("bitfield over a lowered limit: err = %v, want ErrInvalidMessageLength", err)
+	}
+
+	for _, tc := range []struct{ numPieces, want int }{
+		{-5, 1}, {0, 1}, {1, 1}, {8, 1}, {9, 2},
+		{torrent.MaxPieceCount, maxBitfieldBytes},
+		{torrent.MaxPieceCount + 1, maxBitfieldBytes},
+		{int(^uint(0) >> 1), maxBitfieldBytes},
+	} {
+		c.SetBitfieldLimit(tc.numPieces)
+		if got := int(c.bitfieldLimit.Load()); got != tc.want {
+			t.Fatalf("SetBitfieldLimit(%d) = %d, want %d", tc.numPieces, got, tc.want)
+		}
+	}
+}
+
+// MaxMessageLength is exactly the bitfield of the largest torrent we accept.
+func TestMaxMessageLengthCoversLargestBitfield(t *testing.T) {
+	if want := 1 + (torrent.MaxPieceCount+7)/8; MaxMessageLength != want {
+		t.Fatalf("MaxMessageLength = %d, want %d", MaxMessageLength, want)
+	}
+	if _, err := readFrameA1(frameA1(MsgBitfield, MaxMessageLength+1), maxBitfieldBytes); !errors.Is(err, ErrInvalidMessageLength) {
+		t.Fatalf("err = %v, want ErrInvalidMessageLength", err)
+	}
+}
+
+// A rejected large header costs no payload allocation: a length over
+// MaxMessageLength, and an id whose type does not allow a large length.
+func TestRejectedLargeHeaderAllocatesNoPayload(t *testing.T) {
+	for _, header := range [][]byte{
+		frameA1(MsgPiece, 1<<20)[:5],
+		frameA1(30, MaxMessageLength)[:5],
+		frameA1(MsgHave, MaxMessageLength)[:5],
+	} {
+		src := bytes.NewReader(header)
+		r := bufio.NewReader(src)
+		lengthBuf := make([]byte, 4)
+		read := func() {
+			src.Reset(header)
+			r.Reset(src)
+			if _, err := readMessage(r, lengthBuf, defaultBitfieldLimit); !errors.Is(err, ErrInvalidMessageLength) {
+				t.Fatalf("err = %v, want ErrInvalidMessageLength", err)
+			}
+		}
+		// Only the wrapped error is allocated.
+		if allocs := testing.AllocsPerRun(100, read); allocs > 4 {
+			t.Fatalf("rejecting a large header made %.0f allocations", allocs)
+		}
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		const runs = 50
+		for i := 0; i < runs; i++ {
+			read()
+		}
+		runtime.ReadMemStats(&after)
+		if perRun := (after.TotalAlloc - before.TotalAlloc) / runs; perRun > 4096 {
+			t.Fatalf("rejecting a large header allocated %d bytes per read", perRun)
+		}
+	}
+}
+
+// BenchmarkReadMessagePiece reads full-block piece messages through the pooled
+// path, the inbound hot path.
+func BenchmarkReadMessagePiece(b *testing.B) {
+	frame := pieceWire(1, 0, bytes.Repeat([]byte{7}, maxBlockLength))
+	src := bytes.NewReader(frame)
+	r := bufio.NewReaderSize(src, 64*1024)
+	lengthBuf := make([]byte, 4)
+	b.SetBytes(int64(len(frame)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		src.Reset(frame)
+		r.Reset(src)
+		msg, err := readMessage(r, lengthBuf, defaultBitfieldLimit)
+		if err != nil {
+			b.Fatal(err)
+		}
+		msg.Release()
 	}
 }

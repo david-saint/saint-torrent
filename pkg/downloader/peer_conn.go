@@ -796,7 +796,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if logEnabled {
 		logInfoHash, logName = s.logIdentityLocked()
 	}
+	registeredPieces := len(s.PieceStates)
 	s.mu.Unlock()
+	// Size the largest bitfield the reader accepts to this torrent before the
+	// reader starts. Before metadata the client's default (the largest bitfield a
+	// magnet can need) applies until the piece count is known.
+	if registeredPieces > 0 {
+		client.SetBitfieldLimit(registeredPieces)
+	}
 	if logEnabled {
 		logging.Info("peer_connected",
 			logging.String("info_hash", logInfoHash),
@@ -2306,6 +2313,9 @@ peerLoop:
 		case result := <-readCh:
 			if result.err != nil {
 				disconnectReason = "read_error"
+				if errors.Is(result.err, peer.ErrInvalidMessageLength) {
+					disconnectReason = "invalid_message_length"
+				}
 				disconnectErr = result.err
 				break peerLoop
 			}
@@ -2381,6 +2391,9 @@ peerLoop:
 
 		if !inMetaNow && !initializedPeersAndBitfield {
 			// Initialize now that metadata is downloaded!
+			if numPiecesNow > 0 {
+				client.SetBitfieldLimit(numPiecesNow)
+			}
 			sendInitialPeerState()
 
 			// onMetadataDownloaded installs the piece table before it leaves
