@@ -194,26 +194,43 @@ func TestWebseedCorruptBytesRetryAndComplete(t *testing.T) {
 }
 
 func TestBuildWebseedSpecEscapesPathsAndSingleFileDirectory(t *testing.T) {
-	t.Run("percent in multi-file path", func(t *testing.T) {
-		spec, ok := buildWebseedSpec("http://seed.example/mirror", []webseedTorrentFile{
-			{length: 1, path: []string{"root", "50%off.txt"}},
-		}, true)
-		if !ok {
-			t.Fatal("buildWebseedSpec rejected valid path")
+	fileURL := func(t *testing.T, raw string, files []webseedTorrentFile) string {
+		t.Helper()
+		pool := newWebseedPool([]string{raw}, files)
+		if len(pool.sources) != 1 {
+			t.Fatalf("webseed %q rejected", raw)
 		}
-		if got, want := spec.files[0].url, "http://seed.example/mirror/root/50%25off.txt"; got != want {
+		u, ok := pool.sources[0].fileURL(pool.files[0], pool.multiFile)
+		if !ok {
+			t.Fatal("fileURL failed")
+		}
+		return u.String()
+	}
+
+	t.Run("percent in multi-file path", func(t *testing.T) {
+		got := fileURL(t, "http://seed.example/mirror", []webseedTorrentFile{
+			{length: 1, path: []string{"root", "50%off.txt"}},
+			{length: 1, path: []string{"root", "b.txt"}},
+		})
+		if want := "http://seed.example/mirror/root/50%25off.txt"; got != want {
 			t.Fatalf("url = %q, want %q", got, want)
 		}
 	})
 
 	t.Run("single-file directory url", func(t *testing.T) {
-		spec, ok := buildWebseedSpec("http://seed.example/seeddir/", []webseedTorrentFile{
+		got := fileURL(t, "http://seed.example/seeddir/", []webseedTorrentFile{
 			{length: 1, path: []string{"file.iso"}},
-		}, false)
-		if !ok {
-			t.Fatal("buildWebseedSpec rejected valid path")
+		})
+		if want := "http://seed.example/seeddir/file.iso"; got != want {
+			t.Fatalf("url = %q, want %q", got, want)
 		}
-		if got, want := spec.files[0].url, "http://seed.example/seeddir/file.iso"; got != want {
+	})
+
+	t.Run("single-file exact url", func(t *testing.T) {
+		got := fileURL(t, "http://seed.example/files/v1.iso?sig=abc", []webseedTorrentFile{
+			{length: 1, path: []string{"file.iso"}},
+		})
+		if want := "http://seed.example/files/v1.iso?sig=abc"; got != want {
 			t.Fatalf("url = %q, want %q", got, want)
 		}
 	})
@@ -234,7 +251,7 @@ func TestWebseedSyntheticPeerHiddenFromPeerStats(t *testing.T) {
 	if len(specs) != 1 {
 		t.Fatalf("expected 1 webseed spec, got %d", len(specs))
 	}
-	addr, pState := sess.registerWebseedPeer(specs[0])
+	addr, pState := sess.registerWebseedPeer(specs[0].pool.sources[0])
 	defer sess.unregisterWebseedPeer(addr)
 	if !pState.WebSeed {
 		t.Fatal("registered webseed peer state was not marked WebSeed")
