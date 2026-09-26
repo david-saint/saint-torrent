@@ -39,6 +39,10 @@ type Client struct {
 	readLenBuf  [4]byte       // reusable 4-byte length-prefix scratch for ReadMessage
 	DisableDHT  bool          // Disable advertising DHT support in handshake
 
+	// RemotePeerID is the peer's ID from its handshake: set by Handshake, or by
+	// the caller for an incoming connection whose handshake it parsed itself.
+	RemotePeerID [20]byte
+
 	// writeTimeout and writeDeadline implement the write timeout (see
 	// peerWriteTimeout); writeDeadline is the deadline last set on Conn. Both are
 	// guarded by writeMu.
@@ -136,7 +140,12 @@ func (c *Client) Handshake() (*Handshake, error) {
 	// Read the response through the buffered reader: if the peer pipelines its
 	// first messages in the same segment as the handshake, those bytes stay
 	// buffered for the message loop rather than being lost.
-	return ParseHandshake(c.r)
+	hs, err := ParseHandshake(c.r)
+	if err != nil {
+		return nil, err
+	}
+	c.RemotePeerID = hs.PeerID
+	return hs, nil
 }
 
 // SendMessage serializes and writes a message to the peer connection in a

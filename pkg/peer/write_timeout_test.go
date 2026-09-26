@@ -74,6 +74,9 @@ func TestWriteDeadlineArmedLazily(t *testing.T) {
 	if _, err := c.Handshake(); err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
+	if c.RemotePeerID != ([20]byte{3}) {
+		t.Fatalf("RemotePeerID = %x, want the peer's handshake ID", c.RemotePeerID)
+	}
 	_ = conn.SetDeadline(time.Time{}) // what the session does once the handshake is done
 	conn.writeDeadlines.Store(0)
 

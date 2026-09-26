@@ -150,6 +150,7 @@ type Session struct {
 	pieceAvailability []int
 	Peers             map[string]*PeerState
 	activePeers       map[string]*peer.Client // for sending Have messages
+	admission         peerAdmission           // per-host, peer-ID and self checks; see peer_admission.go
 	pipelineBudget    *pipelineByteBudget
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small

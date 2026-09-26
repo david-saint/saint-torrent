@@ -280,13 +280,13 @@ func (s *Session) maintainPeerConnections() {
 
 	launched := 0
 	now := time.Now()
-	for _, ps := range s.Peers {
+	for addr, ps := range s.Peers {
 		if slotsHeld+launched >= maxOutboundPeers || launched >= globalRoom {
 			break
 		}
 		// Skip connected peers, attempts already in flight, and inbound-only source
 		// endpoints whose ports were never advertised as listening ports.
-		if ps.Active || ps.Dialing || !ps.Dialable {
+		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr) {
 			continue
 		}
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
@@ -316,6 +316,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
+	refused := s.refusesDialLocked(peerAddr)
 	s.mu.RUnlock()
 	acquiredSlots := false
 	defer func() {
@@ -325,13 +326,17 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 			// A full per-session or manager-wide pool means no network attempt was
 			// made. Keep the peer immediately eligible instead of burning a full
 			// redial backoff because a lock-free capacity hint raced another session.
+			// A refused address keeps its backoff.
 			resumedDuringDial := s.pauseEpoch != dialPauseEpoch && !s.paused && !s.closed
-			if (!acquiredSlots || resumedDuringDial) && !ps.Active {
+			if (!acquiredSlots || resumedDuringDial) && !ps.Active && !refused {
 				ps.LastAttempt = time.Time{}
 			}
 		}
 		s.mu.Unlock()
 	}()
+	if refused {
+		return
+	}
 
 	// Acquire an outbound slot so concurrent dials stay bounded (see maxOutboundPeers).
 	// outboundSlots is nil only for sessions built outside NewSession (tests), which
@@ -661,6 +666,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	_ = conn.SetDeadline(time.Time{})
 
 	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	client.RemotePeerID = handshake.PeerID
 	peerAddr := conn.RemoteAddr().String()
 	host, portStr, err := net.SplitHostPort(peerAddr)
 	if err != nil {
@@ -682,9 +688,27 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		direction = "outbound"
 	}
 
+	hostKey, loopback := peerHostKey(ip)
+	remoteID := client.RemotePeerID
 	s.mu.Lock()
 	if s.paused || s.closed {
 		s.mu.Unlock()
+		return
+	}
+	if reason := s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound); reason != "" {
+		if reason == "self_connection" {
+			if ps, ok := s.Peers[peerAddr]; ok {
+				ps.Dialable = false
+			}
+		}
+		s.mu.Unlock()
+		if logging.Enabled() {
+			logging.Debug("peer_rejected",
+				logging.String("peer", peerAddr),
+				logging.String("direction", direction),
+				logging.String("reason", reason),
+			)
+		}
 		return
 	}
 	connectionPauseEpoch := s.pauseEpoch
@@ -740,6 +764,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Lock()
 		reconnectAfterResume := false
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
+			s.releasePeerLocked(hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Active = false
 				ps.Choked = true
@@ -2849,7 +2874,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	}
 
 	// Don't exceed the outbound connection cap.
-	if shouldDial && len(s.outboundSlots) >= maxOutboundPeers {
+	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr)) {
 		shouldDial = false
 	}
 
