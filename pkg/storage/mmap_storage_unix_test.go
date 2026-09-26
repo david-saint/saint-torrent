@@ -622,3 +622,17 @@ func TestMMapReadsDoNotRemapDuringCheckpoint(t *testing.T) {
 		t.Fatal("a read during a checkpoint re-established the mapping")
 	}
 }
+
+// BenchmarkMMapStorageBlocks is BenchmarkFileStorageBlocks for the mmap backend,
+// whose ReadBlock looks the overlapping files up three times per block.
+func BenchmarkMMapStorageBlocks(b *testing.B) {
+	benchmarkBlocks(b, func(dir string, files []FileInfo, pieceLength int64) (blockBenchStorage, error) {
+		return NewMMapStorage(dir, files, pieceLength)
+	})
+}
+
+func TestMMapStorageBlockSpans(t *testing.T) {
+	checkBlockSpans(t, func(dir string, files []FileInfo, pieceLength int64) (Storage, error) {
+		return NewStorageWithBackend(BackendMMap, dir, files, pieceLength)
+	})
+}

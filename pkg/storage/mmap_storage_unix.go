@@ -13,6 +13,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// mappedFile pairs a layout with its mapping. MMapStorage.maps holds one per
+// FileStorage.files entry, in the same order, so a file index found in files
+// addresses maps too.
 type mappedFile struct {
 	layout *fileLayout
 	data   []byte
@@ -96,8 +99,11 @@ func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool
 	if !s.rangeMappedLocked(globalStart, globalEnd) {
 		return false, nil
 	}
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
@@ -136,8 +142,11 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	repaired := false
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			wasRepaired, err := s.ensureMappedFileLocked(mapped, true)
 			if err != nil {
@@ -197,8 +206,11 @@ func (s *MMapStorage) hashMapped(globalStart, globalEnd int64) (bool, [20]byte, 
 		return false, actualHash, nil
 	}
 	h := sha1.New()
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
@@ -275,8 +287,11 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			if _, err := s.ensureMappedFileLocked(mapped, false); err != nil {
 				return err
@@ -289,8 +304,11 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 // rangeMappedLocked reports whether every non-empty file overlapping the range is
 // mapped. The caller holds s.mu.
 func (s *MMapStorage) rangeMappedLocked(globalStart, globalEnd int64) bool {
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			if file.length != 0 && len(mapped.data) == 0 {
 				return false

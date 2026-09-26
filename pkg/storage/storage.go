@@ -541,6 +541,15 @@ func (s *FileStorage) PieceLength(pieceIndex int64) int64 {
 	return pieceEnd - pieceStart
 }
 
+// firstFileEndingAfter returns the index of the first file that ends after
+// globalStart. Files are laid out in ascending offset order, so the block paths
+// start there and stop at the first file starting at or past the block's end:
+// O(log files) per block instead of a scan of every file, which a torrent with
+// hundreds of thousands of files turned into milliseconds per 16 KiB request.
+func (s *FileStorage) firstFileEndingAfter(globalStart int64) int {
+	return sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
+}
+
 // ReadBlock reads a block of data from the storage.
 // It returns the number of bytes read, or an error.
 func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
@@ -570,7 +579,10 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(buf))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -633,7 +645,10 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -718,8 +733,7 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
-	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
-	for _, file := range s.files[first:] {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
 		}
