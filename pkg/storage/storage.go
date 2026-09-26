@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -151,8 +152,9 @@ type fileLayout struct {
 
 	// readHandle is an O_RDONLY handle opened on first read and reused for every
 	// subsequent block read of this file — eliminating the open/close syscall pair
-	// per 16 KB block on the seed path. A read only opens it when the file has no
-	// cached write handle. Set and cleared under rmu. Invalidated when a write
+	// per 16 KB block on the seed path. Where reads share the write handle
+	// (readsShareWriteHandle), a read only opens it when the file has no cached
+	// write handle. Set and cleared under rmu. Invalidated when a write
 	// recreates/resizes the file so a stale handle to an orphaned inode is dropped,
 	// on eviction, and on Close.
 	rmu        sync.Mutex
@@ -162,11 +164,22 @@ type fileLayout struct {
 	// resized, repaired) on first write and reused for every subsequent block write
 	// of this file — the write-side analogue of readHandle, eliminating the
 	// open/stat/close syscall churn per completed piece on the download path. Reads
-	// reuse it too, which keeps a file being downloaded and verified to one
-	// descriptor. Set and cleared under wmu. Invalidated on eviction and Close.
+	// reuse it too where readsShareWriteHandle allows, which keeps a file being
+	// downloaded and verified to one descriptor. Set and cleared under wmu.
+	// Invalidated on eviction and Close.
 	wmu         sync.Mutex
 	writeHandle atomic.Pointer[os.File]
 }
+
+// readsShareWriteHandle is whether a read uses a file's cached write handle
+// rather than opening a read handle of its own, which halves the descriptors a
+// file being downloaded and seeded holds. Not on Windows: there every
+// positional read and write through one os.File takes that file's single I/O
+// lock, so a shared handle would queue the upload reads of a file behind its
+// piece writes, where separate handles let them overlap. Windows handles are
+// not scarce, so nothing is lost there. A var so tests can exercise both; treat
+// it as a constant.
+var readsShareWriteHandle = runtime.GOOS != "windows"
 
 // touch stamps f with the budget clock on a cache hit. The clock only moves on
 // opens, so in steady state this is two loads and no store.
@@ -177,15 +190,17 @@ func (f *fileLayout) touch() {
 }
 
 // reader returns a cached handle to read from: the read handle, else the write
-// handle, else a newly opened O_RDONLY one.
+// handle (where readsShareWriteHandle), else a newly opened O_RDONLY one.
 func (f *fileLayout) reader() (*os.File, error) {
 	if h := f.readHandle.Load(); h != nil {
 		f.touch()
 		return h, nil
 	}
-	if h := f.writeHandle.Load(); h != nil {
-		f.touch()
-		return h, nil
+	if readsShareWriteHandle {
+		if h := f.writeHandle.Load(); h != nil {
+			f.touch()
+			return h, nil
+		}
 	}
 
 	f.rmu.Lock()
@@ -194,9 +209,11 @@ func (f *fileLayout) reader() (*os.File, error) {
 		f.rmu.Unlock()
 		return h, nil
 	}
-	if h := f.writeHandle.Load(); h != nil {
-		f.rmu.Unlock()
-		return h, nil
+	if readsShareWriteHandle {
+		if h := f.writeHandle.Load(); h != nil {
+			f.rmu.Unlock()
+			return h, nil
+		}
 	}
 	h, err := f.openReaderLocked()
 	if err != nil {

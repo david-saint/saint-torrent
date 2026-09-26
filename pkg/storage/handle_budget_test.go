@@ -217,37 +217,69 @@ func TestFileStorageRetriesHandleClosedUnderIt(t *testing.T) {
 }
 
 // TestFileStorageReadsReuseWriteHandle: a file being downloaded and verified
-// holds one descriptor, not an O_RDWR and an O_RDONLY one.
+// holds one descriptor, not an O_RDWR and an O_RDONLY one, except where reads
+// keep a handle of their own (readsShareWriteHandle off, as on Windows, where
+// one os.File serializes its reads with its writes).
 func TestFileStorageReadsReuseWriteHandle(t *testing.T) {
-	st, err := NewFileStorage(t.TempDir(), []FileInfo{{Path: "a", Length: 32}}, 32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	piece := budgetPiece(0, 32)
-	if err := st.WriteBlock(0, 0, piece); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, 32)
-	if _, err := st.ReadBlock(0, 0, got); err != nil || !bytes.Equal(got, piece) {
-		t.Fatalf("ReadBlock = %v, %v; want the written piece", got, err)
-	}
-	if ok, err := st.VerifyPiece(0, sha1.Sum(piece)); err != nil || !ok {
-		t.Fatalf("VerifyPiece = %v, %v; want a match", ok, err)
-	}
-	if hasReadHandle(st.files[0]) {
-		t.Fatal("a read opened a second handle to a file with a cached write handle")
-	}
-	if n := cachedHandles(st.files[0]); n != 1 {
-		t.Fatalf("file holds %d cached handles, want 1", n)
+	for _, shared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("shared=%v", shared), func(t *testing.T) {
+			previous := readsShareWriteHandle
+			readsShareWriteHandle = shared
+			t.Cleanup(func() { readsShareWriteHandle = previous })
+
+			st, err := NewFileStorage(t.TempDir(), []FileInfo{{Path: "a", Length: 32}}, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			piece := budgetPiece(0, 32)
+			if err := st.WriteBlock(0, 0, piece); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, 32)
+			if _, err := st.ReadBlock(0, 0, got); err != nil || !bytes.Equal(got, piece) {
+				t.Fatalf("ReadBlock = %v, %v; want the written piece", got, err)
+			}
+			if ok, err := st.VerifyPiece(0, sha1.Sum(piece)); err != nil || !ok {
+				t.Fatalf("VerifyPiece = %v, %v; want a match", ok, err)
+			}
+			wantHandles := 2
+			if shared {
+				wantHandles = 1
+			}
+			if got := hasReadHandle(st.files[0]); got == shared {
+				t.Fatalf("read handle cached = %v, want %v", got, !shared)
+			}
+			if n := cachedHandles(st.files[0]); n != wantHandles {
+				t.Fatalf("file holds %d cached handles, want %d", n, wantHandles)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if n := cachedHandles(st.files[0]); n != 0 {
+				t.Fatalf("closed storage still holds %d cached handles", n)
+			}
+		})
 	}
 }
 
 // TestFileStorageConcurrentIOUnderHandleBudget runs reads, writes and verifies
 // from several goroutines over far more files than the budget holds, so the
 // sweep constantly closes handles that operations have just loaded. No
-// operation may fail and every read must see the stored bytes.
+// operation may fail and every read must see the stored bytes, whether reads
+// share the write handle or keep their own (readsShareWriteHandle).
 func TestFileStorageConcurrentIOUnderHandleBudget(t *testing.T) {
+	for _, shared := range []bool{true, false} {
+		t.Run(fmt.Sprintf("shared=%v", shared), func(t *testing.T) {
+			previous := readsShareWriteHandle
+			readsShareWriteHandle = shared
+			t.Cleanup(func() { readsShareWriteHandle = previous })
+			testConcurrentIOUnderHandleBudget(t)
+		})
+	}
+}
+
+func testConcurrentIOUnderHandleBudget(t *testing.T) {
 	setHandleLimit(t, 8)
 	const fileCount, fileLength, pieceLength = 200, 48, 64
 	st, err := NewFileStorage(t.TempDir(), manySmallFiles(fileCount, fileLength), pieceLength)
