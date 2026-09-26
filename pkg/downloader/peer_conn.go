@@ -766,6 +766,15 @@ func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {
 }
 
 // inboundListenerLoop accepts incoming peer connections on the already-bound listener.
+//
+// Only a standalone session (tests, or a Session used without a
+// TorrentManager) owns a listener. The CLI and TUI serve every torrent from the
+// manager's shared listener, which reads the handshake under a bounded
+// pre-handshake budget (inboundHandshakeSlots, with a per-source share) before
+// any session slot is taken; see TorrentManager.handleRoutedIncomingConnection.
+// This path has no such budget: handleIncomingConnection takes the session's
+// and the global inbound slots before the handshake is read, so connections
+// that never send one can fill them for up to peerHandshakeTimeout.
 func (s *Session) inboundListenerLoop() {
 	defer s.wg.Done()
 
@@ -804,6 +813,10 @@ func (s *Session) inboundListenerLoop() {
 	}
 }
 
+// handleIncomingConnection serves a connection from a standalone session's own
+// listener (see inboundListenerLoop). It holds an inbound slot from before the
+// handshake is read, unlike the manager's shared listener, which the CLI uses
+// and which budgets pre-handshake connections separately.
 func (s *Session) handleIncomingConnection(conn net.Conn) {
 	defer conn.Close()
 
