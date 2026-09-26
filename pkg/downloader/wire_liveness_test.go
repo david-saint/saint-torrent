@@ -216,3 +216,113 @@ func TestOversizedMessageDisconnects(t *testing.T) {
 		})
 	}
 }
+
+// send writes a message the loop must take.
+func (p *livenessPeerA1) send(m *peer.Message) {
+	p.t.Helper()
+	if !p.write(m.Serialize()) {
+		p.t.Fatalf("write message %d failed", m.ID)
+	}
+}
+
+// pieceFrameA1 is a piece message carrying length bytes at (index, begin).
+func pieceFrameA1(index, begin, length uint32) []byte {
+	frame := make([]byte, 13+length)
+	binary.BigEndian.PutUint32(frame[0:4], 9+length)
+	frame[4] = byte(peer.MsgPiece)
+	binary.BigEndian.PutUint32(frame[5:9], index)
+	binary.BigEndian.PutUint32(frame[9:13], begin)
+	return frame
+}
+
+// A peer streaming piece data we never asked for used to be kept for as long as
+// it had pieces we want. It is dropped once the unrequested bytes pass
+// unsolicitedFloodSlack (and the useful bytes).
+func TestUnsolicitedPieceFloodDisconnects(t *testing.T) {
+	reasons := disconnectReasonsA1(t)
+	sess := settled(newWireTestSession(t, 4, 256*1024))
+	p := startLivenessPeerA1(t, sess, 7704, false)
+	p.send(&peer.Message{ID: peer.MsgHaveAll}) // it has everything we want
+
+	sent := 0
+	for sent < 1000 && p.write(pieceFrameA1(0, 0, BlockSize)) {
+		sent++
+	}
+	if !p.closedWithin(3 * time.Second) {
+		t.Fatal("a peer flooding unrequested blocks was not dropped")
+	}
+	if got := reasons(p.addr); got != "unsolicited_flood" {
+		t.Fatalf("disconnect reason %q, want unsolicited_flood", got)
+	}
+	if limit := unsolicitedFloodSlack / BlockSize; sent < limit || sent > limit+16 {
+		t.Fatalf("dropped after %d unrequested blocks, want just over %d", sent, limit)
+	}
+}
+
+// requestsA1 collects the block requests the loop sends until a barrier (a
+// request for a piece that cannot exist, answered by a reject) comes back.
+func (p *livenessPeerA1) requestsA1() [][3]uint32 {
+	p.t.Helper()
+	p.send(&peer.Message{ID: peer.MsgRequest, Payload: blockPayload(0xffffffff, 0, 1)})
+	var reqs [][3]uint32
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-p.in:
+			switch {
+			case msg.ID == peer.MsgRejectRequest && binary.BigEndian.Uint32(msg.Payload[0:4]) == 0xffffffff:
+				return reqs
+			case msg.ID == peer.MsgRequest:
+				reqs = append(reqs, [3]uint32{
+					binary.BigEndian.Uint32(msg.Payload[0:4]),
+					binary.BigEndian.Uint32(msg.Payload[4:8]),
+					binary.BigEndian.Uint32(msg.Payload[8:12]),
+				})
+			}
+		case <-deadline:
+			p.t.Fatal("timed out waiting for the barrier reject")
+		}
+	}
+}
+
+// An honest peer with a deep pipeline keeps answering requests we gave up on:
+// after a choke it may still deliver everything in flight. Those late blocks are
+// discarded but never count as a flood, however many choke rounds pile them up;
+// only data beyond them does.
+func TestLateBlocksAfterChokeAreNotAFlood(t *testing.T) {
+	reasons := disconnectReasonsA1(t)
+	sess := settled(newWireTestSession(t, 64, 256*1024))
+	p := startLivenessPeerA1(t, sess, 7705, false)
+	p.send(&peer.Message{ID: peer.MsgHaveAll})
+
+	var late int
+	for round := 0; late < 2*unsolicitedFloodSlack; round++ {
+		p.send(&peer.Message{ID: peer.MsgUnchoke})
+		reqs := p.requestsA1()
+		if len(reqs) == 0 {
+			t.Fatalf("round %d: no requests after an unchoke", round)
+		}
+		p.send(&peer.Message{ID: peer.MsgChoke})
+		for _, r := range reqs {
+			if !p.write(pieceFrameA1(r[0], r[1], r[2])) {
+				t.Fatalf("round %d: dropped after %d late bytes", round, late)
+			}
+			late += int(r[2])
+		}
+		p.requestsA1() // every late block has been handled
+		t.Logf("round %d: %d requests, %d late bytes so far", round, len(reqs), late)
+	}
+	if p.closedWithin(0) {
+		t.Fatalf("dropped after %d late bytes: %q", late, reasons(p.addr))
+	}
+
+	// Data beyond what we gave up on is still limited.
+	for i := 0; i < 2*unsolicitedFloodSlack/BlockSize && p.write(pieceFrameA1(0, 0, BlockSize)); i++ {
+	}
+	if !p.closedWithin(3 * time.Second) {
+		t.Fatal("a flood after the late blocks was not dropped")
+	}
+	if got := reasons(p.addr); got != "unsolicited_flood" {
+		t.Fatalf("disconnect reason %q, want unsolicited_flood", got)
+	}
+}

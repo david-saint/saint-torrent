@@ -67,6 +67,11 @@ var peerKeepAliveInterval = 30 * time.Second
 // constant.
 var peerIdleTickInterval = 30 * time.Second
 
+// unsolicitedFloodSlack is how many bytes of piece data we did not ask for (or no
+// longer wait for) a connection may send beyond the late-block allowance before
+// it is dropped as a flood; see the MsgPiece handler.
+const unsolicitedFloodSlack = 4 << 20
+
 // peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
 // outbound connection set. New dials previously happened ONLY on a tracker
 // announce (interval up to an hour) or a 30 s DHT lookup, so a slot freed by a
@@ -1102,6 +1107,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		requestFinishAbandon
 	)
 
+	// Unsolicited-data accounting. A peer that has pieces we want is never
+	// inactive, and an inbound one is never stall-reaped, so without these it
+	// could stream piece messages we never asked for at wire speed for good.
+	// usefulBytes counts the block bytes we accepted; lateAllowance the bytes of
+	// requests we stopped waiting for (timed out, cancelled, dropped on a choke),
+	// which an honest peer may still deliver; unsolicitedBytes every block we
+	// discarded. The peer is dropped once the discarded bytes pass both the
+	// allowance plus unsolicitedFloodSlack and the useful bytes.
+	var unsolicitedBytes, usefulBytes, lateAllowance int64
+
 	findDownload := func(index int64) *activeDownload {
 		for _, dl := range activeDownloads {
 			if dl.pieceIndex == index {
@@ -1169,6 +1184,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.pipelineBudget.release(req.pipelineBudgetBytes)
 		req.pipelineBudgetBytes = 0
 	}
+	// finishRequest ends our wait for an outstanding request. It is the only place
+	// a requested, not yet received block stops being outstanding: every path that
+	// gives one up (a timeout, a cancel, a reject, a choke, another peer finishing
+	// the piece) goes through it, which is what keeps lateAllowance complete.
 	finishRequest := func(req *blockRequest, reason requestFinishReason, now time.Time) {
 		if req == nil || !req.requested || req.received {
 			return
@@ -1179,8 +1198,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			pipeline.OnBlockAccepted(req, req.length, now)
 		case requestFinishTimeout:
 			pipeline.OnRequestTimeout(req, now)
+			lateAllowance += req.length
 		case requestFinishCancel, requestFinishAbandon:
 			pipeline.OnCancel(req, now)
+			lateAllowance += req.length
 		}
 		req.requested = false
 	}
@@ -2750,42 +2771,42 @@ peerLoop:
 			blockData := msg.Payload[8:]
 			now := time.Now()
 
-			// Validate against our outstanding requests for this piece.
+			// Validate against our outstanding requests: the block must belong to a
+			// piece we are downloading from this peer, start on a block boundary, be
+			// requested and not yet received, and have the requested length.
+			var req *blockRequest
+			var blockIndex int64
+			valid, duplicate := false, false
 			dl := findDownload(index)
-			if dl == nil {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue // not a piece we're currently downloading; discard
+			if dl != nil && begin%BlockSize == 0 {
+				r, exists := dl.pending[begin]
+				switch {
+				case exists && r.requested && !r.received:
+					req, blockIndex = r, begin/BlockSize
+					valid = int64(len(blockData)) == r.length && blockIndex < int64(len(dl.blocks))
+				case exists && r.received:
+					duplicate = true
+				}
 			}
-
-			// Validate begin is block-aligned
-			if begin%BlockSize != 0 {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue
-			}
-
-			// Validate this block was requested and not already received
-			req, exists := dl.pending[begin]
-			if !exists || !req.requested || req.received {
-				if exists && req.received {
+			if !valid {
+				// Discard it. A peer may still deliver blocks we stopped waiting
+				// for (lateAllowance) and repeat a few, but one that keeps sending
+				// data we never asked for, more of it than useful data, is a flood.
+				if duplicate {
 					pipeline.OnDuplicate(int64(len(blockData)), now)
 				} else {
 					pipeline.OnUnsolicited(int64(len(blockData)), now)
 				}
-				continue // Unsolicited or duplicate block
-			}
-
-			// Validate block length matches expected
-			if int64(len(blockData)) != req.length {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
+				unsolicitedBytes += int64(len(blockData))
+				if unsolicitedBytes > lateAllowance+unsolicitedFloodSlack && unsolicitedBytes > usefulBytes {
+					disconnectReason = "unsolicited_flood"
+					break peerLoop
+				}
 				continue
 			}
 
 			// Accept the block
-			blockIndex := begin / BlockSize
-			if blockIndex >= int64(len(dl.blocks)) {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue
-			}
+			usefulBytes += int64(len(blockData))
 			finishRequest(req, requestFinishAccepted, now)
 			dl.blocks[blockIndex] = blockData
 			// Ownership of the pooled wire buffer passes to this download until the
