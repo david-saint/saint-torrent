@@ -3,15 +3,16 @@ package tracker
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -95,7 +96,71 @@ func escapeBinary(b []byte) string {
 	return sb.String()
 }
 
-// ParseTrackerResponse decodes a bencoded tracker response.
+// MaxResponsePeers caps how many peers one announce reply may contribute. We
+// ask for numwant=200 and honest trackers never send ten times that; the cap
+// bounds the parse, dedup and dial work a hostile tracker can cause.
+const MaxResponsePeers = 2000
+
+// maxTrackerMessage caps tracker-supplied text (failure reason, warning
+// message, UDP error) that ends up in errors, logs, the TUI and the HTTP API.
+const maxTrackerMessage = 256
+
+// trackerMessage bounds tracker-supplied text to maxTrackerMessage bytes of
+// valid UTF-8, so a hostile tracker cannot push megabytes of text (or broken
+// encodings) into every place an error is shown.
+func trackerMessage(s string) string {
+	if len(s) > maxTrackerMessage {
+		s = s[:maxTrackerMessage]
+	}
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) > maxTrackerMessage {
+		// Replacement characters grew it; cut again on a rune boundary.
+		cut := maxTrackerMessage
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
+	return s
+}
+
+// clampCount converts a tracker-supplied integer to a non-negative int that
+// fits in 32 bits, so a huge value cannot wrap on 32-bit builds (2^32+1 would
+// otherwise become 1) or overflow later Duration arithmetic.
+func clampCount(v int64) int {
+	switch {
+	case v < 0:
+		return 0
+	case v > math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int(v)
+}
+
+// compactPeers decodes up to limit compact peer entries of stride bytes (an
+// IPv4 or IPv6 address followed by a big-endian port). The addresses are
+// copied into one small backing array, so the peers never pin the response
+// body in memory.
+func compactPeers(data string, ipLen, limit int) []Peer {
+	stride := ipLen + 2
+	n := min(len(data)/stride, limit)
+	if n <= 0 {
+		return nil
+	}
+	ips := make([]byte, n*ipLen)
+	peers := make([]Peer, 0, n)
+	for i := 0; i < n; i++ {
+		entry := data[i*stride : (i+1)*stride]
+		ip := ips[i*ipLen : (i+1)*ipLen : (i+1)*ipLen]
+		copy(ip, entry[:ipLen])
+		port := uint16(entry[ipLen])<<8 | uint16(entry[ipLen+1])
+		peers = append(peers, Peer{IP: net.IP(ip), Port: port})
+	}
+	return peers
+}
+
+// ParseTrackerResponse decodes a bencoded tracker response. At most
+// MaxResponsePeers peers are returned.
 func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 	val, rest, err := bencode.DecodePrefix(data)
 	if err != nil {
@@ -110,34 +175,34 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 	}
 
 	if failReason, ok := dict["failure reason"].(string); ok {
-		return nil, fmt.Errorf("tracker error: %s", failReason)
+		return nil, fmt.Errorf("tracker error: %s", trackerMessage(failReason))
 	}
 
 	var interval int
 	if intVal, ok := dict["interval"].(int64); ok {
-		interval = int(intVal)
+		interval = clampCount(intVal)
 	} else {
 		return nil, fmt.Errorf("missing or invalid interval")
 	}
 
 	var minInterval int
 	if minIntVal, ok := dict["min interval"].(int64); ok {
-		minInterval = int(minIntVal)
+		minInterval = clampCount(minIntVal)
 	}
 
 	var warning string
 	if warnVal, ok := dict["warning message"].(string); ok {
-		warning = warnVal
+		warning = trackerMessage(warnVal)
 	}
 
 	var complete int
 	if compVal, ok := dict["complete"].(int64); ok {
-		complete = int(compVal)
+		complete = clampCount(compVal)
 	}
 
 	var incomplete int
 	if incompVal, ok := dict["incomplete"].(int64); ok {
-		incomplete = int(incompVal)
+		incomplete = clampCount(incompVal)
 	}
 
 	var peers []Peer
@@ -145,23 +210,16 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 	if exists {
 		if peersStr, ok := peersVal.(string); ok {
 			// Compact IPv4 peers (6 bytes per peer)
-			peersBytes := []byte(peersStr)
-			if len(peersBytes)%6 != 0 {
-				return nil, fmt.Errorf("compact peers length must be a multiple of 6, got %d", len(peersBytes))
+			if len(peersStr)%6 != 0 {
+				return nil, fmt.Errorf("compact peers length must be a multiple of 6, got %d", len(peersStr))
 			}
-			numPeers := len(peersBytes) / 6
-			for i := 0; i < numPeers; i++ {
-				offset := i * 6
-				ip := net.IP(peersBytes[offset : offset+4])
-				port := binary.BigEndian.Uint16(peersBytes[offset+4 : offset+6])
-				peers = append(peers, Peer{
-					IP:   ip,
-					Port: port,
-				})
-			}
+			peers = compactPeers(peersStr, 4, MaxResponsePeers)
 		} else if peersList, ok := peersVal.([]interface{}); ok {
 			// Non-compact peer list (list of dictionaries)
 			for _, pVal := range peersList {
+				if len(peers) >= MaxResponsePeers {
+					break
+				}
 				pDict, ok := pVal.(map[string]interface{})
 				if !ok {
 					continue
@@ -194,20 +252,10 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 
 	// Compact IPv6 peers (18 bytes per peer)
 	if peers6Val, ok := dict["peers6"].(string); ok {
-		peers6Bytes := []byte(peers6Val)
-		if len(peers6Bytes)%18 != 0 {
-			return nil, fmt.Errorf("compact peers6 length must be a multiple of 18, got %d", len(peers6Bytes))
+		if len(peers6Val)%18 != 0 {
+			return nil, fmt.Errorf("compact peers6 length must be a multiple of 18, got %d", len(peers6Val))
 		}
-		numPeers6 := len(peers6Bytes) / 18
-		for i := 0; i < numPeers6; i++ {
-			offset := i * 18
-			ip := net.IP(peers6Bytes[offset : offset+16])
-			port := binary.BigEndian.Uint16(peers6Bytes[offset+16 : offset+18])
-			peers = append(peers, Peer{
-				IP:   ip,
-				Port: port,
-			})
-		}
+		peers = append(peers, compactPeers(peers6Val, 16, MaxResponsePeers-len(peers))...)
 	}
 
 	return &TrackerResponse{
@@ -233,18 +281,33 @@ type ScrapeStats struct {
 }
 
 // maxScrapeResponse caps how many bytes of an HTTP scrape response we buffer. A
-// scrape reply is a small bencoded dictionary; this ceiling stops a malicious or
-// MITM'd tracker from streaming unbounded data into memory.
-const maxScrapeResponse = 1 * 1024 * 1024
+// single-hash scrape reply is about 100 bytes; this ceiling stops a malicious
+// or MITM'd tracker from streaming data (and bencode decode amplification)
+// into memory.
+const maxScrapeResponse = 64 * 1024
 
 // defaultScrapeTimeout bounds an HTTP scrape when the caller passes a context
 // without its own deadline, so an exported call can never hang indefinitely.
 const defaultScrapeTimeout = 30 * time.Second
 
-// scrapeHTTPClient issues scrape requests. Request lifetime is bounded by the
-// per-request context (see HTTPScrape); using a dedicated client avoids
-// coupling to the process-wide http.DefaultClient.
-var scrapeHTTPClient = &http.Client{}
+// ParseAnnounceURL parses a tracker announce URL and checks that it names a
+// host and a supported scheme: http, https or udp, in any letter case (the
+// returned URL's Scheme is lowercase).
+func ParseAnnounceURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch u.Scheme {
+	case "http", "https", "udp":
+	default:
+		return nil, fmt.Errorf("unsupported tracker scheme %q", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("tracker URL has no host")
+	}
+	return u, nil
+}
 
 // ReadCappedBody reads up to max bytes from r, returning an error if the source
 // exceeds the cap rather than silently truncating. Reading one byte past the
@@ -335,7 +398,7 @@ func ParseScrapeResponse(data []byte) (map[[20]byte]ScrapeStats, error) {
 		return nil, fmt.Errorf("scrape response is not a dictionary")
 	}
 	if failReason, ok := dict["failure reason"].(string); ok {
-		return nil, fmt.Errorf("tracker error: %s", failReason)
+		return nil, fmt.Errorf("tracker error: %s", trackerMessage(failReason))
 	}
 	filesVal, ok := dict["files"].(map[string]interface{})
 	if !ok {
@@ -353,13 +416,13 @@ func ParseScrapeResponse(data []byte) (map[[20]byte]ScrapeStats, error) {
 		}
 		var stats ScrapeStats
 		if c, ok := fileDict["complete"].(int64); ok {
-			stats.Complete = int(c)
+			stats.Complete = clampCount(c)
 		}
 		if d, ok := fileDict["downloaded"].(int64); ok {
-			stats.Downloaded = int(d)
+			stats.Downloaded = clampCount(d)
 		}
 		if i, ok := fileDict["incomplete"].(int64); ok {
-			stats.Incomplete = int(i)
+			stats.Incomplete = clampCount(i)
 		}
 		var hash [20]byte
 		copy(hash[:], key)
@@ -390,12 +453,12 @@ func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte)
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req, err := NewRequest(ctx, PurposeScrape, reqURL)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := scrapeHTTPClient.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -417,14 +480,14 @@ func HTTPScrape(ctx context.Context, announceURL string, infoHashes ...[20]byte)
 // implementation based on the announce URL scheme. It returns swarm-health
 // counts keyed by raw info hash.
 func Scrape(ctx context.Context, announceURL string, infoHashes ...[20]byte) (map[[20]byte]ScrapeStats, error) {
-	// Dispatch on the scheme prefix (mirroring announceTracker) instead of a
-	// full url.Parse here; the chosen implementation parses the URL itself.
-	switch {
-	case strings.HasPrefix(announceURL, "udp"):
-		return UDPScrape(ctx, announceURL, infoHashes...)
-	case strings.HasPrefix(announceURL, "http"):
-		return HTTPScrape(ctx, announceURL, infoHashes...)
-	default:
-		return nil, fmt.Errorf("unsupported tracker scheme for scrape: %q", announceURL)
+	// Dispatch on the parsed, lowercased scheme: a byte-prefix match would send
+	// "httpx://" down the HTTP path and reject a valid "HTTP://".
+	u, err := ParseAnnounceURL(announceURL)
+	if err != nil {
+		return nil, fmt.Errorf("scrape: %w", err)
 	}
+	if u.Scheme == "udp" {
+		return UDPScrape(ctx, announceURL, infoHashes...)
+	}
+	return HTTPScrape(ctx, announceURL, infoHashes...)
 }

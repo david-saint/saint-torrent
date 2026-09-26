@@ -287,7 +287,7 @@ func (s *Session) maintainPeerConnections() {
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
-	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
+	peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
 	s.mu.RUnlock()

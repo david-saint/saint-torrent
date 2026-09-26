@@ -492,7 +492,7 @@ func TestUDPAnnounce_NoPeers(t *testing.T) {
 
 func TestParseUDPAnnounceResponse_TooShort(t *testing.T) {
 	data := make([]byte, 10) // too short
-	_, err := parseUDPAnnounceResponse(data)
+	_, err := parseUDPAnnounceResponse(data, false)
 	if err == nil {
 		t.Fatal("expected error for too-short response, got nil")
 	}
@@ -506,7 +506,7 @@ func TestParseUDPAnnounceResponse_BadPeerLength(t *testing.T) {
 	binary.BigEndian.PutUint32(data[12:16], 0)   // leechers
 	binary.BigEndian.PutUint32(data[16:20], 0)   // seeders
 
-	_, err := parseUDPAnnounceResponse(data)
+	_, err := parseUDPAnnounceResponse(data, false)
 	if err == nil {
 		t.Fatal("expected error for non-multiple-of-6 peer data, got nil")
 	}
