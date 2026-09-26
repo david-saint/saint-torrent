@@ -291,9 +291,10 @@ func (s *Session) maintainPeerConnections() {
 		if slotsHeld+launched >= maxOutboundPeers || launched >= globalRoom {
 			break
 		}
-		// Skip connected peers, attempts already in flight, and inbound-only source
-		// endpoints whose ports were never advertised as listening ports.
-		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr, ps.IP) {
+		// Skip connected peers, attempts already in flight, inbound-only source
+		// endpoints whose ports were never advertised as listening ports, and
+		// DHT/PEX peers of a torrent that turned out private.
+		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr, ps.IP) || s.privateRefusesDialLocked(ps) {
 			continue
 		}
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
@@ -323,7 +324,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
-	refused := s.refusesDialLocked(peerAddr, p.IP.String())
+	refused := s.refusesDialLocked(peerAddr, p.IP.String()) || s.privateRefusesDialLocked(s.Peers[peerAddr])
 	s.mu.RUnlock()
 	acquiredSlots := false
 	defer func() {
@@ -338,6 +339,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 			if (!acquiredSlots || resumedDuringDial) && !ps.Active && !refused {
 				ps.LastAttempt = time.Time{}
 			}
+			s.forgetRefusedPeerLocked(peerAddr)
 		}
 		s.mu.Unlock()
 	}()
@@ -710,7 +712,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Unlock()
 		return
 	}
-	if reason := s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound); reason != "" {
+	// A dial started before metadata showed the torrent is private is refused
+	// here, under the same lock that registers the connection, so none slips
+	// past purgeDiscoveryPeersLocked.
+	var reason string
+	if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
+		reason = "private_discovery_peer"
+		s.forgetRefusedPeerLocked(peerAddr)
+	} else {
+		reason = s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound)
+	}
+	if reason != "" {
 		if reason == "self_connection" {
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Dialable = false
@@ -751,6 +763,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// connection does not erase prior tracker/DHT evidence for the same endpoint.
 	if outbound {
 		pState.Dialable = true
+	} else {
+		pState.Source |= PeerSourceIncoming
 	}
 	pState.Active = true
 	// Choke and interest start over on every connection (BEP 3); an entry kept
@@ -794,7 +808,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				// source port: they're worthless as redial candidates, so retaining
 				// them past disconnect only feeds unbounded growth from reconnect
 				// churn. Drop them outright rather than leaving them inactive forever.
-				if !ps.Dialable && !reconnectAfterResume {
+				// So are DHT/PEX peers of a torrent that turned out private.
+				if s.privateRefusesDialLocked(ps) {
+					reconnectAfterResume = false
+					delete(s.Peers, peerAddr)
+				} else if !ps.Dialable && !reconnectAfterResume {
 					delete(s.Peers, peerAddr)
 				}
 			}
@@ -2912,7 +2930,8 @@ func (s *Session) AddPeerFromDiscovery(peerAddr string) {
 // learned via decentralized discovery (DHT/PEX); those are rejected for private
 // torrents. Reconnecting an already-known peer (e.g. after a resume) passes
 // fromDiscovery=false, so a private torrent can still re-establish its
-// tracker-sourced connections.
+// tracker-sourced connections, but not ones DHT/PEX supplied before a magnet's
+// metadata showed it is private.
 func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	host, portStr, err := net.SplitHostPort(peerAddr)
 	if err != nil {
@@ -2942,6 +2961,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	}
 
 	pState, exists := s.Peers[peerAddr]
+	if exists && s.privateRefusesDialLocked(pState) {
+		s.mu.Unlock()
+		return
+	}
+	var source PeerSource
+	if fromDiscovery {
+		source = PeerSourceDiscovery
+	}
 	var shouldDial bool
 	if !exists {
 		shouldDial = true
@@ -2949,6 +2976,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		// Discovery supplies a listening endpoint, so an inbound-only entry with the
 		// same address becomes eligible for maintenance retries.
 		pState.Dialable = true
+		pState.Source |= source
 		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > pState.redialBackoff() {
 			shouldDial = true
 		}
@@ -2970,6 +2998,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 				LastAttempt: time.Now(),
 				Dialable:    true,
 				Dialing:     true,
+				Source:      source,
 			}
 		} else {
 			s.Peers[peerAddr].LastAttempt = time.Now()

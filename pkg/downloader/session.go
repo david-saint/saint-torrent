@@ -81,6 +81,9 @@ type PeerState struct {
 	// WebSeed marks a synthetic HTTP source entry. It is kept out of peer-wire
 	// choking and upload stats because no BitTorrent peer exists behind it.
 	WebSeed bool
+	// Source records who supplied this address, so a magnet whose metadata
+	// turns out private can drop what DHT and PEX gave it (BEP 27).
+	Source PeerSource
 	// FailCount counts connection attempts that failed in a row; past
 	// maxPeerFailCount the peer is rarely redialed.
 	FailCount uint8
@@ -1524,6 +1527,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.Torrent.Files = parsed.Files
 	s.Torrent.InfoBytes = parsed.InfoBytes
 	s.Torrent.Private = parsed.Private
+	s.purgeDiscoveryPeersLocked()
 	if parsed.Private {
 		s.DHT = nil
 	}

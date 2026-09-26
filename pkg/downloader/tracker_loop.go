@@ -387,6 +387,7 @@ func (s *Session) announceAndConnect() int {
 					LastAttempt: time.Now(),
 					Dialable:    true,
 					Dialing:     true,
+					Source:      PeerSourceTracker,
 				}
 			} else {
 				s.Peers[peerAddr].LastAttempt = time.Now()

@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"sainttorrent/pkg/bencode"
+	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/torrent"
 )
 
@@ -28,6 +30,7 @@ func knownPeerState(sess *Session, addr string) (PeerState, bool) {
 		Dialing:     ps.Dialing,
 		Dialable:    ps.Dialable,
 		Active:      ps.Active,
+		Source:      ps.Source,
 		FailCount:   ps.FailCount,
 	}, true
 }
@@ -76,10 +79,10 @@ func TestFailingPeerIsNotRedialedEveryMinute(t *testing.T) {
 		t.Fatal("a failing peer was never retried after failedPeerRedialBackoff")
 	}
 
-	ps := &PeerState{FailCount: maxPeerFailCount}
+	ps := &PeerState{FailCount: maxPeerFailCount, Source: PeerSourceDiscovery}
 	ps.markTrackerListed()
-	if ps.FailCount != maxPeerFailCount-1 {
-		t.Fatalf("after a tracker listing FailCount = %d, want %d", ps.FailCount, maxPeerFailCount-1)
+	if ps.FailCount != maxPeerFailCount-1 || ps.Source != PeerSourceDiscovery|PeerSourceTracker {
+		t.Fatalf("after a tracker listing FailCount = %d, Source = %b", ps.FailCount, ps.Source)
 	}
 }
 
@@ -131,6 +134,179 @@ func TestPrunePeersEvictsFailedPeersFirst(t *testing.T) {
 	}
 	if kept != healthy {
 		t.Fatalf("prune kept %d of %d answering peers, want all", kept, healthy)
+	}
+}
+
+func privatePurgeInfoDict(t *testing.T) []byte {
+	t.Helper()
+	infoBytes, err := bencode.Marshal(map[string]interface{}{
+		"name":         "private-purge.txt",
+		"piece length": int64(1),
+		"pieces":       string(make([]byte, 20)),
+		"length":       int64(1),
+		"private":      int64(1),
+	})
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	return infoBytes
+}
+
+// acceptCountingListener accepts and counts connections on loopback.
+func acceptCountingListener(t *testing.T) (net.Listener, int, func() int) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	accepted := make(chan struct{}, 64)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+	}()
+	count := func() int {
+		n := 0
+		for {
+			select {
+			case <-accepted:
+				n++
+			case <-time.After(200 * time.Millisecond):
+				return n
+			}
+		}
+	}
+	return ln, ln.Addr().(*net.TCPAddr).Port, count
+}
+
+// TestPrivateMetadataDropsDiscoveryPeers covers a private torrent opened by
+// magnet: while its private flag was unknown it took peers from DHT and PEX.
+// Once metadata shows it is private, those connections are closed and the
+// addresses forgotten, a dial that was already under way is refused, and no
+// path (maintenance, Resume, reconnect, direct dial) connects to one again,
+// even one that has also connected to us. Tracker-listed peers, and ones that
+// only connected to us, are kept (BEP 27).
+func TestPrivateMetadataDropsDiscoveryPeers(t *testing.T) {
+	infoBytes := privatePurgeInfoDict(t)
+	sess, err := NewSession(&torrent.Torrent{Name: "private-purge", InfoHash: sha1.Sum(infoBytes)}, nil, [20]byte{}, 0, t.TempDir())
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+
+	loop := func(port int) string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) }
+	discovered := loop(refusingLoopbackPort(t))
+	discoveredIncoming := loop(refusingLoopbackPort(t))
+	listed := loop(refusingLoopbackPort(t))
+	incoming := loop(refusingLoopbackPort(t))
+	inFlight := loop(refusingLoopbackPort(t))
+	sess.mu.Lock()
+	add := func(addr string, ps *PeerState) {
+		host, portStr, _ := net.SplitHostPort(addr)
+		port, _ := strconv.Atoi(portStr)
+		ps.IP, ps.Port, ps.AmChoking, ps.Choked = host, uint16(port), true, true
+		sess.Peers[addr] = ps
+	}
+	add(discovered, &PeerState{Dialable: true, Source: PeerSourceDiscovery})
+	add(discoveredIncoming, &PeerState{Dialable: true, Source: PeerSourceDiscovery | PeerSourceIncoming})
+	add(listed, &PeerState{Dialable: true, Source: PeerSourceDiscovery | PeerSourceTracker})
+	add(incoming, &PeerState{Source: PeerSourceIncoming})
+	add(inFlight, &PeerState{Dialable: true, Dialing: true, Source: PeerSourceDiscovery})
+	connected := loop(7700)
+	add(connected, &PeerState{Dialable: true, Source: PeerSourceDiscovery})
+	sess.mu.Unlock()
+
+	// A live connection we dialed to a DHT/PEX peer during the metadata fetch.
+	runOutbound := func(addr string) (chan struct{}, net.Conn) {
+		clientConn, remote := net.Pipe()
+		go func() { _, _ = io.Copy(io.Discard, remote) }()
+		host, portStr, _ := net.SplitHostPort(addr)
+		port, _ := strconv.Atoi(portStr)
+		client := peer.NewClient(clientConn, sess.Torrent.InfoHash, sess.PeerID)
+		done := make(chan struct{})
+		go func() {
+			sess.runPeerMessageLoop(client, clientConn, addr, host, uint16(port), [8]byte{}, true)
+			close(done)
+		}()
+		return done, remote
+	}
+	connDone, connRemote := runOutbound(connected)
+	defer connRemote.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sess.mu.RLock()
+		_, active := sess.activePeers[connected]
+		sess.mu.RUnlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("discovery connection never became active")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := sess.onMetadataDownloaded(infoBytes); err != nil {
+		t.Fatalf("onMetadataDownloaded: %v", err)
+	}
+
+	select {
+	case <-connDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DHT/PEX connection stayed open after metadata showed the torrent is private")
+	}
+	for _, addr := range []string{discovered, discoveredIncoming, connected} {
+		if sessionKnowsPeer(sess, addr) {
+			t.Errorf("DHT/PEX peer %s still known after the private flip", addr)
+		}
+	}
+	for _, addr := range []string{listed, incoming} {
+		if !sessionKnowsPeer(sess, addr) {
+			t.Errorf("tracker-listed or incoming peer %s was forgotten", addr)
+		}
+	}
+
+	// The dial that was in flight completes its handshake after the flip.
+	sess.mu.Lock()
+	sess.Peers[inFlight].Dialing = false
+	sess.mu.Unlock()
+	lateDone, lateRemote := runOutbound(inFlight)
+	defer lateRemote.Close()
+	select {
+	case <-lateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a DHT/PEX dial that straddled the private flip was admitted")
+	}
+	if sessionKnowsPeer(sess, inFlight) {
+		t.Error("the refused in-flight DHT/PEX peer is still known")
+	}
+
+	// A DHT/PEX entry left over by any path is never dialed again.
+	ln, lnPort, accepted := acceptCountingListener(t)
+	defer ln.Close()
+	leftover := loop(lnPort)
+	sess.mu.Lock()
+	add(leftover, &PeerState{Dialable: true, Source: PeerSourceDiscovery | PeerSourceIncoming})
+	sess.mu.Unlock()
+	sess.maintainPeerConnections()
+	if ps, ok := knownPeerState(sess, listed); !ok || ps.LastAttempt.IsZero() {
+		t.Fatal("maintenance did not dial the tracker-listed peer")
+	}
+	sess.addPeer(leftover, false)
+	sess.Pause()
+	sess.Resume()
+	sess.maintainPeerConnections()
+	sess.connectToPeer(trackerPeer("127.0.0.1", uint16(lnPort)))
+	if n := accepted(); n != 0 {
+		t.Fatalf("a DHT/PEX peer of a private torrent was dialed %d time(s)", n)
 	}
 }
 
@@ -205,8 +381,8 @@ func TestAnnounceDropsUnusableTrackerPeers(t *testing.T) {
 			t.Errorf("tracker endpoint %s was accepted", addr)
 		}
 	}
-	if sess.Peers[want] == nil {
-		t.Fatal("the loopback tracker's loopback peer was not accepted")
+	if ps := sess.Peers[want]; ps == nil || ps.Source != PeerSourceTracker {
+		t.Fatalf("loopback tracker's loopback peer was not recorded as tracker-sourced: %+v", ps)
 	}
 }
 

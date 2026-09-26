@@ -11,6 +11,26 @@ import (
 	"sainttorrent/pkg/tracker"
 )
 
+// PeerSource records who supplied a known peer's address. The bits accumulate,
+// so an address that DHT found and a tracker also listed keeps both.
+type PeerSource uint8
+
+const (
+	// PeerSourceTracker marks an address a tracker listed.
+	PeerSourceTracker PeerSource = 1 << iota
+	// PeerSourceDiscovery marks an address DHT or PEX supplied.
+	PeerSourceDiscovery
+	// PeerSourceIncoming marks an address a peer connected to us from. It
+	// vouches for nothing: anyone who knows the infohash can connect.
+	PeerSourceIncoming
+)
+
+// untrackedDiscovery reports whether DHT or PEX supplied ps's address and no
+// tracker listed it, which BEP 27 rules out as a peer of a private torrent.
+func (ps *PeerState) untrackedDiscovery() bool {
+	return ps.Source&(PeerSourceDiscovery|PeerSourceTracker) == PeerSourceDiscovery
+}
+
 // maxPeerFailCount is how many connection attempts in a row (dial, encryption
 // or handshake) may fail before a known peer is only retried every
 // failedPeerRedialBackoff instead of every peerRedialBackoff, as libtorrent's
@@ -43,8 +63,61 @@ func (ps *PeerState) noteDialFailed() {
 // is apparently reaching the peer, so it earns another try. DHT and PEX
 // listings do not, because anyone can make them.
 func (ps *PeerState) markTrackerListed() {
+	ps.Source |= PeerSourceTracker
 	if ps.FailCount > 0 {
 		ps.FailCount--
+	}
+}
+
+// privateRefusesDialLocked reports whether we must not connect out to the
+// entry ps (nil when the address is unknown) because the torrent is private
+// and DHT or PEX, not a tracker, supplied the address: BEP 27 limits a private
+// torrent's peers to its trackers. A magnet learns the flag only with its
+// metadata, so discovery entries from before that are refused from then on.
+// A nil entry is refused too: an outbound dial always has one, so it was
+// forgotten (by purgeDiscoveryPeersLocked, or pruned) while the dial was in
+// flight. Caller holds s.mu (read or write).
+func (s *Session) privateRefusesDialLocked(ps *PeerState) bool {
+	if s.Torrent == nil || !s.Torrent.Private {
+		return false
+	}
+	return ps == nil || ps.untrackedDiscovery()
+}
+
+// purgeDiscoveryPeersLocked runs when metadata reveals that a magnet is
+// private. Peers that DHT or PEX supplied and no tracker listed (allowed while
+// the flag was unknown) are disconnected and forgotten, so they neither keep
+// trading with us nor get redialed by maintenance or Resume. Entries still
+// being dialed are left for connectToPeer, which refuses them. Caller holds
+// s.mu.
+func (s *Session) purgeDiscoveryPeersLocked() {
+	if s.Torrent == nil || !s.Torrent.Private {
+		return
+	}
+	for addr, ps := range s.Peers {
+		if !ps.untrackedDiscovery() {
+			continue
+		}
+		if client, active := s.activePeers[addr]; active {
+			// The connection's disconnect handler forgets the entry: other
+			// code expects every active connection to have one until then.
+			if client.Conn != nil {
+				_ = client.Conn.Close()
+			}
+			continue
+		}
+		if ps.Dialing {
+			continue
+		}
+		delete(s.Peers, addr)
+	}
+}
+
+// forgetRefusedPeerLocked drops the entry for addr when privateRefusesDialLocked
+// refuses it and no connection or dial is using it. Caller holds s.mu.
+func (s *Session) forgetRefusedPeerLocked(addr string) {
+	if ps := s.Peers[addr]; ps != nil && !ps.Active && !ps.Dialing && s.privateRefusesDialLocked(ps) {
+		delete(s.Peers, addr)
 	}
 }
 
