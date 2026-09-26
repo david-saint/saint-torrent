@@ -1014,11 +1014,13 @@ func (d *DHT) replaceNode(idx int, old, newcomer Node) {
 }
 
 // noteQuerySender handles the sender of a well-formed inbound query. Its
-// source address is unverified, since UDP is trivially spoofed, so it may only
-// refresh a contact it matches that has already answered us this run (BEP 5:
-// a node that has responded to us and sends us queries is good). A saved
-// contact not yet heard from, and an unknown sender, are pinged through the
-// bounded probe path instead, and admitted or refreshed by what answers there.
+// source address is unverified, since UDP is trivially spoofed, so a query
+// never refreshes a contact: LastSeen only moves on an answer to one of our
+// own queries, matched to a random transaction ID and the address we sent to.
+// Otherwise a spoofer replaying queries in a dead contact's name could keep it
+// looking live and pin it in its bucket. A saved contact not yet heard from,
+// and an unknown sender, are pinged through the bounded probe path, and
+// admitted or refreshed by what answers there. The table is only read here.
 func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	if id == d.nodeID {
 		return
@@ -1029,7 +1031,7 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	}
 	idx := bucketIndex(d.nodeID, id)
 
-	d.mu.Lock()
+	d.mu.RLock()
 	probe := false
 	if b := d.buckets[idx]; b != nil {
 		if i := b.indexOf(id); i >= 0 {
@@ -1041,10 +1043,8 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 				// A spoofed query naming a saved contact must not make it
 				// look live, or get it handed out, without it answering us.
 				probe = true
-			default:
-				touchLocked(b, i, time.Now())
 			}
-			d.mu.Unlock()
+			d.mu.RUnlock()
 			if probe {
 				d.probeNode(k, true)
 			}
@@ -1052,7 +1052,7 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 		}
 	}
 	probe = d.mightAdmitLocked(idx, k)
-	d.mu.Unlock()
+	d.mu.RUnlock()
 
 	if probe {
 		d.probeNode(k, true)
@@ -1062,7 +1062,8 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 // mightAdmitLocked reports whether a verified contact at k with an ID in bucket
 // idx could be admitted, so a probe is only spent when it could matter. An
 // endpoint held by another ID is still probed: its answer settles which ID
-// lives there now. It mirrors addNodeSeen's admission rules.
+// lives there now. It mirrors addNodeSeen's admission rules. Callers hold d.mu,
+// read or write.
 func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
 	if _, held := d.nodeAddrs[k]; !held && onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
 		return false
@@ -1082,8 +1083,8 @@ func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
 }
 
 // considerAddressChange queues a candidate address for a node ID already in the
-// routing table. Called with d.mu held; it only reserves a slot and hands the
-// network work to a tracked goroutine.
+// routing table. Called with d.mu held (a read lock suffices); it only reserves
+// a slot and hands the network work to a tracked goroutine.
 func (d *DHT) considerAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
 	if oldAddr == nil || newAddr == nil {
 		return

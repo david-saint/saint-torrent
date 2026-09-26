@@ -181,11 +181,14 @@ func TestHandleQueryDoesNotRepointNodeOnUnverifiedAddressChange(t *testing.T) {
 	}
 }
 
-// TestHandleQueryFromSameAddressRefreshesEntry verifies a genuine liveness
-// signal still refreshes LastSeen and promotes the entry to the bucket tail.
-func TestHandleQueryFromSameAddressRefreshesEntry(t *testing.T) {
+// TestHandleQueryFromSameAddressDoesNotRefreshEntry verifies a query, whose
+// source address is unverified, never refreshes a contact: a spoofer replaying
+// queries in a dead contact's name must not keep it looking live. Only an
+// answer to one of our own queries refreshes LastSeen and promotes the entry
+// to the bucket tail.
+func TestHandleQueryFromSameAddressDoesNotRefreshEntry(t *testing.T) {
 	const bucket = 6
-	d, _ := newFakeDHT(t)
+	d, conn := newFakeDHT(t)
 
 	honestAddr := &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881}
 	honest := idInBucket(d.nodeID, bucket, 1)
@@ -196,20 +199,41 @@ func TestHandleQueryFromSameAddressRefreshesEntry(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	backdateNode(t, d, bucket, honest, past)
 
-	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(honest[:])}, honestAddr)
+	for _, q := range []string{"ping", "find_node", "get_peers"} {
+		d.handleQuery("tx", q, map[string]interface{}{
+			"id":        string(honest[:]),
+			"target":    string(honest[:]),
+			"info_hash": string(honest[:]),
+		}, honestAddr)
+	}
 
 	nodes := bucketNodes(d, bucket)
 	if len(nodes) != 2 {
 		t.Fatalf("expected 2 nodes in bucket %d, got %d", bucket, len(nodes))
 	}
-	if nodes[1].ID != honest {
-		t.Fatalf("same-address query did not move the entry to the tail: tail is %x", nodes[1].ID)
+	if nodes[0].ID != honest || !nodes[0].LastSeen.Equal(past) {
+		t.Fatalf("a query refreshed the contact: head %x, LastSeen %v", nodes[0].ID, nodes[0].LastSeen)
 	}
-	if !sameUDPAddr(nodes[1].Addr, honestAddr) {
-		t.Fatalf("address changed unexpectedly: %s", nodes[1].Addr)
+	if got := conn.queriesTo(honestAddr, "ping"); got != 0 {
+		t.Fatalf("a query from a heard contact cost %d probes", got)
 	}
-	if !nodes[1].LastSeen.After(past) {
-		t.Fatalf("same-address query did not refresh LastSeen")
+
+	// An answer to our own ping is proof of life.
+	k, _ := nodeAddrKeyOf(honestAddr)
+	d.probeNode(k, false)
+	tid := awaitQueryTo(t, conn, honestAddr, "ping")
+	conn.injectPingReply(t, tid, honest, honestAddr)
+	deadline := time.After(5 * time.Second)
+	for {
+		nodes = bucketNodes(d, bucket)
+		if nodes[1].ID == honest && nodes[1].LastSeen.After(past) && sameUDPAddr(nodes[1].Addr, honestAddr) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("an answer to our ping did not refresh the contact: tail %x, LastSeen %v", nodes[1].ID, nodes[1].LastSeen)
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 
