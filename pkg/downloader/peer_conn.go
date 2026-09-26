@@ -75,6 +75,15 @@ const maxInboundPeers = 100
 // it; treat it as a constant in production.
 var metadataRetryInterval = 2 * time.Second
 
+// metadataSizeStallTimeout is how long the ut_metadata accumulator may go without
+// taking a block before a peer that advertised a different metadata_size may
+// replace it. The first peer to advertise a size fixes it for everyone and peers
+// advertising another size are not asked, so without this one peer advertising a
+// bogus size and never answering would stall a magnet for good; honest peers,
+// which all advertise the true size, deliver a block well within it. A var so
+// tests can shorten it; treat it as a constant in production.
+var metadataSizeStallTimeout = 20 * time.Second
+
 // metadataServeWindow and metadataServeRequestsPerBlock bound how many ut_metadata
 // blocks one connection may have us serve: an honest fetcher asks for each block
 // once, so twice the info dict's block count per minute leaves room for retries
@@ -1879,11 +1888,20 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.Unlock()
 			return
 		}
-		if s.metadataSize == 0 {
-			// The first sized peer (or the first after a reset) sizes the accumulator.
+		resize := s.metadataSize == 0 // the first sized peer, or the first after a reset
+		if !resize && s.metadataSize != peerMetadataSize && s.statusErr == nil &&
+			time.Since(s.metadataProgressAt) >= metadataSizeStallTimeout {
+			// Whoever sized the accumulator has delivered nothing for a while: start
+			// a new round at this peer's size. Peers on the old size are no longer
+			// asked, and their late blocks fail the round check.
+			resize = true
+			s.metadataEpoch++
+		}
+		if resize {
 			s.metadataSize = peerMetadataSize
 			s.metadataBuf = make([]byte, peerMetadataSize)
 			s.metadataPieces = make([]bool, (peerMetadataSize+peer.MetadataBlockSize-1)/peer.MetadataBlockSize)
+			s.metadataProgressAt = time.Now()
 		}
 		if s.metadataEpoch != metadataRound || len(metadataRequested) != len(s.metadataPieces) {
 			metadataRound = s.metadataEpoch
@@ -1933,6 +1951,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.metadataPieces[piece] = true
 		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
 		lastActiveAt = lastProgressAt
+		s.metadataProgressAt = lastProgressAt
 		for _, done := range s.metadataPieces {
 			if !done {
 				s.mu.Unlock()
@@ -2259,13 +2278,16 @@ peerLoop:
 			s.mu.RLock()
 			fetching := s.metadataMode && !s.metadataCompleted
 			epoch := s.metadataEpoch
+			otherSize := s.metadataSize != peerMetadataSize
 			s.mu.RUnlock()
 			switch {
 			case !fetching:
 				metadataRetryTicker.Stop()
 				metadataRetryTicker = nil
 				metadataRetryTick = nil
-			case epoch != metadataRound:
+			case epoch != metadataRound || otherSize:
+				// A new round began, or the accumulator is sized differently from
+				// what this peer advertised and may have stalled.
 				requestMetadataBlocks(true)
 			}
 			continue

@@ -269,7 +269,8 @@ type Session struct {
 	metadataPieces       []bool
 	metadataCompleted    bool
 	metadataMode         bool
-	metadataEpoch        uint64 // advances whenever the accumulator is discarded; peers re-request
+	metadataEpoch        uint64    // advances whenever the accumulator is discarded; peers re-request
+	metadataProgressAt   time.Time // when the accumulator was last sized or took a block
 	metadataCompletedCh  chan struct{}
 	DHT                  *dht.DHT
 	downloadDir          string

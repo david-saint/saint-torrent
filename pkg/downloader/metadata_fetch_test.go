@@ -266,3 +266,49 @@ func TestMetadataNoRefetchLoopOnStorageFailure(t *testing.T) {
 		}
 	}
 }
+
+// TestMetadataStalledSizeIsReplaced covers a peer that is first to advertise a
+// bogus metadata_size and then never answers. The accumulator took its size, and
+// peers advertising the true size were never asked, so the magnet stalled for
+// good (an inbound peer is not even reaped). Once the accumulator has gone
+// metadataSizeStallTimeout without a block, an honest peer's size takes over.
+func TestMetadataStalledSizeIsReplaced(t *testing.T) {
+	defer swapDuration(&metadataRetryInterval, 20*time.Millisecond)()
+	defer swapDuration(&metadataSizeStallTimeout, 300*time.Millisecond)()
+	sess, info := newMagnetTestSession(t, 2)
+
+	attacker := startWirePeer(t, sess, 6226, fastReserved())
+	attacker.sendExtended(peer.ExtHandshake, extHandshakePayload(t, 4, len(info)+peer.MetadataBlockSize))
+	attacker.expectMetadataRequests(4, 0, 1, 2)
+	// The attacker never answers; its messages pile up unread in attacker.in.
+
+	honest := startWirePeer(t, sess, 6227, fastReserved())
+	honest.sendExtended(peer.ExtHandshake, extHandshakePayload(t, 3, len(info)))
+	// Answer every request the honest peer gets until the fetch completes.
+	deadline := time.After(5 * time.Second)
+	for {
+		sess.mu.RLock()
+		done := !sess.metadataMode
+		sess.mu.RUnlock()
+		if done {
+			return
+		}
+		select {
+		case msg, ok := <-honest.in:
+			if !ok {
+				t.Fatal("honest peer was disconnected")
+			}
+			if msg.ID != peer.MsgExtended || len(msg.Payload) < 2 || msg.Payload[0] != 3 {
+				continue
+			}
+			m, err := peer.ParseMetadataMessage(msg.Payload[1:])
+			if err != nil || m.MsgType != peer.MetadataRequest {
+				continue
+			}
+			honest.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, m.Piece))
+		case <-time.After(10 * time.Millisecond):
+		case <-deadline:
+			t.Fatal("the honest peer's metadata_size never replaced the stalled one")
+		}
+	}
+}
