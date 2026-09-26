@@ -1,7 +1,9 @@
 package dht
 
 import (
+	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,16 +120,35 @@ func (c *fakeConn) responsesToIP(ip net.IP) int {
 	return count
 }
 
-// drainReadLoop waits until every packet injected so far has been handled, by
-// sending a loopback ping (exempt from rate limiting) and awaiting its answer.
+// hasResponse reports whether a response with transaction ID tid was sent.
+func (c *fakeConn) hasResponse(tid string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.sent {
+		parsed, err := bencode.Unmarshal(p.data)
+		if err != nil {
+			continue
+		}
+		if dict, ok := parsed.(map[string]interface{}); ok && dict["y"] == "r" && dict["t"] == tid {
+			return true
+		}
+	}
+	return false
+}
+
+var drainSeq atomic.Uint32
+
+// drainReadLoop waits until every packet injected so far has been handled: the
+// read loop handles packets in order, so once a marker ping injected after
+// them (from loopback, exempt from rate limiting) is answered, they all were.
 func drainReadLoop(t *testing.T, d *DHT, c *fakeConn) {
 	t.Helper()
 	marker := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}
-	before := c.responsesToIP(marker.IP)
+	tid := fmt.Sprintf("mk%d", drainSeq.Add(1))
 	id := idInBucket(d.nodeID, 3, 0x7777)
-	c.injectQuery(t, "mk", "ping", map[string]interface{}{"id": string(id[:])}, marker)
+	c.injectQuery(t, tid, "ping", map[string]interface{}{"id": string(id[:])}, marker)
 	deadline := time.After(5 * time.Second)
-	for c.responsesToIP(marker.IP) == before {
+	for !c.hasResponse(tid) {
 		select {
 		case <-deadline:
 			t.Fatal("read loop never answered the marker ping")
@@ -179,7 +200,8 @@ func TestRateLimitExemptions(t *testing.T) {
 		conn.injectQuery(t, "lp", "ping", map[string]interface{}{"id": string(id[:])}, local)
 	}
 	drainReadLoop(t, d, conn)
-	if got := conn.responsesToIP(local.IP); got < 51 {
+	// 50 answers to the sender plus one to the drain marker, also on loopback.
+	if got := conn.responsesToIP(local.IP); got != 51 {
 		t.Fatalf("loopback sender was throttled: %d responses to 51 queries", got)
 	}
 
