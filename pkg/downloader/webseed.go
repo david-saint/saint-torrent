@@ -34,6 +34,8 @@ var (
 	// webseedMaxRetryAfter caps how long a server's Retry-After may park a source.
 	webseedMaxRetryAfter = 5 * time.Minute
 	errWebseedPaused     = errors.New("webseed paused")
+	// webseedGetPieceBuf borrows a piece buffer; tests swap it to see when.
+	webseedGetPieceBuf = (*Session).getPieceBuf
 )
 
 const (
@@ -644,7 +646,7 @@ func (s *Session) releaseWebseedPiece(piece webseedPiece, err error) {
 // the session's piece-buffer pool. On success the caller owns the buffer and
 // hands it to the write worker, which returns it to the pool.
 func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, pool *webseedPool, src *webseedSource, piece webseedPiece, pState *PeerState) ([]byte, *[]byte, error) {
-	if piece.length < 0 || piece.length > int64(^uint(0)>>1) {
+	if piece.length < 0 || piece.length > maxPieceBufLen {
 		return nil, nil, fmt.Errorf("piece %d length is not addressable: %d", piece.index, piece.length)
 	}
 	pieceEnd := piece.absoluteStart + piece.length
@@ -652,9 +654,29 @@ func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, po
 		return nil, nil, fmt.Errorf("piece %d range overflows int64", piece.index)
 	}
 
-	buf := s.getPieceBuf(piece.length)
+	// Reserve the first part's bandwidth before borrowing the buffer: under a
+	// download limit the wait can be long, and each worker would otherwise pin
+	// a piece-sized buffer throughout it. Later parts reserve as they go.
+	// firstRefund is owned here until the first part's request takes it.
+	var firstRefund func()
+	if piece.length > 0 {
+		f, ok := pool.fileForOffset(piece.absoluteStart)
+		if !ok {
+			return nil, nil, fmt.Errorf("offset %d is outside webseed file layout", piece.absoluteStart)
+		}
+		refund, err := s.reserveWebseedDownload(ctx, int(min(pieceEnd, f.end)-piece.absoluteStart))
+		if err != nil {
+			return nil, nil, err
+		}
+		firstRefund = refund
+	}
+
+	buf := webseedGetPieceBuf(s, piece.length)
 	data := *buf
 	fail := func(err error) ([]byte, *[]byte, error) {
+		if firstRefund != nil {
+			firstRefund()
+		}
 		s.putPieceBuf(buf)
 		return nil, nil, err
 	}
@@ -678,7 +700,9 @@ func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, po
 		}
 
 		dst := data[int(written):int(written+partLen)]
-		if err := s.fetchWebseedHTTPRange(ctx, client, fileURL, absolute-f.start, dst); err != nil {
+		reserved := firstRefund
+		firstRefund = nil // the request refunds it on failure
+		if err := s.fetchWebseedHTTPRange(ctx, client, fileURL, absolute-f.start, dst, reserved); err != nil {
 			return fail(err)
 		}
 
@@ -716,15 +740,26 @@ func webseedCause(err error) error {
 	return err
 }
 
-func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client, fileURL *url.URL, start int64, dst []byte) error {
+// fetchWebseedHTTPRange reads bytes [start, start+len(dst)) of fileURL into
+// dst. reserved, when non-nil, refunds a reservation the caller already made
+// for len(dst) bytes, which this call then owns; when nil it reserves the
+// bandwidth itself. Either way a failure refunds it exactly once and success
+// keeps it spent.
+func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client, fileURL *url.URL, start int64, dst []byte, reserved func()) error {
 	length := int64(len(dst))
 	if length <= 0 {
+		if reserved != nil {
+			reserved()
+		}
 		return fmt.Errorf("invalid HTTP range length %d", length)
 	}
 	display := redactedURL(fileURL)
-	refund, err := s.reserveWebseedDownload(ctx, len(dst))
-	if err != nil {
-		return err
+	refund := reserved
+	if refund == nil {
+		var err error
+		if refund, err = s.reserveWebseedDownload(ctx, len(dst)); err != nil {
+			return err
+		}
 	}
 
 	reqCtx, cancel := s.webseedRequestContext(ctx)
@@ -750,6 +785,9 @@ func (s *Session) fetchWebseedHTTPRange(ctx context.Context, client *http.Client
 	case resp.StatusCode == http.StatusPartialContent:
 		if cr := resp.Header.Get("Content-Range"); !contentRangeMatches(cr, start, length) {
 			refund()
+			if cr == "" {
+				return fmt.Errorf("range GET %s returned 206 without Content-Range", display)
+			}
 			return fmt.Errorf("range GET %s returned mismatched Content-Range %.64q", display, cr)
 		}
 	case resp.StatusCode == http.StatusOK && start == 0 && resp.ContentLength == length:
@@ -855,10 +893,11 @@ func (s *Session) reserveWebseedDownload(ctx context.Context, n int) (func(), er
 	return refundAll, nil
 }
 
+// contentRangeMatches reports whether a 206's Content-Range names exactly the
+// range requested. A 206 answering a single range must carry one (RFC 9110
+// section 15.3.7), so a missing header does not match: without it nothing
+// says which bytes the body holds (libtorrent refuses such replies too).
 func contentRangeMatches(header string, start, length int64) bool {
-	if header == "" {
-		return true
-	}
 	header = strings.TrimSpace(header)
 	if !strings.HasPrefix(header, "bytes ") {
 		return false

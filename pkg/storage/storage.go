@@ -428,9 +428,12 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	initialInfo := make(map[string]os.FileInfo, len(files))
 	trustedIdentity := make(map[string]string, len(files))
 	// openedObjects catches two layouts that open the same file even though
-	// their names differ after folding: 8.3 short names, normalization forms the
-	// fold does not model, hard links. Both would keep overwriting one file.
-	openedObjects := make(map[fileObjectKey]string, len(files))
+	// their names differ after folding: 8.3 short names and normalization forms
+	// the fold does not model. Both would keep overwriting one file. Hard links
+	// that already existed are the exception (see sharedObjectAllowed): a dedup
+	// tool leaves them between identical payload files, and refusing them made
+	// such a torrent impossible to restore.
+	openedObjects := make(map[fileObjectKey]openedObject, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -462,12 +465,14 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if created {
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
 		}
-		if key, ok := fileObjectKeyOf(f, fi); ok {
-			if other, dup := openedObjects[key]; dup {
+		if key, links, ok := fileObjectKeyOf(f, fi); ok {
+			opened := openedObject{path: path, length: layout.length, created: created}
+			if first, dup := openedObjects[key]; !dup {
+				openedObjects[key] = opened
+			} else if !sharedObjectAllowed(first, opened, links) {
 				f.Close()
-				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", other, path)
+				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", first.path, path)
 			}
-			openedObjects[key] = path
 		}
 		// Grow a short file (sparsely), but never shrink one: a torrent naming a
 		// file that already exists must not destroy its tail before a single piece
@@ -1096,6 +1101,36 @@ func isReservedStorageName(name string) bool {
 // fileObjectKey names the on-disk object an opened file refers to, the same
 // for every path that reaches it (see fileObjectKeyOf).
 type fileObjectKey struct{ a, b uint64 }
+
+// openedObject records a layout of a NewFileStorage call that opened an on-disk
+// object: its path, its torrent length, and whether that call created the
+// object.
+type openedObject struct {
+	path    string
+	length  int64
+	created bool
+}
+
+// sharedObjectAllowed reports whether a later layout, which opened the same
+// on-disk object as first, may keep it. links is the object's current link
+// count.
+//
+// Only distinct, pre-existing directory entries of one multiply-linked file
+// qualify: the hard links rdfind or jdupes -L leave between identical files,
+// which a torrent restores as they are. A file this call created has a single
+// name, so a second layout reaching it is an alias of that name (case, Unicode
+// normalization or an 8.3 short name) and is refused. So is a pre-existing
+// file with one link, since two names can then only be aliases of one entry,
+// and a pair whose paths fold to one key (duplicate layouts are normally
+// refused earlier; this keeps the check self-contained). An unknown link count
+// of zero is refused too. Identical files have one length, so a pair the
+// torrent gives two lengths is refused as well: growing the file for the
+// longer layout would leave the shorter one's name on a file of the wrong
+// size, which no checkpoint trusts.
+func sharedObjectAllowed(first, later openedObject, links uint64) bool {
+	return !first.created && !later.created && links >= 2 && first.length == later.length &&
+		pathKey(first.path) != pathKey(later.path)
+}
 
 // checkNoTrailingSeparator refuses a layout path ending in a separator. Go's
 // os.Root followed a final symlink for such a path (GO-2026-4970), and the

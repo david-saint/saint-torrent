@@ -2,14 +2,14 @@ package downloader
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
-	"github.com/libp2p/go-netroute"
 	"sainttorrent/pkg/logging"
 )
 
@@ -19,6 +19,10 @@ const (
 	natRenewInterval      = 15 * time.Minute
 	natRetryInterval      = 5 * time.Minute
 	natOperationTimeout   = 5 * time.Second
+	// maxNATErrorBytes bounds NATStatus.LastError, which the TUI and the
+	// stats API show. Its text can come from the gateway (a SOAP fault of up
+	// to maxNATResponseBytes).
+	maxNATErrorBytes = 256
 )
 
 // portMapper is one gateway's port-mapping service. Every method must return
@@ -90,24 +94,8 @@ func (d *natDiscovery) discover(ctx context.Context) (portMapper, error) {
 	return nil, fmt.Errorf("no UPnP IGD or NAT-PMP service on gateway %s: %w", gateway, upnpErr)
 }
 
-// natRouteProbe is a public (TEST-NET-3) destination whose route is the
-// default route. go-netroute refuses to route 0.0.0.0 itself on Linux.
-var natRouteProbe = net.IPv4(203, 0, 113, 1)
-
-func defaultGatewayIPv4() (net.IP, error) {
-	router, err := netroute.New()
-	if err != nil {
-		return nil, err
-	}
-	_, gateway, _, err := router.Route(natRouteProbe)
-	if err != nil {
-		return nil, err
-	}
-	if gateway = gateway.To4(); gateway == nil || gateway.IsUnspecified() {
-		return nil, errors.New("no IPv4 default gateway")
-	}
-	return gateway, nil
-}
+// defaultGatewayIPv4 lives in nat_route_netroute.go, or nat_route_stub.go on
+// platforms go-netroute does not support.
 
 // localAddrToward returns the local address the kernel uses to reach gateway:
 // the address SSDP is sent from and mappings point at. Connecting a UDP socket
@@ -370,16 +358,48 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 }
 
 func (m *TorrentManager) recordNATFailure(err error) {
+	msg := sanitizeNATError(err)
 	m.mu.Lock()
 	m.natStatus.TCPMapped = false
 	m.natStatus.UDPMapped = false
-	m.natStatus.LastError = err.Error()
+	m.natStatus.LastError = msg
 	m.mu.Unlock()
 	if logging.Enabled() {
 		logging.Warn("nat_mapping_failed",
-			logging.Err(err),
+			logging.String("error", msg),
 		)
 	}
+}
+
+// sanitizeNATError renders err for NATStatus.LastError. The text can carry a
+// gateway's SOAP fault or description, so runes that are not printable
+// (control characters, including ESC; format characters such as bidi
+// overrides; invalid UTF-8) become '?', and the result is cut on a rune
+// boundary to at most maxNATErrorBytes, ending in an ellipsis when cut.
+func sanitizeNATError(err error) string {
+	if err == nil {
+		return ""
+	}
+	const ellipsis = "…"
+	msg := err.Error()
+	out := make([]byte, 0, min(len(msg), maxNATErrorBytes))
+	cut := -1 // where to cut if the rest does not fit
+	for i := 0; i < len(msg); {
+		r, size := utf8.DecodeRuneInString(msg[i:])
+		i += size
+		if (r == utf8.RuneError && size == 1) || !unicode.IsPrint(r) {
+			r = '?'
+		}
+		n := utf8.RuneLen(r)
+		if cut < 0 && len(out)+n > maxNATErrorBytes-len(ellipsis) {
+			cut = len(out)
+		}
+		if len(out)+n > maxNATErrorBytes {
+			return string(out[:cut]) + ellipsis
+		}
+		out = utf8.AppendRune(out, r)
+	}
+	return string(out)
 }
 
 func waitForContext(ctx context.Context, delay time.Duration) bool {

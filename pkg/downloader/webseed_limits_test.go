@@ -469,3 +469,228 @@ func TestWebseedAcceptsWholeFileOK(t *testing.T) {
 	startWebseedsForTest(t, sess)
 	waitForWebseedState(t, sess, 0, PieceCompleted)
 }
+
+// hookWebseedPieceBuf wraps webseedGetPieceBuf with before, run on each borrow.
+func hookWebseedPieceBuf(t *testing.T, before func(s *Session)) {
+	t.Helper()
+	old := webseedGetPieceBuf
+	webseedGetPieceBuf = func(s *Session, length int64) *[]byte {
+		before(s)
+		return old(s, length)
+	}
+	t.Cleanup(func() { webseedGetPieceBuf = old })
+}
+
+// setWebseedDownloadTokens limits sess to limit B/s with exactly tokens in
+// the bucket now. At 1 B/s, refill is negligible for a test's duration.
+func setWebseedDownloadTokens(sess *Session, limit int64, tokens float64) {
+	sess.SetDownloadLimit(limit)
+	r := sess.DownloadLimiter
+	r.mu.Lock()
+	r.tokens = tokens
+	r.lastRefill = time.Now()
+	r.mu.Unlock()
+}
+
+func webseedDownloadTokens(sess *Session) float64 {
+	r := sess.DownloadLimiter
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tokens
+}
+
+// Under a download limit a webseed worker used to borrow its piece buffer (up
+// to a whole piece) first and then wait for bandwidth, so every worker of
+// every torrent pinned one throughout the wait. The first part's reservation
+// must come first.
+func TestWebseedReservesBandwidthBeforeBorrowingBuffer(t *testing.T) {
+	tor, data := multiPieceWebseedTorrent("reserve-first.bin", 2, 32, nil)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		serveRange(t, w, r, data)
+	}))
+	defer srv.Close()
+	tor.WebSeeds = []string{srv.URL + "/reserve-first.bin"}
+	sess := newWebseedTestSession(t, tor)
+	pool := sess.webseedSpecsForStart()[0].pool
+	var borrows atomic.Int32
+	var limitAtBorrow atomic.Int64
+	hookWebseedPieceBuf(t, func(s *Session) {
+		borrows.Add(1)
+		limitAtBorrow.Store(s.DownloadLimiter.Limit())
+	})
+	setWebseedDownloadTokens(sess, 1, 0) // a 32-byte part waits ~32 s
+
+	piece, ok, _ := sess.claimWebseedPiece()
+	if !ok {
+		t.Fatal("no piece to claim")
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, _, err := sess.fetchWebseedPiece(context.Background(), tracker.HTTPClient, pool, pool.sources[0], piece, &PeerState{})
+		done <- result{got, err}
+	}()
+
+	time.Sleep(250 * time.Millisecond) // a few limiter retry periods
+	select {
+	case res := <-done:
+		t.Fatalf("fetch finished under a blocking limit: %v", res.err)
+	default:
+	}
+	if n := borrows.Load(); n != 0 {
+		t.Fatalf("%d piece buffers borrowed while waiting for bandwidth, want 0", n)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("%d requests sent before bandwidth was reserved", n)
+	}
+
+	sess.SetDownloadLimit(0)
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("fetch: %v", res.err)
+		}
+		if !bytes.Equal(res.data, data[piece.absoluteStart:piece.absoluteStart+piece.length]) {
+			t.Fatal("piece data mismatch")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetch did not finish once the limit was lifted")
+	}
+	if n, limit := borrows.Load(), limitAtBorrow.Load(); n != 1 || limit != 0 {
+		t.Fatalf("borrows = %d at limit %d; want one, after the reservation went through", n, limit)
+	}
+}
+
+// The first part's reservation is made before the request that spends it, so
+// every failure in between, and in the request, must refund it exactly once.
+func TestWebseedFirstPartReservationRefundedOnce(t *testing.T) {
+	tor, data := multiPieceWebseedTorrent("refund-once.bin", 2, 32, nil)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent) // no Content-Range
+		_, _ = w.Write(data[:32])
+	}))
+	defer srv.Close()
+	tor.WebSeeds = []string{srv.URL + "/refund-once.bin"}
+
+	for _, tc := range []struct {
+		name    string
+		pause   bool
+		wantErr string
+	}{
+		{"request fails", false, "without Content-Range"},
+		{"paused before the request", true, errWebseedPaused.Error()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := newWebseedTestSession(t, tor)
+			pool := sess.webseedSpecsForStart()[0].pool
+			hookWebseedPieceBuf(t, func(s *Session) {
+				if tc.pause {
+					s.mu.Lock()
+					s.paused = true
+					s.mu.Unlock()
+				}
+			})
+			const tokens = 1000
+			setWebseedDownloadTokens(sess, 1, tokens)
+			piece, ok, _ := sess.claimWebseedPiece()
+			if !ok {
+				t.Fatal("no piece to claim")
+			}
+			_, buf, err := sess.fetchWebseedPiece(context.Background(), tracker.HTTPClient, pool, pool.sources[0], piece, &PeerState{})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || buf != nil {
+				t.Fatalf("fetch = buf %v, err %v; want an error containing %q", buf != nil, err, tc.wantErr)
+			}
+			if got := webseedDownloadTokens(sess); got < tokens || got >= tokens+1 {
+				t.Fatalf("download tokens after the failure = %.2f, want %d (refunded exactly once)", got, tokens)
+			}
+		})
+	}
+}
+
+// A 206 must say which bytes it carries (RFC 9110 section 15.3.7). One without
+// Content-Range used to be accepted as the requested range; it now fails the
+// part and backs the source off like any other bad response.
+func TestWebseed206WithoutContentRangeFailsSource(t *testing.T) {
+	t.Cleanup(swapDuration(&webseedIdleDelay, 10*time.Millisecond))
+	tor, data := multiPieceWebseedTorrent("no-content-range.bin", 1, 32, nil)
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+	tor.WebSeeds = []string{srv.URL + "/no-content-range.bin"}
+	sess := newWebseedTestSession(t, tor)
+	specs := sess.webseedSpecsForStart()
+	for _, spec := range specs {
+		sess.wg.Add(1)
+		go sess.webseedLoop(spec)
+	}
+
+	waitFor(t, "webseed error", 3*time.Second, func() bool { return sess.LastError() != nil })
+	if got := sess.LastError().Error(); !strings.Contains(got, "206 without Content-Range") {
+		t.Fatalf("LastError = %q", got)
+	}
+	pool := specs[0].pool
+	waitFor(t, "source release", 3*time.Second, func() bool {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return !pool.sources[0].busy
+	})
+	pool.mu.Lock()
+	backoff := pool.sources[0].backoff
+	pool.mu.Unlock()
+	if backoff <= 0 {
+		t.Fatal("source that sent a 206 without Content-Range was not backed off")
+	}
+	if states := sess.GetPieceStates(); states[0] != PieceEmpty {
+		t.Fatalf("piece state = %v, want empty", states[0])
+	}
+}
+
+func TestWebseedContentRangeRequiredFor206(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		ok     bool
+	}{
+		{"", false},
+		{"   ", false},
+		{"bytes 10-19/100", true},
+		{"bytes 10-19/*", true},
+		{" bytes 10-19/100 ", true},
+		{"bytes 0-19/100", false},
+		{"bytes 10-20/100", false},
+		{"items 10-19/100", false},
+	} {
+		if got := contentRangeMatches(tc.header, 10, 10); got != tc.ok {
+			t.Errorf("contentRangeMatches(%q) = %v, want %v", tc.header, got, tc.ok)
+		}
+	}
+
+	// A 200 whose body is exactly the requested span (a file smaller than
+	// Range asked for, served whole) is still used.
+	data := []byte("whole small file")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+	tor, _ := multiPieceWebseedTorrent("ok-200.bin", 1, len(data), []string{srv.URL + "/ok-200.bin"})
+	sess := newWebseedTestSession(t, tor)
+	fileURL, err := url.Parse(srv.URL + "/ok-200.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := make([]byte, len(data))
+	if err := sess.fetchWebseedHTTPRange(context.Background(), tracker.HTTPClient, fileURL, 0, dst, nil); err != nil {
+		t.Fatalf("200 with the exact length: %v", err)
+	}
+	if !bytes.Equal(dst, data) {
+		t.Fatal("200 body mismatch")
+	}
+}

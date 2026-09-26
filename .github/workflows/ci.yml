@@ -103,6 +103,40 @@ jobs:
       - name: Run tests
         run: go test -v ./...
 
+  # Build-only: there are no hosted runners for these targets. A file-name GOOS
+  # suffix or a symbol missing from one platform's syscall package breaks only
+  # that target, and nothing else in CI would notice.
+  cross-build:
+    name: cross-build (BSD / illumos / solaris)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build packages
+        env:
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          status=0
+          for goos in openbsd freebsd netbsd illumos solaris; do
+            echo "::group::GOOS=$goos GOARCH=$GOARCH"
+            if ! GOOS="$goos" go build ./...; then
+              echo "::error::go build ./... failed for GOOS=$goos GOARCH=$GOARCH"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
   govulncheck:
     name: govulncheck
     runs-on: ubuntu-latest

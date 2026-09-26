@@ -10,10 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/huin/goupnp"
 	"github.com/huin/goupnp/dcps/internetgateway2"
+	"github.com/huin/goupnp/soap"
 )
 
 const (
@@ -30,6 +32,10 @@ const (
 	maxSSDPLocations = 4
 	// maxUPnPServiceProbes bounds the SOAP probes one description can trigger.
 	maxUPnPServiceProbes = 8
+	// upnpErrOnlyPermanentLeases is the WANIPConnection error an IGD answers
+	// to a mapping with a non-zero lease when it only supports permanent ones
+	// (OnlyPermanentLeasesSupported, common on IGDv1 routers).
+	upnpErrOnlyPermanentLeases = 725
 )
 
 var errNATResponseTooLarge = errors.New("UPnP response exceeds size limit")
@@ -282,6 +288,11 @@ type upnpMapper struct {
 	client         upnpClient
 	typ            string
 	internalClient string // our address on the gateway's LAN
+	// permanentLease is set once the gateway refused a timed lease with
+	// upnpErrOnlyPermanentLeases; renewals then ask for lease 0 directly.
+	// Such mappings outlive us unless deleted, which the NAT loop's cleanup
+	// does on shutdown.
+	permanentLease atomic.Bool
 }
 
 func (u *upnpMapper) Type() string { return u.typ }
@@ -308,6 +319,9 @@ func (u *upnpMapper) AddPortMapping(ctx context.Context, protocol string, intern
 		return 0, fmt.Errorf("invalid internal port %d", internalPort)
 	}
 	lease := uint32(lifetime / time.Second)
+	if u.permanentLease.Load() {
+		lease = 0
+	}
 	// Renew (or share) the port we were given first, then try random ones.
 	candidates := [...]int{externalPort, randomNATPort(), randomNATPort(), randomNATPort()}
 	err = errors.New("no external port available")
@@ -317,6 +331,13 @@ func (u *upnpMapper) AddPortMapping(ctx context.Context, protocol string, intern
 		}
 		err = u.client.AddPortMappingCtx(ctx, "", uint16(port), proto, uint16(internalPort),
 			u.internalClient, true, description, lease)
+		if err != nil && lease != 0 && upnpErrorCode(err) == upnpErrOnlyPermanentLeases && ctx.Err() == nil {
+			// The port was fine; only the timed lease was refused.
+			u.permanentLease.Store(true)
+			lease = 0
+			err = u.client.AddPortMappingCtx(ctx, "", uint16(port), proto, uint16(internalPort),
+				u.internalClient, true, description, lease)
+		}
 		if err == nil {
 			return port, nil
 		}
@@ -325,6 +346,15 @@ func (u *upnpMapper) AddPortMapping(ctx context.Context, protocol string, intern
 		}
 	}
 	return 0, err
+}
+
+// upnpErrorCode returns the UPnP error code of a SOAP fault, or 0.
+func upnpErrorCode(err error) int {
+	var fault *soap.SOAPFaultError
+	if errors.As(err, &fault) {
+		return fault.Detail.UPnPError.Errorcode
+	}
+	return 0
 }
 
 func (u *upnpMapper) DeletePortMapping(ctx context.Context, protocol string, _, externalPort int) error {

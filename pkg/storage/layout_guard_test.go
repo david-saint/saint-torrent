@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,31 +49,45 @@ func TestStorageRejectsTrailingSeparator(t *testing.T) {
 	}
 }
 
-// TestNewFileStorageRejectsPathsOpeningOneFile: names the path fold cannot
-// model (8.3 short names, other normalization forms, hard links) can still open
-// one file from two layouts, which then keep overwriting each other. A hard link
-// stands in for them here, since it behaves the same on every filesystem.
-func TestNewFileStorageRejectsPathsOpeningOneFile(t *testing.T) {
-	dir := t.TempDir()
-	original := []byte("user")
-	if err := os.WriteFile(filepath.Join(dir, "a"), original, 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
-		t.Skipf("hard links unsupported here: %v", err)
-	}
-	files := []FileInfo{{Path: "new", Length: 4}, {Path: "a", Length: 4}, {Path: "b", Length: 8}}
-	if _, err := NewFileStorage(dir, files, 16); err == nil || !strings.Contains(err.Error(), "open the same file") {
-		t.Fatalf("NewFileStorage over two names of one file = %v, want a duplicate rejection", err)
-	}
-	for _, name := range []string{"a", "b"} {
-		got, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil || !bytes.Equal(got, original) {
-			t.Fatalf("%s after the rejected add = %q, %v; want it untouched", name, got, err)
+// TestSharedObjectAllowed: names the path fold cannot model (8.3 short names,
+// other normalization forms) can still open one file from two layouts, which
+// then keep overwriting each other, so NewFileStorage refuses a second layout on
+// an object it already opened. It refused pre-existing hard links too, which a
+// dedup tool leaves between identical payload files, so such a torrent could no
+// longer be restored. Only those now pass: an alias landing on a file this call
+// created, or on a pre-existing file with a single link, is still refused, and
+// so are links the torrent gives two lengths, which no dedup tool leaves.
+// A case-sensitive filesystem offers no alias a test can create, so the
+// decision is checked directly here; TestNewFileStorageAcceptsPreexistingHardLinks,
+// TestNewFileStorageRejectsHardLinksOfDifferentLengths and, on Windows,
+// TestNewFileStorageRejectsShortNameAlias cover it end to end.
+func TestSharedObjectAllowed(t *testing.T) {
+	existing := openedObject{path: filepath.Join("disc1", "track.flac"), length: 16}
+	created := openedObject{path: existing.path, length: 16, created: true}
+	other := openedObject{path: filepath.Join("disc2", "track.flac"), length: 16}
+	otherCreated := openedObject{path: other.path, length: 16, created: true}
+	otherLonger := openedObject{path: other.path, length: 32}
+	folded := openedObject{path: strings.ToUpper(existing.path), length: 16}
+	for _, tc := range []struct {
+		name  string
+		first openedObject
+		later openedObject
+		links uint64
+		want  bool
+	}{
+		{"pre-existing hard links", existing, other, 2, true},
+		{"three pre-existing hard links", existing, other, 3, true},
+		{"alias of a file this call created", created, other, 2, false},
+		{"alias of a file this call created, one link", created, other, 1, false},
+		{"second open created the file", existing, otherCreated, 2, false},
+		{"alias of a pre-existing single-link file", existing, other, 1, false},
+		{"unknown link count", existing, other, 0, false},
+		{"paths equal under the fold", existing, folded, 2, false},
+		{"hard links of different lengths", existing, otherLonger, 2, false},
+	} {
+		if got := sharedObjectAllowed(tc.first, tc.later, tc.links); got != tc.want {
+			t.Errorf("%s: sharedObjectAllowed = %v, want %v", tc.name, got, tc.want)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(dir, "new")); !os.IsNotExist(err) {
-		t.Fatalf("file created by the rejected add was left behind: %v", err)
 	}
 }
 

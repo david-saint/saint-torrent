@@ -55,15 +55,16 @@ func formatFileIdentity(volume, indexHigh, indexLow uint32, changeTime int64) st
 }
 
 // fileObjectKeyOf keys a file by volume serial number and file index, which
-// every name of one file shares (8.3 short names included). FileInfo does not
-// expose them, so it asks the open handle. Some network redirectors report a
-// zero index for every file; that is reported as unknown, not as a collision.
-func fileObjectKeyOf(f *os.File, _ os.FileInfo) (fileObjectKey, bool) {
+// every name of one file shares (8.3 short names included), and reports its
+// link count. FileInfo does not expose them, so it asks the open handle. Some
+// network redirectors report a zero index for every file; that is reported as
+// unknown, not as a collision.
+func fileObjectKeyOf(f *os.File, _ os.FileInfo) (fileObjectKey, uint64, bool) {
 	var info windows.ByHandleFileInformation
 	if windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info) != nil || info.FileIndexHigh|info.FileIndexLow == 0 {
-		return fileObjectKey{}, false
+		return fileObjectKey{}, 0, false
 	}
-	return fileObjectKey{a: uint64(info.VolumeSerialNumber), b: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, true
+	return fileObjectKey{a: uint64(info.VolumeSerialNumber), b: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, uint64(info.NumberOfLinks), true
 }
 
 func replaceResumeFile(root *DownloadRoot, oldName, newName string, _ bool) error {

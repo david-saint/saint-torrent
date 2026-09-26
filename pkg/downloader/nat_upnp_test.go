@@ -36,6 +36,9 @@ type fakeIGDConfig struct {
 	desc func(w http.ResponseWriter, r *http.Request) bool
 	// soap may answer a SOAP action itself by returning true.
 	soap func(action string, w http.ResponseWriter, r *http.Request) bool
+	// addPortMappingFault, when set, returns the UPnP error code with which
+	// to refuse an AddPortMapping asking for leaseSeconds, or 0 to accept.
+	addPortMappingFault func(leaseSeconds string) int
 }
 
 // fakeIGD is a loopback UPnP gateway: an SSDP responder plus the HTTP server
@@ -48,6 +51,8 @@ type fakeIGD struct {
 	mu              sync.Mutex
 	calls           []string
 	acceptEncodings []string
+	// leases records "PROTO port lease" for every AddPortMapping.
+	leases []string
 }
 
 func newFakeIGD(t *testing.T, cfg fakeIGDConfig) *fakeIGD {
@@ -169,19 +174,30 @@ func (g *fakeIGD) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var env struct {
 		Body struct {
 			Action struct {
-				Protocol     string `xml:"NewProtocol"`
-				ExternalPort string `xml:"NewExternalPort"`
+				Protocol      string `xml:"NewProtocol"`
+				ExternalPort  string `xml:"NewExternalPort"`
+				LeaseDuration string `xml:"NewLeaseDuration"`
 			} `xml:",any"`
 		} `xml:"Body"`
 	}
 	_ = xml.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&env)
-	call := strings.TrimSpace(strings.Join([]string{action, env.Body.Action.Protocol, env.Body.Action.ExternalPort}, " "))
+	args := env.Body.Action
+	call := strings.TrimSpace(strings.Join([]string{action, args.Protocol, args.ExternalPort}, " "))
 	g.mu.Lock()
 	g.calls = append(g.calls, call)
 	g.acceptEncodings = append(g.acceptEncodings, r.Header.Get("Accept-Encoding"))
+	if action == "AddPortMapping" {
+		g.leases = append(g.leases, args.Protocol+" "+args.ExternalPort+" "+args.LeaseDuration)
+	}
 	g.mu.Unlock()
 	if g.cfg.soap != nil && g.cfg.soap(action, w, r) {
 		return
+	}
+	if action == "AddPortMapping" && g.cfg.addPortMappingFault != nil {
+		if code := g.cfg.addPortMappingFault(args.LeaseDuration); code != 0 {
+			writeUPnPFault(w, code)
+			return
+		}
 	}
 
 	inner := ""
@@ -196,6 +212,23 @@ func (g *fakeIGD) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">`+
 		`<s:Body><u:%sResponse xmlns:u="%s">%s</u:%sResponse></s:Body></s:Envelope>`,
 		action, urn, inner, action)
+}
+
+// writeUPnPFault answers a SOAP action with a UPnP error, as an IGD does.
+func writeUPnPFault(w http.ResponseWriter, code int) {
+	w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = fmt.Fprintf(w, `<?xml version="1.0"?>`+
+		`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">`+
+		`<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>`+
+		`<detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>%d</errorCode>`+
+		`<errorDescription>refused</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>`, code)
+}
+
+func (g *fakeIGD) recordedLeases() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.leases...)
 }
 
 // discoverFakeUPnP runs discovery against g and returns the UPnP mapper.
@@ -264,6 +297,95 @@ func TestUPnPMappingDeletesTCPAndUDPOnSharedPort(t *testing.T) {
 		if !containsString(calls, want) {
 			t.Fatalf("gateway never saw %q; calls=%v", want, calls)
 		}
+	}
+}
+
+// onlyPermanentLeases refuses every timed lease the way IGDv1 routers that
+// support only permanent mappings do.
+func onlyPermanentLeases(lease string) int {
+	if lease != "0" {
+		return upnpErrOnlyPermanentLeases
+	}
+	return 0
+}
+
+// A gateway that supports only permanent leases answers every timed mapping
+// with error 725, so such routers never mapped at all. The mapping must be
+// retried on the same port with lease 0, and still be deleted on shutdown.
+func TestUPnPOnlyPermanentLeasesMapsWithLeaseZero(t *testing.T) {
+	g := newFakeIGD(t, fakeIGDConfig{addPortMappingFault: onlyPermanentLeases})
+	stubNATDiscovery(t, g.discovery(loopbackGateway).discover)
+
+	mgr := NewTorrentManager()
+	t.Cleanup(mgr.Close)
+	if err := mgr.StartNATTraversal(51413, 51413); err != nil {
+		t.Fatalf("failed to start NAT traversal: %v", err)
+	}
+	waitForNATStatus(t, mgr, func(s NATStatus) bool { return s.TCPMapped && s.UDPMapped })
+	if status := mgr.NATStatus(); status.LastError != "" {
+		t.Fatalf("mapping reported an error: %+v", status)
+	}
+	leases := g.recordedLeases()
+	if len(leases) != 3 {
+		t.Fatalf("AddPortMapping calls = %v, want TCP timed, TCP permanent, UDP permanent", leases)
+	}
+	var port string
+	if _, err := fmt.Sscanf(leases[0], "TCP %s", &port); err != nil {
+		t.Fatalf("first mapping %q: %v", leases[0], err)
+	}
+	want := []string{
+		"TCP " + port + " " + fmt.Sprint(int(natMappingLifetime/time.Second)),
+		"TCP " + port + " 0", // the same port again, with lease 0
+		"UDP " + port + " 0", // remembered: no timed attempt first
+	}
+	for i := range want {
+		if leases[i] != want[i] {
+			t.Fatalf("AddPortMapping calls = %v, want %v", leases, want)
+		}
+	}
+
+	mgr.Close()
+	calls := g.recorded()
+	for _, c := range []string{"DeletePortMapping TCP " + port, "DeletePortMapping UDP " + port} {
+		if !containsString(calls, c) {
+			t.Fatalf("permanent mapping not deleted on shutdown: no %q in %v", c, calls)
+		}
+	}
+}
+
+// Renewals of a permanent mapping ask for lease 0 directly, and any other
+// UPnP error (a port conflict here) still moves on to another port with the
+// timed lease.
+func TestUPnPPermanentLeaseOnlyAfterError725(t *testing.T) {
+	var conflicts atomic.Int32
+	g := newFakeIGD(t, fakeIGDConfig{addPortMappingFault: func(lease string) int {
+		if conflicts.Add(-1) >= 0 {
+			return 718 // ConflictInMappingEntry
+		}
+		return onlyPermanentLeases(lease)
+	}})
+	mapper := discoverFakeUPnP(t, g)
+	ctx, cancel := context.WithTimeout(context.Background(), natOperationTimeout)
+	defer cancel()
+	timed := fmt.Sprint(int(natMappingLifetime / time.Second))
+
+	conflicts.Store(1)
+	port, err := mapper.AddPortMapping(ctx, "tcp", 51413, 40000, natMappingDescription, natMappingLifetime)
+	if err != nil {
+		t.Fatalf("AddPortMapping: %v", err)
+	}
+	leases := g.recordedLeases()
+	if len(leases) != 3 || leases[0] != "TCP 40000 "+timed ||
+		leases[1] != fmt.Sprintf("TCP %d %s", port, timed) || leases[2] != fmt.Sprintf("TCP %d 0", port) {
+		t.Fatalf("AddPortMapping calls = %v; want a conflict on 40000, then a timed and a permanent try on %d", leases, port)
+	}
+
+	renewed, err := mapper.AddPortMapping(ctx, "tcp", 51413, port, natMappingDescription, natMappingLifetime)
+	if err != nil || renewed != port {
+		t.Fatalf("renewal = %d, %v; want %d", renewed, err, port)
+	}
+	if leases = g.recordedLeases(); len(leases) != 4 || leases[3] != fmt.Sprintf("TCP %d 0", port) {
+		t.Fatalf("renewal calls = %v, want one lease-0 request", leases[3:])
 	}
 }
 
