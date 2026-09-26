@@ -1467,24 +1467,28 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		uploadQueue = kept
 	}
-	// wireAmChoking is the choke state last sent to the peer. The choker only
-	// updates pState.AmChoking and wakes this loop (peer.Client.Notify); syncChoke
-	// sends the change from here, in order with everything else the loop writes.
-	wireAmChoking := true // connections start choked
+	// wireAmChoking is the choke state last sent to the peer; connections start
+	// choked. The choker only updates pState.AmChoking and wakes this loop
+	// (peer.Client.Notify). applyChoke runs wherever the loop reads AmChoking: it
+	// sends a change in order with everything else the loop writes, ahead of the
+	// rejects noteUploadChoke sends for the requests a choke drops.
+	wireAmChoking := true
+	applyChoke := func(amChoking bool) {
+		if amChoking != wireAmChoking {
+			wireAmChoking = amChoking
+			if amChoking {
+				_ = client.SendChoke()
+			} else {
+				_ = client.SendUnchoke()
+			}
+		}
+		noteUploadChoke(amChoking)
+	}
 	syncChoke := func() {
 		s.mu.RLock()
 		amChoking := pState.AmChoking
 		s.mu.RUnlock()
-		if amChoking == wireAmChoking {
-			return
-		}
-		wireAmChoking = amChoking
-		if amChoking {
-			_ = client.SendChoke()
-		} else {
-			_ = client.SendUnchoke()
-		}
-		noteUploadChoke(amChoking)
+		applyChoke(amChoking)
 	}
 
 	// refreshUploadChoke reads AmChoking for paths that do not already hold s.mu;
@@ -1493,10 +1497,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if len(uploadQueue) == 0 {
 			return
 		}
-		s.mu.RLock()
-		amChoking := pState.AmChoking
-		s.mu.RUnlock()
-		noteUploadChoke(amChoking)
+		syncChoke()
 	}
 
 	// pump re-arms timed-out requests, then fills the request window across all
@@ -2261,7 +2262,7 @@ peerLoop:
 		metadataEpochNow := s.metadataEpoch
 		amChokingNow := pState.AmChoking
 		s.mu.RUnlock()
-		noteUploadChoke(amChokingNow)
+		applyChoke(amChokingNow)
 
 		// A failed metadata assembly started a new fetch round: re-ask this peer
 		// for the blocks that are still missing.
@@ -2646,7 +2647,7 @@ peerLoop:
 					pieceLen = s.Storage.PieceLength(index)
 				}
 				s.mu.RUnlock()
-				noteUploadChoke(amChoking)
+				applyChoke(amChoking)
 				_, requestAllowedFast := allowedFastForPeer[index]
 
 				if paused || (amChoking && !requestAllowedFast) {

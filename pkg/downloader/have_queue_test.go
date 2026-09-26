@@ -79,6 +79,49 @@ func TestReconnectedPeerStartsChoked(t *testing.T) {
 	w.expect(peer.MsgUnchoke, 2*time.Second)
 }
 
+// When a choke drops queued uploads, the peer hears the choke first and then the
+// rejects for what it had asked, in that order on the wire.
+func TestChokeGoesOutBeforeItsRejects(t *testing.T) {
+	const numPieces = 40
+	sess, _ := newSeedingWireTestSession(t, numPieces, 1024)
+	fast := map[int]bool{}
+	for _, idx := range allowedFastSet(sess.Torrent.InfoHash, "127.0.0.1", numPieces, allowedFastSetSize) {
+		fast[idx] = true
+	}
+	piece := -1
+	for i := 0; i < numPieces && piece < 0; i++ {
+		if !fast[i] {
+			piece = i
+		}
+	}
+	w := unchokedUploadPeer(t, sess, 7504, 200) // queued requests wait for bandwidth
+	w.sendRequest(uint32(piece), 0, 200)
+	w.sendRequest(uint32(piece), 200, 200)
+	w.barrier()
+
+	sess.mu.Lock()
+	sess.Peers["127.0.0.1:7504"].AmChoking = true
+	client := sess.activePeers["127.0.0.1:7504"]
+	sess.mu.Unlock()
+	client.Notify() // what the choker does
+
+	var order []peer.MessageID
+	for _, msg := range w.barrier() {
+		if msg.ID == peer.MsgChoke || msg.ID == peer.MsgRejectRequest {
+			order = append(order, msg.ID)
+		}
+	}
+	want := []peer.MessageID{peer.MsgChoke, peer.MsgRejectRequest, peer.MsgRejectRequest}
+	if len(order) != len(want) {
+		t.Fatalf("got %v, want a choke followed by two rejects", order)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("got %v, want a choke followed by two rejects", order)
+		}
+	}
+}
+
 // BenchmarkBroadcastHave measures what completing a piece costs the completing
 // goroutine with 200 connected peers whose loops send the queued Haves.
 func BenchmarkBroadcastHave(b *testing.B) {
