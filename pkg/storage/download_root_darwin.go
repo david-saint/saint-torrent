@@ -11,14 +11,27 @@ import (
 )
 
 func openPlatformDownloadRoot(path string) (*os.Root, error) {
+	return openDarwinDownloadRoot(path, true)
+}
+
+// openExistingPlatformDownloadRoot opens an existing download directory with the
+// same removable-volume checks, but creates nothing: removal must not recreate
+// a directory (or a missing volume's mount point path) just to delete from it.
+func openExistingPlatformDownloadRoot(path string) (*os.Root, error) {
+	return openDarwinDownloadRoot(path, false)
+}
+
+func openDarwinDownloadRoot(path string, create bool) (*os.Root, error) {
 	cleanPath, err := canonicalDownloadPath(path)
 	if err != nil {
 		return nil, err
 	}
 	rel, err := filepath.Rel("/Volumes", cleanPath)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		if err := os.MkdirAll(cleanPath, 0755); err != nil {
-			return nil, err
+		if create {
+			if err := os.MkdirAll(cleanPath, 0755); err != nil {
+				return nil, err
+			}
 		}
 		return os.OpenRoot(cleanPath)
 	}
@@ -43,9 +56,11 @@ func openPlatformDownloadRoot(path string) (*os.Root, error) {
 	}
 	current := root
 	for _, component := range parts[1:] {
-		if err := current.Mkdir(component, 0755); err != nil && !os.IsExist(err) {
-			_ = current.Close()
-			return nil, fmt.Errorf("create download directory: %w", err)
+		if create {
+			if err := current.Mkdir(component, 0755); err != nil && !os.IsExist(err) {
+				_ = current.Close()
+				return nil, fmt.Errorf("create download directory: %w", err)
+			}
 		}
 		next, err := current.OpenRoot(component)
 		_ = current.Close()

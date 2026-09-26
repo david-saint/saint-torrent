@@ -1031,10 +1031,12 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		return "", fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", relPath)
 	}
 
-	// Verify that no component of the path is a symlink
+	// Verify that no component of the path is a symlink, and that every existing
+	// parent is a real directory: Go reports a Windows junction as irregular,
+	// never as a symlink or a directory.
 	current := r.canonicalBase
 	components := strings.Split(rel, string(filepath.Separator))
-	for _, comp := range components {
+	for i, comp := range components {
 		if comp == "" || comp == "." || comp == ".." {
 			continue
 		}
@@ -1049,6 +1051,9 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("symlink detected in path component: %s", current)
+		}
+		if i < len(components)-1 && !fi.IsDir() {
+			return "", fmt.Errorf("path component is not a directory: %s", current)
 		}
 	}
 

@@ -77,3 +77,23 @@ func TestNewFileStorageRejectsPathsOpeningOneFile(t *testing.T) {
 		t.Fatalf("file created by the rejected add was left behind: %v", err)
 	}
 }
+
+// TestResolveAndValidateRequiresDirectoryParents: the path check only refused
+// symlinks, and Go reports a Windows junction as irregular rather than as a
+// symlink, so a junction in the middle of a path passed. Every existing parent
+// must now be a real directory; a regular file stands in for the junction here.
+func TestResolveAndValidateRequiresDirectoryParents(t *testing.T) {
+	base := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "file"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveAndValidatePath(base, filepath.Join("file", "x")); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("ResolveAndValidatePath through a non-directory = %v, want a refusal", err)
+	}
+	if _, err := ResolveAndValidatePath(base, "file"); err != nil {
+		t.Fatalf("ResolveAndValidatePath(file) = %v, want the file itself accepted", err)
+	}
+	if _, err := ResolveAndValidatePath(base, filepath.Join("missing", "x")); err != nil {
+		t.Fatalf("ResolveAndValidatePath(missing/x) = %v, want a path still to be created accepted", err)
+	}
+}
