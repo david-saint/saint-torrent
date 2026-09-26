@@ -2,18 +2,21 @@ package bencode
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 )
 
-// FuzzUnmarshal exercises the strict decoder against arbitrary input. It must
-// never panic, and any value it accepts must survive a Marshal/Unmarshal round
-// trip with a stable canonical encoding.
+// FuzzUnmarshal exercises the decoder against arbitrary input. It must never
+// panic, any value it accepts must survive a Marshal/Unmarshal round trip with
+// a stable canonical encoding, and every top-level dictionary value must match
+// what FindRawValue reports for that key.
 func FuzzUnmarshal(f *testing.F) {
 	seeds := []string{
 		"i42e",
 		"i-1e",
-		"i-0e", // invalid: negative zero
-		"i03e", // invalid: leading zero
+		"i-0e",           // non-canonical negative zero, accepted leniently
+		"i03e",           // non-canonical leading zero, accepted leniently
+		"d1:ai1e1:ai2ee", // repeated key: the first value wins
 		"4:spam",
 		"0:",
 		"le",
@@ -47,6 +50,23 @@ func FuzzUnmarshal(f *testing.F) {
 		}
 		if !bytes.Equal(encoded, reencoded) {
 			t.Fatalf("canonical encoding not stable: %q vs %q", encoded, reencoded)
+		}
+		dict, ok := val.(map[string]interface{})
+		if !ok {
+			return
+		}
+		for key, want := range dict {
+			raw, err := FindRawValue(data, key)
+			if err != nil {
+				t.Fatalf("FindRawValue(%q) failed on decodable input: %v", key, err)
+			}
+			got, err := Unmarshal(raw)
+			if err != nil {
+				t.Fatalf("raw value of %q does not decode: %v", key, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("key %q: map holds %v but FindRawValue span decodes to %v", key, want, got)
+			}
 		}
 	})
 }

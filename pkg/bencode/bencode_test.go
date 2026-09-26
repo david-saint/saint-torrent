@@ -2,7 +2,9 @@ package bencode
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -146,5 +148,113 @@ func TestUnmarshalDepthLimit(t *testing.T) {
 	ok := append(bytes.Repeat([]byte("l"), 50), bytes.Repeat([]byte("e"), 50)...)
 	if _, err := Unmarshal(ok); err != nil {
 		t.Errorf("Unmarshal(50 nested lists) = %v, want success", err)
+	}
+}
+
+// TestUnmarshalTokenBudget verifies that decoding stops once an input holds
+// more values than its budget, so a flat run of tiny values (each one a heap
+// allocation) cannot grow the decoded tree without bound.
+func TestUnmarshalTokenBudget(t *testing.T) {
+	// A list of three strings is four values.
+	list := []byte("l1:a1:b1:ce")
+	if _, err := UnmarshalLimited(list, 4); err != nil {
+		t.Fatalf("UnmarshalLimited(4 values, budget 4) = %v, want success", err)
+	}
+	if _, err := UnmarshalLimited(list, 3); !errors.Is(err, errTokenBudget) {
+		t.Fatalf("UnmarshalLimited(4 values, budget 3) = %v, want token budget error", err)
+	}
+	// Dictionary keys count too: one dict, one key, one value.
+	if _, err := UnmarshalLimited([]byte("d1:ai1ee"), 2); !errors.Is(err, errTokenBudget) {
+		t.Fatalf("UnmarshalLimited(3 values, budget 2) = %v, want token budget error", err)
+	}
+	if _, err := UnmarshalLimited([]byte("i1e"), 0); !errors.Is(err, errTokenBudget) {
+		t.Fatalf("UnmarshalLimited(budget 0) = %v, want token budget error", err)
+	}
+
+	// The default budget applies to Unmarshal and DecodePrefix. One repeated
+	// empty key keeps this cheap: the lenient decoder stores it once and empty
+	// strings box without allocating.
+	pairs := DefaultMaxTokens / 2
+	over := make([]byte, 0, 4*pairs+2)
+	over = append(over, 'd')
+	for i := 0; i < pairs; i++ {
+		over = append(over, "0:0:"...)
+	}
+	over = append(over, 'e') // DefaultMaxTokens keys and values plus the dict
+	if _, err := Unmarshal(over); !errors.Is(err, errTokenBudget) {
+		t.Fatalf("Unmarshal(DefaultMaxTokens+1 values) = %v, want token budget error", err)
+	}
+	if _, _, err := DecodePrefix(over); !errors.Is(err, errTokenBudget) {
+		t.Fatalf("DecodePrefix(DefaultMaxTokens+1 values) = %v, want token budget error", err)
+	}
+	within := append([]byte{'d'}, over[5:]...) // one pair fewer
+	if _, err := Unmarshal(within); err != nil {
+		t.Fatalf("Unmarshal(DefaultMaxTokens-1 values) = %v, want success", err)
+	}
+}
+
+// TestUnmarshalDuplicateKeysFirstWins pins the lenient decoder to the value
+// FindRawValue reports for a repeated key. The map used to keep the last value
+// while FindRawValue returned the first, so a torrent's info-hash could commit
+// to one info dict while its files came from another.
+func TestUnmarshalDuplicateKeysFirstWins(t *testing.T) {
+	data := []byte("d4:infod4:name5:firste4:infod4:name6:secondee")
+	val, err := Unmarshal(data)
+	if err != nil {
+		t.Fatalf("Unmarshal() = %v", err)
+	}
+	wantInfo := map[string]interface{}{"name": "first"}
+	if want := map[string]interface{}{"info": wantInfo}; !reflect.DeepEqual(val, want) {
+		t.Fatalf("Unmarshal() = %v, want first value %v", val, want)
+	}
+	raw, err := FindRawValue(data, "info")
+	if err != nil {
+		t.Fatalf("FindRawValue() = %v", err)
+	}
+	fromRaw, err := Unmarshal(raw)
+	if err != nil {
+		t.Fatalf("Unmarshal(raw) = %v", err)
+	}
+	if !reflect.DeepEqual(fromRaw, wantInfo) {
+		t.Fatalf("FindRawValue decoded to %v, map holds %v", fromRaw, wantInfo)
+	}
+	if _, rest, err := DecodePrefix([]byte("d1:ai1e1:ai2eeX")); err != nil || string(rest) != "X" {
+		t.Fatalf("DecodePrefix(duplicate key) rest=%q err=%v, want lenient decode", rest, err)
+	}
+}
+
+func TestUnmarshalStrictRejectsDuplicateKeys(t *testing.T) {
+	for _, input := range []string{
+		"d1:ai1e1:ai2ee",                       // top level
+		"d1:xd1:ai1e1:bi2e1:ai3eee",            // nested dict, non-adjacent repeat
+		"d1:xld1:ai1e1:ai1eeee",                // dict inside a list
+		"d4:infod4:name1:ae4:infod4:name1:bee", // repeated info
+	} {
+		if _, err := UnmarshalStrict([]byte(input)); err == nil || !strings.Contains(err.Error(), "duplicate dictionary key") {
+			t.Errorf("UnmarshalStrict(%q) = %v, want duplicate key error", input, err)
+		}
+		if _, err := Unmarshal([]byte(input)); err != nil {
+			t.Errorf("Unmarshal(%q) = %v, want lenient success", input, err)
+		}
+	}
+	// Unsorted but unique keys stay accepted: some creators emit them.
+	val, err := UnmarshalStrict([]byte("d1:bi2e1:ai1ee"))
+	if err != nil {
+		t.Fatalf("UnmarshalStrict(unsorted keys) = %v, want success", err)
+	}
+	if want := map[string]interface{}{"a": int64(1), "b": int64(2)}; !reflect.DeepEqual(val, want) {
+		t.Fatalf("UnmarshalStrict(unsorted keys) = %v, want %v", val, want)
+	}
+}
+
+// TestUnmarshalErrorOmitsTrailingBytes keeps untrusted trailing input out of
+// error strings, which reach logs and the terminal.
+func TestUnmarshalErrorOmitsTrailingBytes(t *testing.T) {
+	_, err := Unmarshal([]byte("i1e\x1b]0;spoofed\x07"))
+	if err == nil {
+		t.Fatal("Unmarshal(trailing data) = nil, want error")
+	}
+	if strings.Contains(err.Error(), "spoofed") {
+		t.Fatalf("error %q echoes trailing input", err)
 	}
 }
