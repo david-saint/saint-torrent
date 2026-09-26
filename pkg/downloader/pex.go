@@ -27,6 +27,13 @@ func (s *Session) pexEnabledLocked() bool {
 	return s.Torrent != nil && !s.Torrent.Private
 }
 
+// pexAdvertiseAllowedLocked reports whether we may send our peers to others. A
+// magnet still fetching metadata does not know its BEP 27 private flag, so until
+// it does it only takes PEX in: advertising could leak a private swarm.
+func (s *Session) pexAdvertiseAllowedLocked() bool {
+	return s.pexEnabledLocked() && !s.metadataMode
+}
+
 func (s *Session) pexEnabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -75,10 +82,10 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 }
 
 func (s *Session) buildPEXDelta(excludeAddr string, advertised map[string]struct{}) (*peer.PEXMessage, map[string]struct{}, bool) {
-	if !s.pexEnabled() {
+	current, ok := s.pexSnapshot(excludeAddr)
+	if !ok {
 		return nil, advertised, false
 	}
-	current := s.pexSnapshot(excludeAddr)
 	next := make(map[string]struct{}, len(advertised)+len(current))
 	for addr := range advertised {
 		next[addr] = struct{}{}
@@ -119,12 +126,14 @@ func (s *Session) buildPEXDelta(excludeAddr string, advertised map[string]struct
 	return msg, next, true
 }
 
-func (s *Session) pexSnapshot(excludeAddr string) map[string]peer.PEXPeer {
+// pexSnapshot returns the peers we may advertise to excludeAddr; ok is false
+// when we may not advertise any.
+func (s *Session) pexSnapshot(excludeAddr string) (map[string]peer.PEXPeer, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.pexEnabledLocked() {
-		return nil
+	if !s.pexAdvertiseAllowedLocked() {
+		return nil, false
 	}
 
 	peers := make(map[string]peer.PEXPeer)
@@ -138,7 +147,7 @@ func (s *Session) pexSnapshot(excludeAddr string) map[string]peer.PEXPeer {
 		}
 		peers[net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))] = p
 	}
-	return peers
+	return peers, true
 }
 
 func pexPeerFromState(ps *PeerState) (peer.PEXPeer, bool) {

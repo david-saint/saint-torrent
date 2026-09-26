@@ -367,3 +367,32 @@ func TestPEXRejectsAddressesMoreLocalThanSender(t *testing.T) {
 		t.Errorf("PEX endpoint %s was accepted", addr)
 	}
 }
+
+// TestBuildPEXDeltaSilentWhileFetchingMetadata covers a magnet whose private
+// flag is still unknown: it takes PEX in but tells no one about its peers until
+// metadata shows the torrent is public.
+func TestBuildPEXDeltaSilentWhileFetchingMetadata(t *testing.T) {
+	sess := &Session{
+		Torrent:      &torrent.Torrent{},
+		metadataMode: true,
+		Peers: map[string]*PeerState{
+			net.JoinHostPort("127.0.0.1", "1001"): {IP: "127.0.0.1", Port: 1001, Active: true, Dialable: true},
+		},
+	}
+	sess.mu.Lock()
+	extensions := sess.extensionHandshakeMapLocked()
+	sess.mu.Unlock()
+	if extensions[peer.ExtNamePEX] != peer.LocalPEXExtID {
+		t.Fatal("metadata-mode session stopped taking PEX in")
+	}
+	if msg, next, ok := sess.buildPEXDelta("", map[string]struct{}{}); ok || msg != nil || len(next) != 0 {
+		t.Fatalf("metadata-mode session advertised peers: %+v", msg)
+	}
+
+	sess.mu.Lock()
+	sess.metadataMode = false
+	sess.mu.Unlock()
+	if msg, _, ok := sess.buildPEXDelta("", map[string]struct{}{}); !ok || len(msg.Added) != 1 {
+		t.Fatalf("public torrent with metadata did not advertise its peer: %+v", msg)
+	}
+}
