@@ -15,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrFileRepaired is returned when a write had to recreate or resize a target
@@ -333,7 +336,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 
 	for _, file := range files {
 		if file.Length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %s has length %d", file.Path, file.Length)
+			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
@@ -350,17 +353,17 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 			topComponent = topComponent[:i]
 		}
 		if isReservedStorageName(topComponent) {
-			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
 		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
-		lowerPath := strings.ToLower(filepath.Clean(file.Path))
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected: %s", file.Path)
+		key := pathKey(file.Path)
+		if seenPaths[key] {
+			return nil, fmt.Errorf("duplicate file path detected: %q", file.Path)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = true
 
 		// Verify containment and reject symlinks before opening the same relative
 		// path through the anchored root used for all later operations.
@@ -378,6 +381,12 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
+	}
+	// Piece indexes are ints (pieceCount, per-piece resume state). A count that
+	// does not fit would silently truncate on 32-bit builds, leaving most of
+	// the payload outside every piece; refuse it before touching the disk.
+	if currentOffset > 0 && (currentOffset-1)/pieceLength+1 > int64(math.MaxInt) {
+		return nil, fmt.Errorf("piece count for %d bytes at piece length %d overflows int", currentOffset, pieceLength)
 	}
 
 	createdDirs := map[string]struct{}{".": {}}
@@ -1017,11 +1026,28 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 // These names are produced only by our own code (dht.saveNodes writes ".dht_nodes";
 // SaveState writes ".<infohash>.state"), so torrent content must never be allowed
 // to claim them. The check mirrors those literal names rather than importing them,
-// to avoid a storage -> dht import cycle.
+// to avoid a storage -> dht import cycle. It compares folded names: on a
+// case-insensitive filesystem ".DHT_NODES" opens the same file.
 func isReservedStorageName(name string) bool {
+	// Every reserved name starts with a dot, which folding leaves alone.
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	name = pathKey(name)
 	if name == ".dht_nodes" {
 		return true
 	}
 	// Per-torrent fast-resume files: a leading dot plus a ".state" suffix.
-	return strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".state")
+	return strings.HasSuffix(name, ".state")
+}
+
+// pathFolder is stateless and safe for concurrent use (see cases.Fold).
+var pathFolder = cases.Fold()
+
+// pathKey is the duplicate-detection key for a relative path, the same one
+// torrent.Parse uses: Unicode NFC over full case folding, so two names that a
+// case- or normalization-insensitive filesystem (APFS, NTFS) stores as one
+// file collide here too.
+func pathKey(p string) string {
+	return norm.NFC.String(pathFolder.String(norm.NFD.String(filepath.Clean(p))))
 }

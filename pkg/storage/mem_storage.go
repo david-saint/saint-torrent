@@ -60,7 +60,7 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 
 	for _, file := range files {
 		if file.Length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %s has length %d", file.Path, file.Length)
+			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
@@ -72,7 +72,7 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 				return nil, err
 			}
 		} else if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", file.Path)
+			return nil, fmt.Errorf("unsafe file path detected (directory traversal attempt): %q", file.Path)
 		}
 
 		topComponent := cleanPath
@@ -80,17 +80,17 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 			topComponent = topComponent[:i]
 		}
 		if isReservedStorageName(topComponent) {
-			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
 		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
-		lowerPath := strings.ToLower(cleanPath)
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected: %s", file.Path)
+		key := pathKey(cleanPath)
+		if seenPaths[key] {
+			return nil, fmt.Errorf("duplicate file path detected: %q", file.Path)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = true
 
 		layout := &fileLayout{
 			path:        file.Path,
