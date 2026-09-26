@@ -2,6 +2,7 @@ package dht
 
 import (
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -313,6 +314,54 @@ func TestLookupReferralScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLookupWaitsForSlowBootstrapReferral covers a lookup on an empty table:
+// bootstrap referrals must answer a probe before they are admitted, so on a
+// slow link the first contact can arrive after the one second the lookup used
+// to wait. The lookup must still start from it rather than give up until the
+// next round.
+func TestLookupWaitsForSlowBootstrapReferral(t *testing.T) {
+	router := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 6998}
+	old := DefaultBootstrapHosts
+	DefaultBootstrapHosts = []string{net.JoinHostPort(router.IP.String(), strconv.Itoa(router.Port))}
+	t.Cleanup(func() { DefaultBootstrapHosts = old })
+
+	d, conn := newFakeDHT(t)
+	var infoHash [20]byte
+	copy(infoHash[:], "slow-bootstrap-hash-")
+	// The constructor's bootstrap query goes unanswered, so the table is
+	// still empty when the lookup starts and runs its own bootstrap.
+	awaitQueryTo(t, conn, router, "find_node")
+	d.LookupWithOptions(infoHash, 0, LookupOptions{})
+	deadline := time.After(5 * time.Second)
+	for conn.queriesTo(router, "find_node") < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("the lookup never bootstrapped its empty table")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	tid, _ := conn.lastQueryTo(router, "find_node")
+	referral := &net.UDPAddr{IP: net.ParseIP("198.51.100.70"), Port: 6881}
+	referralID := idAtDistance(infoHash, 0x80, 1)
+	payload, err := bencode.Marshal(map[string]interface{}{
+		"t": tid,
+		"y": "r",
+		"r": map[string]interface{}{
+			"id":    idString(idInBucket(d.nodeID, 11, 1)),
+			"nodes": compactNodes([]Node{{ID: referralID, Addr: referral}}),
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to encode find_node reply: %v", err)
+	}
+	conn.in <- fakePacket{data: payload, addr: router}
+
+	ping := awaitQueryTo(t, conn, referral, "ping")
+	time.Sleep(1500 * time.Millisecond)
+	conn.injectPingReply(t, ping, referralID, referral)
+	awaitQueryTo(t, conn, referral, "get_peers")
 }
 
 func compactPeer(ip net.IP, port int) string {

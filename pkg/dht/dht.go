@@ -1624,6 +1624,11 @@ const (
 	dhtLookupCandidates = 64
 	// dhtLookupQueryTimeout bounds each get_peers query of a lookup.
 	dhtLookupQueryTimeout = 3 * time.Second
+	// dhtBootstrapWait bounds how long a lookup that found the table empty
+	// waits for bootstrap referrals to answer their probes;
+	// dhtBootstrapPoll is how often it checks.
+	dhtBootstrapWait = 5 * time.Second
+	dhtBootstrapPoll = 50 * time.Millisecond
 	// dhtMaxValuesPerResponse caps the peers taken from one get_peers answer.
 	// Honest nodes return at most this many (libtorrent's dht_max_peers_reply;
 	// we return 50), so one response cannot fill our dial slots with hundreds.
@@ -1781,12 +1786,7 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
 	if len(startNodes) == 0 {
 		d.bootstrap()
-		select {
-		case <-time.After(1 * time.Second):
-		case <-d.ctx.Done():
-			return
-		}
-		startNodes = d.getCloserNodes(infoHash, dhtLookupStartNodes)
+		startNodes = d.awaitStartNodes(infoHash)
 		if len(startNodes) == 0 {
 			return
 		}
@@ -1939,6 +1939,30 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 				}
 			}
 		})
+	}
+}
+
+// awaitStartNodes waits for bootstrap to put a first contact in an empty table
+// and returns the closest to target. A referral now costs a ping before it is
+// admitted, a round trip more than before, so instead of checking once after a
+// fixed second the lookup starts as soon as any contact is in, and gives slow
+// links up to dhtBootstrapWait.
+func (d *DHT) awaitStartNodes(target [20]byte) []Node {
+	deadline := time.NewTimer(dhtBootstrapWait)
+	defer deadline.Stop()
+	poll := time.NewTicker(dhtBootstrapPoll)
+	defer poll.Stop()
+	for {
+		select {
+		case <-d.ctx.Done():
+			return nil
+		case <-deadline.C:
+			return d.getCloserNodes(target, dhtLookupStartNodes)
+		case <-poll.C:
+			if nodes := d.getCloserNodes(target, dhtLookupStartNodes); len(nodes) > 0 {
+				return nodes
+			}
+		}
 	}
 }
 
