@@ -622,3 +622,40 @@ func TestMMapReadsDoNotRemapDuringCheckpoint(t *testing.T) {
 		t.Fatal("a read during a checkpoint re-established the mapping")
 	}
 }
+
+// BenchmarkMMapStorageBlocks is BenchmarkFileStorageBlocks for the mmap backend,
+// whose ReadBlock looks the overlapping files up three times per block.
+func BenchmarkMMapStorageBlocks(b *testing.B) {
+	benchmarkBlocks(b, func(dir string, files []FileInfo, pieceLength int64) (blockBenchStorage, error) {
+		return NewMMapStorage(dir, files, pieceLength)
+	})
+}
+
+func TestMMapStorageBlockSpans(t *testing.T) {
+	checkBlockSpans(t, func(dir string, files []FileInfo, pieceLength int64) (Storage, error) {
+		return NewStorageWithBackend(BackendMMap, dir, files, pieceLength)
+	})
+}
+
+// TestMMapStorageNeverShrinksExistingFile: the mmap repair path truncated a
+// longer pre-existing file to the declared length, like NewFileStorage did.
+func TestMMapStorageNeverShrinksExistingFile(t *testing.T) {
+	dir, original := preexistingFixture(t)
+	st, err := NewMMapStorage(dir, []FileInfo{{Path: "thesis.docx", Length: 16}}, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	got := make([]byte, 16)
+	if _, err := st.ReadBlock(0, 0, got); err != nil || !bytes.Equal(got, original[:16]) {
+		t.Fatalf("ReadBlock = %q, %v; want the file's first 16 bytes", got, err)
+	}
+	piece := bytes.Repeat([]byte{'z'}, 16)
+	if err := st.WriteBlock(0, 0, piece); err != nil {
+		t.Fatalf("WriteBlock over a longer pre-existing file: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	requireUserTail(t, dir, original)
+}

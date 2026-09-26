@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -267,6 +268,42 @@ type Session struct {
 	downloadDir          string
 	fallbackDownloadDirs []string
 	storageFactory       storage.Factory
+
+	// metadataInitDone is set while onMetadataDownloaded builds storage without
+	// s.mu and is closed once the result is published; Close waits on it.
+	metadataInitDone chan struct{}
+	// verifiedMetadata keeps hash-verified info bytes whose storage could not
+	// be built, and metadataRetryTimer retries the build from them after
+	// metadataRetryDelay, so the swarm is never asked for them again.
+	verifiedMetadata   []byte
+	metadataRetryTimer *time.Timer
+	metadataRetryDelay time.Duration
+	// claimPaths reserves the payload paths with the manager before storage is
+	// built on them (nil for a standalone session); releaseClaims gives the
+	// reservation back and is called by the manager, never by Close.
+	claimPaths    func(infoHash [20]byte, baseDir string, files []storage.FileInfo) (release func(), err error)
+	releaseClaims func()
+}
+
+// errSessionClosing reports work refused or abandoned because the session is
+// shutting down.
+var errSessionClosing = errors.New("session is closing")
+
+// Backoff for rebuilding storage from verified metadata after a failed build:
+// the files belong to another torrent, or the volume is missing or full.
+const (
+	metadataStorageRetryMin = 30 * time.Second
+	metadataStorageRetryMax = 10 * time.Minute
+)
+
+// isNilStorage reports whether st is nil, including a nil pointer boxed in the
+// interface, which a factory must never hand back as a usable Storage.
+func isNilStorage(st storage.Storage) bool {
+	if st == nil {
+		return true
+	}
+	v := reflect.ValueOf(st)
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // NewSession creates a new download session for a torrent.
@@ -337,10 +374,23 @@ func (s *Session) allowsDecentralizedPeerDiscoveryLocked() bool {
 	return s.Torrent == nil || !s.Torrent.Private
 }
 
+// maxPieceBufLen bounds one piece-assembly buffer. torrent.Parse already refuses
+// longer pieces; this keeps a Session built from any other Torrent or Storage
+// from panicking in make() (a length past int on 32-bit builds) or aborting the
+// process with an out-of-memory no recover can catch.
+const maxPieceBufLen = torrent.MaxPieceLength
+
 // getPieceBuf borrows a piece-assembly buffer sliced to exactly length. Buffers
 // are allocated at the standard piece length so every piece but the last reuses
 // them directly; putPieceBuf (from the write worker) returns them afterward.
 func (s *Session) getPieceBuf(length int64) *[]byte {
+	if length < 0 || length > maxPieceBufLen {
+		// Not allocatable as one buffer. An empty one fails the caller's
+		// assembly check, which returns the piece to the picker instead of
+		// crashing the peer goroutine and with it the whole process.
+		empty := []byte{}
+		return &empty
+	}
 	if v := s.pieceBufPool.Get(); v != nil {
 		bp := v.(*[]byte)
 		if int64(cap(*bp)) >= length {
@@ -352,7 +402,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 	// individual piece) so the buffer is reusable for subsequent full pieces.
 	n := length
 	if s.Storage != nil {
-		if std := s.Storage.PieceLengthValue(); std > n {
+		if std := s.Storage.PieceLengthValue(); std > n && std <= maxPieceBufLen {
 			n = std
 		}
 	}
@@ -364,7 +414,7 @@ func (s *Session) getPieceBuf(length int64) *[]byte {
 // putPieceBuf returns a piece-assembly buffer to the pool, restored to full
 // capacity so the next borrow can slice it to any piece length.
 func (s *Session) putPieceBuf(bp *[]byte) {
-	if bp == nil {
+	if bp == nil || cap(*bp) == 0 {
 		return
 	}
 	*bp = (*bp)[:cap(*bp)]
@@ -615,6 +665,13 @@ func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closing = true
+		// Storage being built for metadata was admitted before closing was set;
+		// nothing new is admitted after it, and no retry is armed after it.
+		metadataInit := s.metadataInitDone
+		if s.metadataRetryTimer != nil {
+			s.metadataRetryTimer.Stop()
+			s.metadataRetryTimer = nil
+		}
 		// Shutdown is the last chance to record what has been downloaded. The
 		// periodic hint flush clears stateDirty, so re-arm it when there is
 		// anything to checkpoint.
@@ -639,6 +696,12 @@ func (s *Session) Close() {
 		}
 		if s.cancel != nil {
 			s.cancel()
+		}
+		// Let that storage be published so it is closed below and RemoveSession
+		// sees the files it created. The build never takes s.mu or lifecycleMu
+		// before signalling, so this wait cannot deadlock.
+		if metadataInit != nil {
+			<-metadataInit
 		}
 		// The peer loops are cancelled and their connections gone, so nothing can
 		// touch the files behind the checkpoint.
@@ -1316,14 +1379,21 @@ func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
 	return false
 }
 
-// resetFilePrioritiesLocked allocates a fresh PriorityNormal-filled slice of size numFiles,
-// overlays any valid priority values from s.pendingFilePriorities, and clears the pending slice.
-// Caller holds s.mu.
-func (s *Session) resetFilePrioritiesLocked(numFiles int) {
-	s.filePriorities = make([]FilePriority, numFiles)
-	for i := range s.filePriorities {
-		s.filePriorities[i] = PriorityNormal
+// newFilePriorities returns a PriorityNormal-filled slice for numFiles files. It
+// is built before s.mu is taken, so a many-file torrent never allocates under it.
+func newFilePriorities(numFiles int) []FilePriority {
+	priorities := make([]FilePriority, numFiles)
+	for i := range priorities {
+		priorities[i] = PriorityNormal
 	}
+	return priorities
+}
+
+// installFilePrioritiesLocked installs priorities (from newFilePriorities),
+// overlays any valid priority values from s.pendingFilePriorities, and clears
+// the pending slice. Caller holds s.mu.
+func (s *Session) installFilePrioritiesLocked(priorities []FilePriority) {
+	s.filePriorities = priorities
 	if len(s.pendingFilePriorities) > 0 {
 		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
@@ -1480,8 +1550,9 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
+	keepAccumulator := false
 	defer func() {
-		if err != nil {
+		if err != nil && !keepAccumulator {
 			// A full assembly that fails the infohash check means the size/blocks we
 			// locked onto were bad — most likely a peer that won the race to advertise
 			// metadata_size handed us a poisoned (but in-range) value. Discard the whole
@@ -1502,16 +1573,144 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return fmt.Errorf("metadata hash mismatch: expected %x, got %x", s.Torrent.InfoHash, hash)
 	}
 
-	// Wrap the info dict in a dummy bencode dictionary
-	wrapped := append([]byte("d4:info"), infoBytes...)
-	wrapped = append(wrapped, 'e')
-
-	parsed, err := torrent.Parse(wrapped)
+	// The hash commits to exactly these bytes, so they must be exactly one info
+	// dictionary. Wrapping them as "d4:info" + infoBytes + "e" accepted trailing
+	// values and kept only the first dict, which no longer matched the magnet's
+	// hash yet was served to peers and cached for restore.
+	parsed, err := torrent.ParseInfo(infoBytes)
 	if err != nil {
-		return fmt.Errorf("failed to parse metadata: %w", err)
+		// Every peer serves these same hash-verified bytes, so fetching them again
+		// cannot succeed. Stop fetching and leave the session in metadata mode,
+		// showing the error, instead of re-downloading up to 16 MiB per new peer.
+		err = fmt.Errorf("failed to parse metadata: %w", err)
+		keepAccumulator = true
+		s.mu.Lock()
+		s.metadataCompleted = true
+		// metadataSize and metadataPieces stay: a handshake handler that sized
+		// its request loop from them before this point still indexes them.
+		s.metadataBuf = nil
+		s.lastErr = err
+		s.statusErr = err
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return err
+	}
+
+	// Build everything the session will publish before taking s.mu: a torrent
+	// can declare millions of pieces and hundreds of thousands of files.
+	fileInfos := make([]storage.FileInfo, len(parsed.Files))
+	for i, f := range parsed.Files {
+		fileInfos[i] = storage.FileInfo{
+			Path:   filepath.Join(f.Path...),
+			Length: f.Length,
+		}
+	}
+	numPieces := len(parsed.PieceHashes)
+	pieceStates := make([]PieceState, numPieces) // all PieceEmpty
+	pieceAvailability := make([]int, numPieces)
+	priorities := newFilePriorities(len(parsed.Files))
+
+	s.mu.Lock()
+	// A closing session must not start creating files: Close may already have
+	// taken the storage it will close.
+	if s.closing || s.closed {
+		s.mu.Unlock()
+		return errSessionClosing
+	}
+	if !s.metadataMode || s.Storage != nil || s.metadataInitDone != nil {
+		s.mu.Unlock()
+		// Not this call's metadata to discard: another call owns it.
+		keepAccumulator = true
+		return errors.New("metadata is already being applied")
+	}
+	factory := s.storageFactory
+	if factory == nil {
+		factory = storage.NewStorage
+	}
+	claimPaths := s.claimPaths
+	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
+	// Close waits on initDone, so the storage built below is either published
+	// before Close takes the session's storage or never built at all.
+	initDone := make(chan struct{})
+	s.metadataInitDone = initDone
+	s.mu.Unlock()
+
+	// The factory creates, sizes and stats every file, so it runs without s.mu:
+	// under the lock it froze every peer loop and the UI for as long as that took.
+	var (
+		st            storage.Storage
+		chosen        int
+		releaseClaims func()
+		storageErrors []error
+	)
+	for index, downloadDir := range downloadDirs {
+		// Reserve the payload paths before the factory creates or extends a
+		// file another torrent may be using.
+		var release func()
+		if claimPaths != nil {
+			var claimErr error
+			if release, claimErr = claimPaths(s.Torrent.InfoHash, downloadDir, fileInfos); claimErr != nil {
+				storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, claimErr))
+				continue
+			}
+		}
+		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
+		// Success is decided by the error alone, and a nil pointer boxed in the
+		// interface is refused: installing one crashed the first storage call.
+		if createErr == nil && !isNilStorage(candidate) {
+			st, chosen, releaseClaims = candidate, index, release
+			break
+		}
+		if release != nil {
+			release()
+		}
+		if createErr == nil {
+			createErr = errors.New("storage factory returned no storage")
+		}
+		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
 	}
 
 	s.mu.Lock()
+	s.metadataInitDone = nil
+	close(initDone)
+	if st == nil {
+		// Leave the session exactly as it was before the metadata arrived: no
+		// pieces and no storage, a state every peer and reader path handles. Sizing
+		// PieceStates here would let the first peer Request reach a nil Storage.
+		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
+		s.lastErr = statusErr
+		s.statusErr = statusErr
+		// The bytes are verified and every peer serves the same ones. Discarding
+		// them made each new peer re-send the whole metadata only to fail again,
+		// for as long as the files stayed taken or the volume missing. Keep them,
+		// stop fetching, and retry the build from them on a backoff.
+		keepAccumulator = true
+		s.metadataCompleted = true
+		s.metadataBuf = nil
+		s.verifiedMetadata = infoBytes
+		s.scheduleMetadataStorageRetryLocked()
+		s.broadcastPieceWaitersLocked()
+		s.mu.Unlock()
+		return statusErr
+	}
+	if s.closed {
+		// Unreachable while Close waits on initDone; never leak the storage.
+		s.mu.Unlock()
+		_ = st.Close()
+		if releaseClaims != nil {
+			releaseClaims()
+		}
+		return errSessionClosing
+	}
+
+	// Publish the torrent, its storage and its piece state in one step. A
+	// closing session still takes them: Close is waiting to close this storage,
+	// and RemoveSession reads the file list only after Close returns.
+	s.downloadDir = st.BaseDir()
+	if chosen > 0 {
+		// Otherwise keep the live list, which may have gained entries meanwhile.
+		s.fallbackDownloadDirs = append([]string(nil), downloadDirs[chosen+1:]...)
+	}
 	s.Torrent.PieceLength = parsed.PieceLength
 	s.Torrent.PieceHashes = parsed.PieceHashes
 	s.Torrent.Name = parsed.Name
@@ -1521,56 +1720,27 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	if parsed.Private {
 		s.DHT = nil
 	}
-
-	// Reinitialize priorities
-	s.resetFilePrioritiesLocked(len(s.Torrent.Files))
-
-	// Reinitialize piece states
-	numPieces := len(s.Torrent.PieceHashes)
-	s.PieceStates = make([]PieceState, numPieces)
-	for i := range s.PieceStates {
-		s.PieceStates[i] = PieceEmpty
-	}
-	s.pieceAvailability = make([]int, numPieces)
-
-	// Initialize storage now that we know the files
-	var fileInfos []storage.FileInfo
-	for _, f := range s.Torrent.Files {
-		fileInfos = append(fileInfos, storage.FileInfo{
-			Path:   filepath.Join(f.Path...),
-			Length: f.Length,
-		})
-	}
-	factory := s.storageFactory
-	if factory == nil {
-		factory = storage.NewStorage
-	}
-	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
-	var (
-		st            storage.Storage
-		storageErrors []error
-	)
-	for index, downloadDir := range downloadDirs {
-		st, err = factory(downloadDir, fileInfos, s.Torrent.PieceLength)
-		if err == nil {
-			s.downloadDir = st.BaseDir()
-			s.fallbackDownloadDirs = append([]string(nil), downloadDirs[index+1:]...)
-			break
-		}
-		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, err))
-	}
-	if st == nil {
-		statusErr := fmt.Errorf("failed to initialize storage: %w", errors.Join(storageErrors...))
-		s.lastErr = statusErr
-		s.statusErr = statusErr
-		s.broadcastPieceWaitersLocked()
-		s.mu.Unlock()
-		return statusErr
-	}
+	s.installFilePrioritiesLocked(priorities)
+	s.PieceStates = pieceStates
+	s.pieceAvailability = pieceAvailability
 	s.Storage = st
+	s.releaseClaims = releaseClaims
 	s.statusErr = nil
+	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and
+	// any bytes kept for a retry are no longer needed.
+	s.metadataBuf = nil
+	s.verifiedMetadata = nil
+	s.metadataRetryDelay = 0
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+		s.metadataRetryTimer = nil
+	}
+	closing := s.closing
 	storageToVerify := st
 	s.mu.Unlock()
+	if closing {
+		return errSessionClosing
+	}
 
 	// Load any fast-resume hint and verify in the background (metadata just arrived, so
 	// most pieces are not on disk yet; verification stays off the hot path).
@@ -1592,4 +1762,37 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	}
 
 	return nil
+}
+
+// scheduleMetadataStorageRetryLocked arms the retry of a failed storage build
+// from s.verifiedMetadata, doubling the delay each time up to
+// metadataStorageRetryMax. Close stops the timer; nothing is armed once it has
+// started. Caller holds s.mu.
+func (s *Session) scheduleMetadataStorageRetryLocked() {
+	if s.closing || s.closed {
+		return
+	}
+	switch {
+	case s.metadataRetryDelay <= 0:
+		s.metadataRetryDelay = metadataStorageRetryMin
+	case s.metadataRetryDelay < metadataStorageRetryMax:
+		s.metadataRetryDelay = min(2*s.metadataRetryDelay, metadataStorageRetryMax)
+	}
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+	}
+	s.metadataRetryTimer = time.AfterFunc(s.metadataRetryDelay, s.retryMetadataStorage)
+}
+
+// retryMetadataStorage builds storage again from the metadata a failed build
+// kept. It runs on the retry timer; onMetadataDownloaded re-checks the session
+// under s.mu and arms the next retry if the build fails again.
+func (s *Session) retryMetadataStorage() {
+	s.mu.Lock()
+	infoBytes := s.verifiedMetadata
+	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed
+	s.mu.Unlock()
+	if ready {
+		_ = s.onMetadataDownloaded(infoBytes)
+	}
 }

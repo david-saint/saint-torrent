@@ -37,11 +37,33 @@ func fileIdentity(f *os.File, _ os.FileInfo) string {
 	}
 	var basic fileBasicInfo
 	if windows.GetFileInformationByHandleEx(windows.Handle(f.Fd()), windows.FileBasicInfo, (*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic))) != nil {
-		// Without a change timestamp the identity cannot prove the content is
-		// unchanged, so report none and let the pieces be rechecked.
 		return ""
 	}
-	return fmt.Sprintf("%d:%d:%d:%d", info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime)
+	return formatFileIdentity(info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime)
+}
+
+// formatFileIdentity renders a checkpoint identity. Without a change timestamp
+// the identity cannot prove the content is unchanged, so it reports none and
+// the pieces are rechecked. FAT and exFAT keep no change time and report zero;
+// an identity built on it would reduce to a directory-entry position, and trust
+// would rest on size and a two-second mtime alone.
+func formatFileIdentity(volume, indexHigh, indexLow uint32, changeTime int64) string {
+	if changeTime == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", volume, indexHigh, indexLow, changeTime)
+}
+
+// fileObjectKeyOf keys a file by volume serial number and file index, which
+// every name of one file shares (8.3 short names included). FileInfo does not
+// expose them, so it asks the open handle. Some network redirectors report a
+// zero index for every file; that is reported as unknown, not as a collision.
+func fileObjectKeyOf(f *os.File, _ os.FileInfo) (fileObjectKey, bool) {
+	var info windows.ByHandleFileInformation
+	if windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info) != nil || info.FileIndexHigh|info.FileIndexLow == 0 {
+		return fileObjectKey{}, false
+	}
+	return fileObjectKey{a: uint64(info.VolumeSerialNumber), b: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, true
 }
 
 func replaceResumeFile(root *DownloadRoot, oldName, newName string, _ bool) error {

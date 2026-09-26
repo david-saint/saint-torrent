@@ -60,10 +60,13 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 
 	for _, file := range files {
 		if file.Length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %s has length %d", file.Path, file.Length)
+			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
+		}
+		if err := checkNoTrailingSeparator(file.Path); err != nil {
+			return nil, err
 		}
 
 		cleanPath := filepath.Clean(file.Path)
@@ -72,7 +75,7 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 				return nil, err
 			}
 		} else if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", file.Path)
+			return nil, fmt.Errorf("unsafe file path detected (directory traversal attempt): %q", file.Path)
 		}
 
 		topComponent := cleanPath
@@ -80,17 +83,17 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 			topComponent = topComponent[:i]
 		}
 		if isReservedStorageName(topComponent) {
-			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
 		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
-		lowerPath := strings.ToLower(cleanPath)
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected: %s", file.Path)
+		key := pathKey(cleanPath)
+		if seenPaths[key] {
+			return nil, fmt.Errorf("duplicate file path detected: %q", file.Path)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = true
 
 		layout := &fileLayout{
 			path:        file.Path,
@@ -105,6 +108,14 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 
 	if currentOffset > int64(int(^uint(0)>>1)) {
 		return nil, fmt.Errorf("total file length overflows addressable memory")
+	}
+	// The whole torrent lives in one allocation, so a torrent larger than the
+	// machine's physical memory can never complete here. Refuse it up front:
+	// asking the runtime for that much fails with a fatal out-of-memory error
+	// that takes the process down, not with an error the caller could handle.
+	// Anything up to physical memory is committed lazily as pieces arrive.
+	if limit, ok := physicalMemory(); ok && uint64(currentOffset) > limit {
+		return nil, fmt.Errorf("torrent size %d exceeds this machine's %d bytes of physical memory, which the mem backend must hold it in", currentOffset, limit)
 	}
 
 	return &MemStorage{

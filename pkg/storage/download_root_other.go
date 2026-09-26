@@ -15,6 +15,12 @@ func openPlatformDownloadRoot(path string) (*os.Root, error) {
 	return os.OpenRoot(path)
 }
 
+// openExistingPlatformDownloadRoot opens an existing download directory and
+// creates nothing.
+func openExistingPlatformDownloadRoot(path string) (*os.Root, error) {
+	return os.OpenRoot(path)
+}
+
 func splitPathComponents(path string) []string {
 	return strings.FieldsFunc(filepath.Clean(path), func(r rune) bool {
 		return r == filepath.Separator

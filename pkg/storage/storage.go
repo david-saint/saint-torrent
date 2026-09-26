@@ -15,6 +15,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // ErrFileRepaired is returned when a write had to recreate or resize a target
@@ -76,14 +80,16 @@ func ParseBackend(name string) (Backend, error) {
 func FactoryForBackend(backend Backend) (Factory, error) {
 	switch backend {
 	case BackendFile:
-		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewFileStorage(baseDir, files, pieceLength)
-		}, nil
+		return NewStorage, nil
 	case BackendMMap:
 		return mmapFactory()
 	case BackendMemory:
 		return func(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-			return NewMemStorage(baseDir, files, pieceLength)
+			st, err := NewMemStorage(baseDir, files, pieceLength)
+			if err != nil {
+				return nil, err
+			}
+			return st, nil
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown storage backend %q", backend)
@@ -100,8 +106,16 @@ func NewStorageWithBackend(backend Backend, baseDir string, files []FileInfo, pi
 }
 
 // NewStorage creates the default file-backed storage.
+//
+// Every Factory returns an untyped nil Storage on error. Returning the failed
+// (*FileStorage)(nil) directly would box it into a non-nil interface, and a
+// caller testing st == nil would install it and crash on the first call.
 func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, error) {
-	return NewFileStorage(baseDir, files, pieceLength)
+	st, err := NewFileStorage(baseDir, files, pieceLength)
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // fileLayout holds a file's byte range within the torrent plus a lazily-opened,
@@ -173,9 +187,10 @@ func (f *fileLayout) invalidateReaderLocked() {
 }
 
 // writer returns the cached O_RDWR handle, opening it on first use. The open
-// doubles as the repair check: if the file vanished it is recreated, and if its
-// size drifted it is truncated back to the declared length — either case reports
-// repaired=true and drops the now-stale read handle. Once cached, subsequent
+// doubles as the repair check: if the file vanished it is recreated, and if it
+// is now shorter than the declared length it is grown back — either case reports
+// repaired=true and drops the now-stale read handle. A longer file is left alone
+// for the same reason NewFileStorage never shrinks one. Once cached, subsequent
 // writes reuse the handle, so the open/stat/close syscall churn is paid once per
 // file rather than once per completed piece. Guarded by wmu.
 func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
@@ -210,7 +225,7 @@ func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 		_ = h.Close()
 		return nil, false, statErr
 	}
-	if fi.Size() != f.length {
+	if fi.Size() < f.length {
 		if err := h.Truncate(f.length); err != nil {
 			_ = h.Close()
 			return nil, false, err
@@ -333,10 +348,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 
 	for _, file := range files {
 		if file.Length < 0 {
-			return nil, fmt.Errorf("file length cannot be negative: %s has length %d", file.Path, file.Length)
+			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
+		}
+		if err := checkNoTrailingSeparator(file.Path); err != nil {
+			return nil, err
 		}
 		// Reject torrent-declared paths whose top-level component collides with an
 		// internal file we keep alongside the content in the download dir: the DHT
@@ -350,17 +368,17 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 			topComponent = topComponent[:i]
 		}
 		if isReservedStorageName(topComponent) {
-			return nil, fmt.Errorf("file path uses reserved internal name %q: %s", topComponent, file.Path)
+			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
 		}
 		if currentOffset > math.MaxInt64-file.Length {
 			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
-		lowerPath := strings.ToLower(filepath.Clean(file.Path))
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected: %s", file.Path)
+		key := pathKey(file.Path)
+		if seenPaths[key] {
+			return nil, fmt.Errorf("duplicate file path detected: %q", file.Path)
 		}
-		seenPaths[lowerPath] = true
+		seenPaths[key] = true
 
 		// Verify containment and reject symlinks before opening the same relative
 		// path through the anchored root used for all later operations.
@@ -378,6 +396,12 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		layouts = append(layouts, layout)
 		currentOffset += file.Length
+	}
+	// Piece indexes are ints (pieceCount, per-piece resume state). A count that
+	// does not fit would silently truncate on 32-bit builds, leaving most of
+	// the payload outside every piece; refuse it before touching the disk.
+	if currentOffset > 0 && (currentOffset-1)/pieceLength+1 > int64(math.MaxInt) {
+		return nil, fmt.Errorf("piece count for %d bytes at piece length %d overflows int", currentOffset, pieceLength)
 	}
 
 	createdDirs := map[string]struct{}{".": {}}
@@ -403,6 +427,10 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	stateFileInfo := make(map[string]os.FileInfo, len(files))
 	initialInfo := make(map[string]os.FileInfo, len(files))
 	trustedIdentity := make(map[string]string, len(files))
+	// openedObjects catches two layouts that open the same file even though
+	// their names differ after folding: 8.3 short names, normalization forms the
+	// fold does not model, hard links. Both would keep overwriting one file.
+	openedObjects := make(map[fileObjectKey]string, len(files))
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -434,7 +462,19 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if created {
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
 		}
-		if fi.Size() != layout.length {
+		if key, ok := fileObjectKeyOf(f, fi); ok {
+			if other, dup := openedObjects[key]; dup {
+				f.Close()
+				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", other, path)
+			}
+			openedObjects[key] = path
+		}
+		// Grow a short file (sparsely), but never shrink one: a torrent naming a
+		// file that already exists must not destroy its tail before a single piece
+		// has been verified. Block I/O only ever touches [0, length), and the size
+		// mismatch keeps every resume check (LoadState, LoadResumeState and the
+		// checkpoint) from trusting the file, so its pieces are always rehashed.
+		if fi.Size() < layout.length {
 			if err := f.Truncate(layout.length); err != nil {
 				f.Close()
 				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", path, err)
@@ -522,6 +562,15 @@ func (s *FileStorage) PieceLength(pieceIndex int64) int64 {
 	return pieceEnd - pieceStart
 }
 
+// firstFileEndingAfter returns the index of the first file that ends after
+// globalStart. Files are laid out in ascending offset order, so the block paths
+// start there and stop at the first file starting at or past the block's end:
+// O(log files) per block instead of a scan of every file, which a torrent with
+// hundreds of thousands of files turned into milliseconds per 16 KiB request.
+func (s *FileStorage) firstFileEndingAfter(globalStart int64) int {
+	return sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
+}
+
 // ReadBlock reads a block of data from the storage.
 // It returns the number of bytes read, or an error.
 func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int, error) {
@@ -551,7 +600,10 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(buf))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -614,7 +666,10 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
 
-	for _, file := range s.files {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
+		if file.startOffset >= globalEnd {
+			break
+		}
 		// Check overlap between [globalStart, globalEnd) and [file.startOffset, file.endOffset)
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
@@ -699,8 +754,7 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
-	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > globalStart })
-	for _, file := range s.files[first:] {
+	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
 		}
@@ -978,10 +1032,12 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		return "", fmt.Errorf("unsafe file path detected (directory traversal attempt): %s", relPath)
 	}
 
-	// Verify that no component of the path is a symlink
+	// Verify that no component of the path is a symlink, and that every existing
+	// parent is a real directory: Go reports a Windows junction as irregular,
+	// never as a symlink or a directory.
 	current := r.canonicalBase
 	components := strings.Split(rel, string(filepath.Separator))
-	for _, comp := range components {
+	for i, comp := range components {
 		if comp == "" || comp == "." || comp == ".." {
 			continue
 		}
@@ -996,6 +1052,9 @@ func (r *PathResolver) ResolveAndValidate(relPath string) (string, error) {
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("symlink detected in path component: %s", current)
+		}
+		if i < len(components)-1 && !fi.IsDir() {
+			return "", fmt.Errorf("path component is not a directory: %s", current)
 		}
 	}
 
@@ -1017,11 +1076,63 @@ func ResolveAndValidatePath(baseDir, relPath string) (string, error) {
 // These names are produced only by our own code (dht.saveNodes writes ".dht_nodes";
 // SaveState writes ".<infohash>.state"), so torrent content must never be allowed
 // to claim them. The check mirrors those literal names rather than importing them,
-// to avoid a storage -> dht import cycle.
+// to avoid a storage -> dht import cycle. It compares folded names with trailing
+// dots and spaces removed: on a case-insensitive filesystem ".DHT_NODES" opens
+// the same file, and Windows drops the trailing characters of ".dht_nodes. ".
 func isReservedStorageName(name string) bool {
+	name = strings.TrimRight(name, ". ")
+	// Every reserved name starts with a dot, which folding leaves alone.
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	name = pathKey(name)
 	if name == ".dht_nodes" {
 		return true
 	}
 	// Per-torrent fast-resume files: a leading dot plus a ".state" suffix.
-	return strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".state")
+	return strings.HasSuffix(name, ".state")
+}
+
+// fileObjectKey names the on-disk object an opened file refers to, the same
+// for every path that reaches it (see fileObjectKeyOf).
+type fileObjectKey struct{ a, b uint64 }
+
+// checkNoTrailingSeparator refuses a layout path ending in a separator. Go's
+// os.Root followed a final symlink for such a path (GO-2026-4970), and the
+// storage relies on os.Root to keep payload I/O inside the download directory.
+// Torrent paths are joined from sanitized components and never end in one, so
+// refusing it keeps that defence independent of the toolchain.
+func checkNoTrailingSeparator(path string) error {
+	if path != "" && os.IsPathSeparator(path[len(path)-1]) {
+		return fmt.Errorf("file path ends in a path separator: %q", path)
+	}
+	return nil
+}
+
+// pathFolder is stateless and safe for concurrent use (see cases.Fold).
+var pathFolder = cases.Fold()
+
+// pathKey is the duplicate-detection key for a relative path, the same one
+// torrent.Parse uses: Unicode NFC over full case folding, so two names that a
+// case- or normalization-insensitive filesystem (APFS, NTFS) stores as one
+// file collide here too.
+func pathKey(p string) string {
+	p = filepath.Clean(p)
+	for i := 0; i < len(p); i++ {
+		if p[i] >= utf8.RuneSelf {
+			return norm.NFC.String(pathFolder.String(norm.NFD.String(p)))
+		}
+	}
+	// ASCII, as nearly every payload path is: both normalization forms leave
+	// it unchanged and full case folding maps only A-Z, so skip the Unicode
+	// tables, which cost about a microsecond per file at every add and restore.
+	return strings.ToLower(p)
+}
+
+// PathKey is the key under which two paths name the same file on a case- or
+// normalization-insensitive filesystem: the cleaned path, fully case-folded,
+// in Unicode NFC. The downloader compares keys of resolved payload paths to
+// keep two torrents from sharing a file.
+func PathKey(p string) string {
+	return pathKey(p)
 }

@@ -4,18 +4,33 @@ package storage
 
 import (
 	"crypto/sha1"
+	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
+// errMappingFault reports that touching a mapped page faulted: the file shrank
+// under its mapping (anything, including another torrent naming the same path,
+// can truncate it) or the disk filled up while a sparse page was written.
+var errMappingFault = errors.New("memory-mapped file access faulted: the file shrank or the disk is full")
+
+// mappedFile pairs a layout with its mapping. MMapStorage.maps holds one per
+// FileStorage.files entry, in the same order, so a file index found in files
+// addresses maps too.
 type mappedFile struct {
 	layout *fileLayout
 	data   []byte
+	// stale marks a mapping that faulted. It is set under the shared lock and the
+	// mapping is dropped and re-established under the exclusive one, so no copy
+	// can still be using it when it is unmapped.
+	stale atomic.Bool
 }
 
 // MMapStorage serves torrent content from shared file-backed memory mappings.
@@ -96,8 +111,23 @@ func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool
 	if !s.rangeMappedLocked(globalStart, globalEnd) {
 		return false, nil
 	}
-	for _, mapped := range s.maps {
+	if err := s.copyFromMappingsLocked(globalStart, globalEnd, buf); err != nil {
+		s.markStaleLocked(globalStart, globalEnd)
+		return false, err
+	}
+	return true, nil
+}
+
+// copyFromMappingsLocked copies a mapped range with memory faults contained. The
+// caller holds s.mu and has checked that the range is mapped.
+func (s *MMapStorage) copyFromMappingsLocked(globalStart, globalEnd int64, buf []byte) (err error) {
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer recoverMappingFault(&err)
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
@@ -107,7 +137,39 @@ func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool
 			copy(buf[bufOffset:bufOffset+nBytes], mapped.data[fileOffset:fileOffset+nBytes])
 		}
 	}
-	return true, nil
+	return nil
+}
+
+// recoverMappingFault turns the panic raised by touching a lost mapped page into
+// errMappingFault. The block paths run their mapped copies and hashes with
+// debug.SetPanicOnFault set, so a truncated file costs one failed request rather
+// than a fatal SIGBUS that takes every torrent down with it. Only a memory fault
+// carries Addr(); any other panic, a nil dereference included, is a bug and is
+// raised again. It must be deferred directly for recover to see the panic.
+func recoverMappingFault(err *error) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if _, ok := r.(interface{ Addr() uintptr }); ok {
+		*err = errMappingFault
+		return
+	}
+	panic(r)
+}
+
+// markStaleLocked flags every mapping overlapping a range that faulted, so the
+// next access re-establishes it (and its size check) instead of faulting again.
+// The caller holds s.mu, shared or exclusive.
+func (s *MMapStorage) markStaleLocked(globalStart, globalEnd int64) {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
+		if mapped.layout.startOffset >= globalEnd {
+			break
+		}
+		if len(mapped.data) > 0 {
+			mapped.stale.Store(true)
+		}
+	}
 }
 
 // WriteBlock writes a block of data into mapped files.
@@ -133,18 +195,53 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 		return ErrStorageClosed
 	}
 
-	repaired := false
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
-	for _, mapped := range s.maps {
+	repaired, err := s.writeMappedLocked(globalStart, globalEnd, data)
+	if errors.Is(err, errMappingFault) {
+		// A file shrank under its mapping. Mapping it afresh grows it back to its
+		// declared length, so retry once and report the repair: whatever the
+		// truncation cut off must be rechecked. A second fault means the disk
+		// really is full.
+		s.markStaleLocked(globalStart, globalEnd)
+		_, err = s.writeMappedLocked(globalStart, globalEnd, data)
+		repaired = true
+	}
+	if err != nil {
+		return err
+	}
+	if repaired {
+		return ErrFileRepaired
+	}
+	return nil
+}
+
+// writeMappedLocked maps (repairing as needed) every file the range touches and
+// copies data into the mappings with memory faults contained. The caller holds
+// s.mu exclusively.
+func (s *MMapStorage) writeMappedLocked(globalStart, globalEnd int64, data []byte) (repaired bool, err error) {
+	first := s.firstFileEndingAfter(globalStart)
+	for _, mapped := range s.maps[first:] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			wasRepaired, err := s.ensureMappedFileLocked(mapped, true)
 			if err != nil {
-				return err
+				return repaired, err
 			}
 			repaired = repaired || wasRepaired
-
+		}
+	}
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer recoverMappingFault(&err)
+	for _, mapped := range s.maps[first:] {
+		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
+		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
 			fileOffset := overlapStart - file.startOffset
@@ -154,10 +251,7 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 			s.dirty[file] = struct{}{}
 		}
 	}
-	if repaired {
-		return ErrFileRepaired
-	}
-	return nil
+	return repaired, nil
 }
 
 // VerifyPiece computes the SHA-1 hash of a piece from mapped files.
@@ -197,20 +291,37 @@ func (s *MMapStorage) hashMapped(globalStart, globalEnd int64) (bool, [20]byte, 
 		return false, actualHash, nil
 	}
 	h := sha1.New()
-	for _, mapped := range s.maps {
+	if err := s.hashMappingsLocked(h, globalStart, globalEnd); err != nil {
+		if errors.Is(err, errMappingFault) {
+			s.markStaleLocked(globalStart, globalEnd)
+		}
+		return false, actualHash, err
+	}
+	copy(actualHash[:], h.Sum(nil))
+	return true, actualHash, nil
+}
+
+// hashMappingsLocked feeds a mapped range to h with memory faults contained. The
+// caller holds s.mu and has checked that the range is mapped.
+func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int64) (err error) {
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer recoverMappingFault(&err)
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
 			fileOffset := overlapStart - file.startOffset
 			nBytes := overlapEnd - overlapStart
 			if _, err := h.Write(mapped.data[fileOffset : fileOffset+nBytes]); err != nil {
-				return false, actualHash, err
+				return err
 			}
 		}
 	}
-	copy(actualHash[:], h.Sum(nil))
-	return true, actualHash, nil
+	return nil
 }
 
 // Close flushes and releases mappings. It is idempotent.
@@ -275,8 +386,11 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			if _, err := s.ensureMappedFileLocked(mapped, false); err != nil {
 				return err
@@ -287,12 +401,15 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 }
 
 // rangeMappedLocked reports whether every non-empty file overlapping the range is
-// mapped. The caller holds s.mu.
+// mapped by a mapping that has not faulted. The caller holds s.mu.
 func (s *MMapStorage) rangeMappedLocked(globalStart, globalEnd int64) bool {
-	for _, mapped := range s.maps {
+	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
+		if file.startOffset >= globalEnd {
+			break
+		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
-			if file.length != 0 && len(mapped.data) == 0 {
+			if file.length != 0 && (len(mapped.data) == 0 || mapped.stale.Load()) {
 				return false
 			}
 		}
@@ -302,6 +419,17 @@ func (s *MMapStorage) rangeMappedLocked(globalStart, globalEnd int64) bool {
 
 func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (bool, error) {
 	layout := mapped.layout
+	if mapped.stale.Load() {
+		// The mapping faulted. Drop it and map the file afresh, which checks (or,
+		// for a write, repairs) its size instead of faulting on every access.
+		if len(mapped.data) > 0 {
+			if err := unix.Munmap(mapped.data); err != nil {
+				return false, fmt.Errorf("failed to release faulted mapping of %s: %w", layout.path, err)
+			}
+			mapped.data = nil
+		}
+		mapped.stale.Store(false)
+	}
 	if layout.length == 0 || len(mapped.data) > 0 {
 		return false, nil
 	}
@@ -341,7 +469,10 @@ func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {
 		_ = f.Close()
 		return nil, false, fmt.Errorf("failed to stat file %s for mmap: %w", layout.path, err)
 	}
-	if fi.Size() != layout.length {
+	// Only [0, length) is mapped, so a longer file maps as is; like
+	// NewFileStorage, a repair grows a short file but never shrinks one. Mapping
+	// past the end of a short file would fault on first access.
+	if fi.Size() < layout.length {
 		if !repair {
 			_ = f.Close()
 			return nil, false, fmt.Errorf("file %s size mismatch for mmap: got %d, want %d", layout.path, fi.Size(), layout.length)
@@ -461,6 +592,7 @@ func (s *MMapStorage) unmapForCheckpoint() error {
 			continue
 		}
 		mapped.data = nil
+		mapped.stale.Store(false)
 		if wrote {
 			written = append(written, layout)
 			delete(s.dirty, layout)

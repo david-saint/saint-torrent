@@ -28,7 +28,7 @@ func checkpointFixture(t *testing.T) (*FileStorage, string) {
 }
 
 func TestDurableResumeAndSelectiveFileChanges(t *testing.T) {
-	for _, change := range []string{"unchanged", "modified", "replaced", "resized", "missing"} {
+	for _, change := range []string{"unchanged", "modified", "replaced", "resized", "grown", "missing"} {
 		t.Run(change, func(t *testing.T) {
 			st, hash := checkpointFixture(t)
 			if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
@@ -67,6 +67,15 @@ func TestDurableResumeAndSelectiveFileChanges(t *testing.T) {
 				}
 			case "resized":
 				if err = os.Truncate(path, 1); err != nil {
+					t.Fatal(err)
+				}
+			case "grown":
+				// Reopening never shrinks the file back, so the size mismatch
+				// itself must keep its pieces from being trusted.
+				if err = os.Truncate(path, 8); err != nil {
+					t.Fatal(err)
+				}
+				if err = os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 					t.Fatal(err)
 				}
 			case "missing":

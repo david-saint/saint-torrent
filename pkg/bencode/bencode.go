@@ -16,6 +16,22 @@ import (
 // maliciously deep input from exhausting the goroutine stack via recursion.
 const maxDepth = 100
 
+// DefaultMaxTokens is the token budget Unmarshal, UnmarshalStrict and
+// DecodePrefix allow, matching libtorrent's max_decode_tokens. Every decoded
+// value costs one token (dictionary keys included), so the budget bounds how
+// many heap objects one input can make the decoder allocate. Callers decoding
+// small, frequent messages should pass a tighter budget to UnmarshalLimited.
+const DefaultMaxTokens = 3_000_000
+
+// errTokenBudget is returned once an input holds more values than its budget.
+var errTokenBudget = errors.New("bencode input exceeds token budget")
+
+// decoder carries per-call decode limits through the recursive parse.
+type decoder struct {
+	tokens int  // values still allowed before the input is rejected
+	strict bool // reject any dictionary that repeats a key
+}
+
 // Decode reads bencoded data from an io.Reader and returns the parsed value.
 func Decode(r io.Reader) (interface{}, error) {
 	data, err := io.ReadAll(r)
@@ -25,14 +41,39 @@ func Decode(r io.Reader) (interface{}, error) {
 	return Unmarshal(data)
 }
 
-// Unmarshal decodes a bencoded byte slice and returns the parsed value.
+// Unmarshal decodes a bencoded byte slice and returns the parsed value. When a
+// dictionary repeats a key the first value wins, matching FindRawValue (and
+// libtorrent), so the decoded map and the raw span of a key never disagree.
 func Unmarshal(data []byte) (interface{}, error) {
-	val, rest, err := parse(data, 0)
+	return UnmarshalLimited(data, DefaultMaxTokens)
+}
+
+// UnmarshalLimited is Unmarshal with a caller-chosen token budget: decoding
+// fails once the input holds more than maxTokens values.
+func UnmarshalLimited(data []byte, maxTokens int) (interface{}, error) {
+	d := decoder{tokens: maxTokens}
+	return d.unmarshal(data)
+}
+
+// UnmarshalStrict is Unmarshal that also rejects any dictionary, at any depth,
+// that repeats a key. It is meant for metainfo: BEP 3 requires unique keys, and
+// a repeated key lets two readers of the same bytes (or the info-hash and the
+// decoded fields) disagree about what a torrent contains. Tracker and DHT
+// traffic keeps using the lenient Unmarshal.
+func UnmarshalStrict(data []byte) (interface{}, error) {
+	d := decoder{tokens: DefaultMaxTokens, strict: true}
+	return d.unmarshal(data)
+}
+
+func (d *decoder) unmarshal(data []byte) (interface{}, error) {
+	val, rest, err := d.parse(data, 0)
 	if err != nil {
 		return nil, err
 	}
 	if len(rest) > 0 {
-		return nil, fmt.Errorf("extra data at end of input: %q", rest)
+		// Report only the size: the trailing bytes are untrusted and can be
+		// megabytes long.
+		return nil, fmt.Errorf("extra data at end of input: %d bytes", len(rest))
 	}
 	return val, nil
 }
@@ -41,10 +82,13 @@ func Unmarshal(data []byte) (interface{}, error) {
 // returns it along with any unconsumed trailing bytes. Unlike Unmarshal it does
 // not itself reject trailing data, leaving the caller to decide what the
 // remainder means (e.g. raw piece bytes after a BEP 9 metadata dictionary, or a
-// caller-specific "trailing data" error). Decoding is strict: integers reject
-// leading zeros and negative zero, and string lengths must fit the input.
+// caller-specific "trailing data" error). Otherwise it decodes exactly like
+// Unmarshal, leniency included: integers with leading zeros or negative zero
+// are accepted for non-compliant trackers and peers, a repeated dictionary key
+// keeps its first value, and string lengths must fit the input.
 func DecodePrefix(data []byte) (value interface{}, rest []byte, err error) {
-	return parse(data, 0)
+	d := decoder{tokens: DefaultMaxTokens}
+	return d.parse(data, 0)
 }
 
 // ValueSpan returns the number of bytes occupied by the bencoded value at the
@@ -55,13 +99,17 @@ func ValueSpan(data []byte) (int, error) {
 	return findValueSpan(data, 0)
 }
 
-func parse(data []byte, depth int) (interface{}, []byte, error) {
+func (d *decoder) parse(data []byte, depth int) (interface{}, []byte, error) {
 	if len(data) == 0 {
 		return nil, nil, errors.New("empty input")
 	}
 	if depth > maxDepth {
 		return nil, nil, errors.New("bencode value nested too deeply")
 	}
+	if d.tokens <= 0 {
+		return nil, nil, errTokenBudget
+	}
+	d.tokens--
 
 	switch data[0] {
 	case 'i':
@@ -112,7 +160,7 @@ func parse(data []byte, depth int) (interface{}, []byte, error) {
 		for len(rest) > 0 && rest[0] != 'e' {
 			var val interface{}
 			var err error
-			val, rest, err = parse(rest, depth+1)
+			val, rest, err = d.parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -126,12 +174,15 @@ func parse(data []byte, depth int) (interface{}, []byte, error) {
 	case 'd':
 		// Dictionary format: d<key><value>e
 		dict := make(map[string]interface{})
+		// maxKey is the largest key seen so far. Canonical input has sorted
+		// keys, so a key above it cannot be a repeat and skips the map probe.
+		var maxKey string
 		rest := data[1:]
 		for len(rest) > 0 && rest[0] != 'e' {
 			// Key MUST be a string
 			var keyVal interface{}
 			var err error
-			keyVal, rest, err = parse(rest, depth+1)
+			keyVal, rest, err = d.parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -139,14 +190,25 @@ func parse(data []byte, depth int) (interface{}, []byte, error) {
 			if !ok {
 				return nil, nil, errors.New("dictionary key must be a string")
 			}
+			dup := false
+			if len(dict) > 0 && key <= maxKey {
+				_, dup = dict[key]
+			} else {
+				maxKey = key
+			}
+			if dup && d.strict {
+				return nil, nil, fmt.Errorf("duplicate dictionary key %q", key)
+			}
 
 			// Value
 			var val interface{}
-			val, rest, err = parse(rest, depth+1)
+			val, rest, err = d.parse(rest, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
-			dict[key] = val
+			if !dup {
+				dict[key] = val
+			}
 		}
 		if len(rest) == 0 {
 			return nil, nil, errors.New("unterminated dictionary")
