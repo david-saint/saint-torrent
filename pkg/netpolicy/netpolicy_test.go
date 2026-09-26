@@ -39,6 +39,31 @@ func TestClassify(t *testing.T) {
 		"fec0::1": ScopePrivate,
 		"feff::1": ScopePrivate,
 		"febf::1": ScopeLinkLocal,
+		// IPv6 forms a translator or tunnel turns into IPv4 are judged by
+		// the IPv4 address they carry: NAT64 (well-known and local-use
+		// prefixes), SIIT and 6to4.
+		"64:ff9b::7f00:1":         ScopeLoopback,
+		"64:ff9b::a00:1":          ScopePrivate,
+		"64:ff9b::6440:1":         ScopePrivate,
+		"64:ff9b::a9fe:a9fe":      ScopeLinkLocal,
+		"64:ff9b::":               ScopeInvalid,
+		"64:ff9b::e000:1":         ScopeInvalid,
+		"64:ff9b::808:808":        ScopeGlobal,
+		"64:ff9b:1::a00:1":        ScopePrivate,
+		"64:ff9b:1:abcd::c0a8:1":  ScopePrivate,
+		"64:ff9b:1:abcd::808:808": ScopeGlobal,
+		"::ffff:0:a00:1":          ScopePrivate,
+		"::ffff:0:7f00:1":         ScopeLoopback,
+		"::ffff:0:808:808":        ScopeGlobal,
+		"2002:7f00:1::":           ScopeLoopback,
+		"2002:a00:1::1":           ScopePrivate,
+		"2002:a9fe:a9fe::1":       ScopeLinkLocal,
+		"2002:808:808::1":         ScopeGlobal,
+		// The deprecated IPv4-compatible form is no peer at all.
+		"::7f00:1":  ScopeInvalid,
+		"::a00:1":   ScopeInvalid,
+		"::808:808": ScopeInvalid,
+		"::2":       ScopeInvalid,
 	}
 	for s, want := range cases {
 		if got := Classify(netip.MustParseAddr(s)); got != want {
@@ -89,6 +114,17 @@ func TestPeerAllowed(t *testing.T) {
 		{"127.0.0.1:6881", cgnat, false},
 		{"[fec0::2]:6881", public, false},
 		{"[fec0::2]:6881", lan, true},
+		// A public source cannot reach LAN or loopback through the IPv6
+		// forms of their addresses; public IPv4 behind NAT64 stays reachable.
+		{"[64:ff9b::a00:5]:6881", public, false},
+		{"[64:ff9b::a00:5]:6881", unknown, false},
+		{"[64:ff9b::a00:5]:6881", lan, true},
+		{"[64:ff9b:1::a00:5]:6881", public, false},
+		{"[64:ff9b::7f00:1]:6881", lan, false},
+		{"[64:ff9b::808:808]:6881", public, true},
+		{"[2002:a00:1::1]:6881", public, false},
+		{"[::ffff:0:a00:1]:6881", public, false},
+		{"[::a00:1]:6881", lan, false},
 	}
 	for _, c := range cases {
 		if got := PeerAllowed(netip.MustParseAddrPort(c.peer), c.source); got != c.want {

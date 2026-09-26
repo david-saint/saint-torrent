@@ -54,6 +54,15 @@ func TestDestinationAllowed(t *testing.T) {
 		{"0.0.0.0", loop, false},
 		{"224.0.0.1", loop, false},
 		{"255.255.255.255", lan, false},
+		// NAT64 and the other IPv6 forms of IPv4 addresses are judged by the
+		// IPv4 address: a translator forwards them there.
+		{"64:ff9b::a9fe:a9fe", public, false},
+		{"64:ff9b::a9fe:a9fe", loop, false},
+		{"64:ff9b::a00:5", public, false},
+		{"64:ff9b::a00:5", lan, true},
+		{"64:ff9b:1::a00:5", public, false},
+		{"2002:a00:5::1", public, false},
+		{"64:ff9b::808:808", public, true},
 	}
 	for _, c := range cases {
 		if got := DestinationAllowed(netip.MustParseAddr(c.dst), c.source); got != c.want {
