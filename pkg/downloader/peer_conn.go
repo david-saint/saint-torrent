@@ -2056,7 +2056,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				return "oversized_extension"
 			}
 			if pexMsg, err := peer.ParsePEXMessage(payloadBytes); err == nil {
-				s.handlePEXMessage(peerAddr, pexMsg)
+				s.handlePEXMessage(peerAddr, ip, pexMsg)
 			}
 		}
 		return ""

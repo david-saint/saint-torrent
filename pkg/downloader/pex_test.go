@@ -245,3 +245,53 @@ func writeExtendedTestMessage(t *testing.T, conn net.Conn, extID byte, payload [
 		t.Errorf("failed to write extended message: %v", err)
 	}
 }
+
+// refusingLoopbackPort returns a loopback port nothing listens on, so a dial to
+// it is refused at once without leaving the machine.
+func refusingLoopbackPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// TestPEXRejectsAddressesMoreLocalThanSender covers a remote peer using PEX to
+// aim our dials at loopback, LAN, link-local (cloud metadata) or non-unicast
+// addresses.
+func TestPEXRejectsAddressesMoreLocalThanSender(t *testing.T) {
+	sess := newWireTestSession(t, 1, BlockSize)
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+
+	local := &peer.PEXMessage{Added: []peer.PEXPeer{
+		{IP: net.ParseIP("127.0.0.1"), Port: 22},
+		{IP: net.ParseIP("::ffff:127.0.0.1"), Port: 22},
+		{IP: net.ParseIP("::1"), Port: 22},
+		{IP: net.ParseIP("192.168.1.1"), Port: 80},
+		{IP: net.ParseIP("10.0.0.1"), Port: 445},
+		{IP: net.ParseIP("169.254.169.254"), Port: 80},
+		{IP: net.ParseIP("fe80::1"), Port: 80},
+	}}
+	sess.handlePEXMessage("203.0.113.9:6881", "203.0.113.9", local)
+
+	// Nobody may hand out addresses that are never a unicast peer.
+	invalid := &peer.PEXMessage{Added: []peer.PEXPeer{
+		{IP: net.ParseIP("224.0.0.1"), Port: 1900},
+		{IP: net.ParseIP("255.255.255.255"), Port: 9},
+		{IP: net.ParseIP("0.1.2.3"), Port: 9},
+		{IP: net.ParseIP("240.0.0.1"), Port: 9},
+		{IP: net.ParseIP("ff02::1"), Port: 9},
+	}}
+	sess.handlePEXMessage("127.0.0.1:6881", "127.0.0.1", invalid)
+
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	for addr := range sess.Peers {
+		t.Errorf("PEX endpoint %s was accepted", addr)
+	}
+}

@@ -295,8 +295,9 @@ func (s *Session) announceAndConnect() int {
 		}
 		trackerSeeders = max(trackerSeeders, result.complete)
 		trackerLeechers = max(trackerLeechers, result.incomplete)
+		source := trackerPeerSource(result.tracker)
 		for _, p := range result.peers {
-			if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
+			if !trackerPeerAllowed(p, source) {
 				continue
 			}
 			peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)

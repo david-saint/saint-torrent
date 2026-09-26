@@ -2,9 +2,11 @@ package downloader
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
+	"sainttorrent/pkg/netpolicy"
 	"sainttorrent/pkg/peer"
 )
 
@@ -37,12 +39,18 @@ func (s *Session) extensionHandshakeMapLocked() map[string]int {
 	return extensions
 }
 
-func (s *Session) handlePEXMessage(fromAddr string, msg *peer.PEXMessage) {
+// handlePEXMessage acts on the peers a ut_pex message from fromAddr (at fromIP)
+// added. A sender may only point us at addresses as local as its own
+// (netpolicy): a public peer cannot aim our dials at loopback or LAN services,
+// nor anyone at multicast or broadcast addresses.
+func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage) {
 	if msg == nil || !s.pexEnabled() {
 		return
 	}
+	source, _ := netip.ParseAddr(fromIP)
 	for _, p := range msg.Added {
-		if p.Port == 0 || p.IP == nil || p.IP.IsUnspecified() {
+		ap, ok := peerAddrPort(p.IP, p.Port)
+		if !ok || !netpolicy.PeerAllowed(ap, source) {
 			continue
 		}
 		addr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
