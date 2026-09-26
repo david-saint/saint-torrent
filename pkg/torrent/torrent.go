@@ -298,13 +298,15 @@ type pathEntry struct {
 }
 
 // checkFileDirCollisions rejects a file whose path is also the directory of
-// another file, as in [a] and [a b]: no filesystem can lay that out, and
-// libtorrent refuses it too. keys are the files' pathKey values, so case and
-// normalization fold exactly as in the duplicate check; folding neither adds
-// nor removes a separator, and sanitized components hold none. Each directory
-// component is hashed once, under its parent's number, so the cost is linear
-// in the path bytes: keying every directory by its whole path would hash and
-// keep O(depth^2) bytes per file, 64 times the metadata for 128-deep paths.
+// another file, as in [a] and [a b]: no filesystem can lay that out.
+// libtorrent renames such a file (within max_duplicate_filenames attempts);
+// here it is refused like a duplicate path. keys are the files' pathKey
+// values, so case and normalization fold exactly as in the duplicate check;
+// folding neither adds nor removes a separator, and sanitized components hold
+// none. Each directory component is hashed once, under its parent's number,
+// so the cost is linear in the path bytes: keying every directory by its
+// whole path would hash and keep O(depth^2) bytes per file, 64 times the
+// metadata for 128-deep paths.
 func checkFileDirCollisions(files []File, keys []string) error {
 	if len(files) < 2 {
 		return nil
