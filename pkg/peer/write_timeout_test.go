@@ -105,3 +105,25 @@ func TestWriteDeadlineArmedLazily(t *testing.T) {
 		t.Fatalf("1000 sends set %d write deadlines, want exactly 1", n)
 	}
 }
+
+// discardConn accepts every write at once, so BenchmarkSendPiece measures the
+// client's own per-block cost.
+type discardConn struct{ net.Conn }
+
+func (discardConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (discardConn) SetWriteDeadline(time.Time) error { return nil }
+func (discardConn) Close() error                     { return nil }
+
+// BenchmarkSendPiece measures serving one 16 KiB block, including the write
+// deadline check.
+func BenchmarkSendPiece(b *testing.B) {
+	c := NewClient(discardConn{}, [20]byte{}, [20]byte{})
+	block := make([]byte, 16*1024)
+	b.SetBytes(int64(len(block)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := c.SendPiece(uint32(i), 0, block); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

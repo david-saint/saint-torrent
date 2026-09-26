@@ -92,11 +92,13 @@ func (c *Client) armWriteDeadlineLocked() {
 	if c.writeTimeout <= 0 {
 		return
 	}
-	now := time.Now()
-	if c.writeDeadline.Sub(now) >= c.writeTimeout/2 {
+	// time.Until reads only the monotonic clock for a deadline that carries a
+	// monotonic reading, which makes this per-block check about half the cost of
+	// a time.Now.
+	if time.Until(c.writeDeadline) >= c.writeTimeout/2 {
 		return
 	}
-	c.writeDeadline = now.Add(c.writeTimeout)
+	c.writeDeadline = time.Now().Add(c.writeTimeout)
 	_ = c.Conn.SetWriteDeadline(c.writeDeadline)
 }
 
