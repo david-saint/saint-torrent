@@ -50,6 +50,37 @@ type Options struct {
 	// has no authentication, so this exposes torrent names, local paths and
 	// peer addresses to anyone who can reach the port.
 	AllowRemote bool
+	// AllowHosts are host names accepted in a request's Host header besides
+	// IP literals, localhost and the listen host: the name a LAN dashboard,
+	// container scraper or reverse proxy reaches the API by. Each is a bare
+	// host name (see CheckAllowHost). Only names the user trusts belong here:
+	// a page served under one can read the API through DNS rebinding.
+	AllowHosts []string
+}
+
+// CheckAllowHost reports whether name can be an Options.AllowHosts entry: a
+// bare DNS host name, without a scheme, port, path or wildcard. IP literals
+// and localhost are always accepted and need no entry.
+func CheckAllowHost(name string) error {
+	if name == "" || len(name) > 253 {
+		return fmt.Errorf("invalid host name %q: want a name such as nas.lan", name)
+	}
+	if _, err := netip.ParseAddr(name); err == nil {
+		return fmt.Errorf("%s is an IP address; IP addresses are always allowed", name)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return fmt.Errorf("invalid host name %q: want a name such as nas.lan", name)
+		}
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			default:
+				return fmt.Errorf("invalid host name %q: want a bare name such as nas.lan, without a scheme, port or path", name)
+			}
+		}
+	}
+	return nil
 }
 
 // Server owns the optional HTTP stats listener.
@@ -70,6 +101,11 @@ func Start(addr string, manager *downloader.TorrentManager, opts Options) (*Serv
 	if err != nil {
 		return nil, err
 	}
+	for _, name := range opts.AllowHosts {
+		if err := CheckAllowHost(name); err != nil {
+			return nil, err
+		}
+	}
 	// Refuse wildcard and non-loopback IP literals before binding, so the port
 	// is never open on other interfaces even briefly.
 	if !opts.AllowRemote && nonLoopbackLiteral(host) {
@@ -89,7 +125,7 @@ func Start(addr string, manager *downloader.TorrentManager, opts Options) (*Serv
 	listener = newLimitListener(listener, maxConns)
 
 	srv := &http.Server{
-		Handler:           NewHandler(manager, host),
+		Handler:           NewHandler(manager, append([]string{host}, opts.AllowHosts...)...),
 		MaxHeaderBytes:    maxHeaderBytes,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -229,7 +265,7 @@ func guard(next http.Handler, extraHosts []string) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !hostAllowed(r.Host, allowed) {
-			reject(w, "misdirected request: use an IP address, localhost or the --http-addr host", http.StatusMisdirectedRequest)
+			reject(w, "misdirected request: use an IP address, localhost or the --http-addr host, or allow this name with --http-allow-host", http.StatusMisdirectedRequest)
 			return
 		}
 		switch r.Header.Get("Sec-Fetch-Site") {

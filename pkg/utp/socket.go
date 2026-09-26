@@ -107,6 +107,11 @@ type Socket struct {
 	resetWindow time.Time
 	resetsSent  int
 
+	// refuseIncoming turns away new inbound connections (see
+	// SetRefuseIncoming). It is read only for SYNs and for packets that would
+	// complete a half-open handshake, never for established traffic.
+	refuseIncoming atomic.Bool
+
 	// bufPool hands out scratch buffers for packet marshaling so writePacket
 	// does not allocate a fresh header+payload slice per send. sync.Pool keeps
 	// this contention-free across the read loop and per-conn write goroutines.
@@ -181,6 +186,30 @@ func (s *Socket) Listen() *Listener {
 	}
 	s.listener = l
 	return l
+}
+
+// SetRefuseIncoming sets whether s turns away new inbound connections. While
+// refuse is true, a SYN that would open one is answered with a RESET instead
+// of a SYN-ACK, and an initiator whose SYN was answered before refusal began
+// is reset when it acknowledges the SYN-ACK, so nothing new reaches the
+// listener. Established and already accepted connections, and connections
+// this socket dials, are unaffected.
+//
+// A BitTorrent client that also listens on TCP sets it to keep peers off
+// this uTP, whose writes wait for every packet to be acknowledged (see
+// Conn.Write) and so move about one block per round trip. libtorrent (and so
+// qBittorrent and Deluge), uTorrent and Transmission dial uTP first, take a
+// RESET answering their SYN as a failed connect, and connect again over TCP
+// at once. The cost is a peer that can reach us over UDP but not TCP.
+//
+// The RESET answering a refused SYN is sent whatever the unsolicited-RESET
+// budget (maxResetsPerSecond) says. It stands in for the SYN-ACK an accepting
+// socket sends every SYN unbudgeted, and is no larger than the SYN it
+// answers, so it hands a spoofing sender nothing the SYN-ACK would not;
+// budgeting it would let a burst of stray packets leave a real initiator to
+// time out before it falls back to TCP.
+func (s *Socket) SetRefuseIncoming(refuse bool) {
+	s.refuseIncoming.Store(refuse)
 }
 
 // DialContext opens a uTP connection to addr, which must be host:port.
@@ -346,6 +375,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		halfOpen  bool
 		sendReset bool
 		resetTo   [2]*Conn
+		refused   *halfOpenConn
 	)
 	s.mu.Lock()
 	c = s.conns[key]
@@ -357,8 +387,15 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		if h := s.liveHalfOpenLocked(key, now); h != nil {
 			halfOpen = true
 			if h.acknowledgedBy(p) {
-				c = s.promoteLocked(h, p.ackNr)
-				listener = s.listener
+				if s.refuseIncoming.Load() {
+					// Refusal began after the SYN-ACK went out (see
+					// SetRefuseIncoming).
+					delete(s.halfOpen, h.key)
+					refused = h
+				} else {
+					c = s.promoteLocked(h, p.ackNr)
+					listener = s.listener
+				}
 			}
 		} else if p.typ == packetTypeReset {
 			resetTo = s.resetTargetsLocked(addr, p.connID)
@@ -380,8 +417,21 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 				rc.handlePacket(p)
 			}
 		}
-		if sendReset {
-			s.writeReset(p, addr)
+		switch {
+		case refused != nil:
+			// The sender proved it receives what we send, so no budget is
+			// spent. The RESET carries the SYN's connection id, which the
+			// initiator's conn is keyed by, and acks the last seq_nr the
+			// initiator sent: a STATE carries the next one without sending
+			// it, and libtorrent ignores a RESET acking a seq_nr it has not
+			// sent yet.
+			answered := p
+			if answered.typ == packetTypeState {
+				answered.seqNr--
+			}
+			s.writeReset(refused.connID, answered, addr)
+		case sendReset:
+			s.writeReset(p.connID, p, addr)
 		}
 		return
 	}
@@ -402,7 +452,9 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 // is re-acked by that Conn. Otherwise the SYN is only recorded in the
 // half-open table and answered with a SYN-ACK: no Conn exists and nothing
 // reaches the listener until the initiator acknowledges it, so a spoofed SYN
-// buys one table slot and one 20-byte STATE, never a writable connection.
+// buys one table slot and one 20-byte STATE, never a writable connection. A
+// socket refusing incoming connections (SetRefuseIncoming) answers with a
+// RESET instead and records nothing.
 func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 	now := time.Now()
 	s.mu.Lock()
@@ -428,11 +480,22 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 		sendReset := s.allowResetLocked(now)
 		s.mu.Unlock()
 		if sendReset {
-			s.writeReset(p, addr)
+			s.writeReset(p.connID, p, addr)
 		}
 		return
 	}
 	h := s.liveHalfOpenLocked(key, now)
+	if s.listener != nil && s.refuseIncoming.Load() {
+		// Refused (see SetRefuseIncoming): a RESET goes out in place of the
+		// SYN-ACK, outside the budget, and a half-open entry this SYN
+		// retransmits for is dropped.
+		if h != nil {
+			delete(s.halfOpen, key)
+		}
+		s.mu.Unlock()
+		s.writeReset(p.connID, p, addr)
+		return
+	}
 	if h == nil || h.synSeq != p.seqNr {
 		// A new connection. A SYN with a different seq_nr at a live entry's
 		// key is a fresh attempt that reuses the connection id, so it
@@ -442,7 +505,7 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 			sendReset := s.allowResetLocked(now)
 			s.mu.Unlock()
 			if sendReset {
-				s.writeReset(p, addr)
+				s.writeReset(p.connID, p, addr)
 			}
 			return
 		}
@@ -498,11 +561,13 @@ func (s *Socket) resetTargetsLocked(addr *net.UDPAddr, id uint16) [2]*Conn {
 }
 
 // writeReset answers p, which belongs to no connection we can serve, with a
-// RESET. Callers spend the budget first (allowResetLocked).
-func (s *Socket) writeReset(p packet, addr *net.UDPAddr) {
+// RESET carrying connID: p's own connection id, or the SYN's for a packet
+// that would have completed a refused handshake. Callers spend the budget
+// first (allowResetLocked) where one applies.
+func (s *Socket) writeReset(connID uint16, p packet, addr *net.UDPAddr) {
 	_ = s.writePacket(packet{
 		typ:       packetTypeReset,
-		connID:    p.connID,
+		connID:    connID,
 		timestamp: s.nowMicros(),
 		seqNr:     p.ackNr,
 		ackNr:     p.seqNr,

@@ -24,6 +24,11 @@ const (
 	// MaxPieceCount bounds the number of pieces, which sizes the per-torrent
 	// piece state and every peer's bitfield.
 	MaxPieceCount = 1 << 22
+	// MaxFileCount bounds the number of files. Storage creates, stats and
+	// tracks every file up front, so an info dictionary of millions of empty
+	// entries would pin that much work and memory; the largest real datasets
+	// hold a few hundred thousand files.
+	MaxFileCount = 1 << 20
 )
 
 // maxPathDepth bounds the number of path components one file may declare.
@@ -33,6 +38,11 @@ const maxPathDepth = 128
 type File struct {
 	Length int64
 	Path   []string
+	// LegacyPath is where versions before the current name sanitizer laid the
+	// file out, set only when that differs from Path (see
+	// legacyPathComponent). The downloader moves a file it finds there to
+	// Path, so upgrading does not orphan it and download it again.
+	LegacyPath []string
 }
 
 // Torrent represents the metadata extracted from a torrent file.
@@ -51,9 +61,12 @@ type Torrent struct {
 
 // Parse decodes a bencoded torrent file, calculates the info hash, and returns a Torrent struct.
 func Parse(data []byte) (*Torrent, error) {
-	// Metainfo is decoded strictly: a repeated key would let the info-hash and
-	// the decoded fields (or another client) disagree about the same bytes.
-	val, err := bencode.UnmarshalStrict(data)
+	// The outer dictionary is decoded like libtorrent's: a repeated key keeps
+	// its first value, as FindRawValue does, so a .torrent whose editor
+	// appended a second "comment" or "announce" still loads. Those keys are not
+	// hashed. The info dictionary, which is, is decoded strictly by ParseInfo
+	// from the exact bytes the info-hash commits to.
+	val, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal torrent bencode: %w", err)
 	}
@@ -112,8 +125,10 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// 3. Decode the info fields from the exact bytes that are hashed, so the
-	// info-hash always commits to the content that gets downloaded.
-	bencodedInfo, err := bencode.FindRawValue(data, "info")
+	// info-hash always commits to the content that gets downloaded. A second
+	// "info" is refused: a reader keeping the last copy would hash and
+	// download another torrent from the same file.
+	bencodedInfo, err := bencode.FindUniqueRawValue(data, "info")
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract raw info dictionary: %w", err)
 	}
@@ -190,7 +205,11 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 		if len(filesSlice) == 0 {
 			return nil, fmt.Errorf("files list cannot be empty")
 		}
+		if err := checkFileCount(len(filesSlice)); err != nil {
+			return nil, err
+		}
 		cleanName := sanitizePathComponent(name)
+		legacyName, legacyRoot := legacyComponent(name, cleanName)
 		for _, fVal := range filesSlice {
 			fMap, ok := fVal.(map[string]interface{})
 			if !ok {
@@ -217,6 +236,7 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 			}
 			path := make([]string, 0, len(pathSlice)+1)
 			path = append(path, cleanName) // root under sanitized torrent name
+			legacyDiffers := legacyRoot
 			for _, pVal := range pathSlice {
 				pStr, ok := pVal.(string)
 				if !ok {
@@ -226,14 +246,21 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 				if cleanedComp != "" {
 					path = append(path, cleanedComp)
 				}
+				if _, differs := legacyComponent(pStr, cleanedComp); differs {
+					legacyDiffers = true
+				}
 			}
 			if len(path) == 1 { // Only contains the torrent name, no actual files
 				path = append(path, "unknown_file")
 			}
-			files = append(files, File{
+			file := File{
 				Length: length,
 				Path:   path,
-			})
+			}
+			if legacyDiffers {
+				file.LegacyPath = legacyFilePath(legacyName, pathSlice)
+			}
+			files = append(files, file)
 		}
 	} else {
 		// Single-file mode
@@ -245,11 +272,15 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 			return nil, err
 		}
 		totalLength = length
+		cleanName := sanitizePathComponent(name)
 		files = []File{
 			{
 				Length: length,
-				Path:   []string{sanitizePathComponent(name)},
+				Path:   []string{cleanName},
 			},
+		}
+		if legacyName, differs := legacyComponent(name, cleanName); differs && len(legacyName) <= maxLegacyComponentBytes {
+			files[0].LegacyPath = []string{legacyName}
 		}
 	}
 	if totalLength <= 0 {
@@ -350,6 +381,14 @@ func checkPieceCount(numPieces int, pieceLength, totalLength int64) error {
 	expectedPieces := (totalLength-1)/pieceLength + 1
 	if int64(numPieces) != expectedPieces {
 		return fmt.Errorf("piece hash count mismatch: got %d, expected %d", numPieces, expectedPieces)
+	}
+	return nil
+}
+
+// checkFileCount rejects a files list longer than MaxFileCount.
+func checkFileCount(n int) error {
+	if n > MaxFileCount {
+		return fmt.Errorf("torrent has %d files, more than the maximum of %d", n, MaxFileCount)
 	}
 	return nil
 }

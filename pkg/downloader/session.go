@@ -354,6 +354,10 @@ type Session struct {
 	// reservation back and is called by the manager, never by Close.
 	claimPaths    func(infoHash [20]byte, baseDir string, files []storage.FileInfo) (release func(), err error)
 	releaseClaims func()
+	// migratePaths moves payload files an older version wrote under their
+	// pre-sanitizer names to the current ones once the paths are claimed (nil
+	// for a standalone session; see TorrentManager.migrateLegacyPaths).
+	migratePaths func(infoHash [20]byte, baseDir string, files []torrent.File) (moved int)
 }
 
 // errSessionClosing reports work refused or abandoned because the session is
@@ -1783,6 +1787,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		factory = storage.NewStorage
 	}
 	claimPaths := s.claimPaths
+	migratePaths := s.migratePaths
 	downloadDirs := append([]string{s.downloadDir}, s.fallbackDownloadDirs...)
 	// Close waits on initDone, so the storage built below is either published
 	// before Close takes the session's storage or never built at all.
@@ -1809,6 +1814,9 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 				continue
 			}
 		}
+		if migratePaths != nil {
+			migratePaths(s.Torrent.InfoHash, downloadDir, parsed.Files)
+		}
 		candidate, createErr := factory(downloadDir, fileInfos, parsed.PieceLength)
 		// Success is decided by the error alone, and a nil pointer boxed in the
 		// interface is refused: installing one crashed the first storage call.
@@ -1823,6 +1831,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			createErr = errors.New("storage factory returned no storage")
 		}
 		storageErrors = append(storageErrors, fmt.Errorf("%s: %w", downloadDir, createErr))
+	}
+	// Read any checkpoint while the storage is still private to this call: it
+	// opens every payload file, which under s.mu stalled the peer loops too.
+	var (
+		resume    storage.ResumeState
+		resumeErr error
+	)
+	if st != nil {
+		resume, resumeErr = readResumeState(st, s.Torrent.InfoHash)
 	}
 
 	s.mu.Lock()
@@ -1902,16 +1919,15 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		return errSessionClosing
 	}
 
-	// Load any fast-resume hint and verify in the background (metadata just arrived, so
-	// most pieces are not on disk yet; verification stays off the hot path).
-	s.loadResumeState()
-	s.maybeStartVerification()
-
 	s.mu.Lock()
 	if s.Storage != storageToVerify {
 		s.mu.Unlock()
 		return fmt.Errorf("storage changed while completing metadata")
 	}
+	// Install the fast-resume state read above; verification runs in the
+	// background (metadata just arrived, so most pieces are not on disk yet and
+	// hashing stays off the hot path).
+	s.applyResumeStateLocked(resume, resumeErr)
 	s.metadataCompleted = true
 	s.metadataMode = false
 	close(s.metadataCompletedCh)
@@ -1923,6 +1939,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		c.Notify()
 	}
 	s.mu.Unlock()
+	s.maybeStartVerification()
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()

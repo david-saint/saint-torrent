@@ -43,6 +43,8 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 ### File Explorer View
 - `esc` - Go back to the Torrent Details view
 - `up`/`down` or `k`/`j` - Scroll through the file list
+- `pgup`/`pgdn` - Page through the file list
+- `home`/`end` - Jump to the first/last file
 - `space` or `p` - Cycle priority for the selected file (`NORMAL` ➔ `HIGH` ➔ `SKIP`)
 - `q` or `Ctrl+C` - Quit
 
@@ -133,6 +135,12 @@ also attempts automatic UPnP IGD or NAT-PMP mapping:
 ./sainttorrent --port 0          # explicitly request an ephemeral port
 ```
 
+Inbound peers connect over TCP. The UDP port carries the DHT, but while the TCP
+listener is up saintTorrent refuses inbound uTP connections: peers that try
+uTP first (libtorrent, uTorrent, Transmission) reconnect over TCP at once,
+which is much faster with saintTorrent's current uTP. When forwarding the port
+by hand, forward it for both TCP and UDP.
+
 Peer protocol encryption defaults to `prefer`: saintTorrent tries BitTorrent
 MSE/PE first and falls back to plaintext when a peer does not support it. Use
 `require` to reject plaintext peer connections, or `disable` for plaintext-only
@@ -171,6 +179,11 @@ symlink, a hard link, or a file owned by another user. Rotation defaults to
 10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for
 example `25mb`) and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
 
+To hand the log to a container runtime or the systemd journal instead, log to
+a stream with `--log /dev/stderr` or `--log /dev/stdout` (headless mode; in the
+TUI it would draw over the screen). A stream is written as is: it is never
+rotated, and those two paths are the only symlinks accepted.
+
 The HTTP stats endpoint is off by default. Enable the read-only JSON API with
 `--http-addr`:
 
@@ -194,9 +207,25 @@ To resist DNS rebinding, the API answers only requests whose `Host` is an IP
 literal, `localhost`, or the host given to `--http-addr` (others get `421`),
 and it rejects browser requests from other sites (`Sec-Fetch-Site` of
 `cross-site`/`same-site`, or a foreign `Origin`) with `403`. `curl`, scripts,
-and a URL typed into the browser are unaffected. A reverse proxy in front of it
-must forward a `Host` of `127.0.0.1` or `localhost` (nginx's default does). At
-most 64 connections are served at once.
+and a URL typed into the browser are unaffected. At most 64 connections are
+served at once.
+
+To reach the API by another name, such as `http://nas.lan:16666` on a wildcard
+bind or a container's service name, allow that name with `--http-allow-host`
+(repeatable). List only names you control: a page served under an allowed name
+can read the API.
+
+```bash
+./sainttorrent --headless --http-addr 0.0.0.0:16666 --http-allow-remote \
+  --http-allow-host nas.lan --http-allow-host sainttorrent
+```
+
+A reverse proxy in front of the API must forward a `Host` of `127.0.0.1` or
+`localhost`, or a name allowed with `--http-allow-host`. nginx's default does
+(`proxy_pass http://127.0.0.1:16666` sends `Host: 127.0.0.1:16666`). Caddy
+and Traefik forward the client's `Host` by default: set
+`header_up Host {upstream_hostport}` in Caddy's `reverse_proxy`, or
+`passHostHeader: false` on the Traefik service.
 
 In headless mode, forwarded torrent requests that require confirmation are
 rejected; use `--no-confirm` when scripting additions into a headless instance.
@@ -286,9 +315,9 @@ keeps there private to your user (directories `0700`, files `0600`):
 
 | Path | What it holds |
 | --- | --- |
-| `session.json` | Every torrent: download directory, paused state, file priorities, and any crash quarantine |
+| `session.json` | Every torrent: name, download directory, paused state, file priorities, and any crash quarantine |
 | `torrents/` | A cached copy of each `.torrent` (these can carry private-tracker passkeys) |
-| `restore-failures.log` | Why a torrent failed to restore at startup, one line per failure |
+| `restore-failures.log` | Why a torrent failed to restore, or was not loaded after a crash, at startup: one line per torrent and start |
 | `crash/` | One `<time>-<info-hash>-<component>.txt` file per recorded crash (the newest 32 are kept), and `fatal.txt`, where the Go runtime writes fatal errors (rotated to `fatal.txt.1` past 1 MiB) |
 | `running` | Present while saintTorrent runs; removed on a clean exit |
 | `crash-state.json` | How many runs in a row ended in a crash no torrent was blamed for |
@@ -308,9 +337,10 @@ not exit cleanly, and:
   be what crashed; its error line points at the crash file. Resuming it lifts
   the quarantine. Until then it stays quarantined across restarts.
 - A torrent that crashed saintTorrent *while being restored* is not loaded at
-  all, since loading it would crash again. It stays in `session.json`, the
-  startup line names its info-hash, and `--start-paused` loads it paused and
-  quarantined.
+  all, since loading it would crash again. It stays in `session.json`, and the
+  startup line leads with `Start with --start-paused to load "<name>"`:
+  `--start-paused` loads it paused and quarantined. `restore-failures.log`
+  names its crash file.
 - A crash no torrent is blamed for (the terminal UI, the DHT, a fatal runtime
   error, or the process being killed outright by `SIGKILL`, the OOM killer or
   a power cut) in the first 10 minutes of a run is counted. After two such
@@ -391,10 +421,11 @@ saintTorrent is released under the Apache License, Version 2.0. See [LICENSE](LI
 
 The file and mmap backends restore completed downloads from a durable resume
 checkpoint after validating each file's size, modification time, and identity.
-Identity always includes the change timestamp, which moves even when a tool
-restores the modification time after an in-place edit; the mmap backend releases
-its mappings before taking a checkpoint so that timestamp is settled before it is
-recorded. Unchanged files need no content reads. Files that changed are rechecked
+Identity includes the change timestamp (FAT and exFAT, which lack one, are
+described below), which moves even when a tool restores the modification time
+after an in-place edit; the mmap backend releases its mappings before taking a
+checkpoint so that timestamp is settled before it is recorded. Unchanged files
+need no content reads. Files that changed are rechecked
 along with any torrent pieces crossing their boundaries; unaffected files retain
 their verified state, and pieces the checkpoint never claimed stay immediately
 downloadable instead of queueing behind a hash.
@@ -413,6 +444,13 @@ volume — moves the change timestamp, so those files are hashed once on the nex
 launch. And a file the client is itself writing cannot be compared against its own
 previous metadata, so an external in-place edit of an already-completed region of
 a file that is still downloading is not detected until the next full check.
+
+FAT and exFAT volumes keep no change timestamp. On Windows, files on them are
+identified by volume, file index, size and exact modification time instead,
+which is what libtorrent relies on everywhere: they resume without hashing, but
+an in-place edit that restores the modification time is not detected there
+until the next full check. Any other volume that reports no change timestamp is
+not trusted, so its files are rechecked on every launch.
 
 Use `sainttorrent --recheck` to force full hashing of the torrents restored on a
 launch, including their unchanged files. Metadata validation is a fast-resume

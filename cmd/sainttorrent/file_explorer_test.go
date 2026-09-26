@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/sha1"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -163,5 +165,49 @@ func TestFilesSnapshotNotRebuiltOnTickUnlessChanged(t *testing.T) {
 	m = pressKey(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
 	if &m.files.priorities[0] == before || m.files.priorities[0] != downloader.PriorityHigh {
 		t.Fatalf("toggle did not refresh the snapshot: %v", m.files.priorities[0])
+	}
+}
+
+// TestFileExplorerDocumentsItsKeys: the explorer pages with pgup/pgdn and
+// jumps with home/end, but its help showed only pgup/pgdn and the README
+// neither. The --no-persist help also understated what the flag turns off.
+func TestFileExplorerDocumentsItsKeys(t *testing.T) {
+	m := newManyFilesModel(t, 100, "a.bin", 120, 40)
+	help := ansi.Strip(m.fileExplorerHelp())
+	for _, key := range []string{"pgup/pgdn", "home/end"} {
+		if !strings.Contains(help, key) {
+			t.Errorf("file explorer help %q does not list %s", help, key)
+		}
+	}
+	m = pressKey(t, m, tea.KeyMsg{Type: tea.KeyEnd})
+	if m.selectedFileIdx != 99 {
+		t.Fatalf("end selected file %d, want the last", m.selectedFileIdx)
+	}
+	m = pressKey(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	if m.selectedFileIdx != 0 {
+		t.Fatalf("home selected file %d, want the first", m.selectedFileIdx)
+	}
+
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := string(readme)
+	start := strings.Index(section, "### File Explorer View")
+	if start < 0 {
+		t.Fatal("README has no File Explorer section")
+	}
+	section = section[start:]
+	if end := strings.Index(section, "\n---"); end > 0 {
+		section = section[:end]
+	}
+	for _, key := range []string{"`pgup`/`pgdn`", "`home`/`end`"} {
+		if !strings.Contains(section, key) {
+			t.Errorf("README File Explorer section does not list %s", key)
+		}
+	}
+
+	if usage := usageText(); !strings.Contains(usage, "nothing is restored") || !strings.Contains(usage, "crash handling is off") {
+		t.Error("--help does not say that --no-persist restores nothing and turns crash handling off")
 	}
 }

@@ -137,6 +137,29 @@ func TestParseTrackerResponseFailure(t *testing.T) {
 	}
 }
 
+// TestParseTrackerResponseWithoutInterval: a reply with no usable interval was
+// rejected, discarding its peers and putting the tracker into failure backoff.
+// It now parses with Interval 0, which the announcer replaces with its default,
+// as libtorrent does.
+func TestParseTrackerResponseWithoutInterval(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing":     "d5:peers6:\x01\x02\x03\x04\x1a\xe1e",
+		"not integer": "d8:interval4:18005:peers6:\x01\x02\x03\x04\x1a\xe1e",
+	} {
+		resp, err := ParseTrackerResponse([]byte(body))
+		if err != nil {
+			t.Fatalf("%s interval: %v", name, err)
+		}
+		if resp.Interval != 0 || len(resp.Peers) != 1 || !resp.Peers[0].IP.Equal(net.IPv4(1, 2, 3, 4)) || resp.Peers[0].Port != 6881 {
+			t.Fatalf("%s interval: parsed %+v, want the one peer and interval 0", name, resp)
+		}
+	}
+	// A failure reason is still an error, with or without an interval.
+	if _, err := ParseTrackerResponse([]byte("d14:failure reason4:nopee")); err == nil {
+		t.Fatal("a failure reason without an interval was accepted")
+	}
+}
+
 func TestBuildTrackerURLWithEvent(t *testing.T) {
 	baseURL := "http://tracker.example.com/announce?event=should_be_deleted"
 	infoHash := [20]byte{1}

@@ -3,6 +3,7 @@ package downloader
 import (
 	"bytes"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,6 +40,9 @@ type peerAdmission struct {
 	peerIDs   map[[20]byte]peerIDOwner
 	selfAddrs map[string]struct{}
 	strikes   map[string]*hostStrikes
+	// listenAddrs maps the listen endpoint an inbound connection announced
+	// (see noteListenPortLocked) to that connection's activePeers key.
+	listenAddrs map[string]string
 }
 
 // peerIDOwner is the connection a remote peer ID is admitted under.
@@ -162,6 +166,70 @@ func (s *Session) releasePeerLocked(peerAddr, hostKey string, remoteID [20]byte)
 			delete(a.peerIDs, remoteID)
 		}
 	}
+}
+
+// noteListenPortLocked records that the inbound connection at peerAddr, from
+// ip, listens on port, as its extension handshake announced (BEP 10 p).
+// peerAddr holds the source port the peer connected from, ephemeral over TCP,
+// so without this a tracker, DHT or PEX listing of the peer's listen endpoint
+// would have us dial a peer we are already connected to. libtorrent (one
+// connection per IP by default) and Transmission then drop one of the two,
+// possibly the established one mid-transfer, and we would redial the endpoint
+// every backoff while it stays inactive. Until the connection ends the
+// endpoint counts as held (heldByInboundLocked), and no path starts a dial to
+// it; a dial already in flight is left to finish.
+//
+// The endpoint is taken only at the connection's own IP, and only while no
+// other connection holds it, so a peer can hold back dials to its own IP
+// alone: at worst to another client sharing that address, which libtorrent,
+// keeping one connection per IP by default, would skip too. previous is what
+// this connection registered before (a peer may re-send its handshake),
+// released here; the endpoint now registered for it, or "", is returned.
+// Caller holds s.mu.
+func (s *Session) noteListenPortLocked(peerAddr, ip string, port uint16, previous string) string {
+	a := &s.admission
+	listenAddr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	if listenAddr == previous {
+		return previous
+	}
+	s.releaseListenPortLocked(peerAddr, previous)
+	if listenAddr == peerAddr {
+		return "" // the peer connected from its listen port (uTP does)
+	}
+	if _, active := s.activePeers[listenAddr]; active {
+		return ""
+	}
+	if _, held := a.listenAddrs[listenAddr]; held {
+		return ""
+	}
+	if a.listenAddrs == nil {
+		a.listenAddrs = make(map[string]string)
+	}
+	a.listenAddrs[listenAddr] = peerAddr
+	return listenAddr
+}
+
+// releaseListenPortLocked undoes noteListenPortLocked for the connection at
+// peerAddr, which registered listenAddr ("" for none). The endpoint becomes
+// dialable again, after the redial backoff, as if a connection to it had
+// just ended. Caller holds s.mu.
+func (s *Session) releaseListenPortLocked(peerAddr, listenAddr string) {
+	a := &s.admission
+	if listenAddr == "" || a.listenAddrs[listenAddr] != peerAddr {
+		return
+	}
+	delete(a.listenAddrs, listenAddr)
+	if ps := s.Peers[listenAddr]; ps != nil && !ps.Active && !ps.Dialing {
+		ps.LastAttempt = time.Now()
+	}
+}
+
+// heldByInboundLocked reports whether addr is the listen endpoint of an
+// inbound connection we hold (see noteListenPortLocked), so dialing it would
+// open a second connection to that peer. Caller holds s.mu (read or write).
+func (s *Session) heldByInboundLocked(addr string) bool {
+	_, held := s.admission.listenAddrs[addr]
+	return held
 }
 
 func (a *peerAdmission) rememberSelfAddrLocked(peerAddr string) {

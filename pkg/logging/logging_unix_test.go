@@ -60,6 +60,30 @@ func TestNewRefusesSymlinkedLogPath(t *testing.T) {
 	assertVictimUntouched(t, victim)
 }
 
+// A refused log path says why and what to use instead: the bare "too many
+// levels of symbolic links" of a no-follow open did not.
+func TestRefusedLogPathErrorIsActionable(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "debug.log")
+	if err := os.Symlink(filepath.Join(dir, "target.log"), link); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo.log")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	for path, why := range map[string]string{link: "symbolic link", fifo: "not a regular file"} {
+		logger, err := New(Config{Path: path})
+		if err == nil {
+			logger.Close()
+			t.Fatalf("New accepted %s", path)
+		}
+		if msg := err.Error(); !strings.Contains(msg, why) || !strings.Contains(msg, "/dev/stderr") {
+			t.Fatalf("New(%s) error %q, want it to say %q and suggest /dev/stderr", path, msg, why)
+		}
+	}
+}
+
 // A dangling link would otherwise make us create the attacker-chosen target.
 func TestNewRefusesDanglingSymlink(t *testing.T) {
 	dir := t.TempDir()

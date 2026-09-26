@@ -2,6 +2,8 @@ package torrent
 
 import (
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -207,6 +209,127 @@ func TestPathKeyASCIIShortcutMatchesUnicodeFold(t *testing.T) {
 	for _, p := range inputs {
 		if got, want := pathKey(p), reference(p); got != want {
 			t.Errorf("pathKey(%q) = %q, want %q", p, got, want)
+		}
+	}
+}
+
+// TestParseKeepsLegacyPaths: the sanitizer now drops invisible format
+// characters and replaces control characters and invalid UTF-8, which moved
+// such files away from where earlier versions wrote them, so an upgrade
+// downloaded them again. Parse records the old path for the downloader to move
+// the file from, and only where it differs.
+func TestParseKeepsLegacyPaths(t *testing.T) {
+	long := strings.Repeat("L", 300) + ".mkv"
+	for _, tc := range []struct {
+		name, in, want, legacy string
+	}{
+		{"RLM", "Movie \u200f(RLM).mkv", "Movie (RLM).mkv", "Movie \u200f(RLM).mkv"},
+		{"BOM", "\ufeffep1\ufeff.mkv", "ep1.mkv", "\ufeffep1\ufeff.mkv"},
+		{"Latin-1", "Caf\xe9 Latin1.mkv", "Caf_ Latin1.mkv", "Caf\xe9 Latin1.mkv"},
+		{"GBK", "\xb2\xe2\xca\xd4 GBK", "____ GBK", "\xb2\xe2\xca\xd4 GBK"},
+		{"control character", "Tab\tName.txt", "Tab_Name.txt", "Tab\tName.txt"},
+		{"escape sequence", "a\x1b[31mb", "a_[31mb", "a\x1b[31mb"},
+		// The old rules still applied: ".." inside a name became '_'.
+		{"invisible dot-dot", "..\u200b", "safe_name", "_\u200b"},
+		{"overlong", long, strings.Repeat("L", 251) + ".mkv", long},
+		{"longer than any filesystem holds", strings.Repeat("L", 2000), strings.Repeat("L", maxComponentBytes), ""},
+		{"plain", "movie.mkv", "movie.mkv", ""},
+		{"inner dot-dot", "a..b", "a_b", ""},
+		{"literal replacement character", "a\ufffdb", "a\ufffdb", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tor, err := Parse(marshalTorrent(t, singleFileInfo(tc.in, 16, 16)))
+			if err != nil {
+				t.Fatalf("Parse() = %v", err)
+			}
+			f := tor.Files[0]
+			if len(f.Path) != 1 || f.Path[0] != tc.want {
+				t.Fatalf("Path = %q, want [%q]", f.Path, tc.want)
+			}
+			if tc.legacy == "" {
+				if f.LegacyPath != nil {
+					t.Fatalf("LegacyPath = %q, want none for an unchanged name", f.LegacyPath)
+				}
+				return
+			}
+			if len(f.LegacyPath) != 1 || f.LegacyPath[0] != tc.legacy {
+				t.Fatalf("LegacyPath = %q, want [%q]", f.LegacyPath, tc.legacy)
+			}
+		})
+	}
+
+	// Windows names were only renamed on Windows.
+	tor, err := Parse(marshalTorrent(t, singleFileInfo("a:b", 16, 16)))
+	if err != nil {
+		t.Fatalf("Parse() = %v", err)
+	}
+	if got, want := tor.Files[0].LegacyPath != nil, runtime.GOOS == "windows"; got != want {
+		t.Fatalf("LegacyPath of %q = %q, want one only on Windows", "a:b", tor.Files[0].LegacyPath)
+	}
+}
+
+func TestParseKeepsLegacyPathsOfMultiFileTorrents(t *testing.T) {
+	multi := func(name string, paths ...[]interface{}) *Torrent {
+		t.Helper()
+		info := singleFileInfo(name, 16, int64(len(paths)))
+		delete(info, "length")
+		files := make([]interface{}, len(paths))
+		for i, p := range paths {
+			files[i] = map[string]interface{}{"length": int64(1), "path": p}
+		}
+		info["files"] = files
+		tor, err := Parse(marshalTorrent(t, info))
+		if err != nil {
+			t.Fatalf("Parse() = %v", err)
+		}
+		return tor
+	}
+
+	// A changed root name moves every file.
+	tor := multi("Show \u200bZWSP", []interface{}{"ep1\ufeff.mkv"}, []interface{}{"extras", "plain.txt"}, []interface{}{})
+	want := [][]string{{"Show ZWSP", "ep1.mkv"}, {"Show ZWSP", "extras", "plain.txt"}, {"Show ZWSP", "unknown_file"}}
+	legacy := [][]string{{"Show \u200bZWSP", "ep1\ufeff.mkv"}, {"Show \u200bZWSP", "extras", "plain.txt"}, {"Show \u200bZWSP", "unknown_file"}}
+	for i, f := range tor.Files {
+		if !slices.Equal(f.Path, want[i]) || !slices.Equal(f.LegacyPath, legacy[i]) {
+			t.Fatalf("file %d: Path=%q LegacyPath=%q, want %q and %q", i, f.Path, f.LegacyPath, want[i], legacy[i])
+		}
+	}
+
+	// Under an unchanged root only the changed file has one.
+	tor = multi("Show", []interface{}{"Season 1", "ep\x01.mkv"}, []interface{}{"Season 1", "ep2.mkv"})
+	if got := tor.Files[0].LegacyPath; !slices.Equal(got, []string{"Show", "Season 1", "ep\x01.mkv"}) {
+		t.Fatalf("LegacyPath = %q, want the control character kept", got)
+	}
+	if got := tor.Files[1].LegacyPath; got != nil {
+		t.Fatalf("LegacyPath of an unchanged file = %q, want none", got)
+	}
+
+	// A path with a component no filesystem could hold was never written.
+	huge := strings.Repeat("h", 1<<16)
+	for _, tor := range []*Torrent{
+		multi(huge+"\u200b", []interface{}{"a\u200b"}),
+		multi("Show\u200b", []interface{}{huge, "a"}),
+	} {
+		if got := tor.Files[0].LegacyPath; got != nil {
+			t.Fatalf("LegacyPath with a %d-byte component = %d components, want none", len(huge), len(got))
+		}
+	}
+}
+
+// TestLegacyComponentShortcut: skipping the legacy pass for printable ASCII
+// must not change any result.
+func TestLegacyComponentShortcut(t *testing.T) {
+	inputs := []string{"", ".", "..", "...", "a..b", "/a/", `\a\`, "a/../b", "../x", "CON", "a.", "a:b", " ",
+		"x" + strings.Repeat(".", 254), strings.Repeat("A", maxComponentBytes), strings.Repeat("A", maxComponentBytes+1),
+		strings.Repeat("a..", 90), "café", "a\u200bb", "a\x7fb"}
+	for c := 0x20; c < 0x7f; c++ {
+		inputs = append(inputs, string(rune(c)), "a"+string(rune(c))+"b", ".."+string(rune(c)))
+	}
+	for _, in := range inputs {
+		clean := sanitizePathComponent(in)
+		legacy, differs := legacyComponent(in, clean)
+		if want := legacyPathComponent(in); legacy != want || differs != (want != clean) {
+			t.Errorf("legacyComponent(%q) = %q, %v; want %q, %v", in, legacy, differs, want, want != clean)
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -35,6 +36,17 @@ func FuzzParseTorrent(f *testing.F) {
 				map[string]interface{}{"length": int64(2), "path": []interface{}{"..", "two.bin"}},
 			},
 			"private": int64(1),
+		},
+	})
+	addTorrentSeed(f, map[string]interface{}{
+		"info": map[string]interface{}{
+			"name":         "Show\u200f\xb2\xe2",
+			"piece length": int64(2),
+			"pieces":       string(make([]byte, 40)),
+			"files": []interface{}{
+				map[string]interface{}{"length": int64(1), "path": []interface{}{"ep1\ufeff.mkv"}},
+				map[string]interface{}{"length": int64(2), "path": []interface{}{"Tab\tName", "a..b"}},
+			},
 		},
 	})
 	for _, seed := range [][]byte{
@@ -95,6 +107,18 @@ func FuzzParseTorrent(f *testing.F) {
 			for _, comp := range file.Path {
 				if !safeName(comp) || comp == "" || comp == "." || comp == ".." || strings.ContainsAny(comp, `/\`) {
 					t.Fatalf("unsafe path component %q", comp)
+				}
+			}
+			// A legacy path is only kept where an older version laid the file
+			// out elsewhere, and it too must stay inside the download directory.
+			if file.LegacyPath != nil {
+				if len(file.LegacyPath) != len(file.Path) || slices.Equal(file.LegacyPath, file.Path) {
+					t.Fatalf("legacy path %q for path %q", file.LegacyPath, file.Path)
+				}
+				for _, comp := range file.LegacyPath {
+					if comp == "" || comp == "." || comp == ".." || strings.ContainsAny(comp, `/\`) {
+						t.Fatalf("legacy path component %q escapes its directory", comp)
+					}
 				}
 			}
 			if totalLength > math.MaxInt64-file.Length {

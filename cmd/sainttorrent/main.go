@@ -186,6 +186,7 @@ type cliOptions struct {
 	listenPort           int
 	httpAddr             string
 	httpAllowRemote      bool
+	httpAllowHosts       []string
 	natEnabled           bool
 	encryption           mse.Policy
 	storage              storage.Backend
@@ -1294,7 +1295,8 @@ Options:
       --headless            Run without the TUI
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
-      --no-persist          Do not persist fast-resume state
+      --no-persist          Keep no state: nothing is restored on the next
+                            launch, and crash handling is off
       --start-paused        Restore every torrent paused for this run, including
                             any a crash left unloaded
       --recheck             Fully hash-check restored torrents on this launch
@@ -1302,7 +1304,11 @@ Options:
                             (loopback only, e.g. 127.0.0.1:16666)
       --http-allow-remote   Allow --http-addr on a LAN or wildcard address; the
                             API has no authentication
-      --log <path>          Write JSON-lines debug logs to a rotating file
+      --http-allow-host <name>
+                            Also answer requests for this host name, e.g. the
+                            LAN or reverse-proxy name (repeatable)
+      --log <path>          Write JSON-lines debug logs to a rotating file, or
+                            to /dev/stderr or /dev/stdout
       --log-level <level>   Log level: debug, info, warn, or error
       --write-config <path> Write a default config file and exit
   -h, --help                Show this help message and exit
@@ -1389,6 +1395,18 @@ func parseCLIArgs(args []string) cliOptions {
 			i++
 		case "--http-allow-remote":
 			opts.httpAllowRemote = true
+		case "--http-allow-host":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires a host name", args[i])
+				continue
+			}
+			name := strings.TrimSpace(args[i+1])
+			i++
+			if err := httpapi.CheckAllowHost(name); err != nil {
+				opts.err = fmt.Errorf("--http-allow-host: %w", err)
+				continue
+			}
+			opts.httpAllowHosts = append(opts.httpAllowHosts, name)
 		case "--no-nat":
 			opts.natEnabled = false
 		case "--encryption":
@@ -1904,6 +1922,8 @@ func main() {
 
 	var startupInfos []string
 	var startupWarns []string
+	// Shown ahead of startupWarns: see leadStartupWarnings.
+	var exposureWarn, persistWarn string
 
 	// Resolve the state directory before anything starts goroutines, so a
 	// fatal error from here on also lands in <configDir>/crash/fatal.txt.
@@ -2003,7 +2023,10 @@ func main() {
 
 	var statsServer *httpapi.Server
 	if opts.httpAddr != "" {
-		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{AllowRemote: opts.httpAllowRemote})
+		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{
+			AllowRemote: opts.httpAllowRemote,
+			AllowHosts:  opts.httpAllowHosts,
+		})
 		if err != nil {
 			listener.Close()
 			acceptLoopWG.Wait()
@@ -2019,8 +2042,7 @@ func main() {
 		}
 		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
 		if !statsServer.Loopback() {
-			// First, so the TUI's one-line startup message cannot cut it off.
-			startupWarns = append([]string{fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())}, startupWarns...)
+			exposureWarn = fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())
 		}
 	}
 	perfMarkf("http-stats")
@@ -2028,9 +2050,9 @@ func main() {
 	if persist {
 		warning, err := mgr.EnablePersistence(configDir)
 		if err != nil {
-			startupWarns = append(startupWarns, fmt.Sprintf("Failed to initialize persistence: %v", err))
-		} else if warning != "" {
-			startupWarns = append(startupWarns, warning)
+			persistWarn = fmt.Sprintf("Failed to initialize persistence: %v", err)
+		} else {
+			persistWarn = warning
 		}
 	}
 	perfMarkf("persistence")
@@ -2072,6 +2094,7 @@ func main() {
 		})
 	}
 
+	startupWarns = leadStartupWarnings(exposureWarn, persistWarn, startupWarns)
 	startupWarn := tuiStartupLine(startupInfos, startupWarns)
 
 	exitCode := 0
@@ -2239,6 +2262,21 @@ func notifyHangup(ch chan<- os.Signal) bool {
 	}
 	signal.Notify(ch, syscall.SIGHUP)
 	return true
+}
+
+// leadStartupWarnings puts the warning that the stats API is exposed, then the
+// persistence warning, ahead of the other startup warnings: the TUI shows them
+// on one line cut to its width. The persistence warning starts with crash
+// containment, such as a torrent that was not loaded and how to load it, which
+// nothing else on screen shows. Empty warnings are dropped.
+func leadStartupWarnings(exposure, persistence string, rest []string) []string {
+	var warns []string
+	for _, w := range []string{exposure, persistence} {
+		if w != "" {
+			warns = append(warns, w)
+		}
+	}
+	return append(warns, rest...)
 }
 
 // tuiStartupLine joins startup warnings and infos into the TUI's single

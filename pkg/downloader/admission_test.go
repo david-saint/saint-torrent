@@ -388,3 +388,49 @@ func TestSelfDialIsRememberedAndNotRepeated(t *testing.T) {
 		t.Fatalf("our own address was dialled again (%d connections)", n)
 	}
 }
+
+// A uTP peer sends from its listen port, so a connection it opens to us while
+// our dial to it is in flight is keyed like that dial. The dial failing must
+// leave the live connection active (the choker, stats and dial gating skip
+// inactive entries) and charge the peer no failure; once the connection is
+// gone a failed dial counts again.
+func TestFailedDialKeepsInboundConnectionUnderSameKey(t *testing.T) {
+	sess := newWireTestSession(t, 4, 16*1024)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	closedAddr := ln.Addr().(*net.TCPAddr)
+	_ = ln.Close() // dials to it are refused at once
+	ip, port := "127.0.0.1", uint16(closedAddr.Port)
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	target := tracker.Peer{IP: closedAddr.IP, Port: port}
+
+	ps := knownDialedPeerA1(sess, ip, port)
+	sess.mu.Lock()
+	ps.Dialing = true // as maintenance leaves it when it launches the dial
+	sess.mu.Unlock()
+	c := startAdmissionConn(t, sess, ip, port, peerIDFor(1))
+	admitted(t, sess, addr, c.client)
+
+	sess.connectToPeer(target)
+	sess.mu.RLock()
+	active, dialing, failCount := ps.Active, ps.Dialing, ps.FailCount
+	live := sess.activePeers[addr] == c.client
+	sess.mu.RUnlock()
+	if !live || !active || dialing || failCount != 0 {
+		t.Fatalf("after a failed dial beside a live inbound conn: live=%v Active=%v Dialing=%v FailCount=%d; want true, true, false, 0", live, active, dialing, failCount)
+	}
+	if n := len(sess.GetActivePeers()); n != 1 {
+		t.Fatalf("GetActivePeers lists %d peers, want the live connection", n)
+	}
+
+	_ = c.remote.Close()
+	<-c.done
+	sess.connectToPeer(target)
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if ps.Active || ps.FailCount != 1 {
+		t.Fatalf("after a failed dial with no connection: Active=%v FailCount=%d; want false, 1", ps.Active, ps.FailCount)
+	}
+}

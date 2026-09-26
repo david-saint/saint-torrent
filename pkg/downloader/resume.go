@@ -265,8 +265,42 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 // loadResumeState restores durable verified pieces immediately. Legacy hints and
 // pieces overlapping changed files remain unavailable until background hashing.
 func (s *Session) loadResumeState() {
+	s.mu.RLock()
+	st := s.Storage
+	hasPieces := len(s.Torrent.PieceHashes) > 0
+	s.mu.RUnlock()
+	if st == nil || !hasPieces {
+		return
+	}
+	resume, err := readResumeState(st, s.Torrent.InfoHash)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.Storage != st {
+		return
+	}
+	s.applyResumeStateLocked(resume, err)
+}
+
+// readResumeState reads the checkpoint of the torrent with this info hash from
+// st. It opens the .state file and every payload file, so callers run it
+// without s.mu: under the lock it stalled every peer loop and the UI for as
+// long as that took.
+func readResumeState(st storage.Storage, infoHash [20]byte) (storage.ResumeState, error) {
+	hash := fmt.Sprintf("%x", infoHash)
+	var resume storage.ResumeState
+	var err error
+	if checkpoint, ok := st.(storage.ResumeStorage); ok {
+		resume, err = checkpoint.LoadResumeState(hash)
+	} else {
+		resume.Recheck, err = st.LoadState(hash)
+	}
+	return resume, err
+}
+
+// applyResumeStateLocked installs what readResumeState read from s.Storage:
+// verified pieces become available at once, the rest wait for background
+// hashing. Caller holds s.mu.
+func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) {
 	if s.Storage == nil || len(s.Torrent.PieceHashes) == 0 {
 		return
 	}
@@ -276,14 +310,6 @@ func (s *Session) loadResumeState() {
 	s.verifyCheckedBytes = 0
 	s.verifyTotalBytes = 0
 	s.verifyStartTime = time.Time{}
-	hash := fmt.Sprintf("%x", s.Torrent.InfoHash)
-	var resume storage.ResumeState
-	var err error
-	if checkpoint, ok := s.Storage.(storage.ResumeStorage); ok {
-		resume, err = checkpoint.LoadResumeState(hash)
-	} else {
-		resume.Recheck, err = s.Storage.LoadState(hash)
-	}
 	if err != nil {
 		s.verifyFullScan = true
 	} else {

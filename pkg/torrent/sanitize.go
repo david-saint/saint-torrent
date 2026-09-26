@@ -67,6 +67,73 @@ func sanitizeComponent(p string, windows bool) string {
 	return p
 }
 
+// legacyPathComponent is the name sanitizer of the versions before this one,
+// kept verbatim to find the files they wrote (see File.LegacyPath). It only
+// kept a name inside its directory: control characters, invalid UTF-8,
+// invisible format characters, overlong names and, on Windows, reserved
+// names reached the disk as given.
+func legacyPathComponent(p string) string {
+	p = filepath.Clean(p)
+	p = strings.Trim(p, "/\\")
+	if p == ".." || p == "." || p == "" {
+		return "safe_name"
+	}
+	p = strings.ReplaceAll(p, "/", "_")
+	p = strings.ReplaceAll(p, "\\", "_")
+	p = strings.ReplaceAll(p, "..", "_")
+	return p
+}
+
+// legacyComponent returns legacyPathComponent(p) and whether it differs from
+// clean, the name sanitizePathComponent gave p. Off Windows, printable ASCII
+// within maxComponentBytes comes out the same both ways, so nearly every name
+// skips the second pass.
+func legacyComponent(p, clean string) (string, bool) {
+	if runtime.GOOS != "windows" && len(p) <= maxComponentBytes && isPrintableASCII(p) {
+		return clean, false
+	}
+	legacy := legacyPathComponent(p)
+	return legacy, legacy != clean
+}
+
+// maxLegacyComponentBytes bounds the legacy names worth looking for. No
+// filesystem holds a longer one: the longest allow 255 characters, at most 4
+// UTF-8 bytes each. Skipping longer ones keeps a megabyte-long name that
+// never reached the disk from being kept in memory to be looked up.
+const maxLegacyComponentBytes = 4 * maxComponentBytes
+
+// legacyFilePath is the path legacyPathComponent gave a multi-file torrent's
+// file: its components under root, the torrent's legacy name. It is nil when a
+// component is too long to have been written. Parse has already checked that
+// every component is a string.
+func legacyFilePath(root string, components []interface{}) []string {
+	if len(root) > maxLegacyComponentBytes {
+		return nil
+	}
+	path := make([]string, 0, len(components)+1)
+	path = append(path, root)
+	for _, c := range components {
+		legacy := legacyPathComponent(c.(string))
+		if len(legacy) > maxLegacyComponentBytes {
+			return nil
+		}
+		path = append(path, legacy)
+	}
+	if len(path) == 1 {
+		path = append(path, "unknown_file")
+	}
+	return path
+}
+
+func isPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // cleanRunes replaces C0 and C1 control characters, DEL and invalid UTF-8
 // with '_', and removes the invisible bidi and zero-width format characters
 // that can disguise a name: "photo<U+202E>gpj.exe" displays as "photoexe.jpg".

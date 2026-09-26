@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -96,6 +99,10 @@ func TestManagerSharedUTPListenerRoutesByInfoHash(t *testing.T) {
 		t.Fatalf("failed to start shared UDP/DHT listener: %v", err)
 	}
 	defer mgr.Close()
+	// Inbound uTP is refused while the TCP listener runs (see
+	// StartPeerListener); lift that to exercise the uTP routing, which serves
+	// setups without a TCP listener.
+	mgr.utpSocket.SetRefuseIncoming(false)
 
 	newManagedSession := func(name string) *Session {
 		infoHash := sha1.Sum([]byte(name))
@@ -182,6 +189,7 @@ func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
 		t.Fatalf("failed to start shared UDP/DHT listener: %v", err)
 	}
 	defer mgr.Close()
+	mgr.utpSocket.SetRefuseIncoming(false) // as in TestManagerSharedUTPListenerRoutesByInfoHash
 	sess := newEncryptionTestManagedSession(t, mgr, "encrypted-utp")
 
 	clientSocket, err := utp.NewSocket(0)
@@ -217,6 +225,82 @@ func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// TestManagerRefusesInboundUTPWhileTCPListens pins the inbound uTP policy: a
+// uTP SYN is answered with a RESET while the TCP peer listener runs, whichever
+// was started first, so libtorrent, uTorrent and Transmission reconnect over
+// TCP instead of staying on our stop-and-wait uTP. A manager without a TCP
+// listener still accepts and routes inbound uTP.
+func TestManagerRefusesInboundUTPWhileTCPListens(t *testing.T) {
+	dialUTP := func(t *testing.T, mgr *TorrentManager) (net.Conn, error) {
+		t.Helper()
+		client, err := utp.NewSocket(0)
+		if err != nil {
+			t.Fatalf("client uTP socket: %v", err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, err := client.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", mgr.DHTListenPort()))
+		if err == nil {
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+		return conn, err
+	}
+	expectRefused := func(t *testing.T, mgr *TorrentManager) {
+		t.Helper()
+		conn, err := dialUTP(t, mgr)
+		if err == nil {
+			t.Fatalf("inbound uTP to %s was accepted while the TCP listener runs", conn.RemoteAddr())
+		}
+		// A RESET fails the dial at once; a SYN left unanswered would run
+		// into the dial's deadline, which a libtorrent peer waits out too.
+		if errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "reset") {
+			t.Fatalf("inbound uTP dial failed with %v, want a reset", err)
+		}
+	}
+
+	t.Run("tcp-first", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartPeerListener(0); err != nil {
+			t.Fatalf("start peer listener: %v", err)
+		}
+		if err := mgr.StartDHT(t.TempDir(), int(mgr.PeerListenPort())); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		newEncryptionTestManagedSession(t, mgr, "refuse-utp-tcp-first")
+		expectRefused(t, mgr)
+	})
+	t.Run("dht-first", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartDHT(t.TempDir(), 0); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		if err := mgr.StartPeerListener(0); err != nil {
+			t.Fatalf("start peer listener: %v", err)
+		}
+		newEncryptionTestManagedSession(t, mgr, "refuse-utp-dht-first")
+		expectRefused(t, mgr)
+	})
+	t.Run("no-tcp-listener", func(t *testing.T) {
+		mgr := NewTorrentManager()
+		t.Cleanup(mgr.Close)
+		if err := mgr.StartDHT(t.TempDir(), 0); err != nil {
+			t.Fatalf("start DHT: %v", err)
+		}
+		sess := newEncryptionTestManagedSession(t, mgr, "accept-utp")
+		conn, err := dialUTP(t, mgr)
+		if err != nil {
+			t.Fatalf("inbound uTP without a TCP listener: %v", err)
+		}
+		handshakeOver(t, conn, sess.Torrent.InfoHash)
+		waitForCondition(t, "the uTP peer to be routed", func() bool {
+			return len(sess.GetActivePeers()) == 1
+		})
+	})
 }
 
 func waitForCondition(t *testing.T, what string, cond func() bool) {
@@ -423,6 +507,88 @@ func TestHandshakeSourceGroupsAddresses(t *testing.T) {
 	}
 	if _, ok := handshakeSource(&net.UnixAddr{Name: "sock", Net: "unix"}); ok {
 		t.Error("a non-IP address was given a source")
+	}
+}
+
+// TestIPv6SubscriberCannotTakeTheWholeHandshakeBudget reproduces the IPv6
+// variant of inbound starvation: counted per /64 alone, one subscriber with a
+// /56 (or a /48) held every handshake slot through 17 of its /64s, turning
+// every other inbound peer away. Its /56 and /48 now have shares too, so it
+// holds half the budget, as one IPv4 host can, and peers on other IPv6
+// networks, several connections each, and IPv4 hosts get the other half.
+func TestIPv6SubscriberCannotTakeTheWholeHandshakeBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr func(block, host int) string // host within one of the attacker's blocks
+	}{
+		{"/64s of one /56", func(b, h int) string { return fmt.Sprintf("2001:db8:0:%x::%x", b, h+1) }},
+		{"/56s of one /48", func(b, h int) string { return fmt.Sprintf("2001:db8:0:%x00::%x", b, h+1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewTorrentManager()
+			t.Cleanup(mgr.Close)
+			var admitted []netip.Addr
+			// admit does what handleRoutedIncomingConnection does before
+			// reading a handshake, reporting whether the connection may wait.
+			admit := func(addr string) bool {
+				t.Helper()
+				select {
+				case mgr.inboundHandshakeSlots <- struct{}{}:
+				default:
+					return false
+				}
+				src, ok := handshakeSource(&net.TCPAddr{IP: net.ParseIP(addr), Port: 6881})
+				if !ok {
+					t.Fatalf("no handshake source for %s", addr)
+				}
+				if !mgr.admitHandshakeSource(src) {
+					<-mgr.inboundHandshakeSlots
+					return false
+				}
+				admitted = append(admitted, src)
+				return true
+			}
+
+			// The attacker opens idle sockets from each of its blocks in turn
+			// until that block is refused.
+			for b := 0; b < 256; b++ {
+				for h := 0; h < 256; h++ {
+					if !admit(tc.addr(b, h)) {
+						break
+					}
+				}
+			}
+			if held := len(admitted); held != maxInboundHandshakes/2 {
+				t.Fatalf("one subscriber holds %d of %d handshake slots, want %d", held, maxInboundHandshakes, maxInboundHandshakes/2)
+			}
+
+			// The rest serves everyone else: hosts on 15 other IPv6 networks,
+			// each with its per-/64 share, and an IPv4 host.
+			for n := 1; n <= 15; n++ {
+				for h := 0; h < maxInboundHandshakesPerSource; h++ {
+					if addr := fmt.Sprintf("2001:db8:%x::%x", n, h+1); !admit(addr) {
+						t.Fatalf("%s was refused with %d slots in use", addr, len(admitted))
+					}
+				}
+			}
+			for h := 0; h < maxInboundHandshakesPerSource; h++ {
+				if !admit("192.0.2.7") {
+					t.Fatalf("an IPv4 host was refused with %d slots in use", len(admitted))
+				}
+			}
+			if n := len(mgr.inboundHandshakeSlots); n != maxInboundHandshakes {
+				t.Fatalf("%d of %d handshake slots in use, want all", n, maxInboundHandshakes)
+			}
+
+			for _, src := range admitted {
+				mgr.releaseHandshakeSource(src)
+			}
+			mgr.handshakeSourcesMu.Lock()
+			defer mgr.handshakeSourcesMu.Unlock()
+			if len(mgr.handshakeSources) != 0 || mgr.sourcedHandshakes != 0 {
+				t.Fatalf("after releasing every source: %d blocks counted, %d handshakes; want none", len(mgr.handshakeSources), mgr.sourcedHandshakes)
+			}
+		})
 	}
 }
 

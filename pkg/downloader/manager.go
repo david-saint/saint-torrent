@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
@@ -41,8 +43,8 @@ type TorrentManager struct {
 	globalInboundSlots    chan struct{}
 	inboundHandshakeSlots chan struct{} // see maxInboundHandshakes
 	handshakeSourcesMu    sync.Mutex
-	handshakeSources      map[netip.Addr]int // pre-handshake conns per source; see admitHandshakeSource
-	sourcedHandshakes     int                // sum of handshakeSources
+	handshakeSources      map[netip.Prefix]int // pre-handshake conns per address block; see admitHandshakeSource
+	sourcedHandshakes     int                  // pre-handshake conns counted in handshakeSources
 	peerListener          net.Listener
 	utpListener           net.Listener
 	peerListenPort        uint16
@@ -66,6 +68,9 @@ type TorrentManager struct {
 	startPaused    bool // see SetStartPaused
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+	// restoreMigrations tallies the files restore moved from their legacy
+	// names (see migrateLegacyPaths), for the startup notice.
+	restoreMigrations legacyMigrations
 	// removing holds the lowercase info-hash of every RemoveSession still
 	// deleting state and payload; the channel closes when it finishes. Adds of
 	// that hash are refused meanwhile so they cannot open files being deleted.
@@ -134,7 +139,7 @@ func NewTorrentManager() *TorrentManager {
 		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
 		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
 		inboundHandshakeSlots: make(chan struct{}, maxInboundHandshakes),
-		handshakeSources:      make(map[netip.Addr]int),
+		handshakeSources:      make(map[netip.Prefix]int),
 		storageFactory:        storage.NewStorage,
 		ctx:                   ctx,
 		cancel:                cancel,
@@ -207,6 +212,8 @@ func (m *TorrentManager) StartDHT(downloadDir string, listenPort int) error {
 		}
 		return err
 	}
+	// Set before the listener exists, so no inbound uTP slips in first.
+	udpSocket.SetRefuseIncoming(m.peerListener != nil)
 	utpListener := udpSocket.Listen()
 
 	m.dht = d
@@ -312,6 +319,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) error {
 	}
 	if sess.claimPaths == nil {
 		sess.claimPaths = m.claimPaths
+	}
+	if sess.migratePaths == nil {
+		sess.migratePaths = m.migrateLegacyPaths
 	}
 	if m.peerListener != nil {
 		sess.sharedInbound = true
@@ -890,6 +900,18 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 // one it was cached under.
 var errCachedTorrentMismatch = errors.New("cached torrent does not match its info hash")
 
+// torrentParseError is a .torrent that was read but does not parse. Parsing
+// the same bytes again fails the same way, so restore does not retry it.
+type torrentParseError struct{ err error }
+
+func (e torrentParseError) Error() string { return e.err.Error() }
+func (e torrentParseError) Unwrap() error { return e.err }
+
+func isTorrentParseError(err error) bool {
+	var parseErr torrentParseError
+	return errors.As(err, &parseErr)
+}
+
 // loadTorrentFile reads and parses a .torrent. When wantHashHex is set, the
 // torrent must have that info-hash: a cached copy is trusted only for the
 // torrent it was saved for.
@@ -900,7 +922,7 @@ func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte,
 	}
 	tor, err := torrent.Parse(torrentData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, torrentParseError{err}
 	}
 	if wantHashHex != "" && !strings.EqualFold(fmt.Sprintf("%x", tor.InfoHash), wantHashHex) {
 		return nil, nil, fmt.Errorf("%w: %s holds %x, want %s", errCachedTorrentMismatch, torrentPath, tor.InfoHash, wantHashHex)
@@ -936,7 +958,8 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrRemovalInProgress, infoHashHex)
 	}
-	verifyOnStartup := m.verifyOnStartup && m.restoring
+	restoreAdd := m.restoring
+	verifyOnStartup := m.verifyOnStartup && restoreAdd
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -957,6 +980,11 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	releaseClaims, err := m.claimPaths(tor.InfoHash, downloadDir, files)
 	if err != nil {
 		return nil, err
+	}
+	// Files an older version wrote under their pre-sanitizer names move to
+	// the current ones before the factory would create them empty.
+	if moved := m.migrateLegacyPaths(tor.InfoHash, downloadDir, tor.Files); moved > 0 && restoreAdd {
+		m.noteRestoreMigration(tor.Name, moved)
 	}
 	st, err := storageFactory(downloadDir, files, tor.PieceLength)
 	if err == nil && isNilStorage(st) {
@@ -1030,6 +1058,9 @@ type PersistedTorrent struct {
 	Quarantined    bool   `json:"quarantined,omitempty"`
 	CrashNote      string `json:"crash_note,omitempty"`
 	CrashComponent string `json:"crash_component,omitempty"`
+	// Name is the torrent's name when it was last saved. It names an entry
+	// that is not loaded without parsing what may have crashed.
+	Name string `json:"name,omitempty"`
 }
 
 type PersistedState struct {
@@ -1065,6 +1096,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		// persist the torrent's own state (see Session.autoPaused).
 		paused := sess.paused && !sess.autoPaused
 		addedAt := sess.AddedAt
+		name := sess.Torrent.Name
 		private := sess.Torrent.Private
 		quarantined := sess.quarantined
 		crashNote := sess.quarantineNote
@@ -1078,6 +1110,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 
 		state.Torrents = append(state.Torrents, PersistedTorrent{
 			InfoHashHex:          infoHashHex,
+			Name:                 name,
 			MagnetURI:            magnetURI,
 			DownloadDir:          downloadDir,
 			FallbackDownloadDirs: fallbackDownloadDirs,
@@ -1224,8 +1257,26 @@ func atomicWriteState(stateDir string, state PersistedState) error {
 // cached .torrent files carry private-tracker passkeys and session.json lists
 // every torrent. The temporary file comes from os.CreateTemp (a fresh random
 // name opened O_EXCL with mode 0600) next to destPath, so the write never goes
-// through a name or symlink someone else planted.
+// through a name or symlink someone else planted. The file and its directory
+// are synced, so the new contents survive a power loss.
 func atomicWriteFile(destPath string, data []byte) error {
+	return replaceFile(destPath, data, true)
+}
+
+// replaceFileNoSync is atomicWriteFile without the file and directory syncs:
+// the new contents survive the process dying, since the page cache outlives
+// it, but not necessarily a power loss. It is for files that only need to
+// outlive this process, where the syncs would cost startup milliseconds (tens
+// of them on macOS, where File.Sync is F_FULLFSYNC).
+func replaceFileNoSync(destPath string, data []byte) error {
+	return replaceFile(destPath, data, false)
+}
+
+// fileSyncHook, when set, is called with the destination of each file
+// replaceFile syncs. Tests use it to see which writes are durable.
+var fileSyncHook atomic.Pointer[func(destPath string)]
+
+func replaceFile(destPath string, data []byte, durable bool) error {
 	f, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".tmp-*")
 	if err != nil {
 		return err
@@ -1242,8 +1293,13 @@ func atomicWriteFile(destPath string, data []byte) error {
 	if _, err := f.Write(data); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
+	if durable {
+		if hook := fileSyncHook.Load(); hook != nil {
+			(*hook)(destPath)
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -1254,10 +1310,12 @@ func atomicWriteFile(destPath string, data []byte) error {
 	}
 	renamed = true
 
-	parentDir := filepath.Dir(destPath)
-	if dir, err := os.Open(parentDir); err == nil {
-		_ = dir.Sync()
-		dir.Close()
+	if durable {
+		parentDir := filepath.Dir(destPath)
+		if dir, err := os.Open(parentDir); err == nil {
+			_ = dir.Sync()
+			dir.Close()
+		}
 	}
 
 	return nil
@@ -1290,6 +1348,77 @@ func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
 		return entry.InfoHashHex[:12]
 	}
 	return entry.InfoHashHex
+}
+
+// unloadedDisplayName names an entry left unloaded because it crashed
+// saintTorrent while being restored. Unlike restoreDisplayName it parses
+// nothing, neither the cached .torrent nor the magnet URI, since that may be
+// what crashed: it uses the name session.json kept, or a short hash.
+func unloadedDisplayName(entry PersistedTorrent) string {
+	const maxRunes = 80
+	if name := entry.Name; name != "" {
+		if utf8.RuneCountInString(name) <= maxRunes {
+			return name
+		}
+		runes := []rune(name)
+		return string(runes[:maxRunes-1]) + "…"
+	}
+	if len(entry.InfoHashHex) >= 12 {
+		return entry.InfoHashHex[:12]
+	}
+	return entry.InfoHashHex
+}
+
+// unloadedNotice is the startup notice for the torrents left unloaded because
+// they crashed saintTorrent while being restored. The TUI shows one line cut
+// to its width, so the notice starts with the remedy and the names.
+func unloadedNotice(names []string, crashDir string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = strconv.Quote(name)
+	}
+	if len(names) == 1 {
+		return fmt.Sprintf("Start with --start-paused to load %s, which crashed saintTorrent while loading and was not loaded "+
+			"(crash details: %s)", quoted[0], crashDir)
+	}
+	return fmt.Sprintf("Start with --start-paused to load %d torrents that crashed saintTorrent while loading and were not loaded: %s "+
+		"(crash details: %s)", len(names), strings.Join(quoted, ", "), crashDir)
+}
+
+// restoreFailure is a persisted torrent that was not restored, with the name
+// shown for it and why.
+type restoreFailure struct {
+	entry PersistedTorrent
+	name  string
+	err   error
+}
+
+// sortRestoreFailures orders failures by name, then info-hash.
+func sortRestoreFailures(failures []restoreFailure) {
+	sort.Slice(failures, func(i, j int) bool {
+		if failures[i].name != failures[j].name {
+			return failures[i].name < failures[j].name
+		}
+		return failures[i].entry.InfoHashHex < failures[j].entry.InfoHashHex
+	})
+}
+
+// appendRestoreFailureLog appends one line per failure to restore-failures.log
+// in stateDir, so a failure can be diagnosed after the fact (the startup line
+// is transient). Each line records the exact error, which is what reveals the
+// root cause.
+func appendRestoreFailureLog(stateDir string, failures []restoreFailure) {
+	lf, err := os.OpenFile(filepath.Join(stateDir, "restore-failures.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	_ = lf.Chmod(0600) // a log an older version created 0644
+	ts := time.Now().Format(time.RFC3339)
+	for _, f := range failures {
+		fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
+			ts, f.entry.InfoHashHex, f.entry.DownloadDir, f.name, f.err)
+	}
+	lf.Close()
 }
 
 // EnablePersistence initializes the manager state directory and restores previous torrents.
@@ -1374,16 +1503,11 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	// Collect entries that fail to restore so the failure is surfaced to the
 	// user instead of silently vanishing. The entry is still preserved in
 	// session.json via failedTorrents and retried on the next launch.
-	type restoreFailure struct {
-		entry PersistedTorrent
-		name  string
-		err   error
-	}
 	var restoreFailMu sync.Mutex
 	var restoreFailures []restoreFailure
-	// Quarantined entries, under restoreFailMu: the notes of those left
-	// unloaded, and how many were loaded paused for a crash of the last run.
-	var unloadedQuarantine []string
+	// Quarantined entries, under restoreFailMu: those left unloaded, and how
+	// many were loaded paused for a crash of the last run.
+	var unloadedQuarantine []PersistedTorrent
 	var crashPausedCount int
 
 	restoreOne := func(entry PersistedTorrent) {
@@ -1407,13 +1531,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			m.mu.Lock()
 			m.failedTorrents = append(m.failedTorrents, kept)
 			m.mu.Unlock()
-			shortHash := entry.InfoHashHex
-			if len(shortHash) > 12 {
-				shortHash = shortHash[:12]
-			}
 			restoreFailMu.Lock()
-			unloadedQuarantine = append(unloadedQuarantine, fmt.Sprintf(
-				"torrent %s was not loaded (%s); start with --start-paused to load it paused", shortHash, note))
+			unloadedQuarantine = append(unloadedQuarantine, kept)
 			restoreFailMu.Unlock()
 			return
 		}
@@ -1440,7 +1559,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			for attempt := 1; ; attempt++ {
 				sess, cached, loadErr = m.addTorrentFile(cachedPath, absoluteDownloadDir, entry.InfoHashHex)
 				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) ||
-					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) {
+					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) || isTorrentParseError(loadErr) {
 					break
 				}
 				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
@@ -1592,24 +1711,36 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	restoreWG.Wait()
 
 	if len(restoreFailures) > 0 {
-		sort.Slice(restoreFailures, func(i, j int) bool {
-			return restoreFailures[i].name < restoreFailures[j].name
-		})
+		sortRestoreFailures(restoreFailures)
 
-		details := make([]string, len(restoreFailures))
+		// A saved .torrent this version cannot parse fails the same way on every
+		// launch, so it is not reported as something a retry will fix.
+		var retried, unparsable []string
 		anyPermission := false
-		for i, f := range restoreFailures {
+		for _, f := range restoreFailures {
+			detail := f.name
 			if f.err != nil {
-				details[i] = fmt.Sprintf("%s (%v)", f.name, f.err)
+				detail = fmt.Sprintf("%s (%v)", f.name, f.err)
 				if errors.Is(f.err, os.ErrPermission) {
 					anyPermission = true
 				}
+			}
+			if isTorrentParseError(f.err) {
+				unparsable = append(unparsable, detail)
 			} else {
-				details[i] = f.name
+				retried = append(retried, detail)
 			}
 		}
-		failMsg := fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
-			len(restoreFailures), strings.Join(details, "; "))
+		var failMsgs []string
+		if len(retried) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
+				len(retried), strings.Join(retried, "; ")))
+		}
+		if len(unparsable) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore because this version cannot load the saved .torrent (kept; add the torrent again to replace it): %s",
+				len(unparsable), strings.Join(unparsable, "; ")))
+		}
+		failMsg := strings.Join(failMsgs, "; ")
 		if anyPermission {
 			// macOS TCC: the launching app lacks access to the download folder.
 			failMsg += ". Permission denied — grant your terminal app Full Disk Access " +
@@ -1622,24 +1753,30 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			warning = failMsg
 		}
 
-		// Append the full errors to a durable log so an intermittent failure can
-		// be diagnosed after the fact (the warning banner is transient). Each line
-		// records the exact syscall error, which is what reveals the root cause.
-		if logPath := filepath.Join(stateDir, "restore-failures.log"); logPath != "" {
-			if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
-				_ = lf.Chmod(0600) // a log an older version created 0644
-				ts := time.Now().Format(time.RFC3339)
-				for _, f := range restoreFailures {
-					fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
-						ts, f.entry.InfoHashHex, f.entry.DownloadDir, f.name, f.err)
-				}
-				lf.Close()
-			}
-		}
+		appendRestoreFailureLog(stateDir, restoreFailures)
 	}
 
 	// Crash containment comes first: the TUI shows one line, cut to its width.
+	// A torrent that was not loaded at all leads, since only the notice shows
+	// it and the remedy.
 	var crashNotices []string
+	if len(unloadedQuarantine) > 0 {
+		unloaded := make([]restoreFailure, len(unloadedQuarantine))
+		names := make([]string, len(unloadedQuarantine))
+		for i, entry := range unloadedQuarantine {
+			unloaded[i] = restoreFailure{
+				entry: entry,
+				name:  unloadedDisplayName(entry),
+				err:   fmt.Errorf("not loaded, start with --start-paused to load it: %s", entry.CrashNote),
+			}
+		}
+		sortRestoreFailures(unloaded)
+		for i, f := range unloaded {
+			names[i] = f.name
+		}
+		crashNotices = append(crashNotices, unloadedNotice(names, crashDir))
+		appendRestoreFailureLog(stateDir, unloaded)
+	}
 	if prevRun.pauseAll {
 		crashNotices = append(crashNotices, fmt.Sprintf(
 			"saintTorrent stopped unexpectedly twice in a row; all torrents were restored paused for this run "+
@@ -1650,10 +1787,11 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			"saintTorrent crashed while running %d torrent(s); they were restored paused (\"Paused after crash\"). Crash details: %s",
 			crashPausedCount, crashDir))
 	}
-	sort.Strings(unloadedQuarantine)
-	crashNotices = append(crashNotices, unloadedQuarantine...)
 	if warning != "" {
 		crashNotices = append(crashNotices, warning)
+	}
+	if notice := m.takeRestoreMigrationNotice(); notice != "" {
+		crashNotices = append(crashNotices, notice)
 	}
 	warning = strings.Join(crashNotices, "; ")
 

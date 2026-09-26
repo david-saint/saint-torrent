@@ -15,6 +15,14 @@ import (
 // StartPeerListener starts the manager-wide BitTorrent TCP listener. All
 // managed sessions share this socket and are selected by the incoming
 // handshake's info-hash.
+//
+// While it runs, the shared uTP socket (StartDHT) refuses inbound
+// connections (utp.Socket.SetRefuseIncoming). Our uTP writes wait for every
+// packet's ack, about one block per round trip, while libtorrent, uTorrent
+// and Transmission dial uTP first and would otherwise stay on it for the
+// whole connection: refused, they reconnect over TCP at once. Without a TCP
+// listener inbound uTP is accepted, and outbound dials still fall back to uTP
+// when TCP fails (see dialPeer).
 func (m *TorrentManager) StartPeerListener(port uint16) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -54,6 +62,9 @@ func (m *TorrentManager) StartPeerListener(port uint16) error {
 		sess.mu.RUnlock()
 	}
 	m.peerListener = listener
+	if m.utpSocket != nil {
+		m.utpSocket.SetRefuseIncoming(true)
+	}
 	m.peerListenPort = uint16(actualPort)
 	m.advertisedPeerPort = uint16(actualPort)
 	m.natStatus.ListenPort = uint16(actualPort)
@@ -143,7 +154,30 @@ const (
 	// may hold once more than half of it is in use (see admitHandshakeSource).
 	// It is generous enough for several peers behind one CGNAT address.
 	maxInboundHandshakesPerSource = 8
+	// maxInboundHandshakesPer56 and maxInboundHandshakesPer48 are the shares
+	// of an IPv6 source's /56 and /48 (see handshakeBlocks), ample for the
+	// several hosts of one home or office.
+	maxInboundHandshakesPer56 = 16
+	maxInboundHandshakesPer48 = 32
 )
+
+// ipv6HandshakeShares lists the blocks an IPv6 source is counted under, with
+// the share of the budget each may hold (see handshakeBlocks).
+var ipv6HandshakeShares = [...]struct {
+	bits  int
+	limit int
+}{
+	{64, maxInboundHandshakesPerSource},
+	{56, maxInboundHandshakesPer56},
+	{48, maxInboundHandshakesPer48},
+}
+
+// handshakeBlock is one address block a pre-handshake connection is counted
+// under, and the share of the budget the block may hold.
+type handshakeBlock struct {
+	prefix netip.Prefix
+	limit  int
+}
 
 func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	defer m.wg.Done()
@@ -215,33 +249,64 @@ func handshakeSource(addr net.Addr) (netip.Addr, bool) {
 	return ip, ip.IsValid()
 }
 
+// handshakeBlocks returns the blocks a pre-handshake connection from src (see
+// handshakeSource) is counted under: an IPv4 host alone, holding
+// maxInboundHandshakesPerSource, or an IPv6 source's /64, /56 and /48, each
+// holding its share from ipv6HandshakeShares. ISPs routinely delegate a /56 or
+// a /48 to one subscriber, and tunnel brokers give a /48 away, so counting the
+// /64 alone let one subscriber hold the whole budget with 17 of its /64s. With
+// the /48 capped as well, one subscriber holds no more than one IPv4 host can.
+func handshakeBlocks(src netip.Addr) (blocks [len(ipv6HandshakeShares)]handshakeBlock, n int) {
+	if !src.Is6() {
+		blocks[0] = handshakeBlock{prefix: netip.PrefixFrom(src, src.BitLen()), limit: maxInboundHandshakesPerSource}
+		return blocks, 1
+	}
+	for i, share := range ipv6HandshakeShares {
+		// Prefix fails only for an invalid address or length, and src is a
+		// valid IPv6 address here.
+		prefix, _ := src.Prefix(share.bits)
+		blocks[i] = handshakeBlock{prefix: prefix, limit: share.limit}
+	}
+	return blocks, len(ipv6HandshakeShares)
+}
+
 // admitHandshakeSource counts one more pre-handshake connection from src. The
 // caller already holds a handshake slot. While fewer than half the budget's
 // handshakes are in flight any source is admitted, so a burst from one
 // address (a cross-seeding box dialing us for many torrents at once) is not
-// slowed; past that, a source holding maxInboundHandshakesPerSource is turned
-// away. One host holding idle sockets can then take half the budget, not all
-// of it, and the rest stays open to every other peer.
+// slowed; past that, a source any of whose blocks (handshakeBlocks) holds its
+// share is turned away. One host or subscriber holding idle sockets can then
+// take half the budget, not all of it, and the rest stays open to every other
+// peer.
 func (m *TorrentManager) admitHandshakeSource(src netip.Addr) bool {
+	blocks, n := handshakeBlocks(src)
 	m.handshakeSourcesMu.Lock()
 	defer m.handshakeSourcesMu.Unlock()
-	n := m.handshakeSources[src]
-	if n >= maxInboundHandshakesPerSource && m.sourcedHandshakes >= maxInboundHandshakes/2 {
-		return false
+	if m.sourcedHandshakes >= maxInboundHandshakes/2 {
+		for _, b := range blocks[:n] {
+			if m.handshakeSources[b.prefix] >= b.limit {
+				return false
+			}
+		}
 	}
-	m.handshakeSources[src] = n + 1
+	for _, b := range blocks[:n] {
+		m.handshakeSources[b.prefix]++
+	}
 	m.sourcedHandshakes++
 	return true
 }
 
 func (m *TorrentManager) releaseHandshakeSource(src netip.Addr) {
+	blocks, n := handshakeBlocks(src)
 	m.handshakeSourcesMu.Lock()
 	defer m.handshakeSourcesMu.Unlock()
 	m.sourcedHandshakes--
-	if n := m.handshakeSources[src]; n > 1 {
-		m.handshakeSources[src] = n - 1
-	} else {
-		delete(m.handshakeSources, src)
+	for _, b := range blocks[:n] {
+		if c := m.handshakeSources[b.prefix]; c > 1 {
+			m.handshakeSources[b.prefix] = c - 1
+		} else {
+			delete(m.handshakeSources, b.prefix)
+		}
 	}
 }
 

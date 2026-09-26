@@ -353,17 +353,22 @@ func TestPEXRateLimiterKeepsHonestSenders(t *testing.T) {
 		}
 	}
 
-	// Three messages read back to back after a stall, now and again.
+	// Six messages read back to back after a stall, now and again: a peer
+	// sending one a minute while our loop was blocked for six minutes.
+	// libtorrent keeps such a peer, so we must too.
 	var stalls []time.Duration
 	for i := 0; i < 20; i++ {
-		stalls = append(stalls, 3*pexInterval, 0, 0)
+		stalls = append(stalls, 6*pexInterval, 0, 0, 0, 0, 0)
 	}
 	if _, dropped := run(stalls...); dropped {
 		t.Error("a peer whose messages were read back to back after stalls was dropped")
 	}
+	if _, dropped := run(every(time.Second, 6)...); dropped {
+		t.Error("a peer sending six ut_pex messages within one interval was dropped; libtorrent keeps it")
+	}
 
-	if _, dropped := run(0, time.Second, time.Second, time.Second); !dropped {
-		t.Error("a peer sending four ut_pex messages within one interval was kept")
+	if _, dropped := run(every(time.Second, 7)...); !dropped {
+		t.Error("a peer sending seven ut_pex messages within one interval was kept")
 	}
 	// A flooder is dropped however it spreads its messages inside the window.
 	if _, dropped := run(every(pexInterval/(maxPEXPerInterval+1), 2*maxPEXPerInterval)...); !dropped {
