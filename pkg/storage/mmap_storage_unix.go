@@ -359,7 +359,10 @@ func mapOrRepairFile(layout *fileLayout, repair bool) ([]byte, bool, error) {
 		_ = f.Close()
 		return nil, false, fmt.Errorf("failed to stat file %s for mmap: %w", layout.path, err)
 	}
-	if fi.Size() != layout.length {
+	// Only [0, length) is mapped, so a longer file maps as is; like
+	// NewFileStorage, a repair grows a short file but never shrinks one. Mapping
+	// past the end of a short file would fault on first access.
+	if fi.Size() < layout.length {
 		if !repair {
 			_ = f.Close()
 			return nil, false, fmt.Errorf("file %s size mismatch for mmap: got %d, want %d", layout.path, fi.Size(), layout.length)

@@ -636,3 +636,26 @@ func TestMMapStorageBlockSpans(t *testing.T) {
 		return NewStorageWithBackend(BackendMMap, dir, files, pieceLength)
 	})
 }
+
+// TestMMapStorageNeverShrinksExistingFile: the mmap repair path truncated a
+// longer pre-existing file to the declared length, like NewFileStorage did.
+func TestMMapStorageNeverShrinksExistingFile(t *testing.T) {
+	dir, original := preexistingFixture(t)
+	st, err := NewMMapStorage(dir, []FileInfo{{Path: "thesis.docx", Length: 16}}, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	got := make([]byte, 16)
+	if _, err := st.ReadBlock(0, 0, got); err != nil || !bytes.Equal(got, original[:16]) {
+		t.Fatalf("ReadBlock = %q, %v; want the file's first 16 bytes", got, err)
+	}
+	piece := bytes.Repeat([]byte{'z'}, 16)
+	if err := st.WriteBlock(0, 0, piece); err != nil {
+		t.Fatalf("WriteBlock over a longer pre-existing file: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	requireUserTail(t, dir, original)
+}

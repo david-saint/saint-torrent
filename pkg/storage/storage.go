@@ -186,9 +186,10 @@ func (f *fileLayout) invalidateReaderLocked() {
 }
 
 // writer returns the cached O_RDWR handle, opening it on first use. The open
-// doubles as the repair check: if the file vanished it is recreated, and if its
-// size drifted it is truncated back to the declared length — either case reports
-// repaired=true and drops the now-stale read handle. Once cached, subsequent
+// doubles as the repair check: if the file vanished it is recreated, and if it
+// is now shorter than the declared length it is grown back — either case reports
+// repaired=true and drops the now-stale read handle. A longer file is left alone
+// for the same reason NewFileStorage never shrinks one. Once cached, subsequent
 // writes reuse the handle, so the open/stat/close syscall churn is paid once per
 // file rather than once per completed piece. Guarded by wmu.
 func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
@@ -223,7 +224,7 @@ func (f *fileLayout) writer() (h *os.File, repaired bool, err error) {
 		_ = h.Close()
 		return nil, false, statErr
 	}
-	if fi.Size() != f.length {
+	if fi.Size() < f.length {
 		if err := h.Truncate(f.length); err != nil {
 			_ = h.Close()
 			return nil, false, err
@@ -453,7 +454,12 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if created {
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
 		}
-		if fi.Size() != layout.length {
+		// Grow a short file (sparsely), but never shrink one: a torrent naming a
+		// file that already exists must not destroy its tail before a single piece
+		// has been verified. Block I/O only ever touches [0, length), and the size
+		// mismatch keeps every resume check (LoadState, LoadResumeState and the
+		// checkpoint) from trusting the file, so its pieces are always rehashed.
+		if fi.Size() < layout.length {
 			if err := f.Truncate(layout.length); err != nil {
 				f.Close()
 				return nil, fmt.Errorf("failed to pre-allocate size for file %s: %w", path, err)
