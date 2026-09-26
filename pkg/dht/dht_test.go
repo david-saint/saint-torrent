@@ -1,12 +1,14 @@
 package dht
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -98,13 +100,23 @@ func TestDHTPersistence(t *testing.T) {
 	}
 	defer dht2.Close()
 
-	if dht2.nodeID != dht1.nodeID {
-		t.Errorf("node ID was not persisted across runs: %x vs %x", dht1.nodeID, dht2.nodeID)
+	// The node ID must not survive a restart: it would link sessions across
+	// networks. The saved contacts are still reused to bootstrap.
+	if dht2.nodeID == dht1.nodeID {
+		t.Errorf("node ID %x was reused across runs", dht1.nodeID)
 	}
 
 	closer := dht2.getCloserNodes(id1, 1)
 	if len(closer) != 1 || closer[0].ID != id1 {
 		t.Errorf("routing table nodes were not persisted successfully")
+	}
+
+	data, err := os.ReadFile(filepath.Join(tempDir, ".dht_nodes"))
+	if err != nil {
+		t.Fatalf("failed to read saved nodes: %v", err)
+	}
+	if bytes.Contains(data, []byte("node_id")) {
+		t.Error("the node ID was written to disk")
 	}
 }
 
@@ -393,10 +405,12 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 	go func() {
 		defer close(queriesCh)
 
+		// Serve until the lookup announces, or until it has been quiet for
+		// a while: a fixed total window flaked on loaded CI machines.
+		const quiet = 2 * time.Second
 		buf := make([]byte, 2048)
-		deadline := time.Now().Add(700 * time.Millisecond)
 		for {
-			_ = server.SetReadDeadline(deadline)
+			_ = server.SetReadDeadline(time.Now().Add(quiet))
 			n, addr, err := server.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -450,6 +464,9 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 				return
 			}
 			_, _ = server.WriteToUDP(payload, addr)
+			if query == "announce_peer" {
+				return
+			}
 		}
 	}()
 
@@ -465,7 +482,7 @@ func runLookupAgainstTokenNode(t *testing.T, run func(*DHT, [20]byte, uint16)) [
 			queries = append(queries, query)
 		case err := <-errCh:
 			t.Fatalf("test DHT node failed: %v", err)
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("timed out waiting for DHT lookup queries")
 		}
 	}

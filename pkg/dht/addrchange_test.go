@@ -214,21 +214,23 @@ func TestHandleQueryFromSameAddressRefreshesEntry(t *testing.T) {
 }
 
 // TestHandleQueryNewNodeStillFollowsBucketRules verifies an unseen node ID from
-// an inbound query is still appended while the bucket has room.
+// an inbound query is admitted once it answers our probe, in answer order,
+// while the bucket has room, and that a full bucket of fresh contacts spends
+// no probe on a further sender.
 func TestHandleQueryNewNodeStillFollowsBucketRules(t *testing.T) {
 	const bucket = 8
-	d, _ := newFakeDHT(t)
+	d, conn := newFakeDHT(t)
 
 	for i := 0; i < 8; i++ {
 		id := idInBucket(d.nodeID, bucket, uint16(i+1))
-		addr := &net.UDPAddr{IP: net.ParseIP("10.0.1.1"), Port: 7000 + i}
+		addr := &net.UDPAddr{IP: net.IPv4(10, 0, 1, byte(1+i)), Port: 7000 + i}
 		d.handleQuery("tx", "ping", map[string]interface{}{"id": string(id[:])}, addr)
+		tid := awaitQueryTo(t, conn, addr, "ping")
+		conn.injectPingReply(t, tid, id, addr)
+		awaitBucketLen(t, d, bucket, i+1)
 	}
 
 	nodes := bucketNodes(d, bucket)
-	if len(nodes) != 8 {
-		t.Fatalf("expected 8 nodes appended to bucket %d, got %d", bucket, len(nodes))
-	}
 	for i, n := range nodes {
 		want := idInBucket(d.nodeID, bucket, uint16(i+1))
 		if n.ID != want {
@@ -236,11 +238,28 @@ func TestHandleQueryNewNodeStillFollowsBucketRules(t *testing.T) {
 		}
 	}
 
-	// A ninth distinct ID must not grow the bucket past k=8.
+	// A ninth distinct ID must not grow the bucket past k=8, nor cost a probe.
 	extra := idInBucket(d.nodeID, bucket, 99)
-	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(extra[:])}, &net.UDPAddr{IP: net.ParseIP("10.0.1.1"), Port: 7100})
+	extraAddr := &net.UDPAddr{IP: net.ParseIP("10.0.1.100"), Port: 7100}
+	d.handleQuery("tx", "ping", map[string]interface{}{"id": string(extra[:])}, extraAddr)
 	if got := len(bucketNodes(d, bucket)); got != 8 {
 		t.Fatalf("k-bucket limit violated: %d nodes", got)
+	}
+	if got := conn.queriesTo(extraAddr, "ping"); got != 0 {
+		t.Fatalf("a full bucket of fresh contacts still probed a new sender %d times", got)
+	}
+}
+
+// awaitBucketLen waits for bucket to hold exactly n contacts.
+func awaitBucketLen(t *testing.T, d *DHT, bucket, n int) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for len(bucketNodes(d, bucket)) != n {
+		select {
+		case <-deadline:
+			t.Fatalf("bucket %d holds %d contacts, want %d", bucket, len(bucketNodes(d, bucket)), n)
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 
@@ -284,7 +303,7 @@ func TestAddressChangeVerificationIsBounded(t *testing.T) {
 		const flood = maxPendingAddrChanges * 2
 		for i := 0; i < flood; i++ {
 			id := idInBucket(d.nodeID, i, 1)
-			d.addNode(id, &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 6881})
+			d.addNode(id, &net.UDPAddr{IP: net.IPv4(10, 0, byte(i), 1), Port: 6881})
 		}
 		for i := 0; i < flood; i++ {
 			id := idInBucket(d.nodeID, i, 1)
