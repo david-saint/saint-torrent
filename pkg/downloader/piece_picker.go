@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"container/heap"
+	"math"
 	"sort"
 )
 
@@ -828,6 +829,17 @@ func (s *Session) selectEndgamePieceLocked(hasPiece func(pieceIndex int64) bool,
 		}
 	}
 	return bestIdx
+}
+
+// maxWirePieceLength is the largest piece the peer wire protocol can address:
+// request and piece messages carry the offset within a piece as a uint32.
+const maxWirePieceLength = int64(1) << 32
+
+// pieceLengthAssemblable reports whether a piece of this length can be fetched
+// over the wire and assembled into a single buffer on this platform (an int is
+// 32 bits on 386, so there a piece must stay below 2 GiB).
+func pieceLengthAssemblable(length int64) bool {
+	return length > 0 && length <= maxWirePieceLength && uint64(length) <= uint64(math.MaxInt)
 }
 
 func (s *Session) blocksInPiece(pieceIndex int64) int64 {

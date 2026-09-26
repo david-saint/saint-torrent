@@ -1217,8 +1217,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	openNewPiece := func(canRequestPiece func(int64) bool) *activeDownload {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.paused || s.closed {
+		if s.paused || s.closed || s.Storage == nil {
 			return nil
+		}
+		// Never claim a piece we could not request over the wire or assemble into
+		// one buffer: opening it allocates per-block state up front, before any data
+		// arrives. Only a malformed torrent has such pieces, so a normal torrent
+		// pays a single comparison here and its picker callback is left untouched.
+		if !pieceLengthAssemblable(s.Storage.PieceLengthValue()) {
+			requestable := canRequestPiece
+			canRequestPiece = func(index int64) bool {
+				return requestable(index) && pieceLengthAssemblable(s.Storage.PieceLength(index))
+			}
 		}
 		endgame := false
 		bestIdx := s.selectNeededPieceLocked(canRequestPiece)
