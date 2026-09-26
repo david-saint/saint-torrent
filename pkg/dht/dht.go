@@ -91,6 +91,9 @@ type DHT struct {
 	// and one long entry per (node ID, candidate address) pair.
 	addrCooldowns map[addrChangeKey]time.Time
 
+	// sched queues and paces get_peers lookups; see lookup_scheduler.go.
+	sched lookupScheduler
+
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -291,9 +294,13 @@ func (d *DHT) NodesCount() int {
 	return count
 }
 
-// Close stops the DHT listener and saves the routing table.
+// Close stops the DHT listener, discards queued lookups and saves the routing
+// table.
 func (d *DHT) Close() {
 	d.closeOnce.Do(func() {
+		// Close the scheduler before cancelling, so a lookup that ends on the
+		// cancellation cannot free a slot for a queued one.
+		d.sched.close()
 		d.cancel()
 		_ = d.conn.Close()
 		d.goMu.Lock()
@@ -1795,16 +1802,21 @@ type LookupOptions struct {
 }
 
 // Lookup queries the DHT swarm for a given torrent's info-hash and announces
-// peerPort to nodes that return valid tokens.
+// peerPort to nodes that return valid tokens. The lookup is queued; Lookup
+// returns immediately.
 func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 	d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: true})
 }
 
-// LookupWithOptions queries the DHT swarm for a given torrent's info-hash.
+// LookupWithOptions queries the DHT swarm for a given torrent's info-hash. The
+// lookup is queued; LookupWithOptions returns immediately. At most
+// dhtMaxConcurrentLookups run at once and starts are spaced by
+// dhtLookupStartInterval, with an info-hash's first lookup since the DHT
+// started ahead of repeats. A request for an info-hash already queued is
+// merged into it, and one for an info-hash whose lookup is still running is
+// dropped: callers look up again on their own cadence.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
-	d.goTracked(func() {
-		d.lookup(infoHash, peerPort, opts)
-	})
+	d.queueLookup(infoHash, peerPort, opts)
 }
 
 // lookup runs one get_peers lookup to completion on the calling goroutine. It
