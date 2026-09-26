@@ -1706,7 +1706,7 @@ func TestAnnounceQueriesAllTrackers(t *testing.T) {
 	tor := &torrent.Torrent{
 		Name:     "multi-tracker",
 		InfoHash: sha1.Sum([]byte("multi-tracker")),
-		Trackers: []string{tracker1.URL, tracker2.URL},
+		Trackers: []string{tracker1.URL + "/announce", tracker2.URL + "/announce"},
 	}
 	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
 	if err != nil {
@@ -1747,7 +1747,7 @@ func TestAnnounceSucceedsWhenOneTrackerFails(t *testing.T) {
 	tor := &torrent.Torrent{
 		Name:     "partial-tracker-failure",
 		InfoHash: sha1.Sum([]byte("partial-tracker-failure")),
-		Trackers: []string{failedTrackerURL, workingTracker.URL},
+		Trackers: []string{failedTrackerURL, workingTracker.URL + "/announce"},
 	}
 	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
 	if err != nil {
@@ -2333,7 +2333,7 @@ func TestSessionStartResumesQueue(t *testing.T) {
 	tor := &torrent.Torrent{
 		Name:     "start_resume_test",
 		InfoHash: sha1.Sum([]byte("start_resume_test")),
-		Trackers: []string{ts.URL},
+		Trackers: []string{ts.URL + "/announce"},
 	}
 	sess, err := NewSession(tor, nil, [20]byte{}, 0, "")
 	if err != nil {
