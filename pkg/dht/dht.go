@@ -415,7 +415,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 
 		d.noteQuerySender(senderID, addr)
 
-		closerNodes := d.closestHeardNodes(targetID, 8)
+		closerNodes := d.closestHeardNodes(targetID, 8, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id":    string(d.nodeID[:]),
 			"nodes": compactNodes(closerNodes),
@@ -440,7 +440,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 				"values": peers,
 			}, addr)
 		} else {
-			closerNodes := d.closestHeardNodes(infoHash, 8)
+			closerNodes := d.closestHeardNodes(infoHash, 8, addr)
 			d.sendResponse(t, map[string]interface{}{
 				"id":    string(d.nodeID[:]),
 				"token": token,
@@ -606,25 +606,30 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 // getCloserNodes returns up to count nodes from the routing table closest to
 // target, ordered nearest-first, for seeding our own lookups.
 func (d *DHT) getCloserNodes(target [20]byte, count int) []Node {
-	return d.closestNodes(target, count, false)
+	return d.closestNodes(target, count, false, nil)
 }
 
 // closestHeardNodes is getCloserNodes for the find_node and get_peers answers
-// we give other nodes. It leaves out contacts loaded from disk that have not
-// been heard from this run: the file may predate one-contact-per-IP admission
-// or have been planted, so a saved contact is only handed to the rest of the
-// DHT once it has answered us again. Our own lookups may still start from it.
-func (d *DHT) closestHeardNodes(target [20]byte, count int) []Node {
-	return d.closestNodes(target, count, true)
+// we give asker. It leaves out contacts loaded from disk that have not been
+// heard from this run: the file may predate one-contact-per-IP admission or
+// have been planted, so a saved contact is only handed to the rest of the DHT
+// once it has answered us again. Our own lookups may still start from it. It
+// also leaves out contacts asker may not be told about under netpolicy's
+// scope rule, so a public asker never learns our loopback, LAN or link-local
+// contacts (it could not reach them, and they map our network for it).
+func (d *DHT) closestHeardNodes(target [20]byte, count int, asker *net.UDPAddr) []Node {
+	return d.closestNodes(target, count, true, asker)
 }
 
 // closestNodes returns up to count contacts closest to target, nearest first,
-// skipping never-heard (zero LastSeen) contacts when heardOnly is set. Rather
-// than copying every node out of the table and sorting the copy (which
-// recomputes each XOR distance on every comparison), it keeps a small sorted
-// candidate slice of size <= count and inserts each node into it in place,
-// computing its distance exactly once.
-func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
+// skipping never-heard (zero LastSeen) contacts when heardOnly is set, and,
+// when asker is set, contacts asker may not be told about; the scan goes on
+// past them, so up to count eligible contacts are still returned. Rather than
+// copying every node out of the table and sorting the copy (which recomputes
+// each XOR distance on every comparison), it keeps a small sorted candidate
+// slice of size <= count and inserts each node into it in place, computing its
+// distance exactly once.
+func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool, asker *net.UDPAddr) []Node {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -648,6 +653,15 @@ func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
 				continue
 			}
 			dist := xorDistance(n.ID, target)
+			if len(best) == count && !lessXor(dist, best[count-1].dist) {
+				continue
+			}
+			// Only a contact that would make the cut pays for the scope check.
+			if asker != nil {
+				if k, ok := nodeAddrKeyOf(n.Addr); !ok || !endpointAllowed(k, asker) {
+					continue
+				}
+			}
 
 			if len(best) < count {
 				best = append(best, candidate{node: n, dist: dist})
@@ -657,11 +671,9 @@ func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
 				continue
 			}
 
-			if lessXor(dist, best[count-1].dist) {
-				best[count-1] = candidate{node: n, dist: dist}
-				for i := count - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
-					best[i], best[i-1] = best[i-1], best[i]
-				}
+			best[count-1] = candidate{node: n, dist: dist}
+			for i := count - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
+				best[i], best[i-1] = best[i-1], best[i]
 			}
 		}
 	}

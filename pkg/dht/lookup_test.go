@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -545,6 +546,70 @@ func TestLookupLoopbackResponderMayHandOutLoopbackPeers(t *testing.T) {
 	peers := drainDiscovered(d)
 	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("127.0.0.1")) || peers[0].Port != 6881 {
 		t.Fatalf("loopback responder's loopback peer was not published: %v", peers)
+	}
+}
+
+// TestAnswersOmitContactsTheAskerMayNotLearn verifies find_node and get_peers
+// answers follow netpolicy's scope rule: a public asker never receives our
+// loopback, LAN or link-local contacts (and still gets a full answer of
+// public ones), a LAN asker gets LAN contacts but not loopback, and a
+// loopback asker gets everything.
+func TestAnswersOmitContactsTheAskerMayNotLearn(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	// Our own ID is the target, so higher buckets are closer. The local
+	// contacts are the closest; ten public ones on distinct /24s follow.
+	target := d.nodeID
+	local := []*net.UDPAddr{
+		{IP: net.ParseIP("127.0.0.1"), Port: 7000},
+		{IP: net.ParseIP("192.168.1.10"), Port: 6881},
+		{IP: net.ParseIP("10.0.0.5"), Port: 6881},
+		{IP: net.ParseIP("169.254.3.3"), Port: 6881},
+	}
+	for i, a := range local {
+		d.addNode(idInBucket(d.nodeID, 120+i, 1), a)
+	}
+	for i := 0; i < 10; i++ {
+		d.addNode(idInBucket(d.nodeID, 100+i, 1), &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881})
+	}
+
+	scope := func(n Node) string {
+		switch n.Addr.IP.To4()[0] {
+		case 127:
+			return "loopback"
+		case 198:
+			return "public"
+		}
+		return "lan"
+	}
+	seq := 0
+	ask := func(asker *net.UDPAddr) map[string]int {
+		t.Helper()
+		seq++
+		id := idInBucket(d.nodeID, 5, uint16(seq))
+		f, g := fmt.Sprintf("f%d", seq), fmt.Sprintf("g%d", seq)
+		d.handleQuery(f, "find_node", map[string]interface{}{"id": string(id[:]), "target": string(target[:])}, asker)
+		d.handleQuery(g, "get_peers", map[string]interface{}{"id": string(id[:]), "info_hash": string(target[:])}, asker)
+		counts := make(map[string]int)
+		for _, tid := range []string{f, g} {
+			served := servedNodes(t, conn, tid)
+			if len(served) != 8 {
+				t.Fatalf("answer to %s carried %d contacts, want 8", asker, len(served))
+			}
+			for _, n := range served {
+				counts[scope(n)]++
+			}
+		}
+		return counts
+	}
+
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("203.0.113.40"), Port: 6881}); got["public"] != 16 {
+		t.Fatalf("a public asker was told about local contacts: %v", got)
+	}
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("192.168.1.50"), Port: 6881}); got["lan"] != 6 || got["loopback"] != 0 {
+		t.Fatalf("a LAN asker got %v, want its 3 LAN-scope contacts per answer and no loopback", got)
+	}
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}); got["lan"] != 6 || got["loopback"] != 2 {
+		t.Fatalf("a loopback asker got %v, want every local contact", got)
 	}
 }
 
