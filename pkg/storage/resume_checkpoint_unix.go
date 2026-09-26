@@ -31,10 +31,11 @@ func fileIdentity(_ *os.File, info os.FileInfo) string {
 }
 
 // fileObjectKeyOf keys a file by device and inode, which every name of one
-// file shares.
+// file shares. An inode of zero (some FUSE and network filesystems) names no
+// file in particular and is reported as unknown rather than as a collision.
 func fileObjectKeyOf(_ *os.File, info os.FileInfo) (fileObjectKey, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
+	if !ok || st.Ino == 0 {
 		return fileObjectKey{}, false
 	}
 	return fileObjectKey{a: uint64(st.Dev), b: uint64(st.Ino)}, true
