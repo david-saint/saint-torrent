@@ -1551,8 +1551,11 @@ func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) 
 		if idStr, _ := rDict["id"].(string); len(idStr) != 20 {
 			return nil, errors.New("invalid responder id")
 		}
-		nodesStr, _ := rDict["nodes"].(string)
-		return parseCompactNodes(nodesStr), nil
+		nodes, ok := nodesField(rDict)
+		if !ok {
+			return nil, errMalformedNodes
+		}
+		return nodes, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -1621,10 +1624,13 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 				}
 			}
 		}
-		if nodesVal, exists := rDict["nodes"]; exists {
-			nodesStr, _ := nodesVal.(string)
-			res.Nodes = parseCompactNodes(nodesStr)
+		// A malformed node list fails the whole answer, so the lookup marks
+		// the responder failed and uses neither its token nor its values.
+		nodes, ok := nodesField(rDict)
+		if !ok {
+			return nil, errMalformedNodes
 		}
+		res.Nodes = nodes
 		return res, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -2298,23 +2304,49 @@ func compactNodes(nodes []Node) string {
 	return buf.String()
 }
 
-func parseCompactNodes(s string) []Node {
+// errMalformedNodes reports an answer whose "nodes" is not a compact node list.
+var errMalformedNodes = errors.New("malformed nodes")
+
+// nodesField parses the optional "nodes" entry of a response. It reports false
+// when the entry is present but is not a well-formed compact node list.
+func nodesField(r map[string]interface{}) ([]Node, bool) {
+	v, exists := r["nodes"]
+	if !exists {
+		return nil, true
+	}
+	str, ok := v.(string)
+	if !ok {
+		return nil, false
+	}
+	return parseCompactNodes(str)
+}
+
+// parseCompactNodes decodes a BEP 5 compact node list: 26 bytes per node, a
+// 20-byte ID then an IPv4 address and port. It reports false, and returns no
+// nodes, when the length is not a multiple of 26: like jech/dht and rqbit we
+// treat a ragged list as a broken answer rather than guess where it went
+// wrong. Entries with an all-zero ID are skipped, as jech/dht does; no real
+// node draws that ID.
+func parseCompactNodes(s string) ([]Node, bool) {
+	if len(s)%26 != 0 {
+		return nil, false
+	}
 	data := []byte(s)
 	var nodes []Node
 	for len(data) >= 26 {
 		var id [20]byte
 		copy(id[:], data[0:20])
-		ip := net.IP(data[20:24])
-		port := binary.BigEndian.Uint16(data[24:26])
-		nodes = append(nodes, Node{
-			ID: id,
-			Addr: &net.UDPAddr{
-				IP:   ip,
-				Port: int(port),
-			},
-			LastSeen: time.Now(),
-		})
+		if id != ([20]byte{}) {
+			nodes = append(nodes, Node{
+				ID: id,
+				Addr: &net.UDPAddr{
+					IP:   net.IP(data[20:24]),
+					Port: int(binary.BigEndian.Uint16(data[24:26])),
+				},
+				LastSeen: time.Now(),
+			})
+		}
 		data = data[26:]
 	}
-	return nodes
+	return nodes, true
 }

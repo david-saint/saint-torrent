@@ -402,6 +402,40 @@ func TestBootstrapReferralsAreProbedNotInserted(t *testing.T) {
 	}
 }
 
+// TestBootstrapDropsMalformedReply verifies a bootstrap router's find_node
+// answer with a ragged node list is dropped whole: none of its referrals is
+// probed.
+func TestBootstrapDropsMalformedReply(t *testing.T) {
+	router := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 6997}
+	old := DefaultBootstrapHosts
+	DefaultBootstrapHosts = []string{net.JoinHostPort(router.IP.String(), strconv.Itoa(router.Port))}
+	t.Cleanup(func() { DefaultBootstrapHosts = old })
+
+	d, conn := newFakeDHT(t)
+	tid := awaitQueryTo(t, conn, router, "find_node")
+
+	referral := &net.UDPAddr{IP: net.ParseIP("198.51.100.41"), Port: 6881}
+	routerID := idInBucket(d.nodeID, 11, 1)
+	payload, err := bencode.Marshal(map[string]interface{}{
+		"t": tid,
+		"y": "r",
+		"r": map[string]interface{}{
+			"id":    string(routerID[:]),
+			"nodes": compactNodes([]Node{{ID: idInBucket(d.nodeID, 10, 1), Addr: referral}}) + "\x00",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to encode find_node reply: %v", err)
+	}
+	conn.in <- fakePacket{data: payload, addr: router}
+	drainReadLoop(t, d, conn)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(referral, "ping"); got != 0 {
+		t.Fatalf("a referral from a malformed bootstrap reply was probed %d times", got)
+	}
+}
+
 // BenchmarkAddNodeKnownEndpoint measures the PORT-message path for an endpoint
 // already in a large routing table: an O(1) index lookup, not a table scan.
 func BenchmarkAddNodeKnownEndpoint(b *testing.B) {

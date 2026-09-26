@@ -613,6 +613,55 @@ func TestAnswersOmitContactsTheAskerMayNotLearn(t *testing.T) {
 	}
 }
 
+// TestLookupFailsResponderWithMalformedNodes verifies a get_peers answer whose
+// node list is ragged (jech/dht) fails its responder: its values are ignored,
+// its referrals are not followed and its token is never announced to.
+func TestLookupFailsResponderWithMalformedNodes(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "malformed-nodes-hash")
+	broken := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 6881}
+	brokenID := idAtDistance(infoHash, 0x01, 1)
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.7"), Port: 6881}
+	honestID := idAtDistance(infoHash, 0x02, 1)
+	referral := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 6881}
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		switch {
+		case q == "announce_peer":
+			return map[string]interface{}{"id": idString(honestID)}
+		case q != "get_peers":
+			return nil
+		case sameUDPAddr(to, broken):
+			return map[string]interface{}{
+				"id":     idString(brokenID),
+				"token":  "tok",
+				"values": []interface{}{compactPeer(net.ParseIP("198.18.0.77"), 6881)},
+				"nodes":  compactNodes([]Node{{ID: infoHash, Addr: referral}}) + "x",
+			}
+		case sameUDPAddr(to, honest):
+			return map[string]interface{}{"id": idString(honestID), "token": "tok"}
+		}
+		return nil
+	})
+	d.addNode(brokenID, broken)
+	d.addNode(honestID, honest)
+
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+
+	awaitQueryTo(t, conn, honest, "announce_peer")
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(broken, "announce_peer"); got != 0 {
+		t.Fatalf("a responder with a malformed node list was announced to %d times", got)
+	}
+	if got := conn.queriesTo(referral, "get_peers"); got != 0 {
+		t.Fatalf("a referral from a malformed node list was queried %d times", got)
+	}
+	if peers := drainDiscovered(d); len(peers) != 0 {
+		t.Fatalf("values from a malformed answer reached the dialer: %v", peers)
+	}
+}
+
 // TestLookupSetOneCandidatePerSlash24 verifies a lookup keeps one public
 // candidate per /24 (libtorrent's dht_restrict_search_ips), while LAN
 // addresses keep one per IP and loopback one per port.

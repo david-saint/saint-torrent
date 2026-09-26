@@ -61,9 +61,9 @@ func TestCompactNodes(t *testing.T) {
 		t.Fatalf("expected compacted length to be 26, got %d", len(compacted))
 	}
 
-	parsed := parseCompactNodes(compacted)
-	if len(parsed) != 1 {
-		t.Fatalf("expected 1 parsed node, got %d", len(parsed))
+	parsed, ok := parseCompactNodes(compacted)
+	if !ok || len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed node, got %d (ok %v)", len(parsed), ok)
 	}
 
 	if parsed[0].ID != id1 {
@@ -72,6 +72,26 @@ func TestCompactNodes(t *testing.T) {
 
 	if !parsed[0].Addr.IP.Equal(addr1.IP) || parsed[0].Addr.Port != addr1.Port {
 		t.Errorf("parsed address mismatch: expected %s, got %s", addr1, parsed[0].Addr)
+	}
+}
+
+// TestParseCompactNodesIsStrict verifies a ragged node list is rejected whole
+// and all-zero IDs are skipped (jech/dht).
+func TestParseCompactNodesIsStrict(t *testing.T) {
+	good := compactNodes([]Node{{ID: sha1.Sum([]byte("node1")), Addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881}}})
+	zero := compactNodes([]Node{{Addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}}})
+
+	for _, ragged := range []string{good + "x", good[:25], good + good[:13]} {
+		if nodes, ok := parseCompactNodes(ragged); ok || nodes != nil {
+			t.Fatalf("a %d-byte node list was accepted: %d nodes", len(ragged), len(nodes))
+		}
+	}
+	nodes, ok := parseCompactNodes(zero + good + zero)
+	if !ok || len(nodes) != 1 || !nodes[0].Addr.IP.Equal(net.ParseIP("198.51.100.1")) {
+		t.Fatalf("zero-ID entries were not skipped: %v (ok %v)", nodes, ok)
+	}
+	if nodes, ok := parseCompactNodes(""); !ok || len(nodes) != 0 {
+		t.Fatalf("an empty node list was rejected")
 	}
 }
 
