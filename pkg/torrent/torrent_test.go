@@ -260,7 +260,11 @@ func TestParsePrivateFlag(t *testing.T) {
 		{name: "missing", want: false},
 		{name: "zero", value: int64(0), want: false},
 		{name: "one", value: int64(1), want: true},
-		{name: "other integer", value: int64(2), want: false},
+		// Any nonzero value is private (libtorrent semantics); reading these
+		// as public would announce a private torrent to DHT and PEX.
+		{name: "other integer", value: int64(2), want: true},
+		{name: "negative", value: int64(-1), want: true},
+		{name: "not an integer", value: "1", want: false},
 	}
 
 	for _, tt := range tests {

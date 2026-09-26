@@ -43,6 +43,8 @@ func FuzzParseTorrent(f *testing.F) {
 		[]byte("d4:infod4:name4:bad12:piece lengthi0e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:lengthi1eee"),
 		[]byte("d4:infod4:name4:bad12:piece lengthi1e6:pieces5:short6:lengthi1eee"),
 		[]byte("d4:infod4:name4:bad12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:lengthi-1eee"),
+		[]byte("d4:infod4:name4:huge12:piece lengthi1099511627776e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:lengthi1eee"),
+		[]byte("d4:infod4:name1:a12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaa6:lengthi1ee4:infod4:name1:b12:piece lengthi1e6:pieces20:bbbbbbbbbbbbbbbbbbbb6:lengthi1eee"),
 	} {
 		f.Add(seed)
 	}
@@ -52,17 +54,27 @@ func FuzzParseTorrent(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if tor.PieceLength <= 0 {
-			t.Fatalf("accepted non-positive piece length: %d", tor.PieceLength)
+		if tor.PieceLength <= 0 || tor.PieceLength > MaxPieceLength {
+			t.Fatalf("accepted out-of-range piece length: %d", tor.PieceLength)
 		}
-		if len(tor.PieceHashes) == 0 {
-			t.Fatalf("accepted torrent without piece hashes")
+		if len(tor.PieceHashes) == 0 || len(tor.PieceHashes) > MaxPieceCount {
+			t.Fatalf("accepted out-of-range piece count: %d", len(tor.PieceHashes))
 		}
 		if len(tor.InfoBytes) == 0 {
 			t.Fatalf("accepted torrent without raw info bytes")
 		}
 		if got := sha1.Sum(tor.InfoBytes); got != tor.InfoHash {
 			t.Fatalf("info hash mismatch: got %x from info bytes, torrent has %x", got, tor.InfoHash)
+		}
+		// The info bytes alone must parse to the same content: identity and
+		// content come from the same bytes.
+		info, err := ParseInfo(tor.InfoBytes)
+		if err != nil {
+			t.Fatalf("ParseInfo(InfoBytes) failed after Parse succeeded: %v", err)
+		}
+		if info.InfoHash != tor.InfoHash || info.Name != tor.Name || info.PieceLength != tor.PieceLength ||
+			len(info.PieceHashes) != len(tor.PieceHashes) || len(info.Files) != len(tor.Files) {
+			t.Fatalf("ParseInfo(InfoBytes) disagrees with Parse")
 		}
 		if len(tor.Files) == 0 {
 			t.Fatalf("accepted torrent without files")
@@ -80,11 +92,11 @@ func FuzzParseTorrent(f *testing.F) {
 			}
 			totalLength += file.Length
 		}
-		if totalLength <= 0 {
-			t.Fatalf("accepted non-positive total length: %d", totalLength)
+		if totalLength <= 0 || totalLength > MaxTotalLength {
+			t.Fatalf("accepted out-of-range total length: %d", totalLength)
 		}
-		expectedPieces := int((totalLength-1)/tor.PieceLength + 1)
-		if len(tor.PieceHashes) != expectedPieces {
+		expectedPieces := (totalLength-1)/tor.PieceLength + 1
+		if int64(len(tor.PieceHashes)) != expectedPieces {
 			t.Fatalf("piece count mismatch after parse: got %d, want %d", len(tor.PieceHashes), expectedPieces)
 		}
 	})
