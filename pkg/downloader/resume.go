@@ -99,7 +99,10 @@ type pieceWriteJob struct {
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
 	// (its read loop unblocks and exits) — the decoupled equivalent of the old inline
 	// disconnect-on-corruption.
-	conn                    net.Conn
+	conn net.Conn
+	// source identifies that connection for hash-failure strikes against its host
+	// (see strikePieceSourceLocked); nil for webseed pieces.
+	source                  *pieceSource
 	result                  chan<- pieceWriteResult
 	recoverableStorageError bool
 }
@@ -189,6 +192,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
+		// Closing the connection alone let the peer reconnect at once and do it
+		// again; a repeat offender is banned, and its other connections go too.
+		banned := s.strikePieceSourceLocked(job.source, time.Now())
+		if banned {
+			s.closeHostConnsLocked(job.source.host)
+		}
 		s.mu.Unlock()
 		if job.conn != nil {
 			_ = job.conn.Close()
@@ -197,6 +206,12 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 			logging.Int64("piece", job.index),
 			logging.Err(verifyErr),
 		)
+		if banned {
+			s.logSessionEvent(logging.LevelWarn, "peer_banned",
+				logging.String("host", job.source.host),
+				logging.Duration("duration", peerBanDuration),
+			)
+		}
 		job.sendResult(pieceWriteHashFailed, verifyErr)
 		return
 	}

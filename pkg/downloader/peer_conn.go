@@ -286,7 +286,7 @@ func (s *Session) maintainPeerConnections() {
 		}
 		// Skip connected peers, attempts already in flight, and inbound-only source
 		// endpoints whose ports were never advertised as listening ports.
-		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr) {
+		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr, ps.IP) {
 			continue
 		}
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
@@ -316,7 +316,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	peerAddr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
-	refused := s.refusesDialLocked(peerAddr)
+	refused := s.refusesDialLocked(peerAddr, p.IP.String())
 	s.mu.RUnlock()
 	acquiredSlots := false
 	defer func() {
@@ -607,8 +607,9 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	s.mu.RLock()
 	paused := s.paused
 	closed := s.closed
+	banned := s.refusesIncomingLocked(conn.RemoteAddr())
 	s.mu.RUnlock()
-	if paused || closed {
+	if paused || closed || banned {
 		return
 	}
 
@@ -690,6 +691,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	hostKey, loopback := peerHostKey(ip)
 	remoteID := client.RemotePeerID
+	// A piece from this connection that fails its hash check is charged to its
+	// host; loopback peers are exempt, as from the per-host cap.
+	source := &pieceSource{host: hostKey}
+	if loopback {
+		source.host = ""
+	}
 	s.mu.Lock()
 	if s.paused || s.closed {
 		s.mu.Unlock()
@@ -2564,7 +2571,7 @@ peerLoop:
 			s.ensurePieceWritePool()
 			writeQueueStarted := time.Now()
 			select {
-			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn}:
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source}:
 				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
 					pipeline.OnWriterLimited(time.Now())
 					publishPipelineSnapshot(time.Now(), true)
@@ -2874,7 +2881,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	}
 
 	// Don't exceed the outbound connection cap.
-	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr)) {
+	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host)) {
 		shouldDial = false
 	}
 
