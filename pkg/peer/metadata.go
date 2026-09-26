@@ -36,12 +36,12 @@ const MaxMetadataSize = 16 * 1024 * 1024
 
 const maxMetadataPieces = MaxMetadataSize / MetadataBlockSize
 
-// Size caps for BEP 10 sub-messages, checked before any bencode decode. The wire
-// cap (MaxMessageLength) is sized for piece blocks, and decoding a 2 MiB payload of
-// tiny containers builds a tree ~50x its size, so control messages get their own
-// limits. Real extension handshakes are well under 1 KiB, and a ut_metadata data
-// message is a small dict plus at most one 16 KiB block (libtorrent drops anything
-// over 17 KiB too).
+// Size caps for BEP 10 sub-messages, checked before any bencode decode. The reader
+// admits an extended message of up to MaxExtHandshakeSize (see messageLengthRules),
+// and decoding a payload of tiny containers builds a tree ~50x its size, so each
+// control message gets its own limit. Real extension handshakes are well under
+// 1 KiB, and a ut_metadata data message is a small dict plus at most one 16 KiB
+// block (libtorrent drops anything over 17 KiB too).
 const (
 	MaxExtHandshakeSize    = 64 * 1024
 	MaxMetadataMessageSize = MetadataBlockSize + 1024
