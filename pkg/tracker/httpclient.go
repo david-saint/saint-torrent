@@ -66,9 +66,12 @@ const (
 )
 
 // MaxWebseedURLLength bounds a webseed request URL, the url-list entry with
-// the file's escaped path appended, like torrent.MaxWebSeedURLLength bounds
-// the entry itself. Longer URLs are refused before anything is sent.
-const MaxWebseedURLLength = 4096
+// the file's escaped path appended. Longer URLs are refused before anything
+// is sent. It is twice torrent.MaxWebSeedURLLength, the bound on the entry
+// itself, so even the longest entry leaves 4 KiB for the path, whose
+// non-ASCII bytes triple when escaped; nginx and Apache accept request lines
+// of about this size by default.
+const MaxWebseedURLLength = 8192
 
 // ErrDestinationRefused marks a request refused by the SSRF policy.
 var ErrDestinationRefused = errors.New("destination refused")

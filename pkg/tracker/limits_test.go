@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -300,6 +301,19 @@ func TestNewRequestCapsWebseedURLLength(t *testing.T) {
 		if _, err := NewRequest(context.Background(), PurposeWebseed, padURL("https://cdn.example/files/", n)); !errors.Is(err, ErrURLTooLong) {
 			t.Fatalf("NewRequest(%d-byte webseed URL) = %v, want ErrURLTooLong", n, err)
 		}
+	}
+
+	// The longest url-list entry a torrent may carry (4096 bytes, see
+	// torrent.MaxWebSeedURLLength) still reaches a file whose path is 1,320
+	// bytes of CJK text, 3,960 once escaped: the cap is on the request, so it
+	// must leave room for the path beyond the entry.
+	entry := padURL("https://cdn.example/", 4096-1) + "/"
+	path := strings.Repeat(url.PathEscape("日本語の長いファイル名"), 40)
+	if n := len(entry) + len(path); n <= 4096+3800 {
+		t.Fatalf("request is %d bytes, want a maximal entry plus a long escaped path", n)
+	}
+	if _, err := NewRequest(context.Background(), PurposeWebseed, entry+path); err != nil {
+		t.Fatalf("NewRequest(%d-byte entry + %d-byte escaped path) = %v, want success", len(entry), len(path), err)
 	}
 }
 
