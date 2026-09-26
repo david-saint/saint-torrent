@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -843,7 +844,7 @@ var errCachedTorrentMismatch = errors.New("cached torrent does not match its inf
 // torrent must have that info-hash: a cached copy is trusted only for the
 // torrent it was saved for.
 func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte, error) {
-	torrentData, err := os.ReadFile(torrentPath)
+	torrentData, err := readTorrentFile(torrentPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -855,6 +856,38 @@ func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte,
 		return nil, nil, fmt.Errorf("%w: %s holds %x, want %s", errCachedTorrentMismatch, torrentPath, tor.InfoHash, wantHashHex)
 	}
 	return tor, torrentData, nil
+}
+
+// maxTorrentFileSize bounds a .torrent read into memory, as qBittorrent's
+// default does. Real ones are at most a few MiB, and parsing builds a tree of
+// the whole file at many times its size before unknown keys are dropped.
+const maxTorrentFileSize = 100 << 20
+
+// readTorrentFile reads a .torrent of at most maxTorrentFileSize bytes. The
+// size is checked before anything is read, and the read is bounded as well for
+// a file that grows meanwhile or reports no size.
+func readTorrentFile(torrentPath string) ([]byte, error) {
+	f, err := os.Open(torrentPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	tooLarge := fmt.Errorf("torrent file %s is larger than the maximum of %d bytes", torrentPath, maxTorrentFileSize)
+	if info.Size() > maxTorrentFileSize {
+		return nil, tooLarge
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, info.Size()+bytes.MinRead))
+	if _, err := buf.ReadFrom(io.LimitReader(f, maxTorrentFileSize+1)); err != nil {
+		return nil, err
+	}
+	if buf.Len() > maxTorrentFileSize {
+		return nil, tooLarge
+	}
+	return buf.Bytes(), nil
 }
 
 // addTorrentFile is AddTorrentFile that can require the info-hash (see
