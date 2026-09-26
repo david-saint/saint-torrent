@@ -32,6 +32,13 @@ import (
 // A var (not const) so tests can shorten it; treat it as a constant in production.
 var peerStallTimeout = 60 * time.Second
 
+// peerInactivityTimeout drops a connection, in either direction, on which neither
+// side has been interested and no payload has moved for this long (libtorrent's
+// inactivity_timeout). The stall reaper only covers outbound connections while we
+// download, so without this an idle peer sending keep-alives could hold an inbound
+// slot for good. A var so tests can shorten it; treat it as a constant.
+var peerInactivityTimeout = 10 * time.Minute
+
 // peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
 // outbound connection set. New dials previously happened ONLY on a tracker
 // announce (interval up to an hour) or a 30 s DHT lookup, so a slot freed by a
@@ -1350,6 +1357,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	lastProgressAt := time.Now()
 	lastRequestAt := time.Time{}
 	waitingForBandwidth := false
+	// lastActiveAt is when payload last moved either way or the peer's interest
+	// changed; see peerInactivityTimeout.
+	lastActiveAt := time.Now()
 
 	// uploadQueue holds this peer's block requests awaiting upload bandwidth. It is
 	// owned by this peer goroutine and drained FIFO by uploadPump; never touched by
@@ -1605,6 +1615,12 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// the delay after which it should run again (0 when the queue is empty or fully
 	// drained) so the caller can arm the shared rate-retry timer alongside pump().
 	uploadPump := func() time.Duration {
+		served := false
+		defer func() {
+			if served {
+				lastActiveAt = time.Now()
+			}
+		}()
 		for len(uploadQueue) > 0 {
 			r := uploadQueue[0]
 			reserved, retryAfter, refund := s.reserveUploadWithRefund(int(r.length))
@@ -1643,12 +1659,44 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				return 0
 			}
 			s.putUploadBlockBuf(bufPtr)
+			served = true
 			// Lock-free counter update (see the download hot path above).
 			s.Uploaded.Add(r.length)
 			atomic.AddInt64(&pState.Uploaded, r.length)
 			uploadQueue = uploadQueue[1:]
 		}
 		return 0
+	}
+
+	// eitherSideInterested reports whether the peer wants data from us or has a
+	// piece we still want. It scans the picker, so it only runs once the
+	// connection has been idle for peerInactivityTimeout.
+	eitherSideInterested := func() bool {
+		if len(activeDownloads) > 0 {
+			return true
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// While fetching metadata or rechecking we cannot tell yet what the peer
+		// has that we need.
+		if pState.Interested || s.metadataMode || s.verifying {
+			return true
+		}
+		if s.isCompletedLocked() {
+			return false
+		}
+		peerHas := func(index int64) bool { return hasPiece(index) }
+		if s.hasSelectableNeededPieceLocked(peerHas) {
+			return true
+		}
+		if s.endgameActiveLocked() {
+			for i := range s.downloadingPieces {
+				if hasPiece(int64(i)) && s.isPieceWanted(int64(i)) {
+					return true
+				}
+			}
+		}
+		return false
 	}
 
 	// dropCompletedElsewhere is the endgame "cancel on receipt" path: it drops any
@@ -1779,6 +1827,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		copy(s.metadataBuf[offset:], metaMsg.Data)
 		s.metadataPieces[piece] = true
 		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
+		lastActiveAt = lastProgressAt
 		for _, done := range s.metadataPieces {
 			if !done {
 				s.mu.Unlock()
@@ -1844,6 +1893,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			return
 		}
 		metadataServed++
+		lastActiveAt = now
 		s.Uploaded.Add(blockLen)
 		atomic.AddInt64(&pState.Uploaded, blockLen)
 	}
@@ -2057,6 +2107,17 @@ peerLoop:
 			}
 		}
 
+		// Drop a connection neither side has any use for: an idle peer that only
+		// sends keep-alives would otherwise hold its slot for good.
+		if time.Since(lastActiveAt) > peerInactivityTimeout {
+			if eitherSideInterested() {
+				lastActiveAt = time.Now()
+			} else {
+				disconnectReason = "inactive"
+				break
+			}
+		}
+
 		var msg *peer.Message
 		select {
 		case result := <-readCh:
@@ -2215,6 +2276,7 @@ peerLoop:
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgInterested:
+			lastActiveAt = time.Now()
 			// A repeat changes nothing, so skip the write lock and the upload-slot
 			// scan of s.Peers: a peer could otherwise hold s.mu for a full map walk
 			// with every 5-byte message.
@@ -2239,6 +2301,7 @@ peerLoop:
 			syncChoke()
 
 		case peer.MsgNotInterested:
+			lastActiveAt = time.Now()
 			s.mu.Lock()
 			pState.Interested = false
 			s.mu.Unlock()
@@ -2417,6 +2480,7 @@ peerLoop:
 			req.received = true
 			dl.blocksReceived++
 			lastProgressAt = now // forward progress; keeps the stall reaper off
+			lastActiveAt = now
 
 			// Counters are bumped lock-free on this hot path; s.mu would
 			// otherwise be taken per 16 KB block by every peer goroutine.
