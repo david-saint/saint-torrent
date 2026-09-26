@@ -44,6 +44,14 @@ const (
 	maxWebseedWorkers = 4
 	// maxWebseedSources bounds how many distinct url-list entries are kept.
 	maxWebseedSources = 1024
+	// maxWebseedScan bounds how many raw url-list entries are parsed to find them.
+	maxWebseedScan = 16 * maxWebseedSources
+	// maxWebseedSourcesPerHost keeps one server from being listed under many
+	// paths. Path variants ("/v1/../f.bin", "//f.bin", "/f.bin;1", ...) usually
+	// reach the same file, and the rotating workers would otherwise keep
+	// downloading from that host however often each variant is retired, which
+	// turns every client into a bandwidth drain on a third party.
+	maxWebseedSourcesPerHost = 2
 	// webseedMaxHashFailures retires a source that served this many corrupt
 	// pieces since it was last retired.
 	webseedMaxHashFailures = 3
@@ -136,7 +144,8 @@ func makeWebseedTorrentFiles(files []torrent.File) []webseedTorrentFile {
 
 // newWebseedPool builds the pool, keeping each source once by
 // scheme+host+port+path (query and fragment ignored, so "?v=1", "?v=2", ...
-// cannot multiply one server) and at most maxWebseedSources of them.
+// cannot multiply one server), at most maxWebseedSourcesPerHost per
+// scheme+host+port and at most maxWebseedSources in total.
 func newWebseedPool(rawURLs []string, files []webseedTorrentFile) *webseedPool {
 	pool := &webseedPool{multiFile: len(files) != 1 || len(files[0].path) != 1}
 	var offset int64
@@ -145,26 +154,29 @@ func newWebseedPool(rawURLs []string, files []webseedTorrentFile) *webseedPool {
 		offset += f.length
 	}
 	seen := make(map[string]struct{}, min(len(rawURLs), maxWebseedSources))
-	for _, raw := range rawURLs {
-		if len(pool.sources) >= maxWebseedSources {
+	perHost := make(map[string]int)
+	for i, raw := range rawURLs {
+		if len(pool.sources) >= maxWebseedSources || i >= maxWebseedScan {
 			break
 		}
-		src, key, ok := buildWebseedSource(raw, pool.multiFile)
+		src, hostKey, ok := buildWebseedSource(raw, pool.multiFile)
 		if !ok {
 			continue
 		}
-		if _, dup := seen[key]; dup {
+		key := hostKey + src.base.EscapedPath()
+		if _, dup := seen[key]; dup || perHost[hostKey] >= maxWebseedSourcesPerHost {
 			continue
 		}
 		seen[key] = struct{}{}
+		perHost[hostKey]++
 		pool.sources = append(pool.sources, src)
 	}
 	return pool
 }
 
 // buildWebseedSource validates one url-list entry and returns it with its
-// dedup key. URLs carrying credentials are rejected: Go would send them as
-// Basic auth, and they would leak into errors and the UI.
+// scheme://host:port key. URLs carrying credentials are rejected: Go would
+// send them as Basic auth, and they would leak into errors and the UI.
 func buildWebseedSource(raw string, multiFile bool) (*webseedSource, string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -182,14 +194,21 @@ func buildWebseedSource(raw string, multiFile bool) (*webseedSource, string, boo
 		return nil, "", false
 	}
 	base.Fragment, base.RawFragment = "", ""
-	key := base.Scheme + "://" + net.JoinHostPort(strings.ToLower(base.Hostname()), strconv.Itoa(int(port))) + base.EscapedPath()
+	hostKey := base.Scheme + "://" + net.JoinHostPort(canonicalHost(base.Hostname()), strconv.Itoa(int(port)))
 	return &webseedSource{
 		base:        base,
 		display:     redactedURL(base),
 		host:        base.Hostname(),
 		port:        port,
 		appendNames: !multiFile && strings.HasSuffix(base.EscapedPath(), "/"),
-	}, key, true
+	}, hostKey, true
+}
+
+// canonicalHost folds the spellings of one host name that resolve alike
+// (letter case, a trailing root dot) so per-host limits cannot be sidestepped
+// by respelling it.
+func canonicalHost(host string) string {
+	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
 // redactedURL renders u as scheme://host[:port]/path, without userinfo, query

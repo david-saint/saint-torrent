@@ -213,7 +213,7 @@ func sanitizeTrackers(raw []string) []trackerTarget {
 		case u.Scheme == "https":
 			port = "443"
 		}
-		hostKey := u.Scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+		hostKey := u.Scheme + "://" + net.JoinHostPort(canonicalHost(u.Hostname()), port)
 		key := hostKey + u.EscapedPath() + "?" + u.RawQuery
 		if _, dup := seen[key]; dup || perHost[hostKey] >= maxTrackersPerHost {
 			continue

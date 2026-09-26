@@ -152,7 +152,8 @@ func TestSanitizeTrackersDedupesAndCaps(t *testing.T) {
 		"HTTP://Tracker.Example:80/announce", // same tracker, other spelling
 		" http://tracker.example/announce ",
 		"http://tracker.example/other/announce",
-		"http://tracker.example/third/announce", // over the per-host cap
+		"http://tracker.example/third/announce",   // over the per-host cap
+		"http://TRACKER.example./fourth/announce", // same host, root-dot spelling
 		"udp://tracker.example:6969/announce",
 		"https://tracker.example/announce",
 		"wss://tracker.example/announce",

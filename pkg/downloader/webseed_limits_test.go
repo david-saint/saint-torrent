@@ -74,6 +74,11 @@ func TestWebseedSourcesDedupeAndWorkersBounded(t *testing.T) {
 		"http://seed.example/f.bin#frag",
 		"http://alice:pw@seed.example/g.bin", // credentials: rejected
 		"ftp://seed.example/f.bin",
+		"http://seed.example//f.bin", // another path: the host's second source
+		// Path variants of the same file past the per-host cap, one with the
+		// host spelled with a root dot.
+		"http://seed.example/v1/../f.bin",
+		"http://Seed.Example./f.bin;1",
 	}
 	for i := 0; i < 10; i++ {
 		seeds = append(seeds, fmt.Sprintf("http://m%d.example/f.bin", i))
@@ -90,12 +95,12 @@ func TestWebseedSourcesDedupeAndWorkersBounded(t *testing.T) {
 			t.Fatal("webseed workers do not share one pool")
 		}
 	}
-	if len(pool.sources) != 11 {
+	if want := maxWebseedSourcesPerHost + 10; len(pool.sources) != want {
 		var got []string
 		for _, s := range pool.sources {
 			got = append(got, s.display)
 		}
-		t.Fatalf("pool has %d sources, want 11: %v", len(pool.sources), got)
+		t.Fatalf("pool has %d sources, want %d: %v", len(pool.sources), want, got)
 	}
 	if got := pool.sources[0].display; got != "http://seed.example/f.bin" {
 		t.Fatalf("display = %q, want no query or fragment", got)
@@ -110,7 +115,7 @@ func TestWebseedWorkersBoundedAndRotateThroughList(t *testing.T) {
 	release := make(chan struct{})
 	var inflight, peak atomic.Int32
 	var paths pathCounter
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths.add(r.URL.Path)
 		n := inflight.Add(1)
 		defer inflight.Add(-1)
@@ -122,11 +127,14 @@ func TestWebseedWorkersBoundedAndRotateThroughList(t *testing.T) {
 			return
 		}
 		http.NotFound(w, r)
-	}))
-	defer srv.Close()
+	})
 
+	// Ten mirrors: distinct servers, as maxWebseedSourcesPerHost allows only
+	// two sources on one.
 	var seeds []string
 	for i := 0; i < 10; i++ {
+		srv := httptest.NewServer(handler)
+		t.Cleanup(srv.Close)
 		seeds = append(seeds, fmt.Sprintf("%s/m%d/f.bin", srv.URL, i))
 	}
 	tor, _ := multiPieceWebseedTorrent("rotate.bin", 8, 16, seeds)
@@ -166,15 +174,16 @@ func TestWebseedRetiresOnPermanentFailures(t *testing.T) {
 		"/s200": http.StatusOK, // Range ignored
 	}
 	var paths pathCounter
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths.add(r.URL.Path)
 		w.WriteHeader(statuses[r.URL.Path])
 		_, _ = w.Write([]byte("not a range"))
-	}))
-	defer srv.Close()
+	})
 
 	var seeds []string
 	for p := range statuses {
+		srv := httptest.NewServer(handler) // one mirror each (per-host cap)
+		t.Cleanup(srv.Close)
 		seeds = append(seeds, srv.URL+p)
 	}
 	tor, _ := multiPieceWebseedTorrent("permanent.bin", 2, 16, seeds)
@@ -226,6 +235,46 @@ func TestWebseedRetiresAfterRepeatedHashFailures(t *testing.T) {
 	}
 	if states := sess.GetPieceStates(); states[0] != PieceEmpty {
 		t.Fatalf("piece state = %v, want empty for other sources", states[0])
+	}
+}
+
+// TestWebseedPathVariantsCannotDrainOneHost reproduces a url-list naming one
+// third-party file under many path spellings. Each spelling used to be its
+// own source, so the rotating workers kept downloading from that host (three
+// corrupt pieces per spelling) for as long as the torrent stayed incomplete.
+func TestWebseedPathVariantsCannotDrainOneHost(t *testing.T) {
+	t.Cleanup(swapDuration(&webseedIdleDelay, 10*time.Millisecond))
+	t.Cleanup(swapDuration(&webseedRetryBaseDelay, 5*time.Millisecond))
+	t.Cleanup(swapDuration(&webseedRetryMaxDelay, 10*time.Millisecond))
+	good := []byte("the file the torrent really describes")
+	bad := bytes.Repeat([]byte("x"), len(good))
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		serveRange(t, w, r, bad)
+	}))
+	defer srv.Close()
+
+	var seeds []string
+	for i := 0; i < 32; i++ {
+		seeds = append(seeds, fmt.Sprintf("%s/v%d/../big.iso", srv.URL, i))
+	}
+	tor := &torrent.Torrent{
+		Name:        "big.iso",
+		InfoHash:    sha1.Sum([]byte("path-variants")),
+		WebSeeds:    seeds,
+		PieceLength: int64(len(good)),
+		PieceHashes: [][20]byte{sha1.Sum(good)},
+		Files:       []torrent.File{{Length: int64(len(good)), Path: []string{"big.iso"}}},
+	}
+	sess := newWebseedTestSession(t, tor)
+	startWebseedsForTest(t, sess)
+
+	want := int32(maxWebseedSourcesPerHost * webseedMaxHashFailures)
+	waitFor(t, "hash failures", 3*time.Second, func() bool { return requests.Load() >= want })
+	time.Sleep(200 * time.Millisecond) // many retry periods
+	if got := requests.Load(); got != want {
+		t.Fatalf("one host was asked for %d pieces, want %d", got, want)
 	}
 }
 
