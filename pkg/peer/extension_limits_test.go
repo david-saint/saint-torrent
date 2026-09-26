@@ -38,6 +38,37 @@ func TestExtensionHandshakeRequestQueue(t *testing.T) {
 	}
 }
 
+// TestExtensionHandshakeListenPort checks BEP 10 p (the sender's listen port)
+// round-trips and that a value that is no port is ignored rather than failing
+// the handshake.
+func TestExtensionHandshakeListenPort(t *testing.T) {
+	data, err := (&ExtensionHandshake{Extensions: map[string]int{ExtNamePEX: 2}, ListenPort: 51413}).Serialize()
+	if err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	hs, err := ParseExtensionHandshake(data)
+	if err != nil {
+		t.Fatalf("ParseExtensionHandshake: %v", err)
+	}
+	if hs.ListenPort != 51413 || hs.Extensions[ExtNamePEX] != 2 {
+		t.Fatalf("round trip = %+v", hs)
+	}
+	hs, err = ParseExtensionHandshake([]byte("d1:mde1:pi65535ee"))
+	if err != nil || hs.ListenPort != 65535 {
+		t.Fatalf("p=65535: ListenPort = %v err=%v, want 65535", hs, err)
+	}
+
+	for _, input := range []string{"d1:mde1:p4:6881e", "d1:mde1:pi-1ee", "d1:mde1:pi0ee", "d1:mde1:pi65536ee", "d1:mde1:pi4294973177ee"} {
+		hs, err := ParseExtensionHandshake([]byte(input))
+		if err != nil {
+			t.Fatalf("%q: %v", input, err)
+		}
+		if hs.ListenPort != 0 {
+			t.Fatalf("%q: ListenPort = %d, want 0", input, hs.ListenPort)
+		}
+	}
+}
+
 // TestSendMetadataDataWireFormat checks the directly framed ut_metadata data
 // message parses back to the same piece, total size and block.
 func TestSendMetadataDataWireFormat(t *testing.T) {

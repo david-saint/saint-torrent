@@ -49,13 +49,15 @@ const (
 
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
-// the total metadata size, an optional client identifier, and the optional
-// number of outstanding requests the sender is willing to queue.
+// the total metadata size, an optional client identifier, the optional
+// number of outstanding requests the sender is willing to queue, and the
+// optional port the sender listens on.
 type ExtensionHandshake struct {
 	Extensions   map[string]int // m dict: extension name -> message ID
 	MetadataSize int            // metadata_size field
 	ClientName   string         // v field (optional)
 	RequestQueue int            // reqq field (optional; 0 when absent or invalid)
+	ListenPort   uint16         // p field (optional; 0 when absent or invalid)
 }
 
 // maxRequestQueue caps a parsed reqq value; real clients advertise a few hundred
@@ -132,6 +134,14 @@ func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
 		}
 	}
 
+	// p, the sender's listen port, is advisory too: an out-of-range value is
+	// ignored.
+	if pVal, exists := dict["p"]; exists {
+		if p, ok := pVal.(int64); ok && p > 0 && p <= 65535 {
+			hs.ListenPort = uint16(p)
+		}
+	}
+
 	return hs, nil
 }
 
@@ -177,6 +187,9 @@ func (hs *ExtensionHandshake) Serialize() ([]byte, error) {
 	}
 	if hs.RequestQueue > 0 {
 		payload["reqq"] = hs.RequestQueue
+	}
+	if hs.ListenPort > 0 {
+		payload["p"] = int(hs.ListenPort)
 	}
 
 	data, err := bencode.Marshal(payload)

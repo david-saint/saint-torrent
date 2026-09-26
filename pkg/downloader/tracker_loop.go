@@ -675,8 +675,9 @@ func freshTrackerPeers(peers []tracker.Peer, source netip.Addr, seen map[netip.A
 // lock-free read, 0 for nil test sessions) so goroutines that acquire a slot
 // mid-loop are not double-counted against launched — double-counting previously
 // throttled connection ramp-up under load. Peers past that bound (or all of them
-// while the metadata cannot be used) are recorded undialed, with no LastAttempt,
-// so maintenance dials them as slots free up rather than waiting for the next
+// while the metadata cannot be used), and listen endpoints of peers connected to
+// us (see noteListenPortLocked), are recorded undialed, with no LastAttempt, so
+// maintenance dials them once that changes rather than waiting for the next
 // announce, up to an hour away, to list them again.
 func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 	if len(peers) == 0 {
@@ -707,7 +708,7 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 				shouldDial = true
 			}
 		}
-		if shouldDial && (slotsHeld+launched >= maxOutboundPeers || s.metadataStalledLocked()) {
+		if shouldDial && (slotsHeld+launched >= maxOutboundPeers || s.metadataStalledLocked() || s.heldByInboundLocked(peerAddr)) {
 			shouldDial = false
 			if !exists {
 				s.prunePeersLocked()

@@ -405,10 +405,11 @@ func (s *Session) maintainPeerConnections() {
 		if slotsHeld+launched >= maxOutboundPeers || launched >= globalRoom {
 			break
 		}
-		// Skip connected peers, attempts already in flight, inbound-only source
-		// endpoints whose ports were never advertised as listening ports, and
-		// DHT/PEX peers of a torrent that turned out private.
-		if ps.Active || ps.Dialing || !ps.Dialable || s.refusesDialLocked(addr, ps.IP) || s.privateRefusesDialLocked(ps) {
+		// Skip connected peers (including the listen endpoints of inbound
+		// ones), attempts already in flight, inbound-only source endpoints
+		// whose ports were never advertised as listening ports, and DHT/PEX
+		// peers of a torrent that turned out private.
+		if ps.Active || ps.Dialing || !ps.Dialable || s.heldByInboundLocked(addr) || s.refusesDialLocked(addr, ps.IP) || s.privateRefusesDialLocked(ps) {
 			continue
 		}
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
@@ -1080,12 +1081,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 
 	disconnectReason := "ended"
 	var disconnectErr error
+	// listenAddr is the listen endpoint an inbound peer announced, while this
+	// connection holds it (see noteListenPortLocked). Guarded by s.mu.
+	var listenAddr string
 	defer func() {
 		s.mu.Lock()
 		reconnectAfterResume := false
 		if s.metadataOwner == client {
 			s.metadataOwner = nil // the next connection to ask takes the solo round over
 		}
+		s.releaseListenPortLocked(peerAddr, listenAddr)
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
 			s.releasePeerLocked(peerAddr, hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
@@ -2470,6 +2475,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 			// Keep our request window within the queue the peer says it has.
 			pipeline.LimitWindowBlocks(hs.RequestQueue)
+			if !outbound && hs.ListenPort != 0 {
+				// An inbound peer's listen endpoint is one we must not dial
+				// while this connection lasts.
+				s.mu.Lock()
+				listenAddr = s.noteListenPortLocked(peerAddr, ip, hs.ListenPort, listenAddr)
+				s.mu.Unlock()
+			}
 			if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
 				peerUtPexID = utPexID
 				startPEX()
@@ -3699,13 +3711,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		}
 	}
 
-	// Never dial a refused address. Don't exceed the outbound connection cap, and
-	// dial nobody while the metadata cannot be used; a new peer is recorded then
-	// (with no LastAttempt), so maintenance dials it once that changes instead of
-	// losing it until DHT or PEX happen to list it again.
+	// Never dial a refused address. Don't exceed the outbound connection cap,
+	// dial nobody while the metadata cannot be used, and don't dial the listen
+	// endpoint of a peer connected to us; a new peer is recorded then (with no
+	// LastAttempt), so maintenance dials it once that changes instead of losing
+	// it until DHT or PEX happen to list it again.
 	if shouldDial && s.refusesDialLocked(peerAddr, host) {
 		shouldDial = false
-	} else if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.metadataStalledLocked()) {
+	} else if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.metadataStalledLocked() || s.heldByInboundLocked(peerAddr)) {
 		shouldDial = false
 		if !exists {
 			s.prunePeersLocked()
