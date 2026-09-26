@@ -378,10 +378,10 @@ func TestMagnetStorageFailureKeepsVerifiedMetadata(t *testing.T) {
 		t.Fatalf("metadataMode=%v size=%d status=%q, want the torrent published once storage is available", sess.IsMetadataMode(), sess.TotalSize(), sess.Status())
 	}
 	sess.mu.RLock()
-	leftover := sess.verifiedMetadata != nil || sess.metadataBuf != nil
+	leftover := sess.verifiedMetadata != nil || sess.metadataBuf != nil || sess.metadataRetryTimer != nil
 	sess.mu.RUnlock()
 	if leftover {
-		t.Fatal("metadata copies were kept after the torrent was published")
+		t.Fatal("metadata copies or a retry were kept after the torrent was published")
 	}
 	if n := calls.Load(); n != 3 {
 		t.Fatalf("storage factory ran %d times, want 3", n)

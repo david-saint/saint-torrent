@@ -1731,6 +1731,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.metadataBuf = nil
 	s.verifiedMetadata = nil
 	s.metadataRetryDelay = 0
+	if s.metadataRetryTimer != nil {
+		s.metadataRetryTimer.Stop()
+		s.metadataRetryTimer = nil
+	}
 	closing := s.closing
 	storageToVerify := st
 	s.mu.Unlock()
