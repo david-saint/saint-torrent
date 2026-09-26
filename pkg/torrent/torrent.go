@@ -64,15 +64,21 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// 1. Announce / Trackers
-	announce, _ := getString(dict, "announce")
+	var announce string
+	if raw, ok := getString(dict, "announce"); ok {
+		announce, _ = normalizeURL(raw, true)
+	}
 
-	var trackers []string
+	trackers := newURLSet(maxTrackers, true)
 	if announceList, ok := dict["announce-list"].([]interface{}); ok {
+	tiers:
 		for _, tierVal := range announceList {
 			if tier, ok := tierVal.([]interface{}); ok {
 				for _, trackerVal := range tier {
-					if trackerStr, ok := trackerVal.(string); ok && trackerStr != "" {
-						trackers = append(trackers, trackerStr)
+					if trackerStr, ok := trackerVal.(string); ok {
+						if !trackers.add(trackerStr) {
+							break tiers
+						}
 					}
 				}
 			}
@@ -80,11 +86,21 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// Fallback to announce if no trackers were extracted from announce-list
-	if len(trackers) == 0 && announce != "" {
-		trackers = []string{announce}
+	if len(trackers.list) == 0 && announce != "" {
+		trackers.list = []string{announce}
 	}
 
-	webSeeds := getStringList(dict, "url-list")
+	webSeeds := newURLSet(maxWebSeeds, false)
+	switch v := dict["url-list"].(type) {
+	case string:
+		webSeeds.add(v)
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok && !webSeeds.add(s) {
+				break
+			}
+		}
+	}
 
 	// 2. Info Dictionary
 	infoVal, ok := dict["info"]
@@ -106,8 +122,8 @@ func Parse(data []byte) (*Torrent, error) {
 		return nil, err
 	}
 	tor.Announce = announce
-	tor.Trackers = trackers
-	tor.WebSeeds = webSeeds
+	tor.Trackers = trackers.list
+	tor.WebSeeds = webSeeds.list
 	return tor, nil
 }
 
@@ -317,34 +333,6 @@ func getString(m map[string]interface{}, key string) (string, bool) {
 	}
 	s, ok := v.(string)
 	return s, ok
-}
-
-func getStringList(m map[string]interface{}, key string) []string {
-	v, ok := m[key]
-	if !ok {
-		return nil
-	}
-	add := func(dst []string, s string) []string {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return dst
-		}
-		return append(dst, s)
-	}
-	switch val := v.(type) {
-	case string:
-		return add(nil, val)
-	case []interface{}:
-		out := make([]string, 0, len(val))
-		for _, item := range val {
-			if s, ok := item.(string); ok {
-				out = add(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }
 
 func getInt64(m map[string]interface{}, key string) (int64, bool) {
