@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -130,13 +131,19 @@ func (m *TorrentManager) acceptLoop(listener net.Listener, current func() bool) 
 	}
 }
 
-// maxInboundHandshakes caps inbound connections that have not yet completed a
-// BitTorrent handshake for a torrent we serve. They draw from this budget
-// instead of globalInboundSlots, so connections that stall before the
-// handshake (or never send a byte) cannot hold the slots of established
-// peers; a real handshake takes a few round trips, so 256 in flight is far
-// more than legitimate arrivals need.
-const maxInboundHandshakes = 256
+const (
+	// maxInboundHandshakes caps inbound connections that have not yet
+	// completed a BitTorrent handshake for a torrent we serve. They draw from
+	// this budget instead of globalInboundSlots, so connections that stall
+	// before the handshake (or never send a byte) cannot hold the slots of
+	// established peers; a real handshake takes a few round trips, so 256 in
+	// flight is far more than legitimate arrivals need.
+	maxInboundHandshakes = 256
+	// maxInboundHandshakesPerSource is the share of that budget one source
+	// may hold once more than half of it is in use (see admitHandshakeSource).
+	// It is generous enough for several peers behind one CGNAT address.
+	maxInboundHandshakesPerSource = 8
+)
 
 func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	defer m.wg.Done()
@@ -152,7 +159,15 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 	default:
 		return
 	}
+	src, hasSrc := handshakeSource(conn.RemoteAddr())
+	if hasSrc && !m.admitHandshakeSource(src) {
+		<-m.inboundHandshakeSlots
+		return
+	}
 	conn, handshake, sess := m.readRoutedHandshake(conn)
+	if hasSrc {
+		m.releaseHandshakeSource(src)
+	}
 	<-m.inboundHandshakeSlots
 	if sess == nil {
 		return
@@ -174,6 +189,58 @@ func (m *TorrentManager) handleRoutedIncomingConnection(conn net.Conn) {
 		)
 	}
 	sess.handleRoutedIncomingConnection(conn, handshake)
+}
+
+// handshakeSource returns the address a pre-handshake connection is counted
+// under: the remote IPv4 address, or the /64 of an IPv6 one, since one IPv6
+// host is routinely handed a whole /64 to pick source addresses from.
+func handshakeSource(addr net.Addr) (netip.Addr, bool) {
+	var ip netip.Addr
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip = a.AddrPort().Addr()
+	case *net.UDPAddr:
+		ip = a.AddrPort().Addr()
+	default:
+		return netip.Addr{}, false
+	}
+	ip = ip.Unmap().WithZone("")
+	if ip.Is6() {
+		prefix, err := ip.Prefix(64)
+		if err != nil {
+			return netip.Addr{}, false
+		}
+		ip = prefix.Addr()
+	}
+	return ip, ip.IsValid()
+}
+
+// admitHandshakeSource counts one more pre-handshake connection from src. The
+// caller already holds a handshake slot. While at most half the budget is in
+// use any source is admitted, so a burst from one address (a cross-seeding
+// box dialing us for many torrents at once) is not slowed; past that, a
+// source holding maxInboundHandshakesPerSource is turned away. One host
+// holding idle sockets can then take about half the budget, not all of it,
+// and the rest stays open to every other peer.
+func (m *TorrentManager) admitHandshakeSource(src netip.Addr) bool {
+	m.handshakeSourcesMu.Lock()
+	defer m.handshakeSourcesMu.Unlock()
+	n := m.handshakeSources[src]
+	if n >= maxInboundHandshakesPerSource && len(m.inboundHandshakeSlots) > maxInboundHandshakes/2 {
+		return false
+	}
+	m.handshakeSources[src] = n + 1
+	return true
+}
+
+func (m *TorrentManager) releaseHandshakeSource(src netip.Addr) {
+	m.handshakeSourcesMu.Lock()
+	defer m.handshakeSourcesMu.Unlock()
+	if n := m.handshakeSources[src]; n > 1 {
+		m.handshakeSources[src] = n - 1
+	} else {
+		delete(m.handshakeSources, src)
+	}
 }
 
 // readRoutedHandshake negotiates MSE and reads the BitTorrent handshake under

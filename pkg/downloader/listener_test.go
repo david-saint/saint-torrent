@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,9 +240,27 @@ func dialIdle(t *testing.T, port uint16) net.Conn {
 	return conn
 }
 
+// dialIdleFrom is dialIdle from another loopback address, so a test can play
+// peers on distinct hosts. Linux routes all of 127/8 to lo; where binding
+// another loopback address fails, the test is skipped.
+func dialIdleFrom(t *testing.T, port uint16, local string) net.Conn {
+	t.Helper()
+	d := net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP(local)}}
+	conn, err := d.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Skipf("cannot dial from loopback address %s: %v", local, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
 func handshakeWith(t *testing.T, port uint16, infoHash [20]byte) net.Conn {
 	t.Helper()
-	conn := dialIdle(t, port)
+	return handshakeOver(t, dialIdle(t, port), infoHash)
+}
+
+func handshakeOver(t *testing.T, conn net.Conn, infoHash [20]byte) net.Conn {
+	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
 	hs := &peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: infoHash, PeerID: [20]byte{8, 8, 8}}
 	if _, err := conn.Write(hs.Serialize()); err != nil {
@@ -315,15 +334,17 @@ func TestInboundHandshakeBudgetIsBounded(t *testing.T) {
 	sess := newEncryptionTestManagedSession(t, mgr, "admission-budget")
 	port := mgr.PeerListenPort()
 
+	// The idle connections come from many hosts, a few each, as a crowd of
+	// distinct peers would, so no one source reaches its share of the budget.
 	idle := make([]net.Conn, 0, maxInboundHandshakes)
 	for i := 0; i < maxInboundHandshakes; i++ {
-		idle = append(idle, dialIdle(t, port))
+		idle = append(idle, dialIdleFrom(t, port, fmt.Sprintf("127.0.1.%d", 1+i/4)))
 	}
 	waitForCondition(t, "the handshake budget to fill", func() bool {
 		return len(mgr.inboundHandshakeSlots) == maxInboundHandshakes
 	})
 
-	extra := dialIdle(t, port)
+	extra := dialIdleFrom(t, port, "127.0.2.1")
 	_ = extra.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, err := extra.Read(make([]byte, 1)); err == nil {
 		t.Fatal("connection beyond the handshake budget was not closed")
@@ -337,6 +358,72 @@ func TestInboundHandshakeBudgetIsBounded(t *testing.T) {
 		return len(mgr.inboundHandshakeSlots) < maxInboundHandshakes
 	})
 	handshakeWith(t, port, sess.Torrent.InfoHash)
+}
+
+// TestOneSourceCannotTakeTheWholeHandshakeBudget reproduces the single-host
+// variant of inbound starvation: one machine opening maxInboundHandshakes
+// sockets that never send a byte used to hold every handshake slot, so every
+// other peer was turned away for as long as it kept reconnecting. Past half
+// the budget a source is now held to maxInboundHandshakesPerSource, and a
+// peer on another host still gets through.
+func TestOneSourceCannotTakeTheWholeHandshakeBudget(t *testing.T) {
+	mgr := NewTorrentManager()
+	if err := mgr.StartPeerListener(0); err != nil {
+		t.Fatalf("start shared listener: %v", err)
+	}
+	t.Cleanup(mgr.Close) // after the idle conns are closed
+	sess := newEncryptionTestManagedSession(t, mgr, "admission-per-source")
+	port := mgr.PeerListenPort()
+
+	var refused atomic.Int32
+	for i := 0; i < maxInboundHandshakes; i++ {
+		conn := dialIdle(t, port)
+		go func() {
+			// A refused connection is closed at once; an admitted one
+			// stays open until the test closes it.
+			if _, err := conn.Read(make([]byte, 1)); err != nil {
+				refused.Add(1)
+			}
+		}()
+	}
+	waitForCondition(t, "the flooding host to be held to half the budget", func() bool {
+		return refused.Load() == maxInboundHandshakes/2 && len(mgr.inboundHandshakeSlots) == maxInboundHandshakes/2
+	})
+
+	handshakeOver(t, dialIdleFrom(t, port, "127.0.0.2"), sess.Torrent.InfoHash)
+}
+
+// TestHandshakeSourceGroupsAddresses pins what one source is: an IPv4 host
+// (however it is written), or an IPv6 /64, which a single host can draw any
+// number of addresses from.
+func TestHandshakeSourceGroupsAddresses(t *testing.T) {
+	key := func(addr net.Addr) string {
+		t.Helper()
+		src, ok := handshakeSource(addr)
+		if !ok {
+			t.Fatalf("handshakeSource(%v) found no source", addr)
+		}
+		return src.String()
+	}
+	for _, tc := range []struct {
+		addr net.Addr
+		want string
+	}{
+		{&net.TCPAddr{IP: net.ParseIP("192.0.2.7"), Port: 6881}, "192.0.2.7"},
+		{&net.TCPAddr{IP: net.ParseIP("::ffff:192.0.2.7"), Port: 51413}, "192.0.2.7"},
+		{&net.UDPAddr{IP: net.ParseIP("192.0.2.7"), Port: 1}, "192.0.2.7"},
+		{&net.TCPAddr{IP: net.ParseIP("2001:db8:1:2:aaaa::1"), Port: 6881}, "2001:db8:1:2::"},
+		{&net.UDPAddr{IP: net.ParseIP("2001:db8:1:2:bbbb:cccc:dddd:eeee"), Port: 6881}, "2001:db8:1:2::"},
+		{&net.TCPAddr{IP: net.ParseIP("2001:db8:1:3::1"), Port: 6881}, "2001:db8:1:3::"},
+		{&net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 6881, Zone: "eth0"}, "fe80::"},
+	} {
+		if got := key(tc.addr); got != tc.want {
+			t.Errorf("handshakeSource(%v) = %s, want %s", tc.addr, got, tc.want)
+		}
+	}
+	if _, ok := handshakeSource(&net.UnixAddr{Name: "sock", Net: "unix"}); ok {
+		t.Error("a non-IP address was given a source")
+	}
 }
 
 // TestRequiredEncryptionRefusesPlaintextAtOnce checks that under
