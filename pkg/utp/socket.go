@@ -421,8 +421,15 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		case refused != nil:
 			// The sender proved it receives what we send, so no budget is
 			// spent. The RESET carries the SYN's connection id, which the
-			// initiator's conn is keyed by.
-			s.writeReset(refused.connID, p, addr)
+			// initiator's conn is keyed by, and acks the last seq_nr the
+			// initiator sent: a STATE carries the next one without sending
+			// it, and libtorrent ignores a RESET acking a seq_nr it has not
+			// sent yet.
+			answered := p
+			if answered.typ == packetTypeState {
+				answered.seqNr--
+			}
+			s.writeReset(refused.connID, answered, addr)
 		case sendReset:
 			s.writeReset(p.connID, p, addr)
 		}

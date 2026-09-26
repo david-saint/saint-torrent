@@ -59,31 +59,47 @@ func TestRefuseIncomingResetsSyn(t *testing.T) {
 // TestRefuseIncomingResetsPendingHandshake checks an initiator whose SYN was
 // answered before refusal began: the packet that would have completed its
 // handshake draws a RESET carrying the SYN's connection id (the id its conn
-// is keyed by) and never reaches Accept.
+// is keyed by) and never reaches Accept. The RESET acks the last seq_nr the
+// initiator sent, which a STATE does not consume: libtorrent ignores a RESET
+// acking one beyond it.
 func TestRefuseIncomingResetsPendingHandshake(t *testing.T) {
-	server, err := NewSocket(0)
-	if err != nil {
-		t.Fatalf("server socket: %v", err)
-	}
-	defer server.Close()
-	ln := server.Listen()
-	defer ln.Close()
-	accepted := acceptAsync(ln)
+	for _, tc := range []struct {
+		name    string
+		typ     packetType
+		payload []byte
+		sentSeq func(synSeq uint16) uint16 // the last seq_nr the initiator sent
+	}{
+		{"data", packetTypeData, []byte("handshake"), func(synSeq uint16) uint16 { return synSeq + 1 }},
+		{"state", packetTypeState, nil, func(synSeq uint16) uint16 { return synSeq }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, err := NewSocket(0)
+			if err != nil {
+				t.Fatalf("server socket: %v", err)
+			}
+			defer server.Close()
+			ln := server.Listen()
+			defer ln.Close()
+			accepted := acceptAsync(ln)
 
-	peer := newRawPeer(t, server)
-	syn := packet{connID: 700, seqNr: 42}
-	synAck := peer.synAck(syn)
-	server.SetRefuseIncoming(true)
+			peer := newRawPeer(t, server)
+			syn := packet{connID: 700, seqNr: 42}
+			synAck := peer.synAck(syn)
+			server.SetRefuseIncoming(true)
 
-	data := packet{typ: packetTypeData, connID: syn.connID + 1, seqNr: syn.seqNr + 1, ackNr: synAck.seqNr - 1, payload: []byte("handshake")}
-	peer.send(data)
-	p := peer.mustRecv("RESET for refused handshake")
-	if p.typ != packetTypeReset || p.connID != syn.connID || p.ackNr != data.seqNr {
-		t.Fatalf("reply to refused handshake: type=%d connID=%d ack=%d, want RESET connID=%d ack=%d", p.typ, p.connID, p.ackNr, syn.connID, data.seqNr)
-	}
-	expectNoAccept(t, accepted, "refused handshake")
-	if conns, halfOpen := socketState(server); conns != 0 || halfOpen != 0 {
-		t.Fatalf("socket state after refused handshake: conns=%d halfOpen=%d, want 0 and 0", conns, halfOpen)
+			// Both carry seq_nr SYN+1: a DATA packet sends it, a STATE only
+			// names it as the next one.
+			ack := packet{typ: tc.typ, connID: syn.connID + 1, seqNr: syn.seqNr + 1, ackNr: synAck.seqNr - 1, payload: tc.payload}
+			peer.send(ack)
+			p := peer.mustRecv("RESET for refused handshake")
+			if want := tc.sentSeq(syn.seqNr); p.typ != packetTypeReset || p.connID != syn.connID || p.ackNr != want {
+				t.Fatalf("reply to refused handshake: type=%d connID=%d ack=%d, want RESET connID=%d ack=%d", p.typ, p.connID, p.ackNr, syn.connID, want)
+			}
+			expectNoAccept(t, accepted, "refused handshake")
+			if conns, halfOpen := socketState(server); conns != 0 || halfOpen != 0 {
+				t.Fatalf("socket state after refused handshake: conns=%d halfOpen=%d, want 0 and 0", conns, halfOpen)
+			}
+		})
 	}
 }
 
