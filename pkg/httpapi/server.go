@@ -25,6 +25,21 @@ const statsVersion = 1
 // the file descriptors that peer sockets and storage need.
 const maxConns = 64
 
+// maxHeaderBytes caps a request's header block (net/http reads 4 KiB past it
+// before answering 431). The API takes only bare GETs, so this is plenty,
+// where net/http's 1 MiB default would let each of the maxConns slots pin a
+// megabyte.
+const maxHeaderBytes = 8 << 10
+
+// statsCacheTTL is how long an encoded /stats body is served again. A snapshot
+// takes every session's lock, so a client polling in a loop (on up to maxConns
+// connections) would otherwise turn its request rate into lock traffic that
+// competes with the peer loops. Dashboards poll at 1 s or slower.
+const statsCacheTTL = 500 * time.Millisecond
+
+// statsSnapshot builds the /stats payload; tests swap it to count builds.
+var statsSnapshot = Snapshot
+
 // ErrNotLoopback is returned by Start when addr is not a loopback address and
 // Options.AllowRemote is unset.
 var ErrNotLoopback = errors.New("address is not loopback")
@@ -75,6 +90,7 @@ func Start(addr string, manager *downloader.TorrentManager, opts Options) (*Serv
 
 	srv := &http.Server{
 		Handler:           NewHandler(manager, host),
+		MaxHeaderBytes:    maxHeaderBytes,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -125,13 +141,59 @@ func NewHandler(manager *downloader.TorrentManager, extraHosts ...string) http.H
 		}
 		writeJSON(w, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		if !allowGet(w, r) {
-			return
-		}
-		writeJSON(w, Snapshot(manager))
-	})
+	mux.Handle("/stats", newStatsHandler(manager))
 	return guard(mux, extraHosts)
+}
+
+// statsHandler serves GET /stats from an encoding cached for statsCacheTTL.
+// Requests that arrive while one of them builds a snapshot queue on mu and
+// then share its bytes, so however many clients poll, sessions are locked for
+// at most one snapshot per statsCacheTTL.
+type statsHandler struct {
+	manager *downloader.TorrentManager
+	now     func() time.Time
+
+	mu sync.Mutex
+	// body is never modified once stored; a rebuild replaces it. The last one
+	// stays until then: the size of one response.
+	body []byte
+	at   time.Time
+}
+
+func newStatsHandler(manager *downloader.TorrentManager) *statsHandler {
+	return &statsHandler{manager: manager, now: time.Now}
+}
+
+func (h *statsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !allowGet(w, r) {
+		return
+	}
+	body, err := h.encoded()
+	if err != nil {
+		http.Error(w, "cannot encode stats", http.StatusInternalServerError)
+		return
+	}
+	setJSONHeaders(w)
+	_, _ = w.Write(body)
+}
+
+// encoded returns the cached /stats body, rebuilding it once it is
+// statsCacheTTL old.
+func (h *statsHandler) encoded() ([]byte, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	if age := now.Sub(h.at); h.body != nil && age >= 0 && age < statsCacheTTL {
+		return h.body, nil
+	}
+	body, err := json.Marshal(statsSnapshot(h.manager))
+	if err != nil {
+		return nil, err
+	}
+	// Byte for byte what writeJSON's json.Encoder writes.
+	h.body = append(body, '\n')
+	h.at = now
+	return h.body, nil
 }
 
 // guard applies the browser-facing checks the API needs even on loopback. A
@@ -276,10 +338,14 @@ func allowGet(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
+	setJSONHeaders(w)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func setJSONHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 // Stats is the JSON snapshot returned by GET /stats.
@@ -444,29 +510,21 @@ func snapshotSession(sess *downloader.Session) TorrentStats {
 		DownloadSpeedBytesPerSecond: sess.CurrentSpeed(),
 		UploadSpeedBytesPerSecond:   sess.CurrentUploadSpeed(),
 		LastError:                   lastErr,
-		Pieces:                      summarizePieces(sess.GetPieceStates()),
+		Pieces:                      snapshotPieces(sess.PieceCounts()),
 		Peers:                       snapshotPeers(sess.GetActivePeers()),
 		Files:                       snapshotFiles(sess),
 	}
 }
 
-func summarizePieces(states []downloader.PieceState) PieceStats {
-	stats := PieceStats{Total: len(states)}
-	for _, state := range states {
-		switch state {
-		case downloader.PieceEmpty:
-			stats.Empty++
-		case downloader.PieceDownloading:
-			stats.Downloading++
-		case downloader.PieceCompleted:
-			stats.Completed++
-		case downloader.PieceUnverified:
-			stats.Unverified++
-		default:
-			stats.Unknown++
-		}
+func snapshotPieces(counts downloader.PieceCounts) PieceStats {
+	return PieceStats{
+		Total:       counts.Total,
+		Empty:       counts.Empty,
+		Downloading: counts.Downloading,
+		Completed:   counts.Completed,
+		Unverified:  counts.Unverified,
+		Unknown:     counts.Unknown,
 	}
-	return stats
 }
 
 func snapshotPeers(peers []downloader.PeerState) []PeerStats {
