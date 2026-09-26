@@ -13,8 +13,10 @@ const (
 	// every 200ms, i.e. 5/s, matching libtorrent's dht_block_ratelimit.
 	queryRateInterval = int64(200 * time.Millisecond)
 	// queryRateBurst is how many back-to-back queries an IP may send before the
-	// sustained rate applies. Honest nodes send a handful per lookup at most.
-	queryRateBurst = 10
+	// sustained rate applies, matching libtorrent's dos_blocker. An honest node
+	// runs several lookups at once, and hosts behind one NAT share an IP, so a
+	// tighter burst would block well-behaved nodes for queryBlockDuration.
+	queryRateBurst = 50
 	// queryBlockDuration is how long an IP that exceeded its rate is ignored,
 	// matching libtorrent's dht_block_timeout. Every query sent while blocked
 	// restarts the window, so a flood keeps itself blocked.

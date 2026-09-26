@@ -10,7 +10,12 @@ import (
 	"sainttorrent/pkg/bencode"
 )
 
+// TestQueryLimiterBurstThenBlock verifies an IP may send libtorrent's burst of
+// 50 back-to-back queries, and is blocked on the next one.
 func TestQueryLimiterBurstThenBlock(t *testing.T) {
+	if queryRateBurst != 50 {
+		t.Fatalf("query burst is %d, want libtorrent's 50", queryRateBurst)
+	}
 	l := newQueryLimiter()
 	flooder := [4]byte{198, 51, 100, 7}
 	other := [4]byte{203, 0, 113, 9}
@@ -196,21 +201,25 @@ func TestRateLimitExemptions(t *testing.T) {
 
 	local := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 7000}
 	id := idInBucket(d.nodeID, 42, 1)
-	for i := 0; i < 50; i++ {
+	const flood = 2 * queryRateBurst
+	for i := 0; i < flood; i++ {
 		conn.injectQuery(t, "lp", "ping", map[string]interface{}{"id": string(id[:])}, local)
 	}
 	drainReadLoop(t, d, conn)
-	// 50 answers to the sender plus one to the drain marker, also on loopback.
-	if got := conn.responsesToIP(local.IP); got != 51 {
-		t.Fatalf("loopback sender was throttled: %d responses to 51 queries", got)
+	// Every answer to the sender plus one to the drain marker, also on loopback.
+	if got := conn.responsesToIP(local.IP); got != flood+1 {
+		t.Fatalf("loopback sender was throttled: %d responses to %d queries", got, flood+1)
 	}
 
 	blocked := &net.UDPAddr{IP: net.ParseIP("198.51.100.8"), Port: 6881}
 	blockedID := idInBucket(d.nodeID, 43, 1)
-	for i := 0; i < 50; i++ {
+	for i := 0; i < flood; i++ {
 		conn.injectQuery(t, "bp", "ping", map[string]interface{}{"id": string(blockedID[:])}, blocked)
 	}
 	drainReadLoop(t, d, conn)
+	if got := conn.responsesToIP(blocked.IP); got > queryRateBurst+1 {
+		t.Fatalf("the flooding sender got %d responses, want it blocked after %d", got, queryRateBurst)
+	}
 
 	ch := make(chan interface{}, 1)
 	d.registerTransaction("ours", blocked, ch)

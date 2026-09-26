@@ -68,7 +68,11 @@ func servedNodes(t *testing.T, c *fakeConn, tid string) []Node {
 		}
 		r, _ := dict["r"].(map[string]interface{})
 		nodes, _ := r["nodes"].(string)
-		return parseCompactNodes(nodes)
+		served, ok := parseCompactNodes(nodes)
+		if !ok {
+			t.Fatalf("response %q carries a malformed node list", tid)
+		}
+		return served
 	}
 	t.Fatalf("no response with transaction %q was sent", tid)
 	return nil

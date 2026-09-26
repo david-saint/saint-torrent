@@ -10,7 +10,8 @@ import (
 )
 
 // checkRoutingIndex verifies nodeAddrs and nodeIPs describe exactly the
-// contacts in the buckets, and that no non-loopback IP holds two contacts.
+// contacts in the buckets, that no non-loopback IP holds two contacts, and
+// that no bucket holds two public contacts on one /24.
 func checkRoutingIndex(t *testing.T, d *DHT) {
 	t.Helper()
 	d.mu.RLock()
@@ -25,6 +26,7 @@ func checkRoutingIndex(t *testing.T, d *DHT) {
 		if len(b.nodes) > bucketSize {
 			t.Fatalf("bucket %d holds %d contacts", idx, len(b.nodes))
 		}
+		subnets := make(map[[3]byte]bool)
 		for _, n := range b.nodes {
 			k, ok := nodeAddrKeyOf(n.Addr)
 			if !ok {
@@ -38,6 +40,13 @@ func checkRoutingIndex(t *testing.T, d *DHT) {
 			}
 			addrs[k] = n.ID
 			ips[k.ip]++
+			if diverse(k.ip) {
+				sn := [3]byte(k.ip[:3])
+				if subnets[sn] {
+					t.Fatalf("bucket %d holds two contacts on %v/24", idx, k.ip)
+				}
+				subnets[sn] = true
+			}
 		}
 	}
 	for ip, n := range ips {
@@ -393,6 +402,40 @@ func TestBootstrapReferralsAreProbedNotInserted(t *testing.T) {
 	}
 }
 
+// TestBootstrapDropsMalformedReply verifies a bootstrap router's find_node
+// answer with a ragged node list is dropped whole: none of its referrals is
+// probed.
+func TestBootstrapDropsMalformedReply(t *testing.T) {
+	router := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 6997}
+	old := DefaultBootstrapHosts
+	DefaultBootstrapHosts = []string{net.JoinHostPort(router.IP.String(), strconv.Itoa(router.Port))}
+	t.Cleanup(func() { DefaultBootstrapHosts = old })
+
+	d, conn := newFakeDHT(t)
+	tid := awaitQueryTo(t, conn, router, "find_node")
+
+	referral := &net.UDPAddr{IP: net.ParseIP("198.51.100.41"), Port: 6881}
+	routerID := idInBucket(d.nodeID, 11, 1)
+	payload, err := bencode.Marshal(map[string]interface{}{
+		"t": tid,
+		"y": "r",
+		"r": map[string]interface{}{
+			"id":    string(routerID[:]),
+			"nodes": compactNodes([]Node{{ID: idInBucket(d.nodeID, 10, 1), Addr: referral}}) + "\x00",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to encode find_node reply: %v", err)
+	}
+	conn.in <- fakePacket{data: payload, addr: router}
+	drainReadLoop(t, d, conn)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(referral, "ping"); got != 0 {
+		t.Fatalf("a referral from a malformed bootstrap reply was probed %d times", got)
+	}
+}
+
 // BenchmarkAddNodeKnownEndpoint measures the PORT-message path for an endpoint
 // already in a large routing table: an O(1) index lookup, not a table scan.
 func BenchmarkAddNodeKnownEndpoint(b *testing.B) {
@@ -467,4 +510,147 @@ func TestQuerySenderProbesLeaveRoomForOtherProbes(t *testing.T) {
 	advertised := &net.UDPAddr{IP: net.ParseIP("203.0.113.200"), Port: 6881}
 	d.AddNode(advertised.IP, uint16(advertised.Port))
 	awaitQueryTo(t, conn, advertised, "ping")
+}
+
+// TestBucketHoldsOneContactPerSlash24 verifies a bucket admits one public
+// contact per /24 (libtorrent's dht_restrict_routing_ips), so a host holding a
+// whole subnet cannot fill it, while other /24s, other buckets and local
+// addresses are unaffected.
+func TestBucketHoldsOneContactPerSlash24(t *testing.T) {
+	const bucket = 30
+	d, _ := newFakeDHT(t)
+	has := func(id [20]byte) bool { return storedAddrFor(d, id) != nil }
+
+	first := idInBucket(d.nodeID, bucket, 1)
+	d.addNode(first, &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881})
+	sibling := idInBucket(d.nodeID, bucket, 2)
+	d.addNode(sibling, &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881})
+	if !has(first) || has(sibling) {
+		t.Fatalf("bucket admitted a second contact on one /24 (first %v, sibling %v)", has(first), has(sibling))
+	}
+
+	neighbour := idInBucket(d.nodeID, bucket, 3)
+	d.addNode(neighbour, &net.UDPAddr{IP: net.ParseIP("198.51.101.2"), Port: 6881})
+	if !has(neighbour) {
+		t.Fatal("a contact on a different /24 was refused")
+	}
+	elsewhere := idInBucket(d.nodeID, bucket+1, 1)
+	d.addNode(elsewhere, &net.UDPAddr{IP: net.ParseIP("198.51.100.3"), Port: 6881})
+	if !has(elsewhere) {
+		t.Fatal("a contact on the same /24 in another bucket was refused")
+	}
+
+	// LAN, link-local and loopback test networks share one subnet by nature.
+	for i, ip := range []string{"10.0.0.1", "10.0.0.2", "192.168.1.1", "192.168.1.2", "169.254.1.1", "169.254.1.2", "127.0.0.2", "127.0.0.3"} {
+		id := idInBucket(d.nodeID, bucket+2+i/2, uint16(i+1))
+		d.addNode(id, &net.UDPAddr{IP: net.ParseIP(ip), Port: 6881})
+		if !has(id) {
+			t.Fatalf("local contact %s was refused for sharing a subnet", ip)
+		}
+	}
+	checkRoutingIndex(t, d)
+}
+
+// TestSlash24RuleOnReplacement verifies the challenge, replacement, probe and
+// re-point paths apply the same one-per-/24 rule as a plain insert, ignoring
+// the contact being replaced.
+func TestSlash24RuleOnReplacement(t *testing.T) {
+	// setup fills bucket with seven LAN contacts and one public contact on
+	// 198.51.100.0/24, then backdates the public contact if stalePublic is
+	// set, otherwise the first LAN contact.
+	setup := func(t *testing.T, bucket int, stalePublic bool) (*DHT, *fakeConn, Node) {
+		d, conn := newFakeDHT(t)
+		for i := 0; i < bucketSize-1; i++ {
+			d.addNode(idInBucket(d.nodeID, bucket, uint16(i+1)), &net.UDPAddr{IP: net.IPv4(10, 4, byte(bucket), byte(i+1)), Port: 6881})
+		}
+		d.addNode(idInBucket(d.nodeID, bucket, 50), &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881})
+		nodes := bucketNodes(d, bucket)
+		if len(nodes) != bucketSize {
+			t.Fatalf("bucket holds %d contacts, want %d", len(nodes), bucketSize)
+		}
+		stale := nodes[0]
+		if stalePublic {
+			stale = nodes[bucketSize-1]
+		}
+		backdateNode(t, d, bucket, stale.ID, time.Now().Add(-nodeQuestionableAfter-time.Minute))
+		return d, conn, stale
+	}
+
+	t.Run("replaceNode", func(t *testing.T) {
+		const bucket = 40
+		d, _, stale := setup(t, bucket, false)
+		sibling := Node{ID: idInBucket(d.nodeID, bucket, 90), Addr: &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}}
+		d.replaceNode(bucket, stale, sibling)
+		if storedAddrFor(d, sibling.ID) != nil {
+			t.Fatal("replaceNode admitted a second contact on a /24")
+		}
+		other := Node{ID: idInBucket(d.nodeID, bucket, 91), Addr: &net.UDPAddr{IP: net.ParseIP("198.51.101.2"), Port: 6881}}
+		d.replaceNode(bucket, stale, other)
+		if storedAddrFor(d, other.ID) == nil {
+			t.Fatal("replaceNode refused a contact on a free /24")
+		}
+		checkRoutingIndex(t, d)
+	})
+
+	t.Run("fresh holder blocks the challenge", func(t *testing.T) {
+		const bucket = 41
+		d, conn, stale := setup(t, bucket, false)
+		sibling := idInBucket(d.nodeID, bucket, 90)
+		d.addNode(sibling, &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881})
+		time.Sleep(50 * time.Millisecond)
+		if got := conn.queriesTo(stale.Addr, "ping"); got != 0 {
+			t.Fatalf("a newcomer barred by its /24 still cost %d challenge pings", got)
+		}
+	})
+
+	t.Run("stale holder is challenged", func(t *testing.T) {
+		const bucket = 42
+		d, conn, stale := setup(t, bucket, true)
+		sibling := idInBucket(d.nodeID, bucket, 90)
+		d.addNode(sibling, &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881})
+		tid := awaitQueryTo(t, conn, stale.Addr, "ping")
+		conn.injectPingReply(t, tid, idInBucket(d.nodeID, 100, 1), stale.Addr)
+		deadline := time.After(5 * time.Second)
+		for storedAddrFor(d, sibling) == nil {
+			select {
+			case <-deadline:
+				t.Fatal("the newcomer never replaced the stale contact holding its /24")
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+		checkRoutingIndex(t, d)
+	})
+
+	t.Run("probe", func(t *testing.T) {
+		const bucket = 43
+		d, conn := newFakeDHT(t)
+		d.addNode(idInBucket(d.nodeID, bucket, 1), &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881})
+		barred := &net.UDPAddr{IP: net.ParseIP("198.51.100.9"), Port: 6881}
+		barredID := idInBucket(d.nodeID, bucket, 2)
+		d.handleQuery("tx", "ping", map[string]interface{}{"id": string(barredID[:])}, barred)
+		free := &net.UDPAddr{IP: net.ParseIP("198.51.102.9"), Port: 6881}
+		freeID := idInBucket(d.nodeID, bucket, 3)
+		d.handleQuery("tx", "ping", map[string]interface{}{"id": string(freeID[:])}, free)
+		awaitQueryTo(t, conn, free, "ping")
+		if got := conn.queriesTo(barred, "ping"); got != 0 {
+			t.Fatalf("a query sender barred by its /24 cost %d probes", got)
+		}
+	})
+
+	t.Run("repoint", func(t *testing.T) {
+		const bucket = 44
+		d, _ := newFakeDHT(t)
+		d.addNode(idInBucket(d.nodeID, bucket, 1), &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 6881})
+		mover := idInBucket(d.nodeID, bucket, 2)
+		from := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
+		d.addNode(mover, from)
+		if d.repointNode(mover, from, &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}) {
+			t.Fatal("a contact was re-pointed onto a /24 its bucket already holds")
+		}
+		rebound := &net.UDPAddr{IP: from.IP, Port: 7001}
+		if !d.repointNode(mover, from, rebound) {
+			t.Fatal("a NAT rebinding on the contact's own IP was refused")
+		}
+		checkRoutingIndex(t, d)
+	})
 }

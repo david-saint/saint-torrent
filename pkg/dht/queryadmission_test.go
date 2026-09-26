@@ -241,7 +241,7 @@ func TestAnnouncePeerWithInvalidTokenDoesNotAddSender(t *testing.T) {
 	if got := d.NodesCount(); got != 0 {
 		t.Fatalf("announce_peer with a bad token added %d nodes", got)
 	}
-	if peers := d.getPeersForInfoHash(infoHash); len(peers) != 0 {
+	if peers := d.getPeersForInfoHash(infoHash, nil); len(peers) != 0 {
 		t.Fatalf("announce_peer with a bad token registered %d peers", len(peers))
 	}
 	if got := conn.queriesTo(addr, "ping"); got != 0 {

@@ -1,8 +1,11 @@
 package dht
 
 import (
+	"encoding/binary"
+	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,7 +51,7 @@ func TestLookupStoresResponderUnderReportedID(t *testing.T) {
 	copy(infoHash[:], "lookup-target-hash--")
 	start := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
 	startID := idInBucket(d.nodeID, 3, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.2"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}
 	honestID := idInBucket(d.nodeID, 50, 1)
 	forged := infoHash
 	forged[19] ^= 1
@@ -115,9 +118,9 @@ func TestLookupTraversalResistsHijack(t *testing.T) {
 	copy(infoHash[:], "hijacked-info-hash--")
 	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
 	attackerID := idAtDistance(infoHash, 0x80, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 6881}
 	honestID := idAtDistance(infoHash, 0x81, 1)
-	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	closest := &net.UDPAddr{IP: net.ParseIP("198.18.0.20"), Port: 6881}
 	victim := net.ParseIP("198.51.100.7")
 
 	special := []*net.UDPAddr{
@@ -184,16 +187,18 @@ func TestLookupResponderCannotFloodCandidateSet(t *testing.T) {
 	copy(infoHash[:], "flooded-lookup-hash-")
 	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
 	attackerID := idAtDistance(infoHash, 0x80, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 6881}
 	honestID := idAtDistance(infoHash, 0x81, 1)
-	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	closest := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 6881}
 	closestID := idAtDistance(infoHash, 0x01, 0)
 
+	// Each junk referral sits on its own /24, so per-subnet dedup alone
+	// cannot absorb the flood.
 	var junk []Node
 	for i := 0; i < 150; i++ {
 		junk = append(junk, Node{
 			ID:   idAtDistance(infoHash, 0, byte(i+1)),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, byte(100+i/100), byte(i%100+1)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
@@ -236,12 +241,13 @@ func TestLookupQueriesClosestAndConverges(t *testing.T) {
 	seedID := idAtDistance(infoHash, 0xFF, 1)
 
 	// Referrals arrive farthest first, so a FIFO crawl would query them in
-	// the wrong order.
+	// the wrong order. Each is on its own /24, and its third octet is its
+	// distance.
 	var referrals []Node
 	for i := 40; i >= 1; i-- {
 		referrals = append(referrals, Node{
 			ID:   idAtDistance(infoHash, byte(i), 0),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
@@ -251,14 +257,14 @@ func TestLookupQueriesClosestAndConverges(t *testing.T) {
 		if sameUDPAddr(to, seed) {
 			return map[string]interface{}{"id": idString(seedID), "nodes": compactNodes(referrals)}
 		}
-		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
 	})
 	d.addNode(seedID, seed)
 
 	d.lookup(infoHash, 0, LookupOptions{})
 
 	for i := 1; i <= 40; i++ {
-		addr := &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881}
+		addr := &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881}
 		got := conn.queriesTo(addr, "get_peers")
 		if i <= dhtLookupK && got != 1 {
 			t.Fatalf("one of the %d closest candidates (distance %d) was queried %d times", dhtLookupK, i, got)
@@ -278,17 +284,18 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 	copy(infoHash[:], "announced-info-hash-")
 	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
 	seedID := idAtDistance(infoHash, 0xFF, 1)
+	// Each referral is on its own /24, and its third octet is its distance.
 	var referrals []Node
 	for i := 1; i <= 20; i++ {
 		referrals = append(referrals, Node{
 			ID:   idAtDistance(infoHash, byte(i), 0),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
 		switch {
 		case q == "announce_peer":
-			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
 		case q != "get_peers":
 			return nil
 		case sameUDPAddr(to, seed):
@@ -296,7 +303,7 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 			// holders in all.
 			return map[string]interface{}{"id": idString(seedID), "token": "tok", "nodes": compactNodes(referrals)}
 		}
-		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0)), "token": "tok"}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0)), "token": "tok"}
 	})
 	d.addNode(seedID, seed)
 
@@ -320,7 +327,7 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 	}
 	for _, a := range announced {
 		ip := a.IP.To4()
-		if ip[0] != 198 || int(ip[3]) > dhtLookupK {
+		if ip[0] != 198 || int(ip[2]) > dhtLookupK {
 			t.Fatalf("announced to %s, which is not among the %d closest", a, dhtLookupK)
 		}
 	}
@@ -448,7 +455,7 @@ func TestLookupFiltersCapsAndDedupsValues(t *testing.T) {
 	copy(infoHash[:], "valued-info-hash----")
 	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.5"), Port: 6881}
 	seedID := idAtDistance(infoHash, 0x80, 1)
-	second := &net.UDPAddr{IP: net.ParseIP("203.0.113.6"), Port: 6881}
+	second := &net.UDPAddr{IP: net.ParseIP("192.0.2.6"), Port: 6881}
 	secondID := idAtDistance(infoHash, 0x01, 1)
 
 	special := []string{
@@ -540,5 +547,290 @@ func TestLookupLoopbackResponderMayHandOutLoopbackPeers(t *testing.T) {
 	peers := drainDiscovered(d)
 	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("127.0.0.1")) || peers[0].Port != 6881 {
 		t.Fatalf("loopback responder's loopback peer was not published: %v", peers)
+	}
+}
+
+// TestAnswersOmitContactsTheAskerMayNotLearn verifies find_node and get_peers
+// answers follow netpolicy's scope rule: a public asker never receives our
+// loopback, LAN or link-local contacts (and still gets a full answer of
+// public ones), a LAN asker gets LAN contacts but not loopback, and a
+// loopback asker gets everything.
+func TestAnswersOmitContactsTheAskerMayNotLearn(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	// Our own ID is the target, so higher buckets are closer. The local
+	// contacts are the closest; ten public ones on distinct /24s follow.
+	target := d.nodeID
+	local := []*net.UDPAddr{
+		{IP: net.ParseIP("127.0.0.1"), Port: 7000},
+		{IP: net.ParseIP("192.168.1.10"), Port: 6881},
+		{IP: net.ParseIP("10.0.0.5"), Port: 6881},
+		{IP: net.ParseIP("169.254.3.3"), Port: 6881},
+	}
+	for i, a := range local {
+		d.addNode(idInBucket(d.nodeID, 120+i, 1), a)
+	}
+	for i := 0; i < 10; i++ {
+		d.addNode(idInBucket(d.nodeID, 100+i, 1), &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881})
+	}
+
+	scope := func(n Node) string {
+		switch n.Addr.IP.To4()[0] {
+		case 127:
+			return "loopback"
+		case 198:
+			return "public"
+		}
+		return "lan"
+	}
+	seq := 0
+	ask := func(asker *net.UDPAddr) map[string]int {
+		t.Helper()
+		seq++
+		id := idInBucket(d.nodeID, 5, uint16(seq))
+		f, g := fmt.Sprintf("f%d", seq), fmt.Sprintf("g%d", seq)
+		d.handleQuery(f, "find_node", map[string]interface{}{"id": string(id[:]), "target": string(target[:])}, asker)
+		d.handleQuery(g, "get_peers", map[string]interface{}{"id": string(id[:]), "info_hash": string(target[:])}, asker)
+		counts := make(map[string]int)
+		for _, tid := range []string{f, g} {
+			served := servedNodes(t, conn, tid)
+			if len(served) != 8 {
+				t.Fatalf("answer to %s carried %d contacts, want 8", asker, len(served))
+			}
+			for _, n := range served {
+				counts[scope(n)]++
+			}
+		}
+		return counts
+	}
+
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("203.0.113.40"), Port: 6881}); got["public"] != 16 {
+		t.Fatalf("a public asker was told about local contacts: %v", got)
+	}
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("192.168.1.50"), Port: 6881}); got["lan"] != 6 || got["loopback"] != 0 {
+		t.Fatalf("a LAN asker got %v, want its 3 LAN-scope contacts per answer and no loopback", got)
+	}
+	if got := ask(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}); got["lan"] != 6 || got["loopback"] != 2 {
+		t.Fatalf("a loopback asker got %v, want every local contact", got)
+	}
+}
+
+// TestGetPeersValuesOmitPeersTheAskerMayNotLearn verifies the values of a
+// get_peers answer follow the same scope rule as its nodes: peers that
+// announced to us from loopback or the LAN are never handed to a public
+// asker, and an asker left with no values gets closer nodes instead.
+func TestGetPeersValuesOmitPeersTheAskerMayNotLearn(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	d.addNode(idInBucket(d.nodeID, 100, 1), &net.UDPAddr{IP: net.ParseIP("198.18.0.1"), Port: 6881})
+
+	var mixed, lanOnly [20]byte
+	copy(mixed[:], "mixed-scope-swarm---")
+	copy(lanOnly[:], "lan-only-swarm------")
+	announce := func(infoHash [20]byte, from *net.UDPAddr) {
+		t.Helper()
+		id := idInBucket(d.nodeID, 30, uint16(from.Port))
+		d.handleQuery("a", "announce_peer", map[string]interface{}{
+			"id":        string(id[:]),
+			"info_hash": string(infoHash[:]),
+			"token":     d.generateToken(from),
+			"port":      int64(from.Port),
+		}, from)
+	}
+	public := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 51413}
+	lan := &net.UDPAddr{IP: net.ParseIP("192.168.1.20"), Port: 51414}
+	loopback := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 51415}
+	for _, from := range []*net.UDPAddr{public, lan, loopback} {
+		announce(mixed, from)
+	}
+	announce(lanOnly, lan)
+
+	seq := 0
+	ask := func(infoHash [20]byte, asker *net.UDPAddr) (values []string, nodes int) {
+		t.Helper()
+		seq++
+		tid := fmt.Sprintf("g%d", seq)
+		id := idInBucket(d.nodeID, 5, uint16(seq))
+		d.handleQuery(tid, "get_peers", map[string]interface{}{"id": string(id[:]), "info_hash": string(infoHash[:])}, asker)
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		for _, p := range conn.sent {
+			parsed, _ := bencode.Unmarshal(p.data)
+			dict, _ := parsed.(map[string]interface{})
+			if dict["y"] != "r" || dict["t"] != tid {
+				continue
+			}
+			r, _ := dict["r"].(map[string]interface{})
+			list, _ := r["values"].([]interface{})
+			for _, v := range list {
+				cp, _ := v.(string)
+				ip := net.IP([]byte(cp[:4]))
+				values = append(values, net.JoinHostPort(ip.String(), strconv.Itoa(int(binary.BigEndian.Uint16([]byte(cp[4:]))))))
+			}
+			nodesStr, _ := r["nodes"].(string)
+			return values, len(nodesStr) / 26
+		}
+		t.Fatalf("no answer to get_peers %s", tid)
+		return nil, 0
+	}
+
+	publicAsker := &net.UDPAddr{IP: net.ParseIP("203.0.113.40"), Port: 6881}
+	if got, _ := ask(mixed, publicAsker); strings.Join(got, " ") != public.String() {
+		t.Fatalf("a public asker was handed %v, want only the public peer", got)
+	}
+	if got, _ := ask(mixed, &net.UDPAddr{IP: net.ParseIP("192.168.1.50"), Port: 6881}); len(got) != 2 {
+		t.Fatalf("a LAN asker was handed %v, want the public and LAN peers", got)
+	}
+	if got, _ := ask(mixed, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}); len(got) != 3 {
+		t.Fatalf("a loopback asker was handed %v, want every peer", got)
+	}
+	if got, nodes := ask(lanOnly, publicAsker); len(got) != 0 || nodes != 1 {
+		t.Fatalf("a public asker of a LAN-only swarm got values %v and %d nodes, want no values and our public contact", got, nodes)
+	}
+}
+
+// TestLookupFailsResponderWithMalformedNodes verifies a get_peers answer whose
+// node list is ragged (jech/dht) fails its responder: its values are ignored,
+// its referrals are not followed and its token is never announced to.
+func TestLookupFailsResponderWithMalformedNodes(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "malformed-nodes-hash")
+	broken := &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 6881}
+	brokenID := idAtDistance(infoHash, 0x01, 1)
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.7"), Port: 6881}
+	honestID := idAtDistance(infoHash, 0x02, 1)
+	referral := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 6881}
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		switch {
+		case q == "announce_peer":
+			return map[string]interface{}{"id": idString(honestID)}
+		case q != "get_peers":
+			return nil
+		case sameUDPAddr(to, broken):
+			return map[string]interface{}{
+				"id":     idString(brokenID),
+				"token":  "tok",
+				"values": []interface{}{compactPeer(net.ParseIP("198.18.0.77"), 6881)},
+				"nodes":  compactNodes([]Node{{ID: infoHash, Addr: referral}}) + "x",
+			}
+		case sameUDPAddr(to, honest):
+			return map[string]interface{}{"id": idString(honestID), "token": "tok"}
+		}
+		return nil
+	})
+	d.addNode(brokenID, broken)
+	d.addNode(honestID, honest)
+
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+
+	awaitQueryTo(t, conn, honest, "announce_peer")
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(broken, "announce_peer"); got != 0 {
+		t.Fatalf("a responder with a malformed node list was announced to %d times", got)
+	}
+	if got := conn.queriesTo(referral, "get_peers"); got != 0 {
+		t.Fatalf("a referral from a malformed node list was queried %d times", got)
+	}
+	if peers := drainDiscovered(d); len(peers) != 0 {
+		t.Fatalf("values from a malformed answer reached the dialer: %v", peers)
+	}
+}
+
+// TestLookupDoesNotEchoOversizedToken verifies a get_peers token longer than
+// dhtMaxTokenLen is never echoed back in announce_peer, while one at the cap
+// still is (rakshasa/libtorrent@fa9812b).
+func TestLookupDoesNotEchoOversizedToken(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "oversized-token-hash")
+	long := &net.UDPAddr{IP: net.ParseIP("203.0.113.8"), Port: 6881}
+	longID := idAtDistance(infoHash, 0x01, 1)
+	capped := &net.UDPAddr{IP: net.ParseIP("192.0.2.8"), Port: 6881}
+	cappedID := idAtDistance(infoHash, 0x02, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		switch {
+		case q == "announce_peer":
+			return map[string]interface{}{"id": idString(cappedID)}
+		case q != "get_peers":
+			return nil
+		case sameUDPAddr(to, long):
+			return map[string]interface{}{"id": idString(longID), "token": strings.Repeat("t", dhtMaxTokenLen+1)}
+		case sameUDPAddr(to, capped):
+			return map[string]interface{}{"id": idString(cappedID), "token": strings.Repeat("t", dhtMaxTokenLen)}
+		}
+		return nil
+	})
+	d.addNode(longID, long)
+	d.addNode(cappedID, capped)
+
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+
+	awaitQueryTo(t, conn, capped, "announce_peer")
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(long, "announce_peer"); got != 0 {
+		t.Fatalf("a %d-byte token was echoed in %d announces", dhtMaxTokenLen+1, got)
+	}
+}
+
+// TestLookupDropsPortOneValues verifies a get_peers value on port 1, the mark
+// of a buggy DHT implementation, never reaches the dialer.
+func TestLookupDropsPortOneValues(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "port-one-values-hash")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0x80, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q == "get_peers" && sameUDPAddr(to, seed) {
+			return map[string]interface{}{"id": idString(seedID), "values": []interface{}{
+				compactPeer(net.ParseIP("198.51.100.80"), 1),
+				compactPeer(net.ParseIP("198.51.100.81"), 6881),
+			}}
+		}
+		return nil
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	peers := drainDiscovered(d)
+	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("198.51.100.81")) || peers[0].Port != 6881 {
+		t.Fatalf("published %v, want only 198.51.100.81:6881", peers)
+	}
+}
+
+// TestLookupSetOneCandidatePerSlash24 verifies a lookup keeps one public
+// candidate per /24 (libtorrent's dht_restrict_search_ips), while LAN
+// addresses keep one per IP and loopback one per port.
+func TestLookupSetOneCandidatePerSlash24(t *testing.T) {
+	var target, self [20]byte
+	copy(target[:], "subnet-lookup-target")
+	self[0] = 0xFF
+	l := newLookupSet(target, self)
+	add := func(ip string, port int, d byte) {
+		k, ok := endpointKey(net.ParseIP(ip), port)
+		if !ok {
+			t.Fatalf("bad endpoint %s:%d", ip, port)
+		}
+		l.add(idAtDistance(target, d, 0), k)
+	}
+	add("198.51.100.1", 6881, 10)
+	add("198.51.100.2", 6881, 1) // closer, but its /24 is taken
+	add("198.51.101.1", 6881, 11)
+	add("192.168.1.1", 6881, 12)
+	add("192.168.1.2", 6881, 13)
+	add("192.168.1.2", 6882, 14) // same LAN IP
+	add("127.0.0.1", 7001, 15)
+	add("127.0.0.1", 7002, 16) // loopback: one per port
+
+	var got []string
+	for _, c := range l.list {
+		got = append(got, c.key.udpAddr().String())
+	}
+	want := []string{"198.51.100.1:6881", "198.51.101.1:6881", "192.168.1.1:6881", "192.168.1.2:6881", "127.0.0.1:7001", "127.0.0.1:7002"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("candidates %v, want %v", got, want)
 	}
 }

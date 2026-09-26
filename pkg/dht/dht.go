@@ -91,6 +91,9 @@ type DHT struct {
 	// and one long entry per (node ID, candidate address) pair.
 	addrCooldowns map[addrChangeKey]time.Time
 
+	// sched queues and paces get_peers lookups; see lookup_scheduler.go.
+	sched lookupScheduler
+
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
@@ -291,9 +294,13 @@ func (d *DHT) NodesCount() int {
 	return count
 }
 
-// Close stops the DHT listener and saves the routing table.
+// Close stops the DHT listener, discards queued lookups and saves the routing
+// table.
 func (d *DHT) Close() {
 	d.closeOnce.Do(func() {
+		// Close the scheduler before cancelling, so a lookup that ends on the
+		// cancellation cannot free a slot for a queued one.
+		d.sched.close()
 		d.cancel()
 		_ = d.conn.Close()
 		d.goMu.Lock()
@@ -408,7 +415,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 
 		d.noteQuerySender(senderID, addr)
 
-		closerNodes := d.closestHeardNodes(targetID, 8)
+		closerNodes := d.closestHeardNodes(targetID, 8, addr)
 		d.sendResponse(t, map[string]interface{}{
 			"id":    string(d.nodeID[:]),
 			"nodes": compactNodes(closerNodes),
@@ -425,7 +432,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		d.noteQuerySender(senderID, addr)
 
 		token := d.generateToken(addr)
-		peers := d.getPeersForInfoHash(infoHash)
+		peers := d.getPeersForInfoHash(infoHash, addr)
 		if len(peers) > 0 {
 			d.sendResponse(t, map[string]interface{}{
 				"id":     string(d.nodeID[:]),
@@ -433,7 +440,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 				"values": peers,
 			}, addr)
 		} else {
-			closerNodes := d.closestHeardNodes(infoHash, 8)
+			closerNodes := d.closestHeardNodes(infoHash, 8, addr)
 			d.sendResponse(t, map[string]interface{}{
 				"id":    string(d.nodeID[:]),
 				"token": token,
@@ -577,10 +584,12 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 	return a.Port == b.Port && a.IP.Equal(b.IP)
 }
 
-func (d *DHT) getPeersForInfoHash(infoHash [20]byte) []interface{} {
+// getPeersForInfoHash returns the peers announced to us for infoHash that
+// asker may be told about; a nil asker gets them all.
+func (d *DHT) getPeersForInfoHash(infoHash [20]byte, asker *net.UDPAddr) []interface{} {
 	d.peersMu.Lock()
 	defer d.peersMu.Unlock()
-	return d.peers.get(infoHash, time.Now())
+	return d.peers.get(infoHash, time.Now(), asker)
 }
 
 func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
@@ -599,25 +608,30 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 // getCloserNodes returns up to count nodes from the routing table closest to
 // target, ordered nearest-first, for seeding our own lookups.
 func (d *DHT) getCloserNodes(target [20]byte, count int) []Node {
-	return d.closestNodes(target, count, false)
+	return d.closestNodes(target, count, false, nil)
 }
 
 // closestHeardNodes is getCloserNodes for the find_node and get_peers answers
-// we give other nodes. It leaves out contacts loaded from disk that have not
-// been heard from this run: the file may predate one-contact-per-IP admission
-// or have been planted, so a saved contact is only handed to the rest of the
-// DHT once it has answered us again. Our own lookups may still start from it.
-func (d *DHT) closestHeardNodes(target [20]byte, count int) []Node {
-	return d.closestNodes(target, count, true)
+// we give asker. It leaves out contacts loaded from disk that have not been
+// heard from this run: the file may predate one-contact-per-IP admission or
+// have been planted, so a saved contact is only handed to the rest of the DHT
+// once it has answered us again. Our own lookups may still start from it. It
+// also leaves out contacts asker may not be told about under netpolicy's
+// scope rule, so a public asker never learns our loopback, LAN or link-local
+// contacts (it could not reach them, and they map our network for it).
+func (d *DHT) closestHeardNodes(target [20]byte, count int, asker *net.UDPAddr) []Node {
+	return d.closestNodes(target, count, true, asker)
 }
 
 // closestNodes returns up to count contacts closest to target, nearest first,
-// skipping never-heard (zero LastSeen) contacts when heardOnly is set. Rather
-// than copying every node out of the table and sorting the copy (which
-// recomputes each XOR distance on every comparison), it keeps a small sorted
-// candidate slice of size <= count and inserts each node into it in place,
-// computing its distance exactly once.
-func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
+// skipping never-heard (zero LastSeen) contacts when heardOnly is set, and,
+// when asker is set, contacts asker may not be told about; the scan goes on
+// past them, so up to count eligible contacts are still returned. Rather than
+// copying every node out of the table and sorting the copy (which recomputes
+// each XOR distance on every comparison), it keeps a small sorted candidate
+// slice of size <= count and inserts each node into it in place, computing its
+// distance exactly once.
+func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool, asker *net.UDPAddr) []Node {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -641,6 +655,15 @@ func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
 				continue
 			}
 			dist := xorDistance(n.ID, target)
+			if len(best) == count && !lessXor(dist, best[count-1].dist) {
+				continue
+			}
+			// Only a contact that would make the cut pays for the scope check.
+			if asker != nil {
+				if k, ok := nodeAddrKeyOf(n.Addr); !ok || !endpointAllowed(k, asker) {
+					continue
+				}
+			}
 
 			if len(best) < count {
 				best = append(best, candidate{node: n, dist: dist})
@@ -650,11 +673,9 @@ func (d *DHT) closestNodes(target [20]byte, count int, heardOnly bool) []Node {
 				continue
 			}
 
-			if lessXor(dist, best[count-1].dist) {
-				best[count-1] = candidate{node: n, dist: dist}
-				for i := count - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
-					best[i], best[i-1] = best[i-1], best[i]
-				}
+			best[count-1] = candidate{node: n, dist: dist}
+			for i := count - 1; i > 0 && lessXor(best[i].dist, best[i-1].dist); i-- {
+				best[i], best[i-1] = best[i-1], best[i]
 			}
 		}
 	}
@@ -713,6 +734,43 @@ func (k nodeAddrKey) udpAddr() *net.UDPAddr {
 // from this host, and local test networks run many nodes on 127.0.0.1.
 func onePerIP(ip [4]byte) bool {
 	return ip[0] != 127
+}
+
+// diverse reports whether ip is held to one contact per /24 in each bucket
+// and one candidate per /24 in each lookup, like libtorrent's
+// dht_restrict_routing_ips and dht_restrict_search_ips, so a host controlling
+// a whole /24 still cannot fill the buckets or steer the lookups near a chosen
+// ID. Loopback, link-local and private (LAN) addresses are exempt, so local and
+// test DHTs, which often share one subnet, keep working.
+func diverse(ip [4]byte) bool {
+	return !netpolicy.IsLocal(netip.AddrFrom4(ip))
+}
+
+// sameSlash24 reports whether a and b are in the same IPv4 /24.
+func sameSlash24(a, b [4]byte) bool {
+	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+// slash24Taken reports whether b bars a contact at k for subnet diversity: k
+// is a diverse address and b already holds a contact on its /24, other than
+// one stored at k itself or under skip (the contact k would replace). The
+// bucket holds at most bucketSize contacts, so the scan is short. Callers
+// hold d.mu.
+func slash24Taken(b *bucket, k nodeAddrKey, skip *[20]byte) bool {
+	if b == nil || !diverse(k.ip) {
+		return false
+	}
+	for i := range b.nodes {
+		n := &b.nodes[i]
+		if skip != nil && n.ID == *skip {
+			continue
+		}
+		nk, ok := nodeAddrKeyOf(n.Addr)
+		if ok && nk != k && sameSlash24(nk.ip, k.ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // endpointAllowed reports whether we may contact k after source told us about
@@ -859,9 +917,11 @@ func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 		return
 	}
 
-	n := Node{ID: id, Addr: k.udpAddr(), LastSeen: seen}
 	if len(b.nodes) < bucketSize {
-		d.appendNodeLocked(b, n)
+		if slash24Taken(b, k, nil) {
+			return
+		}
+		d.appendNodeLocked(b, Node{ID: id, Addr: k.udpAddr(), LastSeen: seen})
 		return
 	}
 	// BEP 5: a bucket full of good contacts simply discards the newcomer; only
@@ -870,6 +930,12 @@ func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 	if b.pingInProgress || !questionable(stale, time.Now()) {
 		return
 	}
+	// The challenged contact may be what holds the newcomer's /24; if it is
+	// replaced, that /24 is free again.
+	if slash24Taken(b, k, &stale.ID) {
+		return
+	}
+	n := Node{ID: id, Addr: k.udpAddr(), LastSeen: seen}
 	b.pingInProgress = true
 	d.goTracked(func() {
 		d.challenge(idx, stale, n)
@@ -943,15 +1009,20 @@ func (d *DHT) replaceNode(idx int, old, newcomer Node) {
 	if onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
 		return
 	}
+	if slash24Taken(b, k, nil) {
+		return
+	}
 	d.appendNodeLocked(b, newcomer)
 }
 
 // noteQuerySender handles the sender of a well-formed inbound query. Its
-// source address is unverified, since UDP is trivially spoofed, so it may only
-// refresh a contact it matches that has already answered us this run (BEP 5:
-// a node that has responded to us and sends us queries is good). A saved
-// contact not yet heard from, and an unknown sender, are pinged through the
-// bounded probe path instead, and admitted or refreshed by what answers there.
+// source address is unverified, since UDP is trivially spoofed, so a query
+// never refreshes a contact: LastSeen only moves on an answer to one of our
+// own queries, matched to a random transaction ID and the address we sent to.
+// Otherwise a spoofer replaying queries in a dead contact's name could keep it
+// looking live and pin it in its bucket. A saved contact not yet heard from,
+// and an unknown sender, are pinged through the bounded probe path, and
+// admitted or refreshed by what answers there. The table is only read here.
 func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	if id == d.nodeID {
 		return
@@ -962,7 +1033,7 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	}
 	idx := bucketIndex(d.nodeID, id)
 
-	d.mu.Lock()
+	d.mu.RLock()
 	probe := false
 	if b := d.buckets[idx]; b != nil {
 		if i := b.indexOf(id); i >= 0 {
@@ -974,10 +1045,8 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 				// A spoofed query naming a saved contact must not make it
 				// look live, or get it handed out, without it answering us.
 				probe = true
-			default:
-				touchLocked(b, i, time.Now())
 			}
-			d.mu.Unlock()
+			d.mu.RUnlock()
 			if probe {
 				d.probeNode(k, true)
 			}
@@ -985,7 +1054,7 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 		}
 	}
 	probe = d.mightAdmitLocked(idx, k)
-	d.mu.Unlock()
+	d.mu.RUnlock()
 
 	if probe {
 		d.probeNode(k, true)
@@ -995,21 +1064,29 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 // mightAdmitLocked reports whether a verified contact at k with an ID in bucket
 // idx could be admitted, so a probe is only spent when it could matter. An
 // endpoint held by another ID is still probed: its answer settles which ID
-// lives there now.
+// lives there now. It mirrors addNodeSeen's admission rules. Callers hold d.mu,
+// read or write.
 func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
 	if _, held := d.nodeAddrs[k]; !held && onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
 		return false
 	}
 	b := d.buckets[idx]
-	if b == nil || len(b.nodes) < bucketSize {
+	if b == nil {
 		return true
 	}
-	return !b.pingInProgress && questionable(b.oldest(), time.Now())
+	if len(b.nodes) < bucketSize {
+		return !slash24Taken(b, k, nil)
+	}
+	if b.pingInProgress {
+		return false
+	}
+	stale := b.oldest()
+	return questionable(stale, time.Now()) && !slash24Taken(b, k, &stale.ID)
 }
 
 // considerAddressChange queues a candidate address for a node ID already in the
-// routing table. Called with d.mu held; it only reserves a slot and hands the
-// network work to a tracked goroutine.
+// routing table. Called with d.mu held (a read lock suffices); it only reserves
+// a slot and hands the network work to a tracked goroutine.
 func (d *DHT) considerAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) {
 	if oldAddr == nil || newAddr == nil {
 		return
@@ -1235,8 +1312,8 @@ func (d *DHT) dropNode(id [20]byte, addr *net.UDPAddr) {
 
 // repointNode moves a verified node from oldAddr to newAddr, leaving the entry
 // alone if it no longer points at oldAddr, or if newAddr is already taken by
-// another contact or would give its IP a second one. It reports whether the
-// move applied.
+// another contact, would give its IP a second one, or would give its bucket a
+// second contact on a diverse /24. It reports whether the move applied.
 func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
 	nk, ok := nodeAddrKeyOf(newAddr)
 	if !ok {
@@ -1263,6 +1340,9 @@ func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
 		others-- // the node itself, moving to another port on the same IP
 	}
 	if onePerIP(nk.ip) && others > 0 {
+		return false
+	}
+	if slash24Taken(b, nk, &id) {
 		return false
 	}
 
@@ -1473,8 +1553,11 @@ func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) 
 		if idStr, _ := rDict["id"].(string); len(idStr) != 20 {
 			return nil, errors.New("invalid responder id")
 		}
-		nodesStr, _ := rDict["nodes"].(string)
-		return parseCompactNodes(nodesStr), nil
+		nodes, ok := nodesField(rDict)
+		if !ok {
+			return nil, errMalformedNodes
+		}
+		return nodes, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -1526,6 +1609,12 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 			return nil, errors.New("invalid responder id")
 		}
 		token, _ := rDict["token"].(string)
+		if len(token) > dhtMaxTokenLen {
+			// We echo the token in announce_peer; an oversized one would make
+			// us send the responder a large packet of its choosing. Dropping
+			// it means we never announce there (rakshasa/libtorrent@fa9812b).
+			token = ""
+		}
 		res := &GetPeersResult{Token: token}
 		copy(res.ID[:], idStr)
 
@@ -1543,10 +1632,13 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 				}
 			}
 		}
-		if nodesVal, exists := rDict["nodes"]; exists {
-			nodesStr, _ := nodesVal.(string)
-			res.Nodes = parseCompactNodes(nodesStr)
+		// A malformed node list fails the whole answer, so the lookup marks
+		// the responder failed and uses neither its token nor its values.
+		nodes, ok := nodesField(rDict)
+		if !ok {
+			return nil, errMalformedNodes
 		}
+		res.Nodes = nodes
 		return res, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1664,6 +1756,9 @@ const (
 	// Honest nodes return at most this many (libtorrent's dht_max_peers_reply;
 	// we return 50), so one response cannot fill our dial slots with hundreds.
 	dhtMaxValuesPerResponse = 100
+	// dhtMaxTokenLen caps the get_peers token we are willing to echo back in
+	// announce_peer. Common implementations use 4 to 20 bytes (ours are 8).
+	dhtMaxTokenLen = 64
 )
 
 type candidateState uint8
@@ -1685,13 +1780,14 @@ type lookupCandidate struct {
 
 // lookupSet is a Kademlia traversal's candidate set: at most
 // dhtLookupCandidates nodes ordered by XOR distance to the target, with at
-// most one per IP (libtorrent's dht_restrict_search_ips), so one host cannot
-// steer the query budget with many ports or IDs.
+// most one per /24 for public addresses and one per IP for local ones
+// (libtorrent's dht_restrict_search_ips), so one host, or one subnet, cannot
+// steer the query budget with many ports, IDs or addresses.
 type lookupSet struct {
 	target [20]byte
 	self   [20]byte
 	list   []lookupCandidate
-	seen   map[nodeAddrKey]struct{} // probeKey of every candidate ever admitted
+	seen   map[nodeAddrKey]struct{} // lookupKey of every candidate ever admitted
 }
 
 func newLookupSet(target, self [20]byte) *lookupSet {
@@ -1703,13 +1799,23 @@ func newLookupSet(target, self [20]byte) *lookupSet {
 	}
 }
 
-// add offers a node as a candidate. It is dropped if its IP was already seen,
-// or if the set is full and it is no closer than the farthest candidate.
+// lookupKey is a candidate's identity in a lookup: its /24 for a diverse
+// address, its probeKey (the IP, or the endpoint on loopback) otherwise.
+func lookupKey(k nodeAddrKey) nodeAddrKey {
+	if diverse(k.ip) {
+		return nodeAddrKey{ip: [4]byte{k.ip[0], k.ip[1], k.ip[2], 0}}
+	}
+	return probeKey(k)
+}
+
+// add offers a node as a candidate. It is dropped if its /24 (or, for a local
+// address, its IP) was already seen, or if the set is full and it is no closer
+// than the farthest candidate.
 func (l *lookupSet) add(id [20]byte, k nodeAddrKey) {
 	if id == l.self {
 		return
 	}
-	sk := probeKey(k)
+	sk := lookupKey(k)
 	if _, dup := l.seen[sk]; dup {
 		return
 	}
@@ -1795,16 +1901,24 @@ type LookupOptions struct {
 }
 
 // Lookup queries the DHT swarm for a given torrent's info-hash and announces
-// peerPort to nodes that return valid tokens.
+// peerPort to nodes that return valid tokens. The lookup is queued; Lookup
+// returns immediately.
 func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 	d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: true})
 }
 
-// LookupWithOptions queries the DHT swarm for a given torrent's info-hash.
+// LookupWithOptions queries the DHT swarm for a given torrent's info-hash. The
+// lookup is queued; LookupWithOptions returns immediately. At most
+// dhtMaxConcurrentLookups run at once and starts are spaced by
+// dhtLookupStartInterval, with an info-hash's first lookup since the DHT
+// started ahead of repeats. A request for an info-hash already queued is
+// merged into it, and one for an info-hash whose lookup is still running is
+// dropped: callers look up again on their own cadence. A queued request is
+// never withdrawn, so one made just before its torrent is paused or removed
+// still runs, and announces if asked to, when its turn comes; with many
+// torrents queued that can be minutes later.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
-	d.goTracked(func() {
-		d.lookup(infoHash, peerPort, opts)
-	})
+	d.queueLookup(infoHash, peerPort, opts)
 }
 
 // lookup runs one get_peers lookup to completion on the calling goroutine. It
@@ -1920,6 +2034,13 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 				}
 				seenPeers[value] = struct{}{}
 				pk := nodeAddrKey{ip: [4]byte(value[:4]), port: binary.BigEndian.Uint16(value[4:])}
+				// Some buggy DHT implementation hands out peers on port 1,
+				// where nothing listens, so a dial would only waste an
+				// outbound slot. Transmission drops these too (remove_bad_pex;
+				// transmission issues #527 and #5218).
+				if pk.port == 1 {
+					continue
+				}
 				// We dial these, so a responder may only hand out peers no
 				// more local than itself: a public node cannot aim our
 				// connections at loopback or LAN services.
@@ -2085,8 +2206,8 @@ func writeNodesFile(path string, data []byte) error {
 }
 
 // readNodesFile reads path only if it is a regular file of sane size, so a
-// symlink or device planted in a shared download directory is ignored rather
-// than followed.
+// symlink, FIFO or device planted in a shared download directory is ignored
+// rather than followed or waited on.
 func readNodesFile(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -2095,17 +2216,19 @@ func readNodesFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() || info.Size() > maxNodesFileSize {
 		return nil, errNodesFileNotRegular
 	}
-	f, err := os.Open(path)
+	// The name may be swapped between Lstat and the open: openNodesFile
+	// neither follows a symlink nor blocks on a FIFO, and what it opened must
+	// be the regular file Lstat saw.
+	f, err := openNodesFile(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	// The name may have been swapped between Lstat and Open.
 	opened, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if !os.SameFile(info, opened) {
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() > maxNodesFileSize {
 		return nil, errNodesFileNotRegular
 	}
 	return io.ReadAll(io.LimitReader(f, maxNodesFileSize))
@@ -2204,23 +2327,49 @@ func compactNodes(nodes []Node) string {
 	return buf.String()
 }
 
-func parseCompactNodes(s string) []Node {
+// errMalformedNodes reports an answer whose "nodes" is not a compact node list.
+var errMalformedNodes = errors.New("malformed nodes")
+
+// nodesField parses the optional "nodes" entry of a response. It reports false
+// when the entry is present but is not a well-formed compact node list.
+func nodesField(r map[string]interface{}) ([]Node, bool) {
+	v, exists := r["nodes"]
+	if !exists {
+		return nil, true
+	}
+	str, ok := v.(string)
+	if !ok {
+		return nil, false
+	}
+	return parseCompactNodes(str)
+}
+
+// parseCompactNodes decodes a BEP 5 compact node list: 26 bytes per node, a
+// 20-byte ID then an IPv4 address and port. It reports false, and returns no
+// nodes, when the length is not a multiple of 26: like jech/dht and rqbit we
+// treat a ragged list as a broken answer rather than guess where it went
+// wrong. Entries with an all-zero ID are skipped, as jech/dht does; no real
+// node draws that ID.
+func parseCompactNodes(s string) ([]Node, bool) {
+	if len(s)%26 != 0 {
+		return nil, false
+	}
 	data := []byte(s)
 	var nodes []Node
 	for len(data) >= 26 {
 		var id [20]byte
 		copy(id[:], data[0:20])
-		ip := net.IP(data[20:24])
-		port := binary.BigEndian.Uint16(data[24:26])
-		nodes = append(nodes, Node{
-			ID: id,
-			Addr: &net.UDPAddr{
-				IP:   ip,
-				Port: int(port),
-			},
-			LastSeen: time.Now(),
-		})
+		if id != ([20]byte{}) {
+			nodes = append(nodes, Node{
+				ID: id,
+				Addr: &net.UDPAddr{
+					IP:   net.IP(data[20:24]),
+					Port: int(binary.BigEndian.Uint16(data[24:26])),
+				},
+				LastSeen: time.Now(),
+			})
+		}
 		data = data[26:]
 	}
-	return nodes
+	return nodes, true
 }

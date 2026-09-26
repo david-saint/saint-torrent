@@ -2,6 +2,7 @@ package dht
 
 import (
 	"encoding/binary"
+	"net"
 	"time"
 )
 
@@ -114,7 +115,11 @@ func (s *peerStore) announce(hash [20]byte, ip [4]byte, port uint16, now time.Ti
 }
 
 // get returns up to maxPeersPerHash live peers for hash as compact values.
-func (s *peerStore) get(hash [20]byte, now time.Time) []interface{} {
+// When asker is set, peers it may not be told about under netpolicy's scope
+// rule are left out, as closestHeardNodes does for contacts: a public asker
+// never learns the loopback or LAN peers that announced to us from this host
+// or its network.
+func (s *peerStore) get(hash [20]byte, now time.Time, asker *net.UDPAddr) []interface{} {
 	sw := s.swarms[hash]
 	if sw == nil {
 		return nil
@@ -125,6 +130,9 @@ func (s *peerStore) get(hash [20]byte, now time.Time) []interface{} {
 	}
 	list := make([]interface{}, 0, len(sw.peers))
 	for _, p := range sw.peers {
+		if asker != nil && !endpointAllowed(nodeAddrKey{ip: p.ip, port: p.port}, asker) {
+			continue
+		}
 		var comp [6]byte
 		copy(comp[0:4], p.ip[:])
 		binary.BigEndian.PutUint16(comp[4:6], p.port)
