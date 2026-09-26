@@ -56,7 +56,7 @@ func TestInboundSequenceNumberingMatchesLibutp(t *testing.T) {
 		_, err := c.Write([]byte("z"))
 		writeDone <- err
 	}()
-	if next := peer.mustRecv("our second DATA"); next.typ != packetTypeData || next.seqNr != r+1 {
+	if next := peer.mustRecvAfter("our second DATA", r+1); next.typ != packetTypeData || next.seqNr != r+1 {
 		t.Fatalf("our second DATA: type=%d seq=%d, want DATA seq=%d", next.typ, next.seqNr, r+1)
 	}
 	peer.send(packet{typ: packetTypeState, connID: syn.connID + 1, seqNr: syn.seqNr + 2, ackNr: r + 1})
@@ -69,7 +69,7 @@ func TestInboundSequenceNumberingMatchesLibutp(t *testing.T) {
 	if _, err := io.ReadFull(c, got[:1]); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if ack := peer.mustRecv("ack of second peer DATA"); ack.typ != packetTypeState || ack.seqNr != r+2 || ack.ackNr != syn.seqNr+2 {
+	if ack := peer.mustRecvAfter("ack of second peer DATA", r+2); ack.typ != packetTypeState || ack.seqNr != r+2 || ack.ackNr != syn.seqNr+2 {
 		t.Fatalf("ack of second peer DATA: type=%d seq=%d ack=%d, want STATE seq=%d ack=%d", ack.typ, ack.seqNr, ack.ackNr, r+2, syn.seqNr+2)
 	}
 }

@@ -69,6 +69,20 @@ func (r *rawPeer) mustRecv(what string) packet {
 	return p
 }
 
+// mustRecvAfter is mustRecv for a peer that has already been sent DATA up to
+// nextSeq-1: retransmits of that DATA, which a loaded machine can send before
+// the peer's ack is processed, are skipped.
+func (r *rawPeer) mustRecvAfter(what string, nextSeq uint16) packet {
+	r.t.Helper()
+	for {
+		p := r.mustRecv(what)
+		if p.typ == packetTypeData && seqLT(p.seqNr, nextSeq) {
+			continue
+		}
+		return p
+	}
+}
+
 // synAck sends a SYN and returns the SYN-ACK it draws.
 func (r *rawPeer) synAck(syn packet) packet {
 	r.t.Helper()
