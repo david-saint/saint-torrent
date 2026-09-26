@@ -370,6 +370,7 @@ func (s *Session) announceAndConnect() int {
 			// A tracker response is authoritative evidence that this endpoint is
 			// dialable, even if the same address was first seen as an inbound peer.
 			pState.Dialable = true
+			pState.markTrackerListed()
 			if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
 				shouldDial = true
 			}

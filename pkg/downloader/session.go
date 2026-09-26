@@ -81,6 +81,9 @@ type PeerState struct {
 	// WebSeed marks a synthetic HTTP source entry. It is kept out of peer-wire
 	// choking and upload stats because no BitTorrent peer exists behind it.
 	WebSeed bool
+	// FailCount counts connection attempts that failed in a row; past
+	// maxPeerFailCount the peer is rarely redialed.
+	FailCount uint8
 
 	WindowBlocks         int
 	TargetWindowBlocks   int

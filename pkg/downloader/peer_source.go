@@ -5,10 +5,48 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"time"
 
 	"sainttorrent/pkg/netpolicy"
 	"sainttorrent/pkg/tracker"
 )
+
+// maxPeerFailCount is how many connection attempts in a row (dial, encryption
+// or handshake) may fail before a known peer is only retried every
+// failedPeerRedialBackoff instead of every peerRedialBackoff, as libtorrent's
+// max_failcount. Otherwise dead or junk addresses fed by DHT, PEX or a tracker
+// hold an outbound slot for a dial timeout every minute for as long as the
+// torrent runs, and keep real peers from being dialed.
+const maxPeerFailCount = 3
+
+// failedPeerRedialBackoff is how often a peer past maxPeerFailCount is still
+// tried, in case it was our own network that failed.
+const failedPeerRedialBackoff = 30 * time.Minute
+
+// redialBackoff is how long after its last attempt ps may be dialed again.
+func (ps *PeerState) redialBackoff() time.Duration {
+	if ps.FailCount >= maxPeerFailCount {
+		return failedPeerRedialBackoff
+	}
+	return peerRedialBackoff
+}
+
+// noteDialFailed counts a failed connection attempt to ps.
+func (ps *PeerState) noteDialFailed() {
+	if ps.FailCount < ^uint8(0) {
+		ps.FailCount++
+	}
+}
+
+// markTrackerListed records that a tracker listed ps's address. As in
+// libtorrent, a tracker listing takes one failure off the count: someone else
+// is apparently reaching the peer, so it earns another try. DHT and PEX
+// listings do not, because anyone can make them.
+func (ps *PeerState) markTrackerListed() {
+	if ps.FailCount > 0 {
+		ps.FailCount--
+	}
+}
 
 // peerAddrPort converts a wire-format peer endpoint for netpolicy. ok is false
 // when ip is not a 4- or 16-byte address.

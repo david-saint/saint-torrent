@@ -152,23 +152,29 @@ func minRetry(a, b time.Duration) time.Duration {
 }
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
-// maxKnownPeers, oldest-attempt-first; active peers are never evicted. Caller holds s.mu.
+// maxKnownPeers: first those past maxPeerFailCount, so a flood of dead addresses
+// cannot push out peers that work, then oldest-attempt-first. Active peers are
+// never evicted. Caller holds s.mu.
 func (s *Session) prunePeersLocked() {
 	if len(s.Peers) <= maxKnownPeers {
 		return
 	}
 	type agedPeer struct {
-		addr string
-		at   time.Time
+		addr   string
+		at     time.Time
+		failed bool
 	}
 	inactive := make([]agedPeer, 0, len(s.Peers))
 	for addr, ps := range s.Peers {
 		if ps.Active {
 			continue
 		}
-		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt})
+		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt, failed: ps.FailCount >= maxPeerFailCount})
 	}
 	sort.Slice(inactive, func(i, j int) bool {
+		if inactive[i].failed != inactive[j].failed {
+			return inactive[i].failed
+		}
 		return inactive[i].at.Before(inactive[j].at)
 	})
 	// Evict down to ~75% of the cap so pruning isn't triggered on every insert.
@@ -211,6 +217,7 @@ func (s *Session) markPeerAttemptFailed(peerAddr string) {
 	if ps, ok := s.Peers[peerAddr]; ok {
 		ps.Active = false
 		ps.LastAttempt = time.Now()
+		ps.noteDialFailed()
 	}
 	s.mu.Unlock()
 }
@@ -292,7 +299,7 @@ func (s *Session) maintainPeerConnections() {
 		// Eligible to (re)dial once the backoff has elapsed. A zero LastAttempt means
 		// "dial now" (e.g. Resume clears it on every inactive peer); the dedup against a
 		// concurrent dial is the LastAttempt = now set below, under the lock.
-		if !ps.LastAttempt.IsZero() && now.Sub(ps.LastAttempt) <= peerRedialBackoff {
+		if !ps.LastAttempt.IsZero() && now.Sub(ps.LastAttempt) <= ps.redialBackoff() {
 			continue
 		}
 		ip := net.ParseIP(ps.IP)
@@ -457,6 +464,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		ps.LastAttempt = time.Now()
 		ps.Dialable = true
 		ps.Dialing = false
+		ps.FailCount = 0
 	}
 	s.mu.Unlock()
 
@@ -2941,7 +2949,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		// Discovery supplies a listening endpoint, so an inbound-only entry with the
 		// same address becomes eligible for maintenance retries.
 		pState.Dialable = true
-		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
+		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > pState.redialBackoff() {
 			shouldDial = true
 		}
 	}
