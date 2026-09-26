@@ -570,6 +570,8 @@ func (s *Session) Start() {
 		wasPaused := s.paused
 		if wasPaused {
 			s.paused = false
+			// Wake pause-state waiters (webseeds, the DHT loop) as Resume does.
+			s.renewPauseStateChLocked()
 			s.queueTrackerEventLocked("started")
 			for _, pState := range s.Peers {
 				if !pState.Active {

@@ -148,4 +148,12 @@ func TestDHTLookupAfterResumeA2(t *testing.T) {
 	}
 	sess.Resume()
 	waitLookup("after resume")
+
+	// Start resumes a started session too, and must wake the loop the same way.
+	sess.Pause()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	sess.Start()
+	waitLookup("after a resume through Start")
 }
