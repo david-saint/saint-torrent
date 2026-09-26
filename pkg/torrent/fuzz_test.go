@@ -4,7 +4,9 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"math"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -63,6 +65,9 @@ func FuzzParseTorrent(f *testing.F) {
 		if len(tor.InfoBytes) == 0 {
 			t.Fatalf("accepted torrent without raw info bytes")
 		}
+		if !safeName(tor.Name) {
+			t.Fatalf("unsafe display name %q", tor.Name)
+		}
 		if got := sha1.Sum(tor.InfoBytes); got != tor.InfoHash {
 			t.Fatalf("info hash mismatch: got %x from info bytes, torrent has %x", got, tor.InfoHash)
 		}
@@ -86,6 +91,11 @@ func FuzzParseTorrent(f *testing.F) {
 			}
 			if len(file.Path) == 0 {
 				t.Fatalf("accepted file without path")
+			}
+			for _, comp := range file.Path {
+				if !safeName(comp) || comp == "" || comp == "." || comp == ".." || strings.ContainsAny(comp, `/\`) {
+					t.Fatalf("unsafe path component %q", comp)
+				}
 			}
 			if totalLength > math.MaxInt64-file.Length {
 				t.Fatalf("accepted torrent with overflowing total file length")
@@ -132,6 +142,20 @@ func FuzzParseMagnet(f *testing.F) {
 			t.Fatalf("magnet info hash changed after round trip: got %x, want %x", roundTrip.InfoHash, ml.InfoHash)
 		}
 	})
+}
+
+// safeName reports whether s is valid UTF-8 of at most maxComponentBytes with
+// no control or invisible formatting characters.
+func safeName(s string) bool {
+	if len(s) > maxComponentBytes || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || isInvisibleFormat(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func addTorrentSeed(f *testing.F, value map[string]interface{}) {

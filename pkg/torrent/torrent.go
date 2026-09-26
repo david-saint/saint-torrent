@@ -5,7 +5,6 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -43,7 +42,7 @@ type Torrent struct {
 	InfoHash    [20]byte
 	PieceLength int64
 	PieceHashes [][20]byte
-	Name        string
+	Name        string // Display name, sanitized like a file name and at most 255 bytes
 	Files       []File
 	InfoBytes   []byte // Raw bencoded info dictionary
 	Private     bool   // BEP 27 private torrents must use trackers only
@@ -258,26 +257,27 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 	if err := checkPieceCount(numPieces, pieceLength, totalLength); err != nil {
 		return nil, err
 	}
+	// Reject paths that differ only in case or Unicode normalization: case- or
+	// normalization-insensitive filesystems would store them as one file.
+	seenPaths := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		relPath := filepath.Join(f.Path...)
+		key := pathKey(relPath)
+		if _, dup := seenPaths[key]; dup {
+			return nil, fmt.Errorf("duplicate file path detected in torrent metadata: %q", relPath)
+		}
+		seenPaths[key] = struct{}{}
+	}
 	pieceHashes := make([][20]byte, numPieces)
 	for i := range pieceHashes {
 		copy(pieceHashes[i][:], piecesStr[i*20:])
-	}
-	// Check for case-insensitive duplicate paths
-	seenPaths := make(map[string]bool)
-	for _, f := range files {
-		relPath := filepath.Join(f.Path...)
-		lowerPath := strings.ToLower(filepath.Clean(relPath))
-		if seenPaths[lowerPath] {
-			return nil, fmt.Errorf("duplicate file path detected in torrent metadata: %q", relPath)
-		}
-		seenPaths[lowerPath] = true
 	}
 
 	return &Torrent{
 		InfoHash:    sha1.Sum(infoBytes),
 		PieceLength: pieceLength,
 		PieceHashes: pieceHashes,
-		Name:        name,
+		Name:        sanitizeName(name),
 		Files:       files,
 		InfoBytes:   infoBytes,
 		Private:     private,
@@ -308,22 +308,6 @@ func checkFileLength(length int64) error {
 		return fmt.Errorf("file length %d exceeds the maximum of %d", length, MaxTotalLength)
 	}
 	return nil
-}
-
-func sanitizePathComponent(p string) string {
-	// Clean up any path separators or relative directory navigation
-	p = filepath.Clean(p)
-	// Remove any leading/trailing slash or backslash
-	p = strings.Trim(p, "/\\")
-	// If it contains ".." or is empty, sanitize to prevent traversal
-	if p == ".." || p == "." || p == "" {
-		return "safe_name"
-	}
-	// Replace path separators to prevent breaking out
-	p = strings.ReplaceAll(p, "/", "_")
-	p = strings.ReplaceAll(p, "\\", "_")
-	p = strings.ReplaceAll(p, "..", "_")
-	return p
 }
 
 func getString(m map[string]interface{}, key string) (string, bool) {

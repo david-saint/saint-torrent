@@ -62,7 +62,7 @@ func ParseMagnet(uri string) (*MagnetLink, error) {
 
 	return &MagnetLink{
 		InfoHash: infoHash,
-		Name:     params.Get("dn"),
+		Name:     sanitizeName(params.Get("dn")),
 		Trackers: trackers.list,
 	}, nil
 }
