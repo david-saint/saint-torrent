@@ -1652,6 +1652,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		s.clearMetadataBlameLocked()
 		s.lastErr = err
 		s.statusErr = err
+		s.closeActivePeersLocked() // the session is metadata-stalled now
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return err
@@ -1751,6 +1752,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		s.clearMetadataBlameLocked()
 		s.verifiedMetadata = infoBytes
 		s.scheduleMetadataStorageRetryLocked()
+		s.closeActivePeersLocked() // the session is metadata-stalled now
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return statusErr
@@ -1857,8 +1859,36 @@ func (s *Session) retryMetadataStorage() {
 	infoBytes := s.verifiedMetadata
 	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed
 	s.mu.Unlock()
-	if ready {
-		_ = s.onMetadataDownloaded(infoBytes)
+	if ready && s.onMetadataDownloaded(infoBytes) == nil {
+		// The session dropped and refused every peer while metadata-stalled:
+		// let maintenance dial the known ones again at once.
+		s.mu.Lock()
+		for _, ps := range s.Peers {
+			if !ps.Active && !ps.Dialing {
+				ps.LastAttempt = time.Time{}
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// metadataStalledLocked reports whether a magnet has its info dict but cannot
+// use it: it failed to parse, or storage could not be built from it (a retry
+// is armed). Peers are of no use until that changes, so the session dials
+// none, drops the ones it has and refuses new ones, instead of holding shared
+// outbound slots with connections that sit idle. Caller holds s.mu (read or
+// write).
+func (s *Session) metadataStalledLocked() bool {
+	return s.metadataMode && s.metadataCompleted && s.statusErr != nil
+}
+
+// closeActivePeersLocked closes every active peer connection; each loop's
+// disconnect handler then releases it. Caller holds s.mu.
+func (s *Session) closeActivePeersLocked() {
+	for _, client := range s.activePeers {
+		if client.Conn != nil {
+			_ = client.Conn.Close()
+		}
 	}
 }
 

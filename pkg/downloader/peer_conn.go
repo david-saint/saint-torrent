@@ -370,7 +370,8 @@ func (s *Session) maintainPeerConnections() {
 	// Only maintain download connections while there is still something to fetch.
 	// When seeding, inbound connections and the normal announce flow cover uploads;
 	// isCompletedLocked is false in metadata mode, so metadata fetches still churn.
-	if s.isCompletedLocked() {
+	// A magnet whose metadata cannot be used yet has no use for peers.
+	if s.isCompletedLocked() || s.metadataStalledLocked() {
 		return
 	}
 
@@ -719,8 +720,9 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 	paused := s.paused
 	closed := s.closed
 	banned := s.refusesIncomingLocked(conn.RemoteAddr())
+	stalled := s.metadataStalledLocked()
 	s.mu.RUnlock()
-	if paused || closed || banned {
+	if paused || closed || banned || stalled {
 		return
 	}
 
@@ -817,7 +819,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// here, under the same lock that registers the connection, so none slips
 	// past purgeDiscoveryPeersLocked.
 	var reason string
-	if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
+	if s.metadataStalledLocked() {
+		reason = "metadata_error"
+	} else if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
 		reason = "private_discovery_peer"
 		s.forgetRefusedPeerLocked(peerAddr)
 	} else {
@@ -3303,7 +3307,7 @@ func (s *Session) dhtLoop() {
 		select {
 		case <-ticker.C:
 			s.mu.RLock()
-			paused = s.paused
+			paused = s.paused || s.metadataStalledLocked()
 			d = s.DHT
 			peerPort = s.Port
 			hasInbound = s.hasInboundListenerLocked()
@@ -3386,8 +3390,9 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		}
 	}
 
-	// Don't exceed the outbound connection cap.
-	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host)) {
+	// Don't exceed the outbound connection cap, and dial nobody while the
+	// metadata cannot be used.
+	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host) || s.metadataStalledLocked()) {
 		shouldDial = false
 	}
 

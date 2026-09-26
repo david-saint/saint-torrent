@@ -253,8 +253,10 @@ func TestMetadataNoRefetchLoopOnStorageFailure(t *testing.T) {
 	w.expectMetadataRequests(3, 0, 1)
 	w.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 0))
 	w.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 1))
-	// The barrier's own message already runs the new-round check.
-	after := w.barrier()
+	// A session whose metadata cannot be used drops its peers (see
+	// metadataStalledLocked); until then it must not ask again either.
+	after := w.collect(300 * time.Millisecond)
+	w.waitClosed(2 * time.Second)
 
 	sess.mu.RLock()
 	statusErr := sess.statusErr
@@ -262,7 +264,6 @@ func TestMetadataNoRefetchLoopOnStorageFailure(t *testing.T) {
 	if statusErr == nil {
 		t.Fatal("expected the storage failure to be reported")
 	}
-	after = append(after, w.collect(300*time.Millisecond)...)
 	for _, msg := range after {
 		if msg.ID == peer.MsgExtended {
 			t.Fatal("peer was asked for metadata again after a storage failure")

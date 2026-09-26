@@ -683,7 +683,7 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 		// Same key form as the DHT and PEX paths ("[v6]:port" for IPv6).
 		peerAddr := ap.String()
 		s.mu.Lock()
-		if s.closed || s.paused || slotsHeld+launched >= maxOutboundPeers {
+		if s.closed || s.paused || slotsHeld+launched >= maxOutboundPeers || s.metadataStalledLocked() {
 			s.mu.Unlock()
 			break
 		}
