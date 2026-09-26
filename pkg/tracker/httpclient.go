@@ -23,9 +23,10 @@ import (
 // libtorrent's ssrf_mitigation:
 //
 //   - A destination may be at most as local as the URL that led to it. A
-//     loopback or private address is reachable only when the request's original
-//     URL named a literal local IP or "localhost", and only through a hop whose
-//     own host is such a literal: a hostname must resolve to a public address.
+//     loopback or private (RFC 1918, carrier-grade NAT, unique-local) address
+//     is reachable only when the request's original URL named a literal local
+//     IP or "localhost", and only through a hop whose own host is such a
+//     literal: a hostname must resolve to a public address.
 //     The check runs on the address actually dialed, so DNS rebinding and
 //     redirects cannot get around it.
 //   - Link-local (including 169.254.169.254 cloud metadata), unspecified,

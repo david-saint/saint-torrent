@@ -2,7 +2,9 @@ package tracker
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +20,7 @@ func TestDestinationAllowed(t *testing.T) {
 	public := netip.Addr{}
 	loop := netip.MustParseAddr("127.0.0.1")
 	lan := netip.MustParseAddr("192.168.1.5")
+	cgnat := netip.MustParseAddr("100.64.1.2")
 	cases := []struct {
 		dst    string
 		source netip.Addr
@@ -33,6 +36,15 @@ func TestDestinationAllowed(t *testing.T) {
 		{"10.0.0.1", loop, true},
 		{"10.0.0.1", lan, true},
 		{"127.0.0.1", lan, false}, // a LAN URL cannot reach loopback
+		// Carrier-grade NAT space (ISP services, Tailscale's 100.100.100.100
+		// and tailnet nodes) is private, as in libtorrent's is_local.
+		{"100.100.100.100", public, false},
+		{"100.64.1.2", lan, true},
+		{"100.64.1.2", loop, true},
+		{"100.64.1.3", cgnat, true},
+		{"10.0.0.1", cgnat, true},
+		{"127.0.0.1", cgnat, false},
+		{"fec0::1", public, false},
 		// Link-local (cloud metadata) and non-unicast are refused whatever
 		// the source claims.
 		{"169.254.169.254", public, false},
@@ -81,6 +93,8 @@ func TestNewRequestAppliesDestinationPolicy(t *testing.T) {
 		{"lan tracker", PurposeAnnounce, "http://192.168.1.1/announce.php", false},
 		{"loopback webseed", PurposeWebseed, "http://127.0.0.1:8000/f.bin", false},
 		{"lan webseed with query", PurposeWebseed, "http://192.168.1.1/apply.cgi?dns=6.6.6.6", true},
+		{"cgnat tracker", PurposeAnnounce, "http://100.64.1.2/announce.php", false},
+		{"cgnat webseed with query", PurposeWebseed, "http://100.100.100.100/apply.cgi?dns=6.6.6.6", true},
 		{"public webseed with query", PurposeWebseed, "https://cdn.example/f.bin?sig=abc", false},
 	}
 	for _, c := range cases {
@@ -226,6 +240,140 @@ func TestDialRefusesLocalAddressForPublicOrigin(t *testing.T) {
 	}
 	if got := accepted.Load(); got != 1 {
 		t.Fatalf("listener accepted %d connections, want only the loopback-origin one", got)
+	}
+}
+
+// fakeResolver answers every A query with a and every other query with no
+// records, over in-memory connections, so a hostname can be made to resolve
+// anywhere without touching the network.
+func fakeResolver(a [4]byte) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			client, server := net.Pipe()
+			go serveFakeDNS(server, a)
+			return client, nil
+		},
+	}
+}
+
+// serveFakeDNS answers one DNS query on c. The Go resolver frames messages
+// with a two-byte length (as over TCP) on a conn that is not a PacketConn.
+func serveFakeDNS(c net.Conn, a [4]byte) {
+	defer c.Close()
+	var n [2]byte
+	if _, err := io.ReadFull(c, n[:]); err != nil {
+		return
+	}
+	q := make([]byte, binary.BigEndian.Uint16(n[:]))
+	if _, err := io.ReadFull(c, q); err != nil || len(q) < 12 {
+		return
+	}
+	// Echo the header and question, dropping the query's EDNS record.
+	end := 12
+	for end < len(q) && q[end] != 0 {
+		end += int(q[end]) + 1
+	}
+	end += 5 // root label, QTYPE, QCLASS
+	if end > len(q) {
+		return
+	}
+	resp := append([]byte(nil), q[:end]...)
+	// Response, recursion desired and available, NOERROR; no answer,
+	// authority or additional records unless the query is for an A record.
+	resp[2], resp[3] = 0x81, 0x80
+	clear(resp[6:12])
+	if qtype := binary.BigEndian.Uint16(q[end-4:]); qtype == 1 {
+		resp[7] = 1
+		// Name (pointer to the question), A, IN, TTL 60, RDLENGTH 4, address.
+		resp = append(resp, 0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4)
+		resp = append(resp, a[:]...)
+	}
+	_, _ = c.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(resp))), resp...))
+}
+
+// TestHostnameResolvingToCGNATIsRefused: a tracker or webseed hostname must
+// resolve to a public address. Carrier-grade NAT space (100.64.0.0/10) holds
+// ISP-internal services and Tailscale's 100.100.100.100 resolver and tailnet
+// nodes, so a name resolving there is now refused like one resolving to a LAN
+// address, on the address actually dialed.
+func TestHostnameResolvingToCGNATIsRefused(t *testing.T) {
+	saved := baseDialer
+	baseDialer.Resolver = fakeResolver([4]byte{100, 100, 100, 100})
+	// Bound to loopback, a dial the policy wrongly allowed fails locally
+	// instead of leaving the machine.
+	baseDialer.LocalAddr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	t.Cleanup(func() { baseDialer = saved })
+	addrs, err := baseDialer.Resolver.LookupNetIP(context.Background(), "ip4", "cgnat-tracker.test")
+	if err != nil || len(addrs) != 1 || addrs[0] != netip.MustParseAddr("100.100.100.100") {
+		t.Skipf("the in-memory resolver is not used on this platform: %v, %v", addrs, err)
+	}
+
+	for _, c := range []struct {
+		purpose Purpose
+		url     string
+	}{
+		{PurposeAnnounce, "http://cgnat-tracker.test/announce"},
+		{PurposeWebseed, "http://cgnat-seed.test/files/f.bin"},
+	} {
+		req, err := NewRequest(context.Background(), c.purpose, c.url)
+		if err != nil {
+			t.Fatalf("NewRequest(%q) = %v; a hostname is judged when dialed", c.url, err)
+		}
+		ctx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+		conn, err := dialWithPolicy(ctx, "tcp", net.JoinHostPort(req.URL.Hostname(), "80"))
+		cancel()
+		if err == nil {
+			conn.Close()
+			t.Fatalf("dial for %q connected to 100.100.100.100", c.url)
+		}
+		if !errors.Is(err, ErrDestinationRefused) || !strings.Contains(err.Error(), "100.100.100.100") {
+			t.Fatalf("dial for %q: err = %v, want the resolved address 100.100.100.100 refused", c.url, err)
+		}
+	}
+}
+
+// TestCGNATLiteralTreatedLikeLANLiteral: a URL naming a CGNAT address
+// literally follows exactly the rules for an RFC 1918 literal: allowed as the
+// request's own origin, able to reach local (not loopback) addresses, and
+// refused as a hop of a request that started from a public URL.
+func TestCGNATLiteralTreatedLikeLANLiteral(t *testing.T) {
+	const lan, cgnat = "192.168.1.2", "100.64.1.2"
+	for _, purpose := range []Purpose{PurposeAnnounce, PurposeScrape, PurposeWebseed} {
+		for _, rest := range []string{"/announce", "/announce.php?passkey=1", "/scrape", ":8080/admin/reboot?confirm=yes", "/f.bin", "/apply.cgi?dns=6.6.6.6"} {
+			_, lanErr := NewRequest(context.Background(), purpose, "http://"+lan+rest)
+			_, cgnatErr := NewRequest(context.Background(), purpose, "http://"+cgnat+rest)
+			if (lanErr == nil) != (cgnatErr == nil) || errors.Is(lanErr, ErrDestinationRefused) != errors.Is(cgnatErr, ErrDestinationRefused) {
+				t.Errorf("purpose %d, %q: LAN literal err = %v, CGNAT literal err = %v, want the same outcome", purpose, rest, lanErr, cgnatErr)
+			}
+		}
+	}
+
+	public := &requestPolicy{purpose: PurposeAnnounce}
+	for _, host := range []string{lan, cgnat} {
+		origin := localAddr(host)
+		if !origin.IsValid() {
+			t.Fatalf("localAddr(%s) = zero, want the literal as a local origin", host)
+		}
+		control := DestinationControl(hopSource(host, &requestPolicy{purpose: PurposeAnnounce, origin: origin}))
+		for _, dst := range []string{"100.64.9.9:80", "192.168.9.9:80", "203.0.113.5:80"} {
+			if err := control(context.Background(), "tcp", dst, nil); err != nil {
+				t.Errorf("request from %s: dial %s = %v, want allowed", host, dst, err)
+			}
+		}
+		for _, dst := range []string{"127.0.0.1:80", "169.254.169.254:80"} {
+			if err := control(context.Background(), "tcp", dst, nil); !errors.Is(err, ErrDestinationRefused) {
+				t.Errorf("request from %s: dial %s = %v, want refused", host, dst, err)
+			}
+		}
+		// A public tracker redirecting to the literal cannot reach it.
+		u, err := url.Parse("http://" + host + "/announce")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := public.checkURL(u); !errors.Is(err, ErrDestinationRefused) {
+			t.Errorf("hop to %s from a public origin = %v, want refused", host, err)
+		}
 	}
 }
 
