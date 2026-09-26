@@ -89,7 +89,7 @@ func escapeBinary(b []byte) string {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' {
 			sb.WriteByte(c)
 		} else {
-			sb.WriteString(fmt.Sprintf("%%%02X", c))
+			fmt.Fprintf(&sb, "%%%02X", c)
 		}
 	}
 	return sb.String()
