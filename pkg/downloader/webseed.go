@@ -315,14 +315,15 @@ func (p *webseedPool) succeeded(src *webseedSource) {
 }
 
 // restAfterError returns how long src rests after a failed range request:
-// retired for a permanent failure, otherwise its growing backoff or the
+// retired for a permanent failure (including a destination the SSRF policy
+// refuses, which retrying cannot change), otherwise its growing backoff or the
 // server's Retry-After, whichever is longer.
 func (p *webseedPool) restAfterError(src *webseedSource, err error) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var se *webseedStatusError
 	isStatus := errors.As(err, &se)
-	if isStatus && se.permanent {
+	if (isStatus && se.permanent) || errors.Is(err, tracker.ErrDestinationRefused) {
 		return retireWebseedLocked(src)
 	}
 	src.backoff = nextWebseedBackoff(src.backoff)

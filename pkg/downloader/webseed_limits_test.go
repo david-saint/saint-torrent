@@ -345,13 +345,16 @@ func TestWebseedRejectsCredentialsAndRedactsErrors(t *testing.T) {
 
 func TestWebseedRedirectToLocalServiceRefused(t *testing.T) {
 	t.Cleanup(swapDuration(&webseedIdleDelay, 10*time.Millisecond))
-	var internalHits atomic.Int32
+	t.Cleanup(swapDuration(&webseedRetryBaseDelay, 5*time.Millisecond))
+	t.Cleanup(swapDuration(&webseedRetryMaxDelay, 10*time.Millisecond))
+	var internalHits, mirrorHits atomic.Int32
 	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		internalHits.Add(1)
 	}))
 	defer internal.Close()
 	target := strings.Replace(internal.URL, "http://", "http://admin:admin@", 1) + "/apply.cgi?dns=6.6.6.6"
 	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirrorHits.Add(1)
 		http.Redirect(w, r, target, http.StatusFound)
 	}))
 	defer mirror.Close()
@@ -360,8 +363,12 @@ func TestWebseedRedirectToLocalServiceRefused(t *testing.T) {
 	sess := newWebseedTestSession(t, tor)
 	startWebseedsForTest(t, sess)
 	waitFor(t, "webseed error", 3*time.Second, func() bool { return sess.LastError() != nil })
+	time.Sleep(100 * time.Millisecond) // many retry periods
 	if internalHits.Load() != 0 {
 		t.Fatal("webseed redirect reached a credentialed local target")
+	}
+	if got := mirrorHits.Load(); got != 1 {
+		t.Fatalf("mirror redirecting to a refused target was asked %d times, want 1 (retired)", got)
 	}
 	if got := sess.LastError().Error(); strings.Contains(got, "admin") || strings.Contains(got, "dns=") {
 		t.Fatalf("LastError leaks the redirect target: %q", got)

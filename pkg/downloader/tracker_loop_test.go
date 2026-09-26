@@ -475,15 +475,17 @@ func TestAnnounceRefusesLocalServiceTracker(t *testing.T) {
 }
 
 func TestAnnounceKeysIPv6PeersWithBrackets(t *testing.T) {
+	// [::1]:1 from a loopback tracker: allowed by netpolicy, and the dial
+	// fails fast (refused, or no IPv6) without leaving the machine.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		peer := string(net.ParseIP("2001:db8::1").To16()) + "\x1a\xe1"
+		peer := string(net.IPv6loopback) + "\x00\x01"
 		_, _ = fmt.Fprintf(w, "d8:intervali1800e6:peers6%d:%se", len(peer), peer)
 	}))
 	defer srv.Close()
 	sess := newTrackerTestSession(t, "ipv6", srv.URL+"/announce")
 	sess.announceAndConnect()
 
-	const key = "[2001:db8::1]:6881"
+	const key = "[::1]:1"
 	sess.mu.RLock()
 	_, ok := sess.Peers[key]
 	sess.mu.RUnlock()
@@ -491,7 +493,7 @@ func TestAnnounceKeysIPv6PeersWithBrackets(t *testing.T) {
 		t.Fatalf("IPv6 tracker peer not recorded under %q (err=%v)", key, sess.LastError())
 	}
 	// connectToPeer must use the same key, or the dial never clears Dialing.
-	waitFor(t, "IPv6 dial to finish", 20*time.Second, func() bool {
+	waitFor(t, "IPv6 dial to finish", 10*time.Second, func() bool {
 		sess.mu.RLock()
 		defer sess.mu.RUnlock()
 		return !sess.Peers[key].Dialing

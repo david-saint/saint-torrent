@@ -112,7 +112,7 @@ func trackerMessage(s string) string {
 	if len(s) > maxTrackerMessage {
 		s = s[:maxTrackerMessage]
 	}
-	s = strings.ToValidUTF8(s, "�")
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) > maxTrackerMessage {
 		// Replacement characters grew it; cut again on a rune boundary.
 		cut := maxTrackerMessage
