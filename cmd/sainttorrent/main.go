@@ -186,6 +186,7 @@ type cliOptions struct {
 	listenPort           int
 	httpAddr             string
 	httpAllowRemote      bool
+	httpAllowHosts       []string
 	natEnabled           bool
 	encryption           mse.Policy
 	storage              storage.Backend
@@ -1302,6 +1303,9 @@ Options:
                             (loopback only, e.g. 127.0.0.1:16666)
       --http-allow-remote   Allow --http-addr on a LAN or wildcard address; the
                             API has no authentication
+      --http-allow-host <name>
+                            Also answer requests for this host name, e.g. the
+                            LAN or reverse-proxy name (repeatable)
       --log <path>          Write JSON-lines debug logs to a rotating file, or
                             to /dev/stderr or /dev/stdout
       --log-level <level>   Log level: debug, info, warn, or error
@@ -1390,6 +1394,18 @@ func parseCLIArgs(args []string) cliOptions {
 			i++
 		case "--http-allow-remote":
 			opts.httpAllowRemote = true
+		case "--http-allow-host":
+			if i+1 >= len(args) {
+				opts.err = fmt.Errorf("%s requires a host name", args[i])
+				continue
+			}
+			name := strings.TrimSpace(args[i+1])
+			i++
+			if err := httpapi.CheckAllowHost(name); err != nil {
+				opts.err = fmt.Errorf("--http-allow-host: %w", err)
+				continue
+			}
+			opts.httpAllowHosts = append(opts.httpAllowHosts, name)
 		case "--no-nat":
 			opts.natEnabled = false
 		case "--encryption":
@@ -2006,7 +2022,10 @@ func main() {
 
 	var statsServer *httpapi.Server
 	if opts.httpAddr != "" {
-		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{AllowRemote: opts.httpAllowRemote})
+		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{
+			AllowRemote: opts.httpAllowRemote,
+			AllowHosts:  opts.httpAllowHosts,
+		})
 		if err != nil {
 			listener.Close()
 			acceptLoopWG.Wait()

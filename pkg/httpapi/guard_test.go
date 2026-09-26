@@ -146,6 +146,50 @@ func TestStartLoopbackReportsAndServesGuardedHandler(t *testing.T) {
 	}
 }
 
+// TestStartAllowsConfiguredHosts: with --http-addr 0.0.0.0:P the listen host
+// is "0.0.0.0", so a LAN dashboard at http://nas.lan:P, a compose or Kubernetes
+// scraper using the service name, or a proxy that forwards the client Host
+// (Caddy and Traefik do by default) got 421 with no way to allow the name.
+// Options.AllowHosts (--http-allow-host) accepts exactly the names listed.
+func TestStartAllowsConfiguredHosts(t *testing.T) {
+	server, err := Start("127.0.0.1:0", nil, Options{AllowHosts: []string{"nas.lan", "SaintTorrent"}})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = server.Shutdown(t.Context()) }()
+	for host, want := range map[string]int{
+		"nas.lan:16666":            http.StatusOK,
+		"sainttorrent":             http.StatusOK,
+		"other.lan":                http.StatusMisdirectedRequest,
+		"nas.lan.attacker.example": http.StatusMisdirectedRequest,
+	} {
+		req, err := http.NewRequest(http.MethodGet, "http://"+server.Addr()+"/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /healthz with Host %q: %v", host, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Fatalf("Host %q: status = %d, want %d", host, resp.StatusCode, want)
+		}
+		if want == http.StatusMisdirectedRequest && !strings.Contains(string(body), "--http-allow-host") {
+			t.Fatalf("Host %q: 421 body %q does not say how to allow the name", host, body)
+		}
+	}
+
+	for _, bad := range []string{"", "http://nas.lan", "nas.lan:16666", "*.lan", "nas..lan", "192.168.1.2", "nas lan"} {
+		if server, err := Start("127.0.0.1:0", nil, Options{AllowHosts: []string{bad}}); err == nil {
+			_ = server.Shutdown(t.Context())
+			t.Fatalf("Start accepted the allowed host %q", bad)
+		}
+	}
+}
+
 // Idle connections beyond the cap must wait in the kernel backlog instead of
 // each holding a descriptor and a goroutine.
 func TestLimitListenerCapsConcurrentConnections(t *testing.T) {

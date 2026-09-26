@@ -1740,6 +1740,29 @@ func TestParseCLIArgsStartPaused(t *testing.T) {
 	}
 }
 
+// TestParseCLIArgsHTTPAllowHost: --http-allow-host is repeatable, and a value
+// that is not a bare host name is refused at startup rather than never
+// matching a request.
+func TestParseCLIArgsHTTPAllowHost(t *testing.T) {
+	opts := parseCLIArgs([]string{"--http-addr", "0.0.0.0:16666", "--http-allow-remote",
+		"--http-allow-host", "nas.lan", "--http-allow-host", "sainttorrent"})
+	if opts.err != nil || !slices.Equal(opts.httpAllowHosts, []string{"nas.lan", "sainttorrent"}) || !opts.httpAllowRemote {
+		t.Fatalf("parseCLIArgs = %+v (err %v), want both allowed hosts", opts.httpAllowHosts, opts.err)
+	}
+	for _, args := range [][]string{
+		{"--http-allow-host"},
+		{"--http-allow-host", "http://nas.lan:16666"},
+		{"--http-allow-host", "*.lan"},
+	} {
+		if opts := parseCLIArgs(args); opts.err == nil {
+			t.Fatalf("parseCLIArgs(%q) accepted it", args)
+		}
+	}
+	if !strings.Contains(usageText(), "--http-allow-host") {
+		t.Fatal("usage text does not list --http-allow-host")
+	}
+}
+
 // TestDeleteKeepingCrossSeedFilesIsNotAnError: a removal that kept files a
 // cross-seed still uses went through, so the TUI shows it as a note and
 // returns to the list instead of showing a deletion error.

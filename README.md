@@ -199,9 +199,25 @@ To resist DNS rebinding, the API answers only requests whose `Host` is an IP
 literal, `localhost`, or the host given to `--http-addr` (others get `421`),
 and it rejects browser requests from other sites (`Sec-Fetch-Site` of
 `cross-site`/`same-site`, or a foreign `Origin`) with `403`. `curl`, scripts,
-and a URL typed into the browser are unaffected. A reverse proxy in front of it
-must forward a `Host` of `127.0.0.1` or `localhost` (nginx's default does). At
-most 64 connections are served at once.
+and a URL typed into the browser are unaffected. At most 64 connections are
+served at once.
+
+To reach the API by another name, such as `http://nas.lan:16666` on a wildcard
+bind or a container's service name, allow that name with `--http-allow-host`
+(repeatable). List only names you control: a page served under an allowed name
+can read the API.
+
+```bash
+./sainttorrent --headless --http-addr 0.0.0.0:16666 --http-allow-remote \
+  --http-allow-host nas.lan --http-allow-host sainttorrent
+```
+
+A reverse proxy in front of the API must forward a `Host` of `127.0.0.1` or
+`localhost`, or a name allowed with `--http-allow-host`. nginx's default does
+(`proxy_pass http://127.0.0.1:16666` sends `Host: 127.0.0.1:16666`). Caddy
+and Traefik forward the client's `Host` by default: set
+`header_up Host {upstream_hostport}` in Caddy's `reverse_proxy`, or
+`passHostHeader: false` on the Traefik service.
 
 In headless mode, forwarded torrent requests that require confirmation are
 rejected; use `--no-confirm` when scripting additions into a headless instance.
