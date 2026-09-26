@@ -21,6 +21,7 @@ import (
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
+	"sainttorrent/pkg/torrent"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -1478,13 +1479,14 @@ func TestParseItemBoundsTorrentFileReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(maxTorrentFileSize + 1); err != nil {
+	// The same bound as the manager's (torrent.MaxFileSize).
+	if err := f.Truncate(torrent.MaxFileSize + 1); err != nil {
 		f.Close()
 		t.Fatal(err)
 	}
 	f.Close()
-	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "too large") {
-		t.Fatalf("oversized file: err = %v; want too large", err)
+	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "larger than the maximum") {
+		t.Fatalf("oversized file: err = %v; want larger than the maximum", err)
 	}
 
 	if _, _, err := parseItem(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {

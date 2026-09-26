@@ -1172,11 +1172,6 @@ func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
 // this exact lowercase spelling.
 const magnetPrefix = "magnet:?"
 
-// maxTorrentFileSize bounds a .torrent read from disk. It is far above real
-// torrents (libtorrent's default limit is 10 MB) and stops a path such as
-// /dev/zero from growing the heap until the process is killed.
-const maxTorrentFileSize = 64 << 20
-
 // urlScheme returns the lowercased RFC 3986 scheme of item, or "" for a plain
 // path. A scheme needs at least two characters so Windows drive letters
 // (C:\x.torrent) stay paths.
@@ -1238,10 +1233,12 @@ func parseItem(item string) (name string, hashHex string, err error) {
 	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
 }
 
-// readTorrentFile reads a .torrent from disk. parseItem can run on the TUI's
-// event loop, so it refuses anything but a regular file (opening a FIFO
-// blocks, and a device such as /dev/zero never ends) and anything larger than
-// maxTorrentFileSize.
+// readTorrentFile reads a .torrent from disk the way the manager does
+// (torrent.ReadFile: at most torrent.MaxFileSize, regular files only).
+// parseItem can run on the TUI's event loop, where opening a FIFO blocks and
+// a device such as /dev/zero never ends. torrent.ReadFile checks what it
+// opened; the Stat here also refuses those before any open, which keeps the
+// event loop safe with a torrent.ReadFile that opens before it checks.
 func readTorrentFile(path string) ([]byte, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -1250,22 +1247,7 @@ func readTorrentFile(path string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s: not a regular file", path)
 	}
-	if fi.Size() > maxTorrentFileSize {
-		return nil, fmt.Errorf("%s: torrent file too large (%d bytes, max %d)", path, fi.Size(), maxTorrentFileSize)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxTorrentFileSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxTorrentFileSize {
-		return nil, fmt.Errorf("%s: torrent file too large (max %d bytes)", path, maxTorrentFileSize)
-	}
-	return data, nil
+	return torrent.ReadFile(path)
 }
 
 // normalizeForwardedItems prepares items for a running instance, whose working
