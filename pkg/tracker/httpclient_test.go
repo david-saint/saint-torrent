@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -292,11 +293,13 @@ func serveFakeDNS(c net.Conn, a [4]byte) {
 	_, _ = c.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(resp))), resp...))
 }
 
-// TestHostnameResolvingToCGNATIsRefused: a tracker or webseed hostname must
-// resolve to a public address. Carrier-grade NAT space (100.64.0.0/10) holds
-// ISP-internal services and Tailscale's 100.100.100.100 resolver and tailnet
-// nodes, so a name resolving there is now refused like one resolving to a LAN
-// address, on the address actually dialed.
+// TestHostnameResolvingToCGNATIsRefused: a webseed hostname, or any hostname
+// on a redirect hop, must resolve to a public address. Carrier-grade NAT space
+// (100.64.0.0/10) holds ISP-internal services and Tailscale's 100.100.100.100
+// resolver and tailnet nodes, so a name resolving there is refused like one
+// resolving to a LAN address, on the address actually dialed. (A tracker's own
+// hostname on the first hop may resolve there; see
+// TestTrackerHostnameReachesLocalTracker.)
 func TestHostnameResolvingToCGNATIsRefused(t *testing.T) {
 	saved := baseDialer
 	baseDialer.Resolver = fakeResolver([4]byte{100, 100, 100, 100})
@@ -329,6 +332,175 @@ func TestHostnameResolvingToCGNATIsRefused(t *testing.T) {
 		}
 		if !errors.Is(err, ErrDestinationRefused) || !strings.Contains(err.Error(), "100.100.100.100") {
 			t.Fatalf("dial for %q: err = %v, want the resolved address 100.100.100.100 refused", c.url, err)
+		}
+	}
+}
+
+// TestTrackerHostnameReach: as in libtorrent, a tracker named by a hostname
+// may resolve to a private address, where LAN, company and tailnet trackers
+// live, and to loopback when its path is a tracker endpoint. Webseed
+// hostnames, and literal hosts (judged by checkURL), get public only.
+func TestTrackerHostnameReach(t *testing.T) {
+	for _, c := range []struct {
+		purpose Purpose
+		url     string
+		want    hostReach
+	}{
+		{PurposeAnnounce, "http://tracker.lan:6969/announce", reachLoopback},
+		{PurposeAnnounce, "http://tracker.lan:6969/announce.php?passkey=1", reachLoopback},
+		{PurposeAnnounce, "http://tracker.lan/tr/announce", reachPrivate},
+		{PurposeAnnounce, "http://tracker.lan/announce/../admin", reachPrivate},
+		{PurposeScrape, "http://tracker.lan/scrape", reachLoopback},
+		{PurposeScrape, "http://tracker.lan/announce", reachPrivate},
+		{PurposeWebseed, "http://mirror.lan/announce", reachPublic},
+		{PurposeAnnounce, "http://192.168.1.10/announce", reachPublic},
+		{PurposeAnnounce, "http://localhost:6969/announce", reachPublic},
+	} {
+		u, err := url.Parse(c.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := trackerHostnameReach(c.purpose, u); got != c.want {
+			t.Errorf("trackerHostnameReach(%d, %q) = %d, want %d", c.purpose, c.url, got, c.want)
+		}
+	}
+
+	for _, c := range []struct {
+		reach hostReach
+		dst   string
+		want  bool
+	}{
+		{reachPublic, "93.184.216.34", true},
+		{reachPublic, "192.168.1.10", false},
+		{reachPublic, "127.0.0.1", false},
+		{reachPrivate, "192.168.1.10", true},
+		{reachPrivate, "10.0.0.5", true},
+		{reachPrivate, "100.100.100.100", true},
+		{reachPrivate, "fd00::1", true},
+		{reachPrivate, "127.0.0.1", false},
+		{reachPrivate, "169.254.169.254", false},
+		{reachLoopback, "127.0.0.1", true},
+		{reachLoopback, "::1", true},
+		{reachLoopback, "10.0.0.5", true},
+		{reachLoopback, "169.254.169.254", false},
+		{reachLoopback, "fe80::1", false},
+		{reachLoopback, "0.0.0.0", false},
+		{reachLoopback, "224.0.0.1", false},
+	} {
+		if got := c.reach.allows(netip.MustParseAddr(c.dst)); got != c.want {
+			t.Errorf("reach %d allows(%s) = %v, want %v", c.reach, c.dst, got, c.want)
+		}
+	}
+}
+
+// TestTrackerHostnameReachesLocalTracker: a tracker whose hostname resolves
+// to a local address (here loopback, as a name in /etc/hosts would) is
+// announced to and scraped on its tracker endpoints. A non-endpoint path on
+// it, a webseed on the same host, and a redirect from it to another path are
+// refused, none of them reusing the tracker's pooled connection.
+func TestTrackerHostnameReachesLocalTracker(t *testing.T) {
+	saved := baseDialer
+	baseDialer.Resolver = fakeResolver([4]byte{127, 0, 0, 1})
+	t.Cleanup(func() { baseDialer = saved })
+	addrs, err := baseDialer.Resolver.LookupNetIP(context.Background(), "ip4", "lan-tracker.test")
+	if err != nil || len(addrs) != 1 || addrs[0] != netip.MustParseAddr("127.0.0.1") {
+		t.Skipf("the in-memory resolver is not used on this platform: %v, %v", addrs, err)
+	}
+
+	var mu sync.Mutex
+	var paths []string
+	var redirectTarget string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		if r.URL.Path == "/announce-redirect" {
+			http.Redirect(w, r, redirectTarget, http.StatusFound)
+			return
+		}
+		_, _ = io.WriteString(w, "d8:intervali60ee")
+	}))
+	t.Cleanup(srv.Close)
+	_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	base := "http://lan-tracker.test:" + port
+	redirectTarget = base + "/admin/reboot"
+
+	// A client of its own, without a proxy from the environment, so the
+	// hostname is dialed directly.
+	client := newHTTPClient()
+	pt := client.Transport.(*policyTransport)
+	for _, tr := range []*http.Transport{pt.base, pt.private, pt.loopback} {
+		tr.Proxy = nil
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	get := func(purpose Purpose, rawURL string) error {
+		req, err := NewRequest(context.Background(), purpose, rawURL)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return nil
+	}
+
+	for _, c := range []struct {
+		purpose Purpose
+		path    string
+	}{
+		{PurposeAnnounce, "/announce?info_hash=x"},
+		{PurposeScrape, "/scrape?info_hash=x"},
+		{PurposeAnnounce, "/announce?info_hash=y"}, // on the pooled connection
+	} {
+		if err := get(c.purpose, base+c.path); err != nil {
+			t.Fatalf("GET %s: %v, want the local tracker reached", c.path, err)
+		}
+	}
+	for _, c := range []struct {
+		purpose Purpose
+		path    string
+	}{
+		{PurposeAnnounce, "/admin/reboot"},
+		{PurposeScrape, "/admin/scrape"},
+		{PurposeWebseed, "/f.bin"},
+		{PurposeAnnounce, "/announce-redirect"}, // the redirect hop is refused
+	} {
+		if err := get(c.purpose, base+c.path); !errors.Is(err, ErrDestinationRefused) {
+			t.Fatalf("GET %s (purpose %d): err = %v, want ErrDestinationRefused", c.path, c.purpose, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"/announce", "/scrape", "/announce", "/announce-redirect"}
+	if strings.Join(paths, " ") != strings.Join(want, " ") {
+		t.Fatalf("tracker saw %v, want %v", paths, want)
+	}
+}
+
+// TestUDPTrackerHostnameReachesLAN: a UDP tracker named by a hostname may
+// resolve to a private address. Its path is not sent, so it cannot vouch for
+// loopback, which takes a literal address.
+func TestUDPTrackerHostnameReachesLAN(t *testing.T) {
+	for _, c := range []struct {
+		host, dst string
+		want      bool
+	}{
+		{"tracker.lan", "192.168.1.10:6969", true},
+		{"tracker.lan", "100.64.1.2:6969", true},
+		{"tracker.lan", "93.184.216.34:6969", true},
+		{"tracker.lan", "127.0.0.1:6969", false},
+		{"tracker.lan", "169.254.169.254:6969", false},
+		{"127.0.0.1", "127.0.0.1:6969", true},
+		{"localhost", "127.0.0.1:6969", true},
+		{"192.168.1.10", "192.168.1.10:6969", true},
+		{"192.168.1.10", "127.0.0.1:6969", false},
+	} {
+		err := udpDialControl(c.host)(context.Background(), "udp", c.dst, nil)
+		if allowed := err == nil; allowed != c.want {
+			t.Errorf("UDP tracker %s dialing %s: err = %v, want allowed %v", c.host, c.dst, err, c.want)
 		}
 	}
 }

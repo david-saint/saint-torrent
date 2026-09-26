@@ -323,6 +323,24 @@ not exit cleanly, and:
 Start with `--start-paused` to restore every torrent paused regardless, for
 example to get past a crash loop and resume torrents one at a time.
 
+### Trackers and web seeds on your network
+
+Tracker and web seed URLs come from the torrent, so saintTorrent limits which
+local services they can reach, as libtorrent does:
+
+- A tracker named by a hostname (`http://tracker.lan:6969/announce`, a
+  company tracker, a Tailscale MagicDNS name) may resolve to a LAN,
+  carrier-grade NAT or unique-local address, and to loopback when its path
+  starts with `/announce` (or `/scrape`). A UDP tracker on loopback must be
+  written as `127.0.0.1`, `[::1]` or `localhost`.
+- A tracker or web seed written as a literal LAN or loopback address is
+  reached as written (a loopback tracker's path must start with `/announce`,
+  and a local web seed URL may not carry a query string).
+- A web seed named by a hostname must resolve to a public address, and a
+  redirect reaches a LAN or loopback address only when both the original URL
+  and the redirect name local addresses literally. Link-local addresses
+  (including cloud metadata at `169.254.169.254`) are never reached.
+
 ---
 
 ## Known limitations

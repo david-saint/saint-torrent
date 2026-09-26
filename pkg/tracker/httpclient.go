@@ -24,9 +24,12 @@ import (
 //
 //   - A destination may be at most as local as the URL that led to it. A
 //     loopback or private (RFC 1918, carrier-grade NAT, unique-local) address
-//     is reachable only when the request's original URL named a literal local
-//     IP or "localhost", and only through a hop whose own host is such a
-//     literal: a hostname must resolve to a public address.
+//     is reachable when the request's original URL named a literal local IP
+//     or "localhost", through a hop whose own host is such a literal. A
+//     tracker named by a hostname may resolve to a private address too, and
+//     to loopback under the path rule below, as in libtorrent: LAN, company
+//     and tailnet trackers are usually reached by name. Any other hostname,
+//     a webseed's or a redirect's, must resolve to a public address.
 //     The check runs on the address actually dialed, so DNS rebinding and
 //     redirects cannot get around it.
 //   - Link-local (including 169.254.169.254 cloud metadata), unspecified,
@@ -86,6 +89,62 @@ type requestPolicy struct {
 	// origin is the original URL's own address when its host is a literal
 	// loopback or private IP or "localhost"; the zero Addr (public) otherwise.
 	origin netip.Addr
+	// hostnameReach is what the original URL's host may resolve to on the
+	// request's first hop when it is a hostname (see trackerHostnameReach).
+	// Redirect hops never get it.
+	hostnameReach hostReach
+}
+
+// hostReach is what a hostname may resolve to.
+type hostReach uint8
+
+const (
+	// reachPublic allows public addresses only.
+	reachPublic hostReach = iota
+	// reachPrivate adds private addresses (RFC 1918, carrier-grade NAT,
+	// unique-local).
+	reachPrivate
+	// reachLoopback adds private and loopback addresses.
+	reachLoopback
+)
+
+// allows reports whether a hostname with this reach may resolve to dst.
+// Link-local, unspecified, multicast and broadcast never qualify.
+func (r hostReach) allows(dst netip.Addr) bool {
+	switch netpolicy.Classify(dst) {
+	case netpolicy.ScopeGlobal:
+		return true
+	case netpolicy.ScopePrivate:
+		return r >= reachPrivate
+	case netpolicy.ScopeLoopback:
+		return r >= reachLoopback
+	}
+	return false
+}
+
+// trackerHostnameReach is what the host of a tracker URL u for purpose may
+// resolve to on the request's first hop, as libtorrent allows: a private
+// address, where LAN, company and tailnet trackers live, and loopback only
+// when u's path is a tracker endpoint (see trackerEndpointPath). Webseed
+// hostnames, and hosts that are literal addresses (judged by checkURL), get
+// reachPublic.
+func trackerHostnameReach(purpose Purpose, u *url.URL) hostReach {
+	if _, literal := literalAddr(u.Hostname()); literal {
+		return reachPublic
+	}
+	switch purpose {
+	case PurposeAnnounce:
+		if trackerEndpointPath(u.Path, "/announce") {
+			return reachLoopback
+		}
+		return reachPrivate
+	case PurposeScrape:
+		if trackerEndpointPath(u.Path, "/scrape") {
+			return reachLoopback
+		}
+		return reachPrivate
+	}
+	return reachPublic
 }
 
 type policyKey struct{}
@@ -118,7 +177,7 @@ func newHTTPClient() *http.Client {
 	t.MaxResponseHeaderBytes = maxResponseHeaderBytes
 	t.MaxIdleConnsPerHost = httpMaxIdleConnsPerHost
 	return &http.Client{
-		Transport:     &policyTransport{base: t},
+		Transport:     newPolicyTransport(t),
 		CheckRedirect: checkRedirect,
 	}
 }
@@ -134,7 +193,7 @@ func NewRequest(ctx context.Context, purpose Purpose, rawURL string) (*http.Requ
 	if err != nil {
 		return nil, err
 	}
-	p := &requestPolicy{purpose: purpose, origin: localAddr(u.Hostname())}
+	p := &requestPolicy{purpose: purpose, origin: localAddr(u.Hostname()), hostnameReach: trackerHostnameReach(purpose, u)}
 	if err := p.checkURL(u); err != nil {
 		return nil, err
 	}
@@ -176,8 +235,10 @@ func localAddr(host string) netip.Addr {
 
 // hopSource returns the address a destination reached through host is judged
 // against: the request's local origin when host is itself a literal local
-// address, otherwise the zero Addr (public). A hostname can therefore only
-// ever reach public addresses, whatever it resolves to.
+// address, otherwise the zero Addr (public). A hostname hop can therefore only
+// reach public addresses, whatever it resolves to; the one exception, a
+// tracker's own hostname on the first hop, is dialed by its own transport
+// (see policyTransport).
 func hopSource(host string, p *requestPolicy) netip.Addr {
 	if localAddr(host).IsValid() {
 		return p.origin
@@ -256,24 +317,51 @@ func trackerEndpointPath(path, prefix string) bool {
 }
 
 // policyTransport checks every hop, including each redirect, before handing
-// it to the real transport.
+// it to the real transport. The first hop of a tracker request naming a
+// hostname goes through a transport of its own for that hostname's reach
+// (private, or private and loopback), whose dialer allows those addresses:
+// separate connection pools, so a connection to a local tracker is never
+// reused by a request that could not have dialed it itself (a redirect, a
+// webseed, or a tracker path that fails the loopback path rule).
 type policyTransport struct {
-	base *http.Transport
+	base     *http.Transport // every other hop: dialWithPolicy
+	private  *http.Transport // tracker hostnames with reachPrivate
+	loopback *http.Transport // tracker hostnames with reachLoopback
+}
+
+func newPolicyTransport(base *http.Transport) *policyTransport {
+	t := &policyTransport{base: base, private: base.Clone(), loopback: base.Clone()}
+	t.private.DialContext = hostnameDialer(reachPrivate)
+	t.loopback.DialContext = hostnameDialer(reachLoopback)
+	return t
 }
 
 func (t *policyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := policyFrom(req.Context()).checkURL(req.URL); err != nil {
+	p := policyFrom(req.Context())
+	if err := p.checkURL(req.URL); err != nil {
 		if req.Body != nil {
 			_ = req.Body.Close()
 		}
 		return nil, err
 	}
+	// Response is set on the requests a client creates to follow redirects,
+	// and only on those: nil means the request's own URL.
+	if req.Response == nil {
+		switch p.hostnameReach {
+		case reachPrivate:
+			return t.private.RoundTrip(req)
+		case reachLoopback:
+			return t.loopback.RoundTrip(req)
+		}
+	}
 	return t.base.RoundTrip(req)
 }
 
-// CloseIdleConnections lets http.Client.CloseIdleConnections reach the pool.
+// CloseIdleConnections lets http.Client.CloseIdleConnections reach the pools.
 func (t *policyTransport) CloseIdleConnections() {
 	t.base.CloseIdleConnections()
+	t.private.CloseIdleConnections()
+	t.loopback.CloseIdleConnections()
 }
 
 func checkRedirect(req *http.Request, via []*http.Request) error {
@@ -306,16 +394,36 @@ func dialWithPolicy(ctx context.Context, network, addr string) (net.Conn, error)
 	return d.DialContext(ctx, network, addr)
 }
 
+// hostnameDialer is the dialer of the transport for a tracker hostname's
+// first hop: it applies reach to each resolved address actually connected to.
+// Only policyTransport sends requests through it, for hops whose host is a
+// hostname.
+func hostnameDialer(reach hostReach) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := baseDialer
+		if !proxyDialAddrs()[addr] {
+			d.ControlContext = controlAllowing(reach.allows)
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
 // DestinationControl returns a net.Dialer ControlContext hook that refuses any
 // address DestinationAllowed rejects for source. Pass the zero Addr for a
 // public or unknown source.
 func DestinationControl(source netip.Addr) func(context.Context, string, string, syscall.RawConn) error {
+	return controlAllowing(func(dst netip.Addr) bool { return DestinationAllowed(dst, source) })
+}
+
+// controlAllowing returns a net.Dialer ControlContext hook that refuses any
+// address allowed rejects.
+func controlAllowing(allowed func(netip.Addr) bool) func(context.Context, string, string, syscall.RawConn) error {
 	return func(_ context.Context, _, address string, _ syscall.RawConn) error {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
 			return fmt.Errorf("%w: unparsable address %q", ErrDestinationRefused, address)
 		}
-		if dst := ap.Addr().Unmap(); !DestinationAllowed(dst, source) {
+		if dst := ap.Addr().Unmap(); !allowed(dst) {
 			return fmt.Errorf("%w: %s", ErrDestinationRefused, dst)
 		}
 		return nil

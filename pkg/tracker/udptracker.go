@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"syscall"
 	"time"
 )
 
@@ -87,9 +88,12 @@ func ensureUDPDeadline(ctx context.Context) (context.Context, context.CancelFunc
 // returned cleanup func stops the watchdog and closes the connection; callers
 // must defer it. It is shared by UDPAnnounce and UDPScrape.
 //
-// The dial applies the same destination rule as HTTPClient: a tracker named
-// by a hostname may only resolve to a public address, and loopback or LAN
-// trackers must be written as literal addresses (or "localhost").
+// The dial applies the destination rules of HTTPClient: a literal address
+// (or "localhost") is judged as the request's own origin, and a tracker named
+// by a hostname may resolve to a public or private (LAN, carrier-grade NAT,
+// unique-local) address. A UDP tracker's path is not sent, so the loopback
+// path rule cannot vouch for it: a loopback UDP tracker must be written as
+// 127.0.0.1, [::1] or localhost.
 func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) {
 	u, err := url.Parse(announceURL)
 	if err != nil {
@@ -105,7 +109,7 @@ func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) 
 
 	dialer := net.Dialer{
 		Timeout:        15 * time.Second,
-		ControlContext: DestinationControl(localAddr(u.Hostname())),
+		ControlContext: udpDialControl(u.Hostname()),
 	}
 	conn, err := dialer.DialContext(ctx, "udp", host)
 	if err != nil {
@@ -126,6 +130,15 @@ func udpDial(ctx context.Context, announceURL string) (net.Conn, func(), error) 
 		_ = conn.Close()
 	}
 	return conn, cleanup, nil
+}
+
+// udpDialControl is the destination check for a UDP tracker whose URL names
+// host (see udpDial).
+func udpDialControl(host string) func(context.Context, string, string, syscall.RawConn) error {
+	if _, literal := literalAddr(host); literal {
+		return DestinationControl(localAddr(host))
+	}
+	return controlAllowing(reachPrivate.allows)
 }
 
 // udpRoundTrip writes req on conn and waits for a single response, retrying
