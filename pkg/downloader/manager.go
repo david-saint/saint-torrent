@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sainttorrent/pkg/bencode"
@@ -76,6 +77,10 @@ type TorrentManager struct {
 	claimMu      sync.Mutex
 	pathClaims   map[pathClaimKey]pathClaim
 	sharedClaims map[sharedClaimKey]int32
+
+	// crash records panics under <stateDir>/crash once persistence is on;
+	// sessions get it in AddSession. See crashguard.go.
+	crash atomic.Pointer[crashRecorder]
 }
 
 // SetVerifyOnStartup forces full hashing of the torrents restored on this launch,
@@ -290,6 +295,7 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) error {
 	}
 	sess.GlobalDownloadLimiter = m.globalDownloadLimiter
 	sess.GlobalUploadLimiter = m.globalUploadLimiter
+	sess.crash.Store(m.crash.Load())
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
 	sess.EncryptionPolicy = m.encryptionPolicy
@@ -1238,6 +1244,20 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	}
 	_ = os.Chmod(torrentsDir, 0700)
 
+	// Record crashes under the state directory from here on, including one
+	// while restoring.
+	var recorder *crashRecorder
+	if crashDir := CrashDir(stateDir); os.MkdirAll(crashDir, 0700) == nil {
+		_ = os.Chmod(crashDir, 0700)
+		recorder = &crashRecorder{dir: crashDir}
+	}
+	m.mu.Lock()
+	m.crash.Store(recorder)
+	for _, sess := range m.sessions {
+		sess.crash.Store(recorder)
+	}
+	m.mu.Unlock()
+
 	statePath := filepath.Join(stateDir, "session.json")
 	var savedState PersistedState
 	var warning string
@@ -1289,6 +1309,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	var restoreFailures []restoreFailure
 
 	restoreOne := func(entry PersistedTorrent) {
+		// A crash while restoring entry is recorded against it.
+		defer m.crashGuard(crashComponentRestore, entry.InfoHashHex)()
+
 		absoluteDownloadDir, err := filepath.Abs(entry.DownloadDir)
 		if err != nil {
 			absoluteDownloadDir = entry.DownloadDir

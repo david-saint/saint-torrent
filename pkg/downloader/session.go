@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -203,6 +204,12 @@ type Session struct {
 	// without running the flush (and its file syncs) on the caller's goroutine.
 	stateFlushCh chan struct{}
 
+	// infoHashHex is the info-hash in hex, fixed at creation so a crash guard
+	// can name the torrent without taking s.mu. crash is the manager's crash
+	// recorder (nil without persistence); see crashGuard.
+	infoHashHex string
+	crash       atomic.Pointer[crashRecorder]
+
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
 	cancel              context.CancelFunc
@@ -380,6 +387,7 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 	}
 
 	sess := &Session{
+		infoHashHex:         hex.EncodeToString(tor.InfoHash[:]),
 		verifyOnStartup:     verifyOnStartup,
 		Torrent:             tor,
 		Storage:             st,
@@ -669,7 +677,10 @@ func (s *Session) Start() {
 	}
 	for _, seed := range webseeds {
 		seed := seed
-		go s.webseedLoop(seed)
+		go func() {
+			defer s.crashGuard("webseed")()
+			s.webseedLoop(seed)
+		}()
 	}
 	if logging.Enabled() {
 		s.mu.RLock()
@@ -802,6 +813,7 @@ func (s *Session) Close() {
 
 func (s *Session) speedMonitorLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("speed_monitor")()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1861,6 +1873,7 @@ func (s *Session) scheduleMetadataStorageRetryLocked() {
 // kept. It runs on the retry timer; onMetadataDownloaded re-checks the session
 // under s.mu and arms the next retry if the build fails again.
 func (s *Session) retryMetadataStorage() {
+	defer s.crashGuard("metadata_retry")()
 	s.mu.Lock()
 	infoBytes := s.verifiedMetadata
 	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed

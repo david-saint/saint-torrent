@@ -152,6 +152,7 @@ func (s *Session) ensurePieceWritePool() {
 }
 
 func (s *Session) pieceWriteWorker() {
+	defer s.crashGuard("piece_write")()
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -393,6 +394,7 @@ func (s *Session) acquireVerifySlot(ctx context.Context) (release func(), ok boo
 // becomes PieceCompleted (now advertisable and seedable); on failure it returns to
 // PieceEmpty so the downloader re-fetches it.
 func (s *Session) verifyResume(ctx context.Context) {
+	defer s.crashGuard("verify")()
 	if s.runVerification(ctx) {
 		s.finishVerify()
 	}
@@ -594,6 +596,7 @@ func (s *Session) WaitVerified() {
 // and flushing it to disk periodically.
 func (s *Session) statePersistLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("state_persist")()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 

@@ -347,6 +347,7 @@ func (s *Session) broadcastHave(index uint32) {
 // than wedging at zero once the initial connections go stale.
 func (s *Session) peerMaintenanceLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("peer_maintenance")()
 	ticker := time.NewTicker(peerMaintenanceInterval)
 	defer ticker.Stop()
 	for {
@@ -425,6 +426,7 @@ func (s *Session) maintainPeerConnections() {
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
+	defer s.crashGuard("peer_dial")()
 	// Keyed like addPeer, PEX, DHT and inbound connections (net.JoinHostPort), so
 	// an IPv6 peer's entry is found here too.
 	peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
@@ -675,10 +677,12 @@ func (s *Session) dialPeer(peerAddr string) (net.Conn, string, error) {
 	defer cancelUTP()
 	results := make(chan transportDialResult, 2)
 	go func() {
+		defer s.crashGuard("peer_dial_transport")()
 		conn, err := peerTCPDial(tcpCtx, peerAddr)
 		results <- transportDialResult{transport: "tcp", conn: conn, err: err}
 	}()
 	go func() {
+		defer s.crashGuard("peer_dial_transport")()
 		conn, err := udpSocket.DialContext(utpCtx, peerAddr)
 		results <- transportDialResult{transport: "utp", conn: conn, err: err}
 	}()
@@ -777,6 +781,7 @@ func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {
 // that never send one can fill them for up to peerHandshakeTimeout.
 func (s *Session) inboundListenerLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("inbound_listener")()
 
 	s.mu.RLock()
 	listener := s.listener
@@ -818,6 +823,7 @@ func (s *Session) inboundListenerLoop() {
 // handshake is read, unlike the manager's shared listener, which the CLI uses
 // and which budgets pre-handshake connections separately.
 func (s *Session) handleIncomingConnection(conn net.Conn) {
+	defer s.crashGuard("peer_inbound")()
 	defer conn.Close()
 
 	// Bound concurrent inbound connections (see maxInboundPeers); drop new ones once
@@ -849,6 +855,7 @@ func (s *Session) handleIncomingConnection(conn net.Conn) {
 // by the manager's shared listener. The manager already holds the global inbound
 // slot, so only the per-session budget is acquired here.
 func (s *Session) handleRoutedIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
+	defer s.crashGuard("peer_inbound")()
 	if s.inboundSlots != nil {
 		select {
 		case s.inboundSlots <- struct{}{}:
@@ -861,6 +868,7 @@ func (s *Session) handleRoutedIncomingConnection(conn net.Conn, handshake *peer.
 }
 
 func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
+	defer s.crashGuard("peer_inbound")()
 	tunePeerConn(conn)
 
 	s.mu.RLock()
@@ -943,6 +951,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 }
 
 func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte, outbound bool) {
+	defer s.crashGuard("peer_loop")()
 	fastEnabled := peer.SupportsFastExtension(peerReserved)
 	direction := "inbound"
 	if outbound {
@@ -2517,6 +2526,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	readDone := make(chan struct{})
 	readStop := make(chan struct{})
 	go func() {
+		defer s.crashGuard("peer_reader")()
 		defer close(readDone)
 		// The read deadline is the dead-socket backstop (see peerReadTimeout). It
 		// is moved only once less than peerReadTimeout remains, so a busy
@@ -2624,6 +2634,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
 	// peerInterestScanInterval.
 	var lastInterestScanAt time.Time
+	// A second guard, deferred after the disconnect handler so it runs before
+	// it: a panic in the loop below while s.mu is held would deadlock that
+	// handler, and the guard at the top would then never record it. Only the
+	// first guard to see a panic records it.
+	defer s.crashGuard("peer_loop")()
 peerLoop:
 	for {
 		pooledMsg.Release()
@@ -3465,6 +3480,7 @@ var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, announ
 // picks, and soon after a resume.
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("dht")()
 	running := dhtLoopsRunning.Add(1)
 	defer dhtLoopsRunning.Add(-1)
 

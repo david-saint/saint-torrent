@@ -122,6 +122,7 @@ func runBounded(ctx context.Context, n, workers int, fn func(i int)) {
 // event arrives on resumeCh, or the session closes.
 func (s *Session) trackerLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("tracker")()
 
 	// sched and lastScrape are loop-local state (only this goroutine touches
 	// them), so they need no locking. The zero lastScrape forces a scrape on
@@ -557,6 +558,7 @@ func (s *Session) announceDue(sched *trackerSchedule) {
 	// that has returned early on shutdown.
 	results := make(chan roundResult, len(due))
 	runBounded(s.ctx, len(due), trackerAnnounceWorkers, func(n int) {
+		defer s.crashGuard("tracker_announce")()
 		if !acquireTrackerSlot(s.ctx) {
 			return
 		}
@@ -805,6 +807,7 @@ func (s *Session) scrapeTargets(targets []trackerTarget) {
 	}
 	results := make(chan scrapeResult, len(targets))
 	runBounded(s.ctx, len(targets), trackerAnnounceWorkers, func(i int) {
+		defer s.crashGuard("tracker_announce")()
 		if !acquireTrackerSlot(s.ctx) {
 			return
 		}
