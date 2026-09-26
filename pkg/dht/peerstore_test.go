@@ -109,7 +109,7 @@ func TestAnnounceFromOneIPCannotFillSwarm(t *testing.T) {
 		announce(attacker, port)
 	}
 
-	values := d.getPeersForInfoHash(infoHash)
+	values := d.getPeersForInfoHash(infoHash, nil)
 	if len(values) != 1+maxPeersPerIPPerHash {
 		t.Fatalf("get_peers returns %d values, want the honest peer plus %d attacker ports", len(values), maxPeersPerIPPerHash)
 	}
@@ -209,7 +209,7 @@ func TestPeerStoreExpiry(t *testing.T) {
 	}
 
 	later := now.Add(peerStoreTTL + time.Second)
-	if got := s.get(testHash(0), later); got != nil {
+	if got := s.get(testHash(0), later, nil); got != nil {
 		t.Fatalf("expired peers were returned: %d", len(got))
 	}
 	if !s.announce(testHash(999), ip, 6881, later) {

@@ -293,7 +293,7 @@ func TestDHTAnnouncePeerValidatesPort(t *testing.T) {
 	}
 	args["port"] = int64(70000)
 	d.handleQuery("tx", "announce_peer", args, addr)
-	if peers := d.getPeersForInfoHash(infoHash); len(peers) != 0 {
+	if peers := d.getPeersForInfoHash(infoHash, nil); len(peers) != 0 {
 		t.Fatalf("expected invalid port announce to be ignored, got %d peers", len(peers))
 	}
 
@@ -303,7 +303,7 @@ func TestDHTAnnouncePeerValidatesPort(t *testing.T) {
 	}
 	args["port"] = int64(51413)
 	d.handleQuery("tx", "announce_peer", args, addr)
-	peers := d.getPeersForInfoHash(infoHash)
+	peers := d.getPeersForInfoHash(infoHash, nil)
 	if len(peers) != 1 {
 		t.Fatalf("expected valid announce to register peer, got %d", len(peers))
 	}

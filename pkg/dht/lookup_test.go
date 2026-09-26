@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strconv"
@@ -610,6 +611,79 @@ func TestAnswersOmitContactsTheAskerMayNotLearn(t *testing.T) {
 	}
 	if got := ask(&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}); got["lan"] != 6 || got["loopback"] != 2 {
 		t.Fatalf("a loopback asker got %v, want every local contact", got)
+	}
+}
+
+// TestGetPeersValuesOmitPeersTheAskerMayNotLearn verifies the values of a
+// get_peers answer follow the same scope rule as its nodes: peers that
+// announced to us from loopback or the LAN are never handed to a public
+// asker, and an asker left with no values gets closer nodes instead.
+func TestGetPeersValuesOmitPeersTheAskerMayNotLearn(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	d.addNode(idInBucket(d.nodeID, 100, 1), &net.UDPAddr{IP: net.ParseIP("198.18.0.1"), Port: 6881})
+
+	var mixed, lanOnly [20]byte
+	copy(mixed[:], "mixed-scope-swarm---")
+	copy(lanOnly[:], "lan-only-swarm------")
+	announce := func(infoHash [20]byte, from *net.UDPAddr) {
+		t.Helper()
+		id := idInBucket(d.nodeID, 30, uint16(from.Port))
+		d.handleQuery("a", "announce_peer", map[string]interface{}{
+			"id":        string(id[:]),
+			"info_hash": string(infoHash[:]),
+			"token":     d.generateToken(from),
+			"port":      int64(from.Port),
+		}, from)
+	}
+	public := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 51413}
+	lan := &net.UDPAddr{IP: net.ParseIP("192.168.1.20"), Port: 51414}
+	loopback := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 51415}
+	for _, from := range []*net.UDPAddr{public, lan, loopback} {
+		announce(mixed, from)
+	}
+	announce(lanOnly, lan)
+
+	seq := 0
+	ask := func(infoHash [20]byte, asker *net.UDPAddr) (values []string, nodes int) {
+		t.Helper()
+		seq++
+		tid := fmt.Sprintf("g%d", seq)
+		id := idInBucket(d.nodeID, 5, uint16(seq))
+		d.handleQuery(tid, "get_peers", map[string]interface{}{"id": string(id[:]), "info_hash": string(infoHash[:])}, asker)
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		for _, p := range conn.sent {
+			parsed, _ := bencode.Unmarshal(p.data)
+			dict, _ := parsed.(map[string]interface{})
+			if dict["y"] != "r" || dict["t"] != tid {
+				continue
+			}
+			r, _ := dict["r"].(map[string]interface{})
+			list, _ := r["values"].([]interface{})
+			for _, v := range list {
+				cp, _ := v.(string)
+				ip := net.IP([]byte(cp[:4]))
+				values = append(values, net.JoinHostPort(ip.String(), strconv.Itoa(int(binary.BigEndian.Uint16([]byte(cp[4:]))))))
+			}
+			nodesStr, _ := r["nodes"].(string)
+			return values, len(nodesStr) / 26
+		}
+		t.Fatalf("no answer to get_peers %s", tid)
+		return nil, 0
+	}
+
+	publicAsker := &net.UDPAddr{IP: net.ParseIP("203.0.113.40"), Port: 6881}
+	if got, _ := ask(mixed, publicAsker); strings.Join(got, " ") != public.String() {
+		t.Fatalf("a public asker was handed %v, want only the public peer", got)
+	}
+	if got, _ := ask(mixed, &net.UDPAddr{IP: net.ParseIP("192.168.1.50"), Port: 6881}); len(got) != 2 {
+		t.Fatalf("a LAN asker was handed %v, want the public and LAN peers", got)
+	}
+	if got, _ := ask(mixed, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}); len(got) != 3 {
+		t.Fatalf("a loopback asker was handed %v, want every peer", got)
+	}
+	if got, nodes := ask(lanOnly, publicAsker); len(got) != 0 || nodes != 1 {
+		t.Fatalf("a public asker of a LAN-only swarm got values %v and %d nodes, want no values and our public contact", got, nodes)
 	}
 }
 

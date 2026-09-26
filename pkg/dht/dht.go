@@ -432,7 +432,7 @@ func (d *DHT) handleQuery(t string, q string, a map[string]interface{}, addr *ne
 		d.noteQuerySender(senderID, addr)
 
 		token := d.generateToken(addr)
-		peers := d.getPeersForInfoHash(infoHash)
+		peers := d.getPeersForInfoHash(infoHash, addr)
 		if len(peers) > 0 {
 			d.sendResponse(t, map[string]interface{}{
 				"id":     string(d.nodeID[:]),
@@ -584,10 +584,12 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 	return a.Port == b.Port && a.IP.Equal(b.IP)
 }
 
-func (d *DHT) getPeersForInfoHash(infoHash [20]byte) []interface{} {
+// getPeersForInfoHash returns the peers announced to us for infoHash that
+// asker may be told about; a nil asker gets them all.
+func (d *DHT) getPeersForInfoHash(infoHash [20]byte, asker *net.UDPAddr) []interface{} {
 	d.peersMu.Lock()
 	defer d.peersMu.Unlock()
-	return d.peers.get(infoHash, time.Now())
+	return d.peers.get(infoHash, time.Now(), asker)
 }
 
 func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
