@@ -76,6 +76,7 @@ type detailSig struct {
 // without the view re-locking the session every frame.
 type filesSnapshot struct {
 	valid      bool
+	session    *downloader.Session
 	name       string
 	files      []torrent.File
 	priorities []downloader.FilePriority
@@ -234,10 +235,23 @@ func (m *model) buildFilesSnapshot() {
 	}
 	m.files = filesSnapshot{
 		valid:      true,
+		session:    s,
 		name:       displayText(s.Name()),
 		files:      s.Files(),
 		priorities: s.GetFilePriorities(),
 	}
+}
+
+// refreshFilesSnapshot is the per-tick refresh: it rebuilds only when the
+// selected session or its file list changed. Priorities change only through
+// the toggle key, which rebuilds explicitly, so re-copying an O(files) slice
+// under the session lock twice a second bought nothing.
+func (m *model) refreshFilesSnapshot() {
+	if s, ok := m.selectedSession(); ok && m.files.valid && m.files.session == s &&
+		len(s.Files()) == len(m.files.files) {
+		return
+	}
+	m.buildFilesSnapshot()
 }
 
 // filesData returns the current files snapshot, falling back to a fresh live

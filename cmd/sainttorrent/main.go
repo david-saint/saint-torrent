@@ -737,6 +737,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveFileSelection(-1)
 			case "down", "j":
 				m.moveFileSelection(1)
+			case "pgup":
+				m.moveFilePage(-1)
+			case "pgdown":
+				m.moveFilePage(1)
+			case "home":
+				m.selectedFileIdx = 0
+			case "end":
+				m.selectedFileIdx = max(0, len(files)-1)
 			case " ", "p":
 				if len(files) > 0 && m.selectedFileIdx < len(files) {
 					priorities := s.GetFilePriorities()
@@ -985,7 +993,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshSessions()
 		m.recordSpeeds()
 		if m.viewMode == viewFiles {
-			m.buildFilesSnapshot()
+			m.refreshFilesSnapshot()
 		}
 		if m.viewMode == viewDetail {
 			// Refresh the cached body now so the following View reuses it and a
@@ -1027,7 +1035,6 @@ func (m model) View() string {
 		return "\nShutting down saintTorrent client...\n"
 	}
 
-	st := m.theme.styles
 	var out string
 	switch m.viewMode {
 	case viewList:
@@ -1038,7 +1045,7 @@ func (m model) View() string {
 	default:
 		// secondary screens share a layout under a themed banner.
 		var sb strings.Builder
-		sb.WriteString(st.Title.Render(" saintTorrent CLI v0.2 ") + "\n")
+		sb.WriteString(m.secondaryBanner())
 		switch m.viewMode {
 		case viewFiles:
 			sb.WriteString(m.viewFileExplorer())
@@ -1057,12 +1064,17 @@ func (m model) View() string {
 	switch m.viewMode {
 	case viewDetail:
 		out = verticalSlice(out, m.detailScroll, m.height)
-	case viewList:
-		// Keep the header + list (incl. the selected torrent) and let the help
+	case viewList, viewFiles:
+		// Keep the header + list (incl. the selected row) and let the help
 		// block clip from the bottom when the terminal is too short for all of it.
 		out = verticalSlice(out, 0, m.height)
 	}
 	return out
+}
+
+// secondaryBanner is the themed banner above the secondary screens.
+func (m model) secondaryBanner() string {
+	return m.theme.styles.Title.Render(" saintTorrent CLI v0.2 ") + "\n"
 }
 
 func newTUIProgram(m tea.Model, opts ...tea.ProgramOption) *tea.Program {

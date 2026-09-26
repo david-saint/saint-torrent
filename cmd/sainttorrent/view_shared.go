@@ -462,14 +462,23 @@ func (m model) viewFileExplorer() string {
 	bw := bodyWidth(m.width)
 	g := gutterStr(m.width)
 
+	help := m.fileExplorerHelp()
+
 	var sb strings.Builder
 	label := "File Explorer: "
 	sb.WriteString(g + st.Header.Render("File Explorer:") + " " +
-		truncateRight(data.name, bw-dispWidth(label)) + "\n\n")
+		truncateRight(data.name, bw-dispWidth(label)) + "\n")
 
 	if len(files) == 0 {
-		sb.WriteString(g + "No files in metadata.\n\n")
+		sb.WriteString("\n" + g + "No files in metadata.\n\n")
 	} else {
+		// Render only the window around the selection. A torrent can list
+		// hundreds of thousands of files; rendering them all froze the TUI, and
+		// the renderer then kept only the last screenful, hiding the header and
+		// the first files (the selection never scrolled into view).
+		start, end := visibleSessionRange(len(files), m.selectedFileIdx, m.fileRowCapacity())
+		sb.WriteString(g + st.Subtle.Render(truncateRight(
+			fmt.Sprintf("%d–%d of %d files", start+1, end, len(files)), bw)) + "\n")
 		priorities := data.priorities
 		const badgeW = 6 // " HIGH " / "NORMAL" / " SKIP "
 		const sizeW = 10
@@ -477,7 +486,8 @@ func (m model) viewFileExplorer() string {
 		if pathW < 4 {
 			pathW = 4
 		}
-		for i, f := range files {
+		for i := start; i < end; i++ {
+			f := files[i]
 			prio := downloader.PriorityNormal
 			if i < len(priorities) {
 				prio = priorities[i]
@@ -493,11 +503,44 @@ func (m model) viewFileExplorer() string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(renderHelp([][2]string{
-		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"}, {"q", "Quit"},
-	}, helpColumns, st, m.width))
+	sb.WriteString(help)
 	sb.WriteString("\n")
 	return sb.String()
+}
+
+// defaultViewHeight stands in for the terminal height before the first
+// WindowSizeMsg, so an unknown height never means "render every file".
+const defaultViewHeight = 24
+
+func (m model) fileExplorerHelp() string {
+	return renderHelp([][2]string{
+		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"},
+		{"pgup/pgdn", "Page"}, {"q", "Quit"},
+	}, helpColumns, m.theme.styles, m.width)
+}
+
+// fileRowCapacity reports how many file rows fit. When the help block does
+// not fit as well it is left to clip (View pins the top), so the rows keep
+// priority.
+func (m model) fileRowCapacity() int {
+	height := m.height
+	if height <= 0 {
+		height = defaultViewHeight
+	}
+	// Around the rows: the banner View draws, the header, the range line and
+	// the spacer above the help.
+	chrome := lineCount(m.secondaryBanner()) + 3
+	rows := height - chrome - lineCount(m.fileExplorerHelp())
+	if rows < 1 {
+		rows = height - chrome
+	}
+	return max(1, rows)
+}
+
+// moveFilePage moves the file selection by one screenful, keeping one row of
+// context.
+func (m *model) moveFilePage(dir int) {
+	m.moveFileSelection(dir * max(1, m.fileRowCapacity()-1))
 }
 
 func (m model) viewInputBox() string {
