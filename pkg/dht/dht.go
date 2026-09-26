@@ -58,8 +58,8 @@ type DHT struct {
 	conn         PacketConn
 	mu           sync.RWMutex
 	buckets      [160]*bucket
-	peersMu      sync.Mutex                        // guards peersMap; separate from mu so announce_peer eviction never blocks getCloserNodes/generateToken/addNode
-	peersMap     map[[20]byte]map[string]time.Time // infoHash -> peerAddr -> lastSeen
+	peersMu      sync.Mutex // guards peers; separate from mu so announce_peer storage never blocks getCloserNodes/generateToken/addNode
+	peers        *peerStore
 	tokenSecrets [2][20]byte
 	tokenCreated time.Time
 	peerChan     chan DiscoveredPeer
@@ -164,7 +164,7 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 
 	d := &DHT{
 		conn:           conn,
-		peersMap:       make(map[[20]byte]map[string]time.Time),
+		peers:          newPeerStore(),
 		peerChan:       make(chan DiscoveredPeer, 256),
 		transactions:   make(map[string]transaction),
 		inFlightProbes: make(map[string]struct{}),
@@ -545,44 +545,7 @@ func sameUDPAddr(a, b *net.UDPAddr) bool {
 func (d *DHT) getPeersForInfoHash(infoHash [20]byte) []interface{} {
 	d.peersMu.Lock()
 	defer d.peersMu.Unlock()
-
-	peers, ok := d.peersMap[infoHash]
-	if !ok {
-		return nil
-	}
-
-	// Prune expired entries (TTL of 30 minutes)
-	now := time.Now()
-	for addrStr, lastSeen := range peers {
-		if now.Sub(lastSeen) > 30*time.Minute {
-			delete(peers, addrStr)
-		}
-	}
-
-	if len(peers) == 0 {
-		delete(d.peersMap, infoHash)
-		return nil
-	}
-
-	var list []interface{}
-	for addrStr := range peers {
-		if len(list) >= 50 {
-			break
-		}
-		host, portStr, err := net.SplitHostPort(addrStr)
-		if err != nil {
-			continue
-		}
-		ip := net.ParseIP(host).To4()
-		port, err := net.LookupPort("tcp", portStr)
-		if ip != nil && err == nil && port > 0 && port <= 65535 {
-			var comp [6]byte
-			copy(comp[0:4], ip)
-			binary.BigEndian.PutUint16(comp[4:6], uint16(port))
-			list = append(list, string(comp[:]))
-		}
-	}
-	return list
+	return d.peers.get(infoHash, time.Now())
 }
 
 func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
@@ -590,78 +553,12 @@ func (d *DHT) registerPeer(infoHash [20]byte, ip net.IP, port uint16) {
 	if ip4 == nil {
 		return
 	}
+	var key [4]byte
+	copy(key[:], ip4)
 
 	d.peersMu.Lock()
 	defer d.peersMu.Unlock()
-
-	now := time.Now()
-
-	// Prune expired entries from the current infoHash
-	if peers, exists := d.peersMap[infoHash]; exists {
-		for addr, lastSeen := range peers {
-			if now.Sub(lastSeen) > 30*time.Minute {
-				delete(peers, addr)
-			}
-		}
-		if len(peers) == 0 {
-			delete(d.peersMap, infoHash)
-		}
-	}
-
-	// Limit total info-hashes stored to 500 (evicting an expired/empty or random one when space is needed)
-	if d.peersMap[infoHash] == nil {
-		if len(d.peersMap) >= 500 {
-			var evictedHash [20]byte
-			foundEvictable := false
-			for h, peers := range d.peersMap {
-				for addr, lastSeen := range peers {
-					if now.Sub(lastSeen) > 30*time.Minute {
-						delete(peers, addr)
-					}
-				}
-				if len(peers) == 0 {
-					evictedHash = h
-					foundEvictable = true
-					break
-				}
-			}
-			if !foundEvictable {
-				for h := range d.peersMap {
-					evictedHash = h
-					foundEvictable = true
-					break
-				}
-			}
-			if foundEvictable {
-				delete(d.peersMap, evictedHash)
-			}
-		}
-
-		d.peersMap[infoHash] = make(map[string]time.Time)
-	}
-
-	addrStr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
-
-	// Limit peers stored per info-hash to 50 (evicting the oldest peer when full)
-	peers := d.peersMap[infoHash]
-	_, exists := peers[addrStr]
-	if !exists && len(peers) >= 50 {
-		var oldestAddr string
-		var oldestTime time.Time
-		first := true
-		for addr, lastSeen := range peers {
-			if first || lastSeen.Before(oldestTime) {
-				oldestAddr = addr
-				oldestTime = lastSeen
-				first = false
-			}
-		}
-		if oldestAddr != "" {
-			delete(peers, oldestAddr)
-		}
-	}
-
-	d.peersMap[infoHash][addrStr] = now
+	d.peers.announce(infoHash, key, port, time.Now())
 }
 
 // getCloserNodes returns up to count nodes from the routing table closest to
