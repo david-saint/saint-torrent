@@ -202,6 +202,11 @@ func NewDHTWithConn(downloadDir string, conn PacketConn) (*DHT, error) {
 	_, _ = io.ReadFull(rand.Reader, d.tokenSecrets[1][:])
 	d.tokenCreated = time.Now()
 
+	// A fresh node ID every run: the ID rides in every KRPC message, so a
+	// persisted one would link this client's sessions across networks (for
+	// example with a VPN on and off) for as long as it was kept. Saved
+	// contacts are still reused below to bootstrap.
+	d.nodeID = d.generateNodeID()
 	d.loadNodes()
 
 	d.goTracked(func() {
@@ -1936,8 +1941,7 @@ func (d *DHT) saveNodes() {
 	d.mu.RUnlock()
 
 	saveDict := map[string]interface{}{
-		"node_id": string(d.nodeID[:]),
-		"nodes":   nodesList,
+		"nodes": nodesList,
 	}
 
 	data, err := bencode.Marshal(saveDict)
@@ -1948,35 +1952,26 @@ func (d *DHT) saveNodes() {
 	_ = os.WriteFile(path, data, 0644)
 }
 
+// loadNodes seeds the routing table from contacts saved by an earlier run.
+// d.nodeID must already be set; a node_id saved by older versions is ignored.
 func (d *DHT) loadNodes() {
 	if d.downloadDir == "" {
-		d.nodeID = d.generateNodeID()
 		return
 	}
 	path := filepath.Join(d.downloadDir, ".dht_nodes")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		d.nodeID = d.generateNodeID()
 		return
 	}
 
 	parsed, err := bencode.Unmarshal(data)
 	if err != nil {
-		d.nodeID = d.generateNodeID()
 		return
 	}
 
 	dict, ok := parsed.(map[string]interface{})
 	if !ok {
-		d.nodeID = d.generateNodeID()
 		return
-	}
-
-	idStr, ok := dict["node_id"].(string)
-	if ok && len(idStr) == 20 {
-		copy(d.nodeID[:], idStr)
-	} else {
-		d.nodeID = d.generateNodeID()
 	}
 
 	nodesVal, exists := dict["nodes"]
