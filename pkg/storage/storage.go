@@ -466,9 +466,10 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 			createdFiles = append(createdFiles, createdFile{path: path, info: fi})
 		}
 		if key, links, ok := fileObjectKeyOf(f, fi); ok {
+			opened := openedObject{path: path, length: layout.length, created: created}
 			if first, dup := openedObjects[key]; !dup {
-				openedObjects[key] = openedObject{path: path, created: created}
-			} else if !sharedObjectAllowed(first, path, created, links) {
+				openedObjects[key] = opened
+			} else if !sharedObjectAllowed(first, opened, links) {
 				f.Close()
 				return nil, fmt.Errorf("duplicate file path detected: %q and %q open the same file", first.path, path)
 			}
@@ -1101,16 +1102,18 @@ func isReservedStorageName(name string) bool {
 // for every path that reaches it (see fileObjectKeyOf).
 type fileObjectKey struct{ a, b uint64 }
 
-// openedObject records the first layout of a NewFileStorage call that opened an
-// on-disk object, and whether that call created the object.
+// openedObject records a layout of a NewFileStorage call that opened an on-disk
+// object: its path, its torrent length, and whether that call created the
+// object.
 type openedObject struct {
 	path    string
+	length  int64
 	created bool
 }
 
-// sharedObjectAllowed reports whether a later layout at path, which opened the
-// same on-disk object as first, may keep it. created says whether this open
-// created the object, and links is its current link count.
+// sharedObjectAllowed reports whether a later layout, which opened the same
+// on-disk object as first, may keep it. links is the object's current link
+// count.
 //
 // Only distinct, pre-existing directory entries of one multiply-linked file
 // qualify: the hard links rdfind or jdupes -L leave between identical files,
@@ -1120,9 +1123,13 @@ type openedObject struct {
 // file with one link, since two names can then only be aliases of one entry,
 // and a pair whose paths fold to one key (duplicate layouts are normally
 // refused earlier; this keeps the check self-contained). An unknown link count
-// of zero is refused too.
-func sharedObjectAllowed(first openedObject, path string, created bool, links uint64) bool {
-	return !first.created && !created && links >= 2 && pathKey(first.path) != pathKey(path)
+// of zero is refused too. Identical files have one length, so a pair the
+// torrent gives two lengths is refused as well: growing the file for the
+// longer layout would leave the shorter one's name on a file of the wrong
+// size, which no checkpoint trusts.
+func sharedObjectAllowed(first, later openedObject, links uint64) bool {
+	return !first.created && !later.created && links >= 2 && first.length == later.length &&
+		pathKey(first.path) != pathKey(later.path)
 }
 
 // checkNoTrailingSeparator refuses a layout path ending in a separator. Go's

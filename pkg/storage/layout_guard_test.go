@@ -55,32 +55,37 @@ func TestStorageRejectsTrailingSeparator(t *testing.T) {
 // an object it already opened. It refused pre-existing hard links too, which a
 // dedup tool leaves between identical payload files, so such a torrent could no
 // longer be restored. Only those now pass: an alias landing on a file this call
-// created, or on a pre-existing file with a single link, is still refused.
+// created, or on a pre-existing file with a single link, is still refused, and
+// so are links the torrent gives two lengths, which no dedup tool leaves.
 // A case-sensitive filesystem offers no alias a test can create, so the
-// decision is checked directly here; TestNewFileStorageAcceptsPreexistingHardLinks
-// and, on Windows, TestNewFileStorageRejectsShortNameAlias cover it end to end.
+// decision is checked directly here; TestNewFileStorageAcceptsPreexistingHardLinks,
+// TestNewFileStorageRejectsHardLinksOfDifferentLengths and, on Windows,
+// TestNewFileStorageRejectsShortNameAlias cover it end to end.
 func TestSharedObjectAllowed(t *testing.T) {
-	existing := openedObject{path: filepath.Join("disc1", "track.flac")}
-	created := openedObject{path: existing.path, created: true}
-	other := filepath.Join("disc2", "track.flac")
+	existing := openedObject{path: filepath.Join("disc1", "track.flac"), length: 16}
+	created := openedObject{path: existing.path, length: 16, created: true}
+	other := openedObject{path: filepath.Join("disc2", "track.flac"), length: 16}
+	otherCreated := openedObject{path: other.path, length: 16, created: true}
+	otherLonger := openedObject{path: other.path, length: 32}
+	folded := openedObject{path: strings.ToUpper(existing.path), length: 16}
 	for _, tc := range []struct {
-		name    string
-		first   openedObject
-		path    string
-		created bool
-		links   uint64
-		want    bool
+		name  string
+		first openedObject
+		later openedObject
+		links uint64
+		want  bool
 	}{
-		{"pre-existing hard links", existing, other, false, 2, true},
-		{"three pre-existing hard links", existing, other, false, 3, true},
-		{"alias of a file this call created", created, other, false, 2, false},
-		{"alias of a file this call created, one link", created, other, false, 1, false},
-		{"second open created the file", existing, other, true, 2, false},
-		{"alias of a pre-existing single-link file", existing, other, false, 1, false},
-		{"unknown link count", existing, other, false, 0, false},
-		{"paths equal under the fold", existing, strings.ToUpper(existing.path), false, 2, false},
+		{"pre-existing hard links", existing, other, 2, true},
+		{"three pre-existing hard links", existing, other, 3, true},
+		{"alias of a file this call created", created, other, 2, false},
+		{"alias of a file this call created, one link", created, other, 1, false},
+		{"second open created the file", existing, otherCreated, 2, false},
+		{"alias of a pre-existing single-link file", existing, other, 1, false},
+		{"unknown link count", existing, other, 0, false},
+		{"paths equal under the fold", existing, folded, 2, false},
+		{"hard links of different lengths", existing, otherLonger, 2, false},
 	} {
-		if got := sharedObjectAllowed(tc.first, tc.path, tc.created, tc.links); got != tc.want {
+		if got := sharedObjectAllowed(tc.first, tc.later, tc.links); got != tc.want {
 			t.Errorf("%s: sharedObjectAllowed = %v, want %v", tc.name, got, tc.want)
 		}
 	}

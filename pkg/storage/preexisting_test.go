@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +169,40 @@ func TestNewFileStorageAcceptsPreexistingHardLinks(t *testing.T) {
 				t.Fatalf("hard links after restore: %v, %v; want one %d-byte file under both names", errA, errB, len(payload))
 			}
 		})
+	}
+}
+
+// TestNewFileStorageRejectsHardLinksOfDifferentLengths: a dedup tool links only
+// files with identical contents, so two pre-existing hard links the torrent
+// gives different lengths are not such a pair. Accepting them grew the shared
+// file to the longer length, which left the shorter layout's name holding a
+// file of the wrong size that no checkpoint would trust, so its pieces were
+// rehashed at every launch. The add is refused, a file it created is removed
+// and the links are left as they were.
+func TestNewFileStorageRejectsHardLinksOfDifferentLengths(t *testing.T) {
+	dir := t.TempDir()
+	original := []byte("sixteen bytes!!!")
+	if err := os.WriteFile(filepath.Join(dir, "a"), original, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(dir, "a"), filepath.Join(dir, "b")); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	files := []FileInfo{{Path: "new", Length: 4}, {Path: "a", Length: 16}, {Path: "b", Length: 32}}
+	st, err := NewFileStorage(dir, files, 16)
+	if err == nil {
+		_ = st.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "open the same file") {
+		t.Fatalf("NewFileStorage over hard links of lengths 16 and 32 = %v, want a duplicate rejection", err)
+	}
+	for _, name := range []string{"a", "b"} {
+		got, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !bytes.Equal(got, original) {
+			t.Fatalf("%s after the rejected add = %q, %v; want it untouched", name, got, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "new")); !os.IsNotExist(err) {
+		t.Fatalf("file created by the rejected add was left behind: %v", err)
 	}
 }
