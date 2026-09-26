@@ -29,6 +29,9 @@ const (
 	logFileMode         = 0600
 )
 
+// logPathHint ends the error for a log path OpenPrivateFile refuses.
+const logPathHint = "use the path of a regular file, or /dev/stderr or /dev/stdout to log to a stream"
+
 var levelNames = map[Level]string{
 	LevelDebug: "debug",
 	LevelInfo:  "info",
@@ -58,6 +61,7 @@ type Logger struct {
 	maxSizeBytes int64
 	maxBackups   int
 	file         *os.File
+	stream       bool // file is os.Stdout or os.Stderr: never rotated or closed
 	size         int64
 	now          func() time.Time
 }
@@ -209,6 +213,16 @@ func New(cfg Config) (*Logger, error) {
 	if cfg.MaxBackups < 0 {
 		return nil, fmt.Errorf("max backups must be non-negative")
 	}
+	if out := stdStream(path); out != nil {
+		return &Logger{
+			path:         path,
+			level:        cfg.Level,
+			maxSizeBytes: cfg.MaxSizeBytes,
+			file:         out,
+			stream:       true,
+			now:          time.Now,
+		}, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
@@ -232,6 +246,21 @@ func New(cfg Config) (*Logger, error) {
 	}, nil
 }
 
+// stdStream returns the stream a log path names, if it names one: /dev/stdout
+// or /dev/stderr, the usual way to hand the log to a container runtime or the
+// journal. The logger writes to the process's own descriptor, with no rotation,
+// chmod or close. The paths are matched exactly and never opened: on Linux they
+// are symlinks into /proc, which OpenPrivateFile refuses.
+func stdStream(path string) *os.File {
+	switch path {
+	case "/dev/stdout":
+		return os.Stdout
+	case "/dev/stderr":
+		return os.Stderr
+	}
+	return nil
+}
+
 // OpenPrivateFile opens path for appending, creating it with mode 0600. It
 // refuses a symlink (on Unix), anything but a regular file, a file owned by
 // another user, and a file with extra hard links, then forces mode 0600. A log
@@ -240,11 +269,22 @@ func New(cfg Config) (*Logger, error) {
 func OpenPrivateFile(path string) (*os.File, error) {
 	f, err := openNoFollow(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
 	if err != nil {
+		// Say what was refused and what works instead: the no-follow open of a
+		// symlink fails with ELOOP, EMLINK or EFTYPE depending on the system,
+		// and that of a FIFO nobody reads with ENXIO.
+		if fi, lerr := os.Lstat(path); lerr == nil {
+			switch {
+			case fi.Mode()&os.ModeSymlink != 0:
+				return nil, fmt.Errorf("refusing to log to %s: it is a symbolic link; %s", path, logPathHint)
+			case !fi.Mode().IsRegular():
+				return nil, fmt.Errorf("refusing to log to %s: not a regular file; %s", path, logPathHint)
+			}
+		}
 		return nil, err
 	}
 	fi, err := f.Stat()
 	if err == nil && !fi.Mode().IsRegular() {
-		err = fmt.Errorf("refusing to log to %s: not a regular file", path)
+		err = fmt.Errorf("refusing to log to %s: not a regular file; %s", path, logPathHint)
 	}
 	if err == nil {
 		if ownerErr := checkOwner(fi); ownerErr != nil {
@@ -274,6 +314,11 @@ func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file == nil {
+		return nil
+	}
+	if l.stream {
+		// The process's stdout or stderr outlives the logger.
+		l.file = nil
 		return nil
 	}
 	err := l.file.Close()
@@ -317,7 +362,7 @@ func (l *Logger) Log(level Level, event string, fields ...Field) error {
 	if l.file == nil {
 		return fmt.Errorf("logger is closed")
 	}
-	if l.maxBackups > 0 && l.size > 0 && l.size+int64(len(line)) > l.maxSizeBytes {
+	if !l.stream && l.maxBackups > 0 && l.size > 0 && l.size+int64(len(line)) > l.maxSizeBytes {
 		if err := l.rotateLocked(); err != nil {
 			return err
 		}

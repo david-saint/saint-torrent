@@ -1302,7 +1302,8 @@ Options:
                             (loopback only, e.g. 127.0.0.1:16666)
       --http-allow-remote   Allow --http-addr on a LAN or wildcard address; the
                             API has no authentication
-      --log <path>          Write JSON-lines debug logs to a rotating file
+      --log <path>          Write JSON-lines debug logs to a rotating file, or
+                            to /dev/stderr or /dev/stdout
       --log-level <level>   Log level: debug, info, warn, or error
       --write-config <path> Write a default config file and exit
   -h, --help                Show this help message and exit

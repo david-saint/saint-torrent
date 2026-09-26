@@ -171,6 +171,11 @@ symlink, a hard link, or a file owned by another user. Rotation defaults to
 10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for
 example `25mb`) and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
 
+To hand the log to a container runtime or the systemd journal instead, log to
+a stream with `--log /dev/stderr` or `--log /dev/stdout` (headless mode; in the
+TUI it would draw over the screen). A stream is written as is: it is never
+rotated, and those two paths are the only symlinks accepted.
+
 The HTTP stats endpoint is off by default. Enable the read-only JSON API with
 `--http-addr`:
 
