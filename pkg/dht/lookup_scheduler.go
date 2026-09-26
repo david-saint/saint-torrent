@@ -48,7 +48,8 @@ type pendingLookup struct {
 // take turns. Urgent is drained newest first: at startup every restored
 // torrent's first lookup lands there within a second or two, and a magnet the
 // user adds just after (the magnet launcher starts the client with one) must
-// not wait for hundreds of them, which at a few lookups a second is minutes.
+// not wait for hundreds of them: lookups complete at well under one a second,
+// so that would take minutes.
 type lookupScheduler struct {
 	mu          sync.Mutex
 	pending     map[[20]byte]*pendingLookup // queued, by info-hash

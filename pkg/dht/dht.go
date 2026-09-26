@@ -1913,7 +1913,10 @@ func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
 // dhtLookupStartInterval, with an info-hash's first lookup since the DHT
 // started ahead of repeats. A request for an info-hash already queued is
 // merged into it, and one for an info-hash whose lookup is still running is
-// dropped: callers look up again on their own cadence.
+// dropped: callers look up again on their own cadence. A queued request is
+// never withdrawn, so one made just before its torrent is paused or removed
+// still runs, and announces if asked to, when its turn comes; with many
+// torrents queued that can be minutes later.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	d.queueLookup(infoHash, peerPort, opts)
 }
