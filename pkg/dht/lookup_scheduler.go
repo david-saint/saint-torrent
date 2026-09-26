@@ -42,9 +42,13 @@ type pendingLookup struct {
 }
 
 // lookupScheduler queues lookups and starts them under the concurrency and
-// pacing limits above. Two FIFO queues are drained urgent first: urgent holds
+// pacing limits above. Two queues are drained urgent first: urgent holds
 // info-hashes not looked up since this DHT started (a newly added torrent or
-// magnet), routine holds the periodic repeats.
+// magnet), routine holds the periodic repeats. Routine is FIFO, so repeats
+// take turns. Urgent is drained newest first: at startup every restored
+// torrent's first lookup lands there within a second or two, and a magnet the
+// user adds just after (the magnet launcher starts the client with one) must
+// not wait for hundreds of them, which at a few lookups a second is minutes.
 type lookupScheduler struct {
 	mu          sync.Mutex
 	pending     map[[20]byte]*pendingLookup // queued, by info-hash
@@ -146,10 +150,10 @@ func (s *lookupScheduler) take(now time.Time, interval time.Duration) (*pendingL
 		}
 	}
 	var p *pendingLookup
-	if len(s.urgent) > 0 {
-		p = s.urgent[0]
-		s.urgent[0] = nil
-		s.urgent = s.urgent[1:]
+	if n := len(s.urgent); n > 0 {
+		p = s.urgent[n-1]
+		s.urgent[n-1] = nil
+		s.urgent = s.urgent[:n-1]
 	} else {
 		p = s.routine[0]
 		s.routine[0] = nil

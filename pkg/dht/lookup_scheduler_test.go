@@ -176,11 +176,52 @@ func TestLookupSchedulerReturnsImmediately(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("100 lookup requests took %v", elapsed)
 	}
-	// The first start after an idle spell is immediate, the next waits an hour.
-	if c := f.next(t); c.infoHash != schedHash(0) {
-		t.Fatalf("first lookup started was %x, want the first requested", c.infoHash)
+	// The first start after an idle spell is immediate, the next waits an
+	// hour. Which request it is depends on when the dispatcher first runs.
+	c := f.next(t)
+	requested := false
+	for i := 0; i < 100 && !requested; i++ {
+		requested = c.infoHash == schedHash(i)
+	}
+	if !requested {
+		t.Fatalf("first lookup started was %x, not one requested", c.infoHash)
 	}
 	f.expectNoStart(t, 50*time.Millisecond)
+}
+
+// TestLookupSchedulerNewestFirstLookupFirst verifies first-time lookups are
+// started newest first, so a torrent added just after a large restore does not
+// queue behind every restored torrent's first lookup. Repeats stay FIFO.
+func TestLookupSchedulerNewestFirstLookupFirst(t *testing.T) {
+	f := installFakeLookups(t, 0)
+	d, _ := newFakeDHT(t)
+
+	repeats := []int{700, 701, 702}
+	for _, i := range repeats {
+		d.LookupWithOptions(schedHash(i), 6881, LookupOptions{})
+		f.next(t)
+		f.release(schedHash(i))
+	}
+	awaitSchedIdle(t, d)
+
+	running := saturate(t, d, f, 0)
+	for _, i := range repeats {
+		d.LookupWithOptions(schedHash(i), 6881, LookupOptions{})
+	}
+	restored := []int{100, 101, 102, 103}
+	for _, i := range restored {
+		d.LookupWithOptions(schedHash(i), 6881, LookupOptions{})
+	}
+	added := schedHash(200)
+	d.LookupWithOptions(added, 6881, LookupOptions{})
+
+	want := []int{200, 103, 102, 101, 100, 700, 701, 702}
+	for i, w := range want {
+		f.release(running[i])
+		if c := f.next(t); c.infoHash != schedHash(w) {
+			t.Fatalf("start %d was %x, want %x", i, c.infoHash, schedHash(w))
+		}
+	}
 }
 
 // TestLookupSchedulerCoalesces verifies a request for a queued info-hash
