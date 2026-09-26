@@ -76,10 +76,11 @@ type DHT struct {
 	inFlightProbes    map[nodeAddrKey]struct{} // in-flight probes, keyed by probeKey
 	querySenderProbes int                      // in-flight probes started by inbound queries
 
-	// limiter and started are owned by the read goroutine; started anchors the
-	// monotonic clock the limiter runs on.
-	limiter *queryLimiter
-	started time.Time
+	// limiter is owned by the read goroutine; respBudget locks itself; started
+	// anchors the monotonic clock both run on.
+	limiter    *queryLimiter
+	respBudget responseBudget
+	started    time.Time
 
 	addrMu sync.Mutex
 	// addrChanges holds only the node IDs with a verification in flight, so a
@@ -486,9 +487,10 @@ func (d *DHT) sendResponse(t string, r map[string]interface{}, addr *net.UDPAddr
 		"r": r,
 	}
 	payload, err := bencode.Marshal(msg)
-	if err == nil {
-		_, _ = d.conn.WriteToUDP(payload, addr)
+	if err != nil || !d.respBudget.take(len(payload), int64(time.Since(d.started))) {
+		return
 	}
+	_, _ = d.conn.WriteToUDP(payload, addr)
 }
 
 // nextTransactionID returns an unpredictable transaction ID for an outgoing

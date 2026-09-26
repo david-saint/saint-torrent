@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,15 @@ const (
 	// queryLimiterSlots sizes the fixed limiter table (a power of two). It only
 	// has to catch heavy senders, not remember every IP.
 	queryLimiterSlots = 4096
+
+	// responseByteRate and responseByteBurst bound the bytes per second we
+	// spend answering other nodes' queries. A node sees on the order of ten
+	// queries a second, a few KB/s; this is 8x libtorrent's default
+	// dht_upload_rate_limit.
+	responseByteRate  = 64 << 10
+	responseByteBurst = 128 << 10
+	// responseBurstTolerance is responseByteBurst expressed as GCRA slack.
+	responseBurstTolerance = int64(responseByteBurst) * int64(time.Second) / responseByteRate
 )
 
 // queryLimiterSlot tracks one source IP with the generic cell rate algorithm:
@@ -87,5 +97,33 @@ func (l *queryLimiter) allow(ip [4]byte, now int64) bool {
 		return false
 	}
 	s.tat = tat + queryRateInterval
+	return true
+}
+
+// responseBudget caps the bytes we send answering queries. The per-IP limiter
+// cannot see a spoofed flood whose source addresses all differ; this bounds
+// what such a flood can push out of our uplink, which also carries uTP and the
+// TCP ACKs of our downloads. Responses to our own queries are not sent here,
+// so lookups never wait on it. It is a GCRA over bytes; the lock is only ever
+// taken by the read goroutine in practice.
+type responseBudget struct {
+	mu  sync.Mutex
+	tat int64
+}
+
+// take reports whether n more response bytes fit the budget at now, charging
+// them if so.
+func (b *responseBudget) take(n int, now int64) bool {
+	cost := int64(n) * int64(time.Second) / responseByteRate
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tat := b.tat
+	if tat < now {
+		tat = now
+	}
+	if tat+cost-now > responseBurstTolerance {
+		return false
+	}
+	b.tat = tat + cost
 	return true
 }

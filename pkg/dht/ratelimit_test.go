@@ -243,6 +243,56 @@ func TestQueriesFromInvalidSourcesAreDropped(t *testing.T) {
 	}
 }
 
+func TestResponseBudgetBurstThenRate(t *testing.T) {
+	var b responseBudget
+	now := int64(time.Hour)
+	sent := 0
+	for b.take(1000, now) {
+		sent += 1000
+	}
+	if sent < responseByteBurst-1000 || sent > responseByteBurst {
+		t.Fatalf("burst let %d bytes through, want about %d", sent, responseByteBurst)
+	}
+	now += int64(time.Second)
+	sent = 0
+	for b.take(1000, now) {
+		sent += 1000
+	}
+	if sent < responseByteRate-1000 || sent > responseByteRate {
+		t.Fatalf("one second of refill let %d bytes through, want about %d", sent, responseByteRate)
+	}
+}
+
+// TestSpoofedRandomSourceFloodIsBudgeted covers the flood the per-IP limiter
+// cannot see: every query from a different source address. What we send back
+// must stay within the global response budget.
+func TestSpoofedRandomSourceFloodIsBudgeted(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	fillBucket(t, d, 0, 9) // find_node answers then carry 8 contacts
+
+	start := time.Now()
+	var target [20]byte
+	copy(target[:], "flooded-find-target-")
+	for i := 0; i < 4000; i++ {
+		id := idInBucket(d.nodeID, 1+i%100, uint16(i))
+		src := &net.UDPAddr{IP: net.IPv4(198, 18, byte(i>>8), byte(i)), Port: 6881}
+		d.handleQuery("tx", "find_node", map[string]interface{}{"id": string(id[:]), "target": string(target[:])}, src)
+	}
+	elapsed := time.Since(start)
+
+	conn.mu.Lock()
+	sent := 0
+	for _, p := range conn.sent {
+		sent += len(p.data)
+	}
+	conn.mu.Unlock()
+	// Probe pings are small and few; allow one response of slack besides.
+	limit := responseByteBurst + int(elapsed.Seconds()*responseByteRate) + maxQuerySenderProbes*100 + 1024
+	if sent > limit {
+		t.Fatalf("a random-source flood pushed out %d bytes in %v, budget allows %d", sent, elapsed, limit)
+	}
+}
+
 // BenchmarkQueryLimiterAllow shows the per-query gate is a few nanoseconds and
 // allocation-free on the read loop.
 func BenchmarkQueryLimiterAllow(b *testing.B) {
