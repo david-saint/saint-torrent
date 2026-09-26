@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"bufio"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -220,5 +222,69 @@ func TestLimitListenerCapsConcurrentConnections(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Accept did not return after Close")
+	}
+}
+
+// A web page can keep a rejected request's connection alive and hold one of
+// the maxConns slots for the whole idle timeout. Across enough loopback host
+// names it can fill every slot and lock out local monitoring, so the server
+// must drop the connection after a rejection. Honest keep-alive is unchanged.
+func TestRejectedRequestsDoNotHoldConnectionSlots(t *testing.T) {
+	server, err := Start("127.0.0.1:0", nil, Options{})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer server.Shutdown(t.Context())
+
+	get := func(conn net.Conn, br *bufio.Reader, host, site string) int {
+		t.Helper()
+		req := "GET /healthz HTTP/1.1\r\nHost: " + host + "\r\n"
+		if site != "" {
+			req += "Sec-Fetch-Site: " + site + "\r\n"
+		}
+		if _, err := io.WriteString(conn, req+"\r\n"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, tc := range []struct{ host, site string }{
+		{"rebind.attacker.example", ""},
+		{server.Addr(), "cross-site"},
+	} {
+		conn, err := net.Dial("tcp", server.Addr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(conn)
+		if code := get(conn, br, tc.host, tc.site); code < 400 {
+			conn.Close()
+			t.Fatalf("Host %q, Sec-Fetch-Site %q: status %d; want rejection", tc.host, tc.site, code)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := br.ReadByte(); !errors.Is(err, io.EOF) {
+			conn.Close()
+			t.Fatalf("Host %q, Sec-Fetch-Site %q: connection kept open after rejection (read err %v)", tc.host, tc.site, err)
+		}
+		conn.Close()
+	}
+
+	// An accepted request keeps its connection for the next one.
+	conn, err := net.Dial("tcp", server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	for i := 0; i < 2; i++ {
+		if code := get(conn, br, server.Addr(), ""); code != http.StatusOK {
+			t.Fatalf("keep-alive request %d: status %d", i, code)
+		}
 	}
 }

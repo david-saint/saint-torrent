@@ -150,21 +150,29 @@ func guard(next http.Handler, extraHosts []string) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !hostAllowed(r.Host, allowed) {
-			http.Error(w, "misdirected request", http.StatusMisdirectedRequest)
+			reject(w, "misdirected request: use an IP address, localhost or the --http-addr host", http.StatusMisdirectedRequest)
 			return
 		}
 		switch r.Header.Get("Sec-Fetch-Site") {
 		case "", "none", "same-origin":
 		default:
-			http.Error(w, "cross-site requests are not allowed", http.StatusForbidden)
+			reject(w, "cross-site requests are not allowed", http.StatusForbidden)
 			return
 		}
 		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
-			http.Error(w, "cross-origin requests are not allowed", http.StatusForbidden)
+			reject(w, "cross-origin requests are not allowed", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// reject answers a refused request and closes its connection. Kept alive, a
+// page's rejected connections would each hold one of the maxConns slots for
+// the idle timeout, enough to lock local monitoring out.
+func reject(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Connection", "close")
+	http.Error(w, msg, code)
 }
 
 // hostAllowed reports whether a Host header value is an IP literal or one of
