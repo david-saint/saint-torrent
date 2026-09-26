@@ -24,6 +24,11 @@ const (
 	// MaxPieceCount bounds the number of pieces, which sizes the per-torrent
 	// piece state and every peer's bitfield.
 	MaxPieceCount = 1 << 22
+	// MaxFileCount bounds the number of files. Storage creates, stats and
+	// tracks every file up front, so an info dictionary of millions of empty
+	// entries would pin that much work and memory; the largest real datasets
+	// hold a few hundred thousand files.
+	MaxFileCount = 1 << 20
 )
 
 // maxPathDepth bounds the number of path components one file may declare.
@@ -200,6 +205,9 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 		if len(filesSlice) == 0 {
 			return nil, fmt.Errorf("files list cannot be empty")
 		}
+		if err := checkFileCount(len(filesSlice)); err != nil {
+			return nil, err
+		}
 		cleanName := sanitizePathComponent(name)
 		legacyName, legacyRoot := legacyComponent(name, cleanName)
 		for _, fVal := range filesSlice {
@@ -373,6 +381,14 @@ func checkPieceCount(numPieces int, pieceLength, totalLength int64) error {
 	expectedPieces := (totalLength-1)/pieceLength + 1
 	if int64(numPieces) != expectedPieces {
 		return fmt.Errorf("piece hash count mismatch: got %d, expected %d", numPieces, expectedPieces)
+	}
+	return nil
+}
+
+// checkFileCount rejects a files list longer than MaxFileCount.
+func checkFileCount(n int) error {
+	if n > MaxFileCount {
+		return fmt.Errorf("torrent has %d files, more than the maximum of %d", n, MaxFileCount)
 	}
 	return nil
 }

@@ -53,6 +53,20 @@ func benchmarkBlocks(b *testing.B, open func(string, []FileInfo, int64) (blockBe
 				}
 			}
 		})
+		// Many peers reading the same file at once: the seed path's shared state
+		// (the storage lock and the file's cached handle) under contention.
+		b.Run(fmt.Sprintf("files=%d/ReadBlock16KiBParallel", fileCount), func(b *testing.B) {
+			b.SetBytes(int64(len(block)))
+			b.RunParallel(func(pb *testing.PB) {
+				buf := make([]byte, len(block))
+				for pb.Next() {
+					if _, err := st.ReadBlock(lastPiece, pieceLength-int64(len(buf)), buf); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
 		_ = st.Close()
 	}
 }

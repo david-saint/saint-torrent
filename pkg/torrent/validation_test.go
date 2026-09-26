@@ -109,6 +109,21 @@ func TestCheckPieceCount(t *testing.T) {
 	}
 }
 
+// TestCheckFileCount exercises the file-count cap directly; a torrent that
+// actually lists MaxFileCount+1 files would be a 20 MiB fixture that decodes
+// into a million maps.
+func TestCheckFileCount(t *testing.T) {
+	if MaxFileCount < 1<<20 {
+		t.Fatalf("MaxFileCount = %d, want at least 1<<20 so large datasets still load", MaxFileCount)
+	}
+	if err := checkFileCount(MaxFileCount); err != nil {
+		t.Fatalf("checkFileCount(MaxFileCount) = %v, want success", err)
+	}
+	if err := checkFileCount(MaxFileCount + 1); err == nil || !strings.Contains(err.Error(), "more than the maximum") {
+		t.Fatalf("checkFileCount(MaxFileCount+1) = %v, want cap rejection", err)
+	}
+}
+
 // TestParsePieceCountComparedIn64Bits is the GOARCH=386 regression: the
 // expected count used to be converted to int before comparing, so 2^32+1
 // expected pieces truncated to 1 and matched a single hash. CI runs this test
