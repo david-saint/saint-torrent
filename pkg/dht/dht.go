@@ -1470,8 +1470,11 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 			list, ok := val.([]interface{})
 			if ok {
 				for _, item := range list {
+					if len(res.Peers) == dhtMaxValuesPerResponse {
+						break
+					}
 					s, ok := item.(string)
-					if ok {
+					if ok && len(s) == 6 {
 						res.Peers = append(res.Peers, s)
 					}
 				}
@@ -1589,6 +1592,10 @@ const (
 	dhtLookupCandidates = 64
 	// dhtLookupQueryTimeout bounds each get_peers query of a lookup.
 	dhtLookupQueryTimeout = 3 * time.Second
+	// dhtMaxValuesPerResponse caps the peers taken from one get_peers answer.
+	// Honest nodes return at most this many (libtorrent's dht_max_peers_reply;
+	// we return 50), so one response cannot fill our dial slots with hundreds.
+	dhtMaxValuesPerResponse = 100
 )
 
 type candidateState uint8
@@ -1760,6 +1767,10 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		}
 	}
 
+	// seenPeers dedups values across the lookup's responses, so the same peer
+	// handed out by several nodes is published once.
+	seenPeers := make(map[[6]byte]struct{})
+
 	type lookupResult struct {
 		key nodeAddrKey
 		res *GetPeersResult
@@ -1816,14 +1827,21 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 			d.addNode(result.res.ID, responder)
 
 			for _, cp := range result.res.Peers {
-				if len(cp) != 6 {
+				var value [6]byte
+				copy(value[:], cp)
+				if _, dup := seenPeers[value]; dup {
 					continue
 				}
-				ip := net.IP([]byte(cp[0:4]))
-				port := binary.BigEndian.Uint16([]byte(cp[4:6]))
-				if port == 0 {
+				seenPeers[value] = struct{}{}
+				pk := nodeAddrKey{ip: [4]byte(value[:4]), port: binary.BigEndian.Uint16(value[4:])}
+				// We dial these, so a responder may only hand out peers no
+				// more local than itself: a public node cannot aim our
+				// connections at loopback or LAN services.
+				if !endpointAllowed(pk, responder) {
 					continue
 				}
+				ip := net.IP(append([]byte(nil), pk.ip[:]...))
+				port := pk.port
 
 				select {
 				case d.peerChan <- DiscoveredPeer{

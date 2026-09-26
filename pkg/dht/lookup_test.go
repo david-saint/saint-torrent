@@ -314,3 +314,130 @@ func TestLookupReferralScope(t *testing.T) {
 		})
 	}
 }
+
+func compactPeer(ip net.IP, port int) string {
+	var b [6]byte
+	copy(b[:4], ip.To4())
+	b[4], b[5] = byte(port>>8), byte(port)
+	return string(b[:])
+}
+
+// drainDiscovered returns every peer published on PeerChan so far.
+func drainDiscovered(d *DHT) []DiscoveredPeer {
+	var out []DiscoveredPeer
+	for {
+		select {
+		case p := <-d.PeerChan():
+			out = append(out, p)
+		default:
+			return out
+		}
+	}
+}
+
+// TestLookupFiltersCapsAndDedupsValues is the reported dial flood: a public
+// responder's values naming loopback, LAN, multicast, broadcast and port-0
+// endpoints must never reach the dialer, one response yields at most
+// dhtMaxValuesPerResponse peers, and a peer repeated by another responder is
+// published once.
+func TestLookupFiltersCapsAndDedupsValues(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "valued-info-hash----")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.5"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0x80, 1)
+	second := &net.UDPAddr{IP: net.ParseIP("203.0.113.6"), Port: 6881}
+	secondID := idAtDistance(infoHash, 0x01, 1)
+
+	special := []string{
+		compactPeer(net.ParseIP("127.0.0.1"), 22),
+		compactPeer(net.ParseIP("192.168.1.1"), 80),
+		compactPeer(net.ParseIP("10.0.0.1"), 445),
+		compactPeer(net.ParseIP("169.254.169.254"), 80),
+		compactPeer(net.ParseIP("224.0.0.1"), 80),
+		compactPeer(net.ParseIP("255.255.255.255"), 80),
+		compactPeer(net.ParseIP("0.0.0.0"), 1),
+		compactPeer(net.ParseIP("198.51.100.200"), 0),
+	}
+	public := func(i int) string { return compactPeer(net.IPv4(198, 51, byte(i/200), byte(i%200)), 6881) }
+	var seedValues []interface{}
+	for _, v := range special {
+		seedValues = append(seedValues, v)
+	}
+	for i := 0; i < 150; i++ {
+		seedValues = append(seedValues, public(i))
+	}
+	var secondValues []interface{}
+	for i := 0; i < 20; i++ {
+		secondValues = append(secondValues, public(i)) // already published
+	}
+	for i := 1000; i < 1005; i++ {
+		secondValues = append(secondValues, public(i))
+	}
+
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		switch {
+		case sameUDPAddr(to, seed):
+			return map[string]interface{}{
+				"id":     idString(seedID),
+				"values": seedValues,
+				"nodes":  compactNodes([]Node{{ID: secondID, Addr: second}}),
+			}
+		case sameUDPAddr(to, second):
+			return map[string]interface{}{"id": idString(secondID), "values": secondValues}
+		}
+		return nil
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	peers := drainDiscovered(d)
+	seen := make(map[string]bool)
+	for _, p := range peers {
+		key := compactPeer(p.IP, int(p.Port))
+		if seen[key] {
+			t.Fatalf("peer %s:%d was published twice", p.IP, p.Port)
+		}
+		seen[key] = true
+		for _, v := range special {
+			if key == v {
+				t.Fatalf("special-purpose endpoint %s:%d from a public node reached the dialer", p.IP, p.Port)
+			}
+		}
+	}
+	// The seed's first 100 values include the 8 special ones, so 92 public
+	// peers survive from it, plus the second responder's 5 new ones.
+	if want := dhtMaxValuesPerResponse - len(special) + 5; len(peers) != want {
+		t.Fatalf("published %d peers, want %d", len(peers), want)
+	}
+}
+
+// TestLookupLoopbackResponderMayHandOutLoopbackPeers keeps local test swarms
+// working: a loopback DHT node may hand out loopback peers.
+func TestLookupLoopbackResponderMayHandOutLoopbackPeers(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "local-info-hash-----")
+	seed := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 7001}
+	seedID := idAtDistance(infoHash, 0x80, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q == "get_peers" && sameUDPAddr(to, seed) {
+			return map[string]interface{}{"id": idString(seedID), "values": []interface{}{compactPeer(net.ParseIP("127.0.0.1"), 6881)}}
+		}
+		return nil
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	peers := drainDiscovered(d)
+	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("127.0.0.1")) || peers[0].Port != 6881 {
+		t.Fatalf("loopback responder's loopback peer was not published: %v", peers)
+	}
+}
