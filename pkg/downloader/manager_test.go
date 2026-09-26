@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/storage"
@@ -1676,10 +1677,12 @@ func TestQuarantineSurvivesRestart(t *testing.T) {
 // while it was being restored would crash it again while parsing it or
 // building its storage, so it is not loaded; it stays in session.json and a
 // warning points at --start-paused, which loads it paused and quarantined.
+// The warning leads with that remedy and the name session.json kept, since
+// the TUI cuts it to one line, and restore-failures.log records the crash file.
 func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
 	data, hash := testTorrent(t, "poison.bin", false)
 	hashHex := fmt.Sprintf("%x", hash)
-	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir(), Name: "Poison"}}, map[string][]byte{hashHex: data})
 	startedAt := time.Now().Add(-time.Hour)
 	writeCrashTestSentinel(t, stateDir, startedAt, false)
 	crashPath := writeCrashTestFile(t, stateDir, startedAt.Add(time.Second), hashHex, crashComponentRestore)
@@ -1693,13 +1696,21 @@ func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
 		if sess := mgr.GetSession(hashHex); sess != nil {
 			t.Fatalf("round %d: a torrent that crashed while restoring was loaded", round)
 		}
-		if !strings.Contains(warning, hashHex[:12]) || !strings.Contains(warning, "--start-paused") || !strings.Contains(warning, crashPath) {
-			t.Fatalf("round %d: warning %q does not name the torrent, its crash and --start-paused", round, warning)
+		if !strings.HasPrefix(warning, `Start with --start-paused to load "Poison", which crashed saintTorrent while loading`) ||
+			!strings.Contains(warning, CrashDir(stateDir)) {
+			t.Fatalf("round %d: warning %q does not lead with --start-paused and the torrent's name, and point at the crash directory", round, warning)
 		}
 		mgr.Close()
 		entry, ok := readCrashTestState(t, stateDir)[hashHex]
-		if !ok || !entry.Quarantined || entry.CrashComponent != crashComponentRestore {
-			t.Fatalf("round %d: persisted entry %+v (present %v), want it kept and quarantined", round, entry, ok)
+		if !ok || !entry.Quarantined || entry.CrashComponent != crashComponentRestore || entry.Name != "Poison" {
+			t.Fatalf("round %d: persisted entry %+v (present %v), want it kept, named and quarantined", round, entry, ok)
+		}
+		logData, err := os.ReadFile(filepath.Join(stateDir, "restore-failures.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lines := strings.Count(string(logData), crashPath); lines != round+1 || !strings.Contains(string(logData), "infohash="+hashHex) {
+			t.Fatalf("round %d: restore-failures.log %q, want a line per start naming the torrent and its crash file", round, logData)
 		}
 	}
 
@@ -1716,10 +1727,11 @@ func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
 		t.Fatalf("loaded torrent paused=%v quarantined=%v status %q, want paused after crash", sess.IsPaused(), sess.IsQuarantined(), sess.Status())
 	}
 	mgr.Close()
-	// Loaded once, it is an ordinary quarantined torrent from then on.
+	// Loaded once, it is an ordinary quarantined torrent from then on, saved
+	// under the name it now has.
 	entry := readCrashTestState(t, stateDir)[hashHex]
-	if !entry.Quarantined || entry.CrashComponent != "" {
-		t.Fatalf("persisted entry %+v, want it quarantined but no longer held unloaded", entry)
+	if !entry.Quarantined || entry.CrashComponent != "" || entry.Name != "poison.bin" {
+		t.Fatalf("persisted entry %+v, want it quarantined but no longer held unloaded, and named", entry)
 	}
 	again := NewTorrentManager()
 	defer again.Close()
@@ -1728,6 +1740,25 @@ func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
 	}
 	if sess := again.GetSession(hashHex); sess == nil || !sess.IsQuarantined() {
 		t.Fatalf("session = %v, want it loaded and still quarantined", sess)
+	}
+}
+
+// TestUnloadedNoticeNamesWithoutParsing: an unloaded torrent is named from
+// session.json alone, never by parsing its cached .torrent or magnet URI
+// (either may be what crashed): the saved name, bounded, or a short hash.
+// Several are listed in one notice that still leads with the remedy.
+func TestUnloadedNoticeNamesWithoutParsing(t *testing.T) {
+	hash := strings.Repeat("ab", 20)
+	if got := unloadedDisplayName(PersistedTorrent{InfoHashHex: hash, MagnetURI: "magnet:?xt=urn:btih:" + hash + "&dn=from-magnet"}); got != hash[:12] {
+		t.Fatalf("name without a saved one = %q, want the short hash", got)
+	}
+	long := strings.Repeat("é", 200)
+	if got := unloadedDisplayName(PersistedTorrent{InfoHashHex: hash, Name: long}); utf8.RuneCountInString(got) != 80 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("long name shown as %q, want it cut to 80 runes", got)
+	}
+	notice := unloadedNotice([]string{"a", "b"}, "/state/crash")
+	if !strings.HasPrefix(notice, `Start with --start-paused to load 2 torrents`) || !strings.Contains(notice, `"a", "b"`) {
+		t.Fatalf("notice for two torrents = %q", notice)
 	}
 }
 

@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
@@ -1032,6 +1034,9 @@ type PersistedTorrent struct {
 	Quarantined    bool   `json:"quarantined,omitempty"`
 	CrashNote      string `json:"crash_note,omitempty"`
 	CrashComponent string `json:"crash_component,omitempty"`
+	// Name is the torrent's name when it was last saved. It names an entry
+	// that is not loaded without parsing what may have crashed.
+	Name string `json:"name,omitempty"`
 }
 
 type PersistedState struct {
@@ -1067,6 +1072,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		// persist the torrent's own state (see Session.autoPaused).
 		paused := sess.paused && !sess.autoPaused
 		addedAt := sess.AddedAt
+		name := sess.Torrent.Name
 		private := sess.Torrent.Private
 		quarantined := sess.quarantined
 		crashNote := sess.quarantineNote
@@ -1080,6 +1086,7 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 
 		state.Torrents = append(state.Torrents, PersistedTorrent{
 			InfoHashHex:          infoHashHex,
+			Name:                 name,
 			MagnetURI:            magnetURI,
 			DownloadDir:          downloadDir,
 			FallbackDownloadDirs: fallbackDownloadDirs,
@@ -1319,6 +1326,77 @@ func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
 	return entry.InfoHashHex
 }
 
+// unloadedDisplayName names an entry left unloaded because it crashed
+// saintTorrent while being restored. Unlike restoreDisplayName it parses
+// nothing, neither the cached .torrent nor the magnet URI, since that may be
+// what crashed: it uses the name session.json kept, or a short hash.
+func unloadedDisplayName(entry PersistedTorrent) string {
+	const maxRunes = 80
+	if name := entry.Name; name != "" {
+		if utf8.RuneCountInString(name) <= maxRunes {
+			return name
+		}
+		runes := []rune(name)
+		return string(runes[:maxRunes-1]) + "…"
+	}
+	if len(entry.InfoHashHex) >= 12 {
+		return entry.InfoHashHex[:12]
+	}
+	return entry.InfoHashHex
+}
+
+// unloadedNotice is the startup notice for the torrents left unloaded because
+// they crashed saintTorrent while being restored. The TUI shows one line cut
+// to its width, so the notice starts with the remedy and the names.
+func unloadedNotice(names []string, crashDir string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = strconv.Quote(name)
+	}
+	if len(names) == 1 {
+		return fmt.Sprintf("Start with --start-paused to load %s, which crashed saintTorrent while loading and was not loaded "+
+			"(crash details: %s)", quoted[0], crashDir)
+	}
+	return fmt.Sprintf("Start with --start-paused to load %d torrents that crashed saintTorrent while loading and were not loaded: %s "+
+		"(crash details: %s)", len(names), strings.Join(quoted, ", "), crashDir)
+}
+
+// restoreFailure is a persisted torrent that was not restored, with the name
+// shown for it and why.
+type restoreFailure struct {
+	entry PersistedTorrent
+	name  string
+	err   error
+}
+
+// sortRestoreFailures orders failures by name, then info-hash.
+func sortRestoreFailures(failures []restoreFailure) {
+	sort.Slice(failures, func(i, j int) bool {
+		if failures[i].name != failures[j].name {
+			return failures[i].name < failures[j].name
+		}
+		return failures[i].entry.InfoHashHex < failures[j].entry.InfoHashHex
+	})
+}
+
+// appendRestoreFailureLog appends one line per failure to restore-failures.log
+// in stateDir, so a failure can be diagnosed after the fact (the startup line
+// is transient). Each line records the exact error, which is what reveals the
+// root cause.
+func appendRestoreFailureLog(stateDir string, failures []restoreFailure) {
+	lf, err := os.OpenFile(filepath.Join(stateDir, "restore-failures.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	_ = lf.Chmod(0600) // a log an older version created 0644
+	ts := time.Now().Format(time.RFC3339)
+	for _, f := range failures {
+		fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
+			ts, f.entry.InfoHashHex, f.entry.DownloadDir, f.name, f.err)
+	}
+	lf.Close()
+}
+
 // EnablePersistence initializes the manager state directory and restores previous torrents.
 // It returns a non-fatal warning message (if any recovery was needed) and a fatal error.
 //
@@ -1401,16 +1479,11 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	// Collect entries that fail to restore so the failure is surfaced to the
 	// user instead of silently vanishing. The entry is still preserved in
 	// session.json via failedTorrents and retried on the next launch.
-	type restoreFailure struct {
-		entry PersistedTorrent
-		name  string
-		err   error
-	}
 	var restoreFailMu sync.Mutex
 	var restoreFailures []restoreFailure
-	// Quarantined entries, under restoreFailMu: the notes of those left
-	// unloaded, and how many were loaded paused for a crash of the last run.
-	var unloadedQuarantine []string
+	// Quarantined entries, under restoreFailMu: those left unloaded, and how
+	// many were loaded paused for a crash of the last run.
+	var unloadedQuarantine []PersistedTorrent
 	var crashPausedCount int
 
 	restoreOne := func(entry PersistedTorrent) {
@@ -1434,13 +1507,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			m.mu.Lock()
 			m.failedTorrents = append(m.failedTorrents, kept)
 			m.mu.Unlock()
-			shortHash := entry.InfoHashHex
-			if len(shortHash) > 12 {
-				shortHash = shortHash[:12]
-			}
 			restoreFailMu.Lock()
-			unloadedQuarantine = append(unloadedQuarantine, fmt.Sprintf(
-				"torrent %s was not loaded (%s); start with --start-paused to load it paused", shortHash, note))
+			unloadedQuarantine = append(unloadedQuarantine, kept)
 			restoreFailMu.Unlock()
 			return
 		}
@@ -1619,9 +1687,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	restoreWG.Wait()
 
 	if len(restoreFailures) > 0 {
-		sort.Slice(restoreFailures, func(i, j int) bool {
-			return restoreFailures[i].name < restoreFailures[j].name
-		})
+		sortRestoreFailures(restoreFailures)
 
 		details := make([]string, len(restoreFailures))
 		anyPermission := false
@@ -1649,24 +1715,30 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			warning = failMsg
 		}
 
-		// Append the full errors to a durable log so an intermittent failure can
-		// be diagnosed after the fact (the warning banner is transient). Each line
-		// records the exact syscall error, which is what reveals the root cause.
-		if logPath := filepath.Join(stateDir, "restore-failures.log"); logPath != "" {
-			if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
-				_ = lf.Chmod(0600) // a log an older version created 0644
-				ts := time.Now().Format(time.RFC3339)
-				for _, f := range restoreFailures {
-					fmt.Fprintf(lf, "%s\tinfohash=%s\tdir=%s\tname=%q\terr=%v\n",
-						ts, f.entry.InfoHashHex, f.entry.DownloadDir, f.name, f.err)
-				}
-				lf.Close()
-			}
-		}
+		appendRestoreFailureLog(stateDir, restoreFailures)
 	}
 
 	// Crash containment comes first: the TUI shows one line, cut to its width.
+	// A torrent that was not loaded at all leads, since only the notice shows
+	// it and the remedy.
 	var crashNotices []string
+	if len(unloadedQuarantine) > 0 {
+		unloaded := make([]restoreFailure, len(unloadedQuarantine))
+		names := make([]string, len(unloadedQuarantine))
+		for i, entry := range unloadedQuarantine {
+			unloaded[i] = restoreFailure{
+				entry: entry,
+				name:  unloadedDisplayName(entry),
+				err:   fmt.Errorf("not loaded, start with --start-paused to load it: %s", entry.CrashNote),
+			}
+		}
+		sortRestoreFailures(unloaded)
+		for i, f := range unloaded {
+			names[i] = f.name
+		}
+		crashNotices = append(crashNotices, unloadedNotice(names, crashDir))
+		appendRestoreFailureLog(stateDir, unloaded)
+	}
 	if prevRun.pauseAll {
 		crashNotices = append(crashNotices, fmt.Sprintf(
 			"saintTorrent stopped unexpectedly twice in a row; all torrents were restored paused for this run "+
@@ -1677,8 +1749,6 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			"saintTorrent crashed while running %d torrent(s); they were restored paused (\"Paused after crash\"). Crash details: %s",
 			crashPausedCount, crashDir))
 	}
-	sort.Strings(unloadedQuarantine)
-	crashNotices = append(crashNotices, unloadedQuarantine...)
 	if warning != "" {
 		crashNotices = append(crashNotices, warning)
 	}

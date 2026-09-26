@@ -288,6 +288,81 @@ func TestWriteHeadlessStartupMessagesSeparatesInfoAndWarnings(t *testing.T) {
 	}
 }
 
+// TestLeadStartupWarnings: the exposed-API warning, then the persistence one,
+// come before the rest, and empty ones are dropped.
+func TestLeadStartupWarnings(t *testing.T) {
+	got := leadStartupWarnings("exposed", "crash", []string{"dht", "nat"})
+	if want := []string{"exposed", "crash", "dht", "nat"}; !slices.Equal(got, want) {
+		t.Fatalf("leadStartupWarnings = %q, want %q", got, want)
+	}
+	if got := leadStartupWarnings("", "", []string{"dht"}); !slices.Equal(got, []string{"dht"}) {
+		t.Fatalf("leadStartupWarnings with no lead = %q", got)
+	}
+}
+
+// TestUnloadedTorrentNoticeShowsRemedyInTUI: a torrent that crashed
+// saintTorrent while being restored is not loaded, so the TUI's startup line is
+// the only place it shows. That line is cut to the terminal width, and the
+// notice used to lead with the crash-file path and end with --start-paused, so
+// the remedy never showed at any width, nor did the torrent's name, and other
+// warnings came first.
+func TestUnloadedTorrentNoticeShowsRemedyInTUI(t *testing.T) {
+	configDir := t.TempDir()
+	hashHex := fmt.Sprintf("%x", [20]byte{0xab, 0xcd})
+	state, err := json.Marshal(downloader.PersistedState{Version: 1, Torrents: []downloader.PersistedTorrent{
+		{InfoHashHex: hashHex, DownloadDir: t.TempDir(), Name: "Poison Torrent"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "session.json"), state, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// What a run that crashed while restoring the torrent leaves behind: its
+	// running sentinel and a restore crash file blaming the torrent.
+	startedAt := time.Now().Add(-time.Hour)
+	sentinel := fmt.Sprintf(`{"pid":1,"nonce":"another-process","started_at":%q,"stable":false}`, startedAt.Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(configDir, "running"), []byte(sentinel), 0600); err != nil {
+		t.Fatal(err)
+	}
+	crashDir := downloader.CrashDir(configDir)
+	if err := os.MkdirAll(crashDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	crashFile := filepath.Join(crashDir, fmt.Sprintf("%d-%s-restore.txt", startedAt.Add(time.Second).UnixNano(), hashHex))
+	if err := os.WriteFile(crashFile, []byte("component: restore\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := downloader.NewTorrentManager()
+	t.Cleanup(mgr.Close)
+	warning, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.GetSession(hashHex) != nil {
+		t.Fatal("the torrent that crashed while restoring was loaded")
+	}
+	line := tuiStartupLine([]string{"HTTP stats endpoint: http://127.0.0.1:16666/stats"},
+		leadStartupWarnings("", warning, []string{"DHT unavailable: " + strings.Repeat("x", 80)}))
+	for _, th := range themes {
+		for _, width := range []int{80, 120, 200} {
+			m := initialModel(mgr, ".", line, nil)
+			m.theme = th
+			um, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 40})
+			out := um.View()
+			if !strings.Contains(out, "--start-paused") || !strings.Contains(out, `"Poison Torrent"`) {
+				t.Fatalf("theme=%s width=%d: the startup line does not show --start-paused and the torrent's name:\n%s", th.name, width, out)
+			}
+		}
+	}
+	// The crash file the line leaves out is in restore-failures.log.
+	logData, err := os.ReadFile(filepath.Join(configDir, "restore-failures.log"))
+	if err != nil || !strings.Contains(string(logData), crashFile) || !strings.Contains(string(logData), hashHex) {
+		t.Fatalf("restore-failures.log %q (%v), want the torrent and its crash file", logData, err)
+	}
+}
+
 // In TUI mode the stats endpoint address (and the warning for a network-
 // reachable bind) must reach the startup line, not only headless stderr.
 func TestTUIStartupLineIncludesInfos(t *testing.T) {

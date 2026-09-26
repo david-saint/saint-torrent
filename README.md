@@ -291,9 +291,9 @@ keeps there private to your user (directories `0700`, files `0600`):
 
 | Path | What it holds |
 | --- | --- |
-| `session.json` | Every torrent: download directory, paused state, file priorities, and any crash quarantine |
+| `session.json` | Every torrent: name, download directory, paused state, file priorities, and any crash quarantine |
 | `torrents/` | A cached copy of each `.torrent` (these can carry private-tracker passkeys) |
-| `restore-failures.log` | Why a torrent failed to restore at startup, one line per failure |
+| `restore-failures.log` | Why a torrent failed to restore, or was not loaded after a crash, at startup: one line per torrent and start |
 | `crash/` | One `<time>-<info-hash>-<component>.txt` file per recorded crash (the newest 32 are kept), and `fatal.txt`, where the Go runtime writes fatal errors (rotated to `fatal.txt.1` past 1 MiB) |
 | `running` | Present while saintTorrent runs; removed on a clean exit |
 | `crash-state.json` | How many runs in a row ended in a crash no torrent was blamed for |
@@ -313,9 +313,10 @@ not exit cleanly, and:
   be what crashed; its error line points at the crash file. Resuming it lifts
   the quarantine. Until then it stays quarantined across restarts.
 - A torrent that crashed saintTorrent *while being restored* is not loaded at
-  all, since loading it would crash again. It stays in `session.json`, the
-  startup line names its info-hash, and `--start-paused` loads it paused and
-  quarantined.
+  all, since loading it would crash again. It stays in `session.json`, and the
+  startup line leads with `Start with --start-paused to load "<name>"`:
+  `--start-paused` loads it paused and quarantined. `restore-failures.log`
+  names its crash file.
 - A crash no torrent is blamed for (the terminal UI, the DHT, a fatal runtime
   error, or the process being killed outright by `SIGKILL`, the OOM killer or
   a power cut) in the first 10 minutes of a run is counted. After two such

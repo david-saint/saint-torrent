@@ -1905,6 +1905,8 @@ func main() {
 
 	var startupInfos []string
 	var startupWarns []string
+	// Shown ahead of startupWarns: see leadStartupWarnings.
+	var exposureWarn, persistWarn string
 
 	// Resolve the state directory before anything starts goroutines, so a
 	// fatal error from here on also lands in <configDir>/crash/fatal.txt.
@@ -2020,8 +2022,7 @@ func main() {
 		}
 		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
 		if !statsServer.Loopback() {
-			// First, so the TUI's one-line startup message cannot cut it off.
-			startupWarns = append([]string{fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())}, startupWarns...)
+			exposureWarn = fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())
 		}
 	}
 	perfMarkf("http-stats")
@@ -2029,9 +2030,9 @@ func main() {
 	if persist {
 		warning, err := mgr.EnablePersistence(configDir)
 		if err != nil {
-			startupWarns = append(startupWarns, fmt.Sprintf("Failed to initialize persistence: %v", err))
-		} else if warning != "" {
-			startupWarns = append(startupWarns, warning)
+			persistWarn = fmt.Sprintf("Failed to initialize persistence: %v", err)
+		} else {
+			persistWarn = warning
 		}
 	}
 	perfMarkf("persistence")
@@ -2073,6 +2074,7 @@ func main() {
 		})
 	}
 
+	startupWarns = leadStartupWarnings(exposureWarn, persistWarn, startupWarns)
 	startupWarn := tuiStartupLine(startupInfos, startupWarns)
 
 	exitCode := 0
@@ -2240,6 +2242,21 @@ func notifyHangup(ch chan<- os.Signal) bool {
 	}
 	signal.Notify(ch, syscall.SIGHUP)
 	return true
+}
+
+// leadStartupWarnings puts the warning that the stats API is exposed, then the
+// persistence warning, ahead of the other startup warnings: the TUI shows them
+// on one line cut to its width. The persistence warning starts with crash
+// containment, such as a torrent that was not loaded and how to load it, which
+// nothing else on screen shows. Empty warnings are dropped.
+func leadStartupWarnings(exposure, persistence string, rest []string) []string {
+	var warns []string
+	for _, w := range []string{exposure, persistence} {
+		if w != "" {
+			warns = append(warns, w)
+		}
+	}
+	return append(warns, rest...)
 }
 
 // tuiStartupLine joins startup warnings and infos into the TUI's single
