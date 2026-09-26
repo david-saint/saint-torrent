@@ -92,8 +92,9 @@ type pieceWriteJob struct {
 	data  []byte
 	// pieceBuf, when non-nil, is the pooled buffer backing data. The worker returns
 	// it to the session's piece-buffer pool once the piece is hashed and written, so
-	// the per-piece assembly allocation becomes buffer reuse. Nil for jobs whose
-	// data is not pooled (e.g. the webseed path allocates its own buffer).
+	// the per-piece assembly allocation becomes buffer reuse. Peer and webseed
+	// pieces are both assembled into buffers from getPieceBuf; it is nil only when
+	// data is not pooled (tests that build jobs by hand).
 	pieceBuf *[]byte
 	// conn is the connection of the peer that supplied the piece. If the assembled
 	// data fails the SHA-1 check the worker closes it, dropping the misbehaving peer
