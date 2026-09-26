@@ -88,6 +88,10 @@ type PeerState struct {
 	// FailCount counts connection attempts that failed in a row; past
 	// maxPeerFailCount the peer is rarely redialed.
 	FailCount uint8
+	// seenAt is when DHT, PEX or a tracker last listed the address. An entry
+	// recorded while every outbound slot was busy has no LastAttempt yet, and
+	// prunePeersLocked ages it by this instead of evicting it first.
+	seenAt time.Time
 
 	WindowBlocks         int
 	TargetWindowBlocks   int

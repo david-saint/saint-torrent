@@ -672,7 +672,10 @@ func freshTrackerPeers(peers []tracker.Peer, source netip.Addr, seen map[netip.A
 // spawn a goroutine storm. slotsHeld is snapshotted once (len() is a safe,
 // lock-free read, 0 for nil test sessions) so goroutines that acquire a slot
 // mid-loop are not double-counted against launched — double-counting previously
-// throttled connection ramp-up under load.
+// throttled connection ramp-up under load. Peers past that bound (or all of them
+// while the metadata cannot be used) are recorded undialed, with no LastAttempt,
+// so maintenance dials them as slots free up rather than waiting for the next
+// announce, up to an hour away, to list them again.
 func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 	if len(peers) == 0 {
 		return
@@ -683,10 +686,11 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 		// Same key form as the DHT and PEX paths ("[v6]:port" for IPv6).
 		peerAddr := ap.String()
 		s.mu.Lock()
-		if s.closed || s.paused || slotsHeld+launched >= maxOutboundPeers || s.metadataStalledLocked() {
+		if s.closed || s.paused {
 			s.mu.Unlock()
 			break
 		}
+		now := time.Now()
 		pState, exists := s.Peers[peerAddr]
 		shouldDial := false
 		if !exists {
@@ -696,8 +700,24 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 			// dialable, even if the same address was first seen as an inbound peer.
 			pState.Dialable = true
 			pState.markTrackerListed()
-			if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > peerRedialBackoff {
+			pState.seenAt = now
+			if !pState.Active && !pState.Dialing && now.Sub(pState.LastAttempt) > peerRedialBackoff {
 				shouldDial = true
+			}
+		}
+		if shouldDial && (slotsHeld+launched >= maxOutboundPeers || s.metadataStalledLocked()) {
+			shouldDial = false
+			if !exists {
+				s.prunePeersLocked()
+				s.Peers[peerAddr] = &PeerState{
+					IP:        ap.Addr().String(),
+					Port:      ap.Port(),
+					Choked:    true,
+					AmChoking: true,
+					Dialable:  true,
+					Source:    PeerSourceTracker,
+					seenAt:    now,
+				}
 			}
 		}
 		if shouldDial {
@@ -709,13 +729,14 @@ func (s *Session) connectTrackerPeers(peers []netip.AddrPort) {
 					Choked:      true,
 					Active:      false,
 					AmChoking:   true,
-					LastAttempt: time.Now(),
+					LastAttempt: now,
 					Dialable:    true,
 					Dialing:     true,
 					Source:      PeerSourceTracker,
+					seenAt:      now,
 				}
 			} else {
-				s.Peers[peerAddr].LastAttempt = time.Now()
+				s.Peers[peerAddr].LastAttempt = now
 				s.Peers[peerAddr].Dialing = true
 			}
 			s.wg.Add(1)

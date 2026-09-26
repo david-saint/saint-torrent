@@ -505,3 +505,102 @@ func TestDHTPeerOwnEndpointIsDropped(t *testing.T) {
 		}
 	}
 }
+
+// fillOutboundSlotsA2 takes n of the session's outbound slots, as dials in
+// flight would, and returns a func that frees one.
+func fillOutboundSlotsA2(sess *Session, n int) func() {
+	for i := 0; i < n; i++ {
+		sess.outboundSlots <- struct{}{}
+	}
+	return func() { <-sess.outboundSlots }
+}
+
+// TestDiscoveryPeerRecordedWhenSlotsFullA2 covers DHT and PEX peers that arrive
+// while every outbound slot is busy: they were dropped, and with DHT lookups
+// now minutes apart nothing would supply them again. They are recorded
+// undialed, and maintenance dials them once a slot frees.
+func TestDiscoveryPeerRecordedWhenSlotsFullA2(t *testing.T) {
+	sess, _, _ := newStallTestTorrent(t, 1)
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	freeSlot := fillOutboundSlotsA2(sess, maxOutboundPeers)
+
+	ln, port, accepted := acceptCountingListener(t)
+	defer ln.Close()
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	sess.AddPeerFromDiscovery(addr)
+	ps, ok := knownPeerState(sess, addr)
+	if !ok || ps.Dialing || !ps.LastAttempt.IsZero() || !ps.Dialable || ps.Source != PeerSourceDiscovery {
+		t.Fatalf("discovery peer seen with every slot busy: known %v %+v; want recorded undialed", ok, ps)
+	}
+	if n := accepted(); n != 0 {
+		t.Fatalf("dialed %d time(s) past the outbound cap", n)
+	}
+
+	freeSlot()
+	sess.maintainPeerConnections()
+	if n := accepted(); n != 1 {
+		t.Fatalf("maintenance dialed the recorded peer %d time(s) once a slot freed, want 1", n)
+	}
+}
+
+// TestTrackerPeersBeyondSlotCapRecordedA2 covers a tracker answer that holds
+// more peers than there are free slots: the loop stopped at the cap and the
+// rest were lost until the next announce, up to an hour away.
+func TestTrackerPeersBeyondSlotCapRecordedA2(t *testing.T) {
+	sess, _, _ := newStallTestTorrent(t, 1)
+	defer sess.Close()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	fillOutboundSlotsA2(sess, maxOutboundPeers-1)
+
+	var peers []netip.AddrPort
+	for i := 0; i < 3; i++ {
+		peers = append(peers, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(refusingLoopbackPort(t))))
+	}
+	sess.connectTrackerPeers(peers)
+	for i, ap := range peers {
+		ps, ok := knownPeerState(sess, ap.String())
+		if !ok || ps.Source != PeerSourceTracker || !ps.Dialable {
+			t.Fatalf("tracker peer %d: known %v %+v", i, ok, ps)
+		}
+		if i > 0 && (ps.Dialing || !ps.LastAttempt.IsZero()) {
+			t.Fatalf("tracker peer %d past the slot cap was dialed: %+v", i, ps)
+		}
+	}
+	if ps, _ := knownPeerState(sess, peers[0].String()); ps.LastAttempt.IsZero() {
+		t.Fatal("the tracker peer that fit under the slot cap was not dialed")
+	}
+}
+
+// TestPruneKeepsFreshUndialedPeersA2 checks an entry recorded undialed (no
+// LastAttempt) is aged by when it was listed, so a full Peers map evicts stale
+// attempted entries before fresh ones nobody has tried yet.
+func TestPruneKeepsFreshUndialedPeersA2(t *testing.T) {
+	s := &Session{Peers: make(map[string]*PeerState)}
+	now := time.Now()
+	fresh := maxKnownPeers / 4
+	for i := 0; i < fresh; i++ {
+		s.Peers[fmt.Sprintf("198.51.100.%d:%d", i%256, 1000+i)] = &PeerState{Dialable: true, seenAt: now}
+	}
+	for i := 0; i < maxKnownPeers; i++ {
+		s.Peers[fmt.Sprintf("203.0.113.%d:%d", i%256, 1000+i)] = &PeerState{Dialable: true, LastAttempt: now.Add(-time.Hour)}
+	}
+
+	s.mu.Lock()
+	s.prunePeersLocked()
+	s.mu.Unlock()
+
+	kept := 0
+	for _, ps := range s.Peers {
+		if ps.LastAttempt.IsZero() {
+			kept++
+		}
+	}
+	if kept != fresh {
+		t.Fatalf("prune kept %d of %d fresh undialed peers, want all", kept, fresh)
+	}
+}

@@ -253,8 +253,10 @@ func laterTime(a, b time.Time) time.Time {
 
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
 // maxKnownPeers: first those past maxPeerFailCount, so a flood of dead addresses
-// cannot push out peers that work, then oldest-attempt-first. Active peers are
-// never evicted. Caller holds s.mu.
+// cannot push out peers that work, then the ones least recently tried or listed
+// (the later of LastAttempt and seenAt), so a peer recorded undialed because
+// every slot was busy is not the first to go. Active peers are never evicted.
+// Caller holds s.mu.
 func (s *Session) prunePeersLocked() {
 	if len(s.Peers) <= maxKnownPeers {
 		return
@@ -269,7 +271,7 @@ func (s *Session) prunePeersLocked() {
 		if ps.Active {
 			continue
 		}
-		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt, failed: ps.FailCount >= maxPeerFailCount})
+		inactive = append(inactive, agedPeer{addr: addr, at: laterTime(ps.LastAttempt, ps.seenAt), failed: ps.FailCount >= maxPeerFailCount})
 	}
 	sort.Slice(inactive, func(i, j int) bool {
 		if inactive[i].failed != inactive[j].failed {
@@ -3456,6 +3458,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	if fromDiscovery {
 		source = PeerSourceDiscovery
 	}
+	now := time.Now()
 	var shouldDial bool
 	if !exists {
 		shouldDial = true
@@ -3464,15 +3467,34 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		// same address becomes eligible for maintenance retries.
 		pState.Dialable = true
 		pState.Source |= source
-		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > pState.redialBackoff() {
+		if fromDiscovery {
+			pState.seenAt = now
+		}
+		if !pState.Active && !pState.Dialing && now.Sub(pState.LastAttempt) > pState.redialBackoff() {
 			shouldDial = true
 		}
 	}
 
-	// Don't exceed the outbound connection cap, and dial nobody while the
-	// metadata cannot be used.
-	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host) || s.metadataStalledLocked()) {
+	// Never dial a refused address. Don't exceed the outbound connection cap, and
+	// dial nobody while the metadata cannot be used; a new peer is recorded then
+	// (with no LastAttempt), so maintenance dials it once that changes instead of
+	// losing it until DHT or PEX happen to list it again.
+	if shouldDial && s.refusesDialLocked(peerAddr, host) {
 		shouldDial = false
+	} else if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.metadataStalledLocked()) {
+		shouldDial = false
+		if !exists {
+			s.prunePeersLocked()
+			s.Peers[peerAddr] = &PeerState{
+				IP:        host,
+				Port:      uint16(port),
+				AmChoking: true,
+				Choked:    true,
+				Dialable:  true,
+				Source:    source,
+				seenAt:    now,
+			}
+		}
 	}
 
 	if shouldDial {
@@ -3483,13 +3505,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 				Port:        uint16(port),
 				AmChoking:   true,
 				Choked:      true,
-				LastAttempt: time.Now(),
+				LastAttempt: now,
 				Dialable:    true,
 				Dialing:     true,
 				Source:      source,
+				seenAt:      now,
 			}
 		} else {
-			s.Peers[peerAddr].LastAttempt = time.Now()
+			s.Peers[peerAddr].LastAttempt = now
 			s.Peers[peerAddr].Dialing = true
 		}
 		s.wg.Add(1)
