@@ -41,6 +41,47 @@ func newWireTestSession(t testing.TB, numPieces int, pieceLen int64) *Session {
 	return sess
 }
 
+// newSeedingWireTestSession is newWireTestSession with every piece written and
+// marked complete, so the session serves requests. It returns the torrent data.
+func newSeedingWireTestSession(t *testing.T, numPieces int, pieceLen int64) (*Session, []byte) {
+	t.Helper()
+	data := make([]byte, int64(numPieces)*pieceLen)
+	for i := range data {
+		data[i] = byte(i*13 + 7)
+	}
+	hashes := make([][20]byte, numPieces)
+	for i := range hashes {
+		hashes[i] = sha1.Sum(data[int64(i)*pieceLen : int64(i+1)*pieceLen])
+	}
+	tor := &torrent.Torrent{
+		Name:        "wire-seed.bin",
+		InfoHash:    sha1.Sum([]byte("wire-seed-test")),
+		PieceLength: pieceLen,
+		PieceHashes: hashes,
+		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"wire-seed.bin"}}},
+	}
+	st, err := storage.NewMemStorage(t.TempDir(), []storage.FileInfo{{Path: "wire-seed.bin", Length: int64(len(data))}}, pieceLen)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	sess, err := NewSession(tor, st, [20]byte{}, 0, t.TempDir())
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+	for i := 0; i < numPieces; i++ {
+		if err := sess.Storage.WriteBlock(int64(i), 0, data[int64(i)*pieceLen:int64(i+1)*pieceLen]); err != nil {
+			t.Fatalf("seed piece %d: %v", i, err)
+		}
+	}
+	sess.mu.Lock()
+	for i := 0; i < numPieces; i++ {
+		sess.setPieceStateLocked(i, PieceCompleted)
+	}
+	sess.mu.Unlock()
+	return sess, data
+}
+
 // wirePeer is the remote end of a runPeerMessageLoop connection over net.Pipe.
 // Everything the loop sends is collected on in, so the loop never blocks on a
 // write the test has not read yet.

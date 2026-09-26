@@ -788,6 +788,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// short-circuits the re-check once every index in it has been offered.
 	var localAllowedFast []int
 	allowedFastFullyAdvertised := false
+	// allowedFastServed counts blocks of each allowed-fast piece queued for this
+	// peer while we choke it (keys are limited to allowedFastForPeer).
+	allowedFastServed := make(map[int64]int64)
 	// Fast messages that arrive before we have metadata reference piece indices we
 	// cannot validate yet; remember them and replay once the piece count is known
 	// (a seed sends have_all exactly once, right after the handshake — well before
@@ -796,7 +799,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// pendingAllowedFast buffers allowed_fast offers that arrive before metadata,
 	// deduped and capped at pendingAllowedFastCap. The cap sits far above any real
 	// client's allowed-fast set so legitimate offers all replay once metadata lands
-	// (matching the post-metadata path, which is bounded only by the piece count),
+	// (the post-metadata path applies the same cap to peerAllowedFast),
 	// while still preventing a peer from growing our memory at wire rate by spamming
 	// distinct indices we cannot yet validate. The map is sized for the common case
 	// (~allowedFastSetSize offers); it grows on its own if a peer sends more.
@@ -2225,7 +2228,10 @@ peerLoop:
 				}
 				continue
 			}
-			if index >= 0 && index < int64(numPiecesNow) {
+			// The same cap applies once metadata is known: the set is scanned by
+			// hasAllowedFastWork on every pump while we are choked, so it must not
+			// grow to the piece count.
+			if index >= 0 && index < int64(numPiecesNow) && len(peerAllowedFast) < pendingAllowedFastCap {
 				peerAllowedFast[index] = struct{}{}
 			}
 
@@ -2396,6 +2402,18 @@ peerLoop:
 				}
 
 				if isCompleted && length > 0 && length <= BlockSize && begin >= 0 && begin+length <= pieceLen {
+					// While we choke the peer, an allowed-fast piece may be fetched only a
+					// few times over (libtorrent's mitigation): otherwise a choked peer
+					// could re-download its fast set forever, bypassing the choker.
+					if amChoking {
+						if allowedFastServed[index] >= allowedFastServeRounds*((pieceLen+BlockSize-1)/BlockSize) {
+							_ = client.SendRejectRequest(uint32(index), uint32(begin), uint32(length))
+							continue
+						}
+						if len(uploadQueue) < maxUploadQueue {
+							allowedFastServed[index]++
+						}
+					}
 					// Queue the block for upload rather than blocking on the limiter here:
 					// waiting for upload tokens inside the message loop would stop this
 					// goroutine running pump(), stalling the download side (issue #59).

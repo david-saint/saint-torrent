@@ -10,14 +10,19 @@ import (
 
 const allowedFastSetSize = 10
 
-// pendingAllowedFastCap bounds how many distinct allowed_fast offers we buffer
-// before metadata is known and we can validate indices against the piece count.
-// It sits far above any real client's allowed-fast set (allowedFastSetSize) so a
-// legitimate seed's offers all survive to be replayed once metadata lands —
-// matching the post-metadata path, which honors every valid index up to the piece
-// count — while still capping memory so a peer can't grow the buffer at wire rate
-// by flooding distinct indices we cannot yet validate.
+// pendingAllowedFastCap bounds how many distinct allowed_fast offers we keep from
+// one peer, both buffered before metadata is known (when indices cannot be
+// validated yet) and once they can be. It sits far above any real client's
+// allowed-fast set (allowedFastSetSize) so legitimate offers all survive, while
+// stopping a peer from growing our memory at wire rate or making the per-message
+// hasAllowedFastWork scan O(pieces) by offering every index.
 const pendingAllowedFastCap = 256
+
+// allowedFastServeRounds is how many times over (in blocks) a peer we are choking
+// may fetch each piece of its allowed-fast set, as libtorrent does. An honest
+// peer fetches a piece once; the cap stops a choked peer re-downloading its fast
+// set indefinitely.
+const allowedFastServeRounds = 3
 
 func completedPieceBitfield(states []PieceState) (bitfield []byte, hasAny bool, hasAll bool) {
 	if len(states) == 0 {
