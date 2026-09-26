@@ -19,9 +19,37 @@ const pexDeltaLimit = 50
 // list is ignored rather than dialed.
 const pexIngestLimit = 50
 
-// maxPEXFloods is how many ut_pex messages one connection may send too soon
-// (under half of pexInterval after the last one we used) before it is dropped.
-const maxPEXFloods = 3
+// maxPEXPerInterval is how many ut_pex messages one connection may send within
+// one pexInterval; the next one inside it drops the connection. libtorrent
+// allows the same three a minute, so no client that works with it is dropped.
+const maxPEXPerInterval = 3
+
+// pexRateLimiter decides, per connection, which ut_pex messages we act on. It
+// is owned by the connection's message loop.
+type pexRateLimiter struct {
+	recent   [maxPEXPerInterval]time.Time // when the last messages arrived, oldest first
+	lastUsed time.Time                    // when we last acted on one
+}
+
+// admit reports, for a ut_pex message arriving at now, whether to decode and act
+// on it (use) and whether to drop the sender instead (flood). A message sooner
+// than half of pexInterval after the last one used is ignored undecoded, so a
+// peer cannot make us dial at the rate it sends. Only a sender over the
+// libtorrent rate is dropped: a lifetime count of early messages would also
+// catch an honest peer whose messages our loop happened to read back to back
+// (after a stall on disk backpressure, say), or that sends every 20-30 s.
+func (l *pexRateLimiter) admit(now time.Time) (use, flood bool) {
+	if !l.recent[0].IsZero() && now.Sub(l.recent[0]) < pexInterval {
+		return false, true
+	}
+	copy(l.recent[:], l.recent[1:])
+	l.recent[len(l.recent)-1] = now
+	if !l.lastUsed.IsZero() && now.Sub(l.lastUsed) < pexInterval/2 {
+		return false, false
+	}
+	l.lastUsed = now
+	return true, false
+}
 
 func (s *Session) pexEnabledLocked() bool {
 	return s.Torrent != nil && !s.Torrent.Private

@@ -302,10 +302,71 @@ func TestPEXIgnoresTooFrequentMessagesAndDropsFlooder(t *testing.T) {
 		t.Fatal("a ut_pex message sent right after the previous one was acted on")
 	}
 
-	for i := 1; i < maxPEXFloods; i++ {
+	// The message after maxPEXPerInterval within one interval drops the peer.
+	for i := 1; i < maxPEXPerInterval; i++ {
 		sendPEX(fmt.Sprintf("127.0.1.%d", 10+i))
 	}
 	w.waitClosed(5 * time.Second)
+}
+
+// TestPEXRateLimiterKeepsHonestSenders covers the ut_pex rate rule over a long
+// connection: honest senders are never dropped, however long they stay (nor when
+// our loop reads a few of their messages back to back after a stall), while a
+// sender over maxPEXPerInterval messages per interval is.
+func TestPEXRateLimiterKeepsHonestSenders(t *testing.T) {
+	start := time.Unix(1_000_000, 0)
+	run := func(gaps ...time.Duration) (used int, dropped bool) {
+		var l pexRateLimiter
+		now := start
+		for _, gap := range gaps {
+			now = now.Add(gap)
+			use, flood := l.admit(now)
+			if flood {
+				return used, true
+			}
+			if use {
+				used++
+			}
+		}
+		return used, false
+	}
+	every := func(gap time.Duration, n int) []time.Duration {
+		gaps := make([]time.Duration, n)
+		for i := range gaps {
+			gaps[i] = gap
+		}
+		return gaps
+	}
+
+	for _, gap := range []time.Duration{pexInterval, pexInterval / 2, pexInterval / 3} {
+		used, dropped := run(every(gap, 200)...)
+		if dropped {
+			t.Errorf("a peer sending ut_pex every %v was dropped", gap)
+		}
+		if gap >= pexInterval/2 && used != 200 {
+			t.Errorf("a peer sending ut_pex every %v had %d of 200 messages used", gap, used)
+		}
+		if gap < pexInterval/2 && used > 100 {
+			t.Errorf("a peer sending ut_pex every %v had %d of 200 messages used", gap, used)
+		}
+	}
+
+	// Three messages read back to back after a stall, now and again.
+	var stalls []time.Duration
+	for i := 0; i < 20; i++ {
+		stalls = append(stalls, 3*pexInterval, 0, 0)
+	}
+	if _, dropped := run(stalls...); dropped {
+		t.Error("a peer whose messages were read back to back after stalls was dropped")
+	}
+
+	if _, dropped := run(0, time.Second, time.Second, time.Second); !dropped {
+		t.Error("a peer sending four ut_pex messages within one interval was kept")
+	}
+	// A flooder is dropped however it spreads its messages inside the window.
+	if _, dropped := run(every(pexInterval/(maxPEXPerInterval+1), 2*maxPEXPerInterval)...); !dropped {
+		t.Error("a peer sending ut_pex faster than the rate was kept")
+	}
 }
 
 // TestPEXActsOnAtMostFiftyAddedPeers covers a ut_pex message listing far more
