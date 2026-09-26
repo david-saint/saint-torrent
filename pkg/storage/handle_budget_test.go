@@ -78,6 +78,9 @@ func budgetPiece(i int, length int64) []byte {
 // a read and a write handle until Close, 6000 descriptors for these 3000 files,
 // where macOS allows about 10k for the whole process.
 func TestFileStorageBoundsCachedHandles(t *testing.T) {
+	if !evictCachedHandles {
+		t.Skip("cached handles are not evicted on this platform (see evictCachedHandles)")
+	}
 	const limit = 64
 	const fileCount = 3000
 	setHandleLimit(t, limit)
@@ -143,6 +146,9 @@ func TestFileStorageBoundsCachedHandles(t *testing.T) {
 // TestFileStorageEvictsLeastRecentlyUsed: the files a sweep closes are the
 // ones used longest ago, and a file whose handle it closed reads on.
 func TestFileStorageEvictsLeastRecentlyUsed(t *testing.T) {
+	if !evictCachedHandles {
+		t.Skip("cached handles are not evicted on this platform (see evictCachedHandles)")
+	}
 	const limit = 8
 	setHandleLimit(t, limit)
 	const fileCount = 64

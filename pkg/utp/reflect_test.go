@@ -50,7 +50,9 @@ func TestDHTDatagramCopyIsCapped(t *testing.T) {
 	}
 	defer raw.Close()
 
-	big := bytes.Repeat([]byte("d1:ae"), 12000) // 60000 bytes, not a uTP header
+	// 8000 bytes: past maxDHTDatagram, not a uTP header, and under macOS's
+	// default net.inet.udp.maxdgram (9216), past which sendto fails.
+	big := bytes.Repeat([]byte("d1:ae"), 1600)
 	target := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: int(socket.Port())}
 	if _, err := raw.WriteToUDP(big, target); err != nil {
 		t.Fatalf("send datagram: %v", err)

@@ -173,6 +173,32 @@ func TestAnnounceFromOneIPCannotFlushStore(t *testing.T) {
 
 // TestPeerStoreEvictsLeastRecentlyAnnounced verifies a full store makes room by
 // dropping the swarm announced to longest ago, not an arbitrary one.
+// TestPeerStoreKeepsNewestPortsWithTiedClock: one IP's newest ports replace
+// its oldest even when every announce carries the same time, as happens on a
+// coarse clock (Windows). Ordering by time alone kept replacing one slot, so
+// the IP's first ports outlived its newest ones.
+func TestPeerStoreKeepsNewestPortsWithTiedClock(t *testing.T) {
+	s := newPeerStore()
+	now := time.Now()
+	hash, ip := testHash(1), testIP(1)
+	const first, last = 1000, 1050
+	for port := first; port < last; port++ {
+		if !s.announce(hash, ip, uint16(port), now) {
+			t.Fatalf("announce of port %d refused", port)
+		}
+	}
+	kept := map[uint16]bool{}
+	for _, p := range s.swarms[hash].peers {
+		kept[p.port] = true
+	}
+	for port := last - maxPeersPerIPPerHash; port < last; port++ {
+		if !kept[uint16(port)] {
+			t.Fatalf("stored ports %v, want the newest %d (%d-%d)", kept, maxPeersPerIPPerHash, last-maxPeersPerIPPerHash, last-1)
+		}
+	}
+	checkPeerStore(t, s)
+}
+
 func TestPeerStoreEvictsLeastRecentlyAnnounced(t *testing.T) {
 	s := newPeerStore()
 	now := time.Now()

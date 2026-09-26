@@ -220,6 +220,12 @@ func TestPathKeyASCIIShortcutMatchesUnicodeFold(t *testing.T) {
 // the file from, and only where it differs.
 func TestParseKeepsLegacyPaths(t *testing.T) {
 	long := strings.Repeat("L", 300) + ".mkv"
+	// Windows keeps one byte free for the '_' a device name gets
+	// (sanitizeComponent), so its names are cut a byte shorter.
+	limit := maxComponentBytes
+	if runtime.GOOS == "windows" {
+		limit--
+	}
 	for _, tc := range []struct {
 		name, in, want, legacy string
 	}{
@@ -231,8 +237,8 @@ func TestParseKeepsLegacyPaths(t *testing.T) {
 		{"escape sequence", "a\x1b[31mb", "a_[31mb", "a\x1b[31mb"},
 		// The old rules still applied: ".." inside a name became '_'.
 		{"invisible dot-dot", "..\u200b", "safe_name", "_\u200b"},
-		{"overlong", long, strings.Repeat("L", 251) + ".mkv", long},
-		{"longer than any filesystem holds", strings.Repeat("L", 2000), strings.Repeat("L", maxComponentBytes), ""},
+		{"overlong", long, strings.Repeat("L", limit-len(".mkv")) + ".mkv", long},
+		{"longer than any filesystem holds", strings.Repeat("L", 2000), strings.Repeat("L", limit), ""},
 		{"plain", "movie.mkv", "movie.mkv", ""},
 		{"inner dot-dot", "a..b", "a_b", ""},
 		{"literal replacement character", "a\ufffdb", "a\ufffdb", ""},

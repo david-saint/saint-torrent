@@ -25,8 +25,13 @@ const (
 
 type storedPeer struct {
 	seen time.Time
-	ip   [4]byte
-	port uint16
+	// order is the store's announce count when this entry was last announced.
+	// Recency is judged by it, not by seen, which ties on coarse clocks
+	// (Windows ticks in milliseconds): with ties, one slot kept being replaced
+	// and an IP's older ports outlived its newest ones.
+	order uint64
+	ip    [4]byte
+	port  uint16
 }
 
 // swarm holds the peers announced for one info-hash. Swarms are linked in
@@ -46,6 +51,8 @@ type peerStore struct {
 	head, tail *swarm
 	// ipHashes counts, per IP, the swarms that hold at least one of its entries.
 	ipHashes map[[4]byte]int
+	// announces counts announces, ordering entries by recency (storedPeer.order).
+	announces uint64
 }
 
 func newPeerStore() *peerStore {
@@ -78,21 +85,23 @@ func (s *peerStore) announce(hash [20]byte, ip [4]byte, port uint16, now time.Ti
 	}
 	s.pushFront(sw)
 	sw.lastAnnounce = now
+	s.announces++
+	order := s.announces
 
 	sameIP, oldestSameIP, oldest := 0, -1, -1
 	for i := range sw.peers {
 		p := &sw.peers[i]
 		if p.ip == ip && p.port == port {
-			p.seen = now
+			p.seen, p.order = now, order
 			return true
 		}
 		if p.ip == ip {
 			sameIP++
-			if oldestSameIP < 0 || p.seen.Before(sw.peers[oldestSameIP].seen) {
+			if oldestSameIP < 0 || p.order < sw.peers[oldestSameIP].order {
 				oldestSameIP = i
 			}
 		}
-		if oldest < 0 || p.seen.Before(sw.peers[oldest].seen) {
+		if oldest < 0 || p.order < sw.peers[oldest].order {
 			oldest = i
 		}
 	}
@@ -101,6 +110,7 @@ func (s *peerStore) announce(hash [20]byte, ip [4]byte, port uint16, now time.Ti
 		// The IP's newest port replaces its oldest; nobody else loses a slot.
 		sw.peers[oldestSameIP].port = port
 		sw.peers[oldestSameIP].seen = now
+		sw.peers[oldestSameIP].order = order
 		return true
 	case len(sw.peers) >= maxPeersPerHash:
 		s.dropPeer(sw, oldest)
@@ -110,7 +120,7 @@ func (s *peerStore) announce(hash [20]byte, ip [4]byte, port uint16, now time.Ti
 	if !sw.hasIP(ip) {
 		s.ipHashes[ip]++
 	}
-	sw.peers = append(sw.peers, storedPeer{seen: now, ip: ip, port: port})
+	sw.peers = append(sw.peers, storedPeer{seen: now, order: order, ip: ip, port: port})
 	return true
 }
 

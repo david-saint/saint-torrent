@@ -30,6 +30,9 @@ const (
 // handle it closes after the operation loaded it gets os.ErrClosed and retries
 // with a reopened handle (see fileLayout). Should the sweep fall behind, the
 // opener evicts on its own goroutine once the limit is exceeded by half.
+//
+// Eviction only runs where closing a handle in use is safe
+// (evictCachedHandles); elsewhere the budget just counts the cached handles.
 type handleBudget struct {
 	// open counts cached handles, read and write, across every storage.
 	open atomic.Int64
@@ -91,7 +94,11 @@ func (b *handleBudget) acquire(f *fileLayout) (evictNow bool) {
 	f.cached++
 	b.mu.Unlock()
 
-	open, limit := b.open.Add(1), b.limitValue()
+	open := b.open.Add(1)
+	if !evictCachedHandles {
+		return false
+	}
+	limit := b.limitValue()
 	if open <= limit {
 		return false
 	}
@@ -105,7 +112,7 @@ func (b *handleBudget) acquire(f *fileLayout) (evictNow bool) {
 // background sweep has fallen far behind (it may not even have been scheduled
 // yet). One such pass at a time is enough; other openers carry on.
 func (b *handleBudget) evictOverrun() {
-	if b.evicting.CompareAndSwap(false, true) {
+	if evictCachedHandles && b.evicting.CompareAndSwap(false, true) {
 		b.evict()
 		b.evicting.Store(false)
 	}
@@ -153,6 +160,9 @@ type heldFile struct {
 // a handle whose file lock is held, because it is being opened or invalidated,
 // is skipped. It returns how many handles it closed.
 func (b *handleBudget) evict() int {
+	if !evictCachedHandles {
+		return 0
+	}
 	limit := b.limitValue()
 	excess := b.open.Load() - (limit - limit/4)
 	if excess <= 0 {
