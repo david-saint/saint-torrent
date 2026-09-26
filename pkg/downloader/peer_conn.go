@@ -2099,6 +2099,15 @@ peerLoop:
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgInterested:
+			// A repeat changes nothing, so skip the write lock and the upload-slot
+			// scan of s.Peers: a peer could otherwise hold s.mu for a full map walk
+			// with every 5-byte message.
+			s.mu.RLock()
+			alreadyInterested := pState.Interested
+			s.mu.RUnlock()
+			if alreadyInterested {
+				break
+			}
 			s.mu.Lock()
 			pState.Interested = true
 			unchokedInterested := 0
