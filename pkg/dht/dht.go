@@ -947,8 +947,10 @@ func (d *DHT) replaceNode(idx int, old, newcomer Node) {
 
 // noteQuerySender handles the sender of a well-formed inbound query. Its
 // source address is unverified, since UDP is trivially spoofed, so it may only
-// refresh the contact it already matches. An unknown sender is pinged through
-// the bounded probe path and admitted under whatever ID answers from there.
+// refresh a contact it matches that has already answered us this run (BEP 5:
+// a node that has responded to us and sends us queries is good). A saved
+// contact not yet heard from, and an unknown sender, are pinged through the
+// bounded probe path instead, and admitted or refreshed by what answers there.
 func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	if id == d.nodeID {
 		return
@@ -960,19 +962,28 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 	idx := bucketIndex(d.nodeID, id)
 
 	d.mu.Lock()
+	probe := false
 	if b := d.buckets[idx]; b != nil {
 		if i := b.indexOf(id); i >= 0 {
-			if sameUDPAddr(b.nodes[i].Addr, addr) {
-				touchLocked(b, i, time.Now())
-			} else {
+			switch {
+			case !sameUDPAddr(b.nodes[i].Addr, addr):
 				// A claimed address change is never trusted on sight; it is only a candidate.
 				d.considerAddressChange(id, b.nodes[i].Addr, addr)
+			case b.nodes[i].LastSeen.IsZero():
+				// A spoofed query naming a saved contact must not make it
+				// look live, or get it handed out, without it answering us.
+				probe = true
+			default:
+				touchLocked(b, i, time.Now())
 			}
 			d.mu.Unlock()
+			if probe {
+				d.probeNode(k, true)
+			}
 			return
 		}
 	}
-	probe := d.mightAdmitLocked(idx, k)
+	probe = d.mightAdmitLocked(idx, k)
 	d.mu.Unlock()
 
 	if probe {

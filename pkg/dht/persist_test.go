@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -76,7 +77,8 @@ func servedNodes(t *testing.T, c *fakeConn, tid string) []Node {
 // TestSavedContactsAreNotServedUntilHeardFrom verifies contacts loaded from a
 // nodes file, which may predate one-contact-per-IP admission or be planted,
 // still seed our own lookups but are not handed to other nodes until they
-// answer us, and that addresses that can never be a node are not loaded.
+// answer us (a query from their address is not enough), and that addresses
+// that can never be a node are not loaded.
 func TestSavedContactsAreNotServedUntilHeardFrom(t *testing.T) {
 	dir := t.TempDir()
 	var contact, multicast, broadcast, zero [20]byte
@@ -116,9 +118,25 @@ func TestSavedContactsAreNotServedUntilHeardFrom(t *testing.T) {
 		t.Fatalf("a saved contact not heard from this run was handed out: %x", served[0].ID)
 	}
 
-	// It answers one of our queries, so it may be handed out again.
-	d.addNode(contact, addr)
-	served := ask("b")
+	// A query claiming to come from it proves nothing, since UDP is easily
+	// spoofed; it only makes us ping the contact.
+	d.handleQuery("sp", "ping", map[string]interface{}{"id": string(contact[:])}, addr)
+	if served := ask("b"); len(served) != 0 {
+		t.Fatal("a spoofed query from a saved contact's address got it handed out")
+	}
+	ping := awaitQueryTo(t, conn, addr, "ping")
+
+	// It answers our ping, so it may be handed out again.
+	conn.injectPingReply(t, ping, contact, addr)
+	deadline := time.After(5 * time.Second)
+	for seeds := d.getCloserNodes(contact, 1); seeds[0].LastSeen.IsZero(); seeds = d.getCloserNodes(contact, 1) {
+		select {
+		case <-deadline:
+			t.Fatal("the saved contact's answer was never recorded")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	served := ask("c")
 	if len(served) != 2 || served[0].ID != contact || served[1].ID != contact {
 		t.Fatalf("a saved contact that answered us is still withheld: %v", served)
 	}
