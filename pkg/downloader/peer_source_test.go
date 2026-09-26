@@ -397,9 +397,14 @@ func TestTrackerPeerAllowed(t *testing.T) {
 		{"198.51.100.7", public, true},
 		{"127.0.0.1", public, false},
 		{"::ffff:127.0.0.1", public, false},
-		{"192.168.1.1", public, false},
+		{"169.254.169.254", public, false},
+		{"fe80::1", public, false},
+		{"192.168.1.1", public, true},
+		{"10.1.2.3", public, true},
+		{"fd00::1", public, true},
 		{"127.0.0.1", loopback, true},
 		{"192.168.1.1", loopback, true},
+		{"169.254.169.254", loopback, true},
 		{"224.0.0.1", loopback, false},
 	}
 	for _, c := range cases {
@@ -410,6 +415,27 @@ func TestTrackerPeerAllowed(t *testing.T) {
 	}
 	if trackerPeerAllowed(trackerPeer("198.51.100.7", 0), public) {
 		t.Error("port 0 was allowed")
+	}
+	if trackerPeerAllowed(trackerPeer("192.168.1.1", 0), public) {
+		t.Error("a private peer with port 0 was allowed")
+	}
+}
+
+// TestHostnameTrackerListsLANPeers covers a LAN or company swarm whose tracker
+// is reached by name: every peer it lists has a private address, and all of them
+// must stay dialable, or nothing downloads. Loopback and link-local peers stay
+// refused, since a name tells us nothing about where the tracker is.
+func TestHostnameTrackerListsLANPeers(t *testing.T) {
+	source := trackerPeerSource(trackerLogID("http://tracker.corp.example:6969/announce"))
+	for _, ip := range []string{"10.20.30.40", "172.16.0.9", "192.168.0.7", "fd12:3456::7"} {
+		if !trackerPeerAllowed(trackerPeer(ip, 6881), source) {
+			t.Errorf("peer %s from a hostname tracker was refused", ip)
+		}
+	}
+	for _, ip := range []string{"127.0.0.1", "169.254.169.254", "0.0.0.1", "239.1.2.3"} {
+		if trackerPeerAllowed(trackerPeer(ip, 6881), source) {
+			t.Errorf("peer %s from a hostname tracker was allowed", ip)
+		}
 	}
 }
 

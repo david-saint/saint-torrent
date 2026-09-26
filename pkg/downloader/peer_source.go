@@ -132,10 +132,9 @@ func peerAddrPort(ip net.IP, port uint16) (netip.AddrPort, bool) {
 }
 
 // trackerPeerSource returns the address a tracker's peers are judged against
-// (netpolicy.PeerAllowed): the tracker's host when it is an IP literal or
-// "localhost", else the zero Addr, which counts as public. So only a tracker on
-// loopback or the LAN can point us at loopback or LAN peers. trackerURL may be
-// the announce URL or its trackerLogID form.
+// (trackerPeerAllowed): the tracker's host when it is an IP literal or
+// "localhost", else the zero Addr, which counts as public. trackerURL may be the
+// announce URL or its trackerLogID form.
 func trackerPeerSource(trackerURL string) netip.Addr {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
@@ -154,11 +153,22 @@ func trackerPeerSource(trackerURL string) netip.Addr {
 
 // trackerPeerAllowed reports whether a peer a tracker at source listed may be
 // dialed: never an address that cannot be a unicast peer (multicast,
-// broadcast, 0.0.0.0/8, 240.0.0.0/4), and loopback or LAN ones only from a
-// tracker that is itself that local.
+// broadcast, 0.0.0.0/8, 240.0.0.0/4), and loopback or link-local ones only
+// from a tracker that is itself that local. Private (RFC 1918, ULA) peers are
+// taken from any tracker: a LAN or company swarm's tracker is usually reached
+// by a hostname, which gives no source address, and every peer it lists is
+// private. Refusing them would stop such a swarm from downloading at all, while
+// a hostile tracker gains little: it could already list any public host, and
+// each dial carries only our fixed handshake.
 func trackerPeerAllowed(p tracker.Peer, source netip.Addr) bool {
 	ap, ok := peerAddrPort(p.IP, p.Port)
-	return ok && netpolicy.PeerAllowed(ap, source)
+	if !ok {
+		return false
+	}
+	if netpolicy.Classify(ap.Addr()) == netpolicy.ScopePrivate {
+		return ap.Port() != 0
+	}
+	return netpolicy.PeerAllowed(ap, source)
 }
 
 // isOwnPeerEndpointLocked reports whether ip:port is our own advertised peer
