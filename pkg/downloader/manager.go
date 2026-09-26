@@ -890,6 +890,18 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 // one it was cached under.
 var errCachedTorrentMismatch = errors.New("cached torrent does not match its info hash")
 
+// torrentParseError is a .torrent that was read but does not parse. Parsing
+// the same bytes again fails the same way, so restore does not retry it.
+type torrentParseError struct{ err error }
+
+func (e torrentParseError) Error() string { return e.err.Error() }
+func (e torrentParseError) Unwrap() error { return e.err }
+
+func isTorrentParseError(err error) bool {
+	var parseErr torrentParseError
+	return errors.As(err, &parseErr)
+}
+
 // loadTorrentFile reads and parses a .torrent. When wantHashHex is set, the
 // torrent must have that info-hash: a cached copy is trusted only for the
 // torrent it was saved for.
@@ -900,7 +912,7 @@ func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte,
 	}
 	tor, err := torrent.Parse(torrentData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, torrentParseError{err}
 	}
 	if wantHashHex != "" && !strings.EqualFold(fmt.Sprintf("%x", tor.InfoHash), wantHashHex) {
 		return nil, nil, fmt.Errorf("%w: %s holds %x, want %s", errCachedTorrentMismatch, torrentPath, tor.InfoHash, wantHashHex)
@@ -1440,7 +1452,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			for attempt := 1; ; attempt++ {
 				sess, cached, loadErr = m.addTorrentFile(cachedPath, absoluteDownloadDir, entry.InfoHashHex)
 				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) ||
-					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) {
+					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) || isTorrentParseError(loadErr) {
 					break
 				}
 				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
@@ -1596,20 +1608,34 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			return restoreFailures[i].name < restoreFailures[j].name
 		})
 
-		details := make([]string, len(restoreFailures))
+		// A saved .torrent this version cannot parse fails the same way on every
+		// launch, so it is not reported as something a retry will fix.
+		var retried, unparsable []string
 		anyPermission := false
-		for i, f := range restoreFailures {
+		for _, f := range restoreFailures {
+			detail := f.name
 			if f.err != nil {
-				details[i] = fmt.Sprintf("%s (%v)", f.name, f.err)
+				detail = fmt.Sprintf("%s (%v)", f.name, f.err)
 				if errors.Is(f.err, os.ErrPermission) {
 					anyPermission = true
 				}
+			}
+			if isTorrentParseError(f.err) {
+				unparsable = append(unparsable, detail)
 			} else {
-				details[i] = f.name
+				retried = append(retried, detail)
 			}
 		}
-		failMsg := fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
-			len(restoreFailures), strings.Join(details, "; "))
+		var failMsgs []string
+		if len(retried) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
+				len(retried), strings.Join(retried, "; ")))
+		}
+		if len(unparsable) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore because this version cannot load the saved .torrent (kept; add the torrent again to replace it): %s",
+				len(unparsable), strings.Join(unparsable, "; ")))
+		}
+		failMsg := strings.Join(failMsgs, "; ")
 		if anyPermission {
 			// macOS TCC: the launching app lacks access to the download folder.
 			failMsg += ". Permission denied — grant your terminal app Full Disk Access " +

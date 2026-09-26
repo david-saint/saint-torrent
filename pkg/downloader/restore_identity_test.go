@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"sainttorrent/pkg/bencode"
@@ -158,5 +159,57 @@ func TestPersistenceRecordsPrivateFlag(t *testing.T) {
 	}
 	if len(state.Torrents) != 1 || state.Torrents[0].InfoHashHex != fmt.Sprintf("%x", infoHash) || !state.Torrents[0].Private {
 		t.Fatalf("persisted torrents = %+v, want the private torrent marked private", state.Torrents)
+	}
+}
+
+// TestRestoreLoadsTorrentWithRepeatedOuterKey: the whole cached .torrent was
+// decoded strictly, so one whose editor had appended a second "comment"
+// dropped out of the list after an upgrade, shown only by its hash.
+func TestRestoreLoadsTorrentWithRepeatedOuterKey(t *testing.T) {
+	data, infoHash := testTorrent(t, "repeated.bin", false)
+	// d4:info... -> d7:comment1:a7:comment1:b4:info...
+	data = append([]byte("d7:comment1:a7:comment1:b"), data[1:]...)
+	hashHex := fmt.Sprintf("%x", infoHash)
+	configDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}},
+		map[string][]byte{hashHex: data})
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	warning, err := mgr.EnablePersistence(configDir)
+	if err != nil || warning != "" {
+		t.Fatalf("EnablePersistence = %q, %v; want a clean restore", warning, err)
+	}
+	if sess := mgr.GetSession(hashHex); sess == nil || sess.IsMetadataMode() {
+		t.Fatalf("session = %v, want the cached torrent restored", sess)
+	}
+}
+
+// TestRestoreReportsUnparsableTorrentAsSuch: a saved .torrent this version
+// cannot parse was retried with backoff and then reported as something the
+// next launch would retry, although parsing the same bytes fails the same way.
+func TestRestoreReportsUnparsableTorrentAsSuch(t *testing.T) {
+	// A repeated key inside the info dict, which the info-hash covers.
+	info := []byte("d6:lengthi1e4:name1:a4:name1:b12:piece lengthi16384e6:pieces20:" + string(make([]byte, 20)) + "e")
+	data := append(append([]byte("d4:info"), info...), 'e')
+	hashHex := fmt.Sprintf("%x", sha1.Sum(info))
+	configDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}},
+		map[string][]byte{hashHex: data})
+
+	cachedPath := filepath.Join(configDir, "torrents", hashHex+".torrent")
+	if _, _, err := loadTorrentFile(cachedPath, hashHex); !isTorrentParseError(err) {
+		t.Fatalf("loadTorrentFile = %v, want a parse error, which restore does not retry", err)
+	}
+	if _, _, err := loadTorrentFile(filepath.Join(configDir, "missing.torrent"), ""); err == nil || isTorrentParseError(err) {
+		t.Fatalf("loadTorrentFile(missing) = %v, want a read error, which restore retries", err)
+	}
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	warning, err := mgr.EnablePersistence(configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warning, "failed to restore because this version cannot load the saved .torrent") ||
+		!strings.Contains(warning, "duplicate dictionary key") || strings.Contains(warning, "will retry") {
+		t.Fatalf("warning = %q, want the parse failure reported as permanent", warning)
 	}
 }

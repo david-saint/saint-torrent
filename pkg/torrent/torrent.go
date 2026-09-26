@@ -51,9 +51,12 @@ type Torrent struct {
 
 // Parse decodes a bencoded torrent file, calculates the info hash, and returns a Torrent struct.
 func Parse(data []byte) (*Torrent, error) {
-	// Metainfo is decoded strictly: a repeated key would let the info-hash and
-	// the decoded fields (or another client) disagree about the same bytes.
-	val, err := bencode.UnmarshalStrict(data)
+	// The outer dictionary is decoded like libtorrent's: a repeated key keeps
+	// its first value, as FindRawValue does, so a .torrent whose editor
+	// appended a second "comment" or "announce" still loads. Those keys are not
+	// hashed. The info dictionary, which is, is decoded strictly by ParseInfo
+	// from the exact bytes the info-hash commits to.
+	val, err := bencode.Unmarshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal torrent bencode: %w", err)
 	}
@@ -112,8 +115,10 @@ func Parse(data []byte) (*Torrent, error) {
 	}
 
 	// 3. Decode the info fields from the exact bytes that are hashed, so the
-	// info-hash always commits to the content that gets downloaded.
-	bencodedInfo, err := bencode.FindRawValue(data, "info")
+	// info-hash always commits to the content that gets downloaded. A second
+	// "info" is refused: a reader keeping the last copy would hash and
+	// download another torrent from the same file.
+	bencodedInfo, err := bencode.FindUniqueRawValue(data, "info")
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract raw info dictionary: %w", err)
 	}

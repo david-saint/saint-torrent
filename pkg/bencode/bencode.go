@@ -56,10 +56,11 @@ func UnmarshalLimited(data []byte, maxTokens int) (interface{}, error) {
 }
 
 // UnmarshalStrict is Unmarshal that also rejects any dictionary, at any depth,
-// that repeats a key. It is meant for metainfo: BEP 3 requires unique keys, and
-// a repeated key lets two readers of the same bytes (or the info-hash and the
-// decoded fields) disagree about what a torrent contains. Tracker and DHT
-// traffic keeps using the lenient Unmarshal.
+// that repeats a key. It is meant for a torrent's info dictionary, the bytes
+// the info-hash commits to: BEP 3 requires unique keys, and a repeated key
+// there lets two readers of the same bytes disagree about what a torrent
+// contains. The rest of a .torrent, and tracker and DHT traffic, keep using
+// the lenient Unmarshal, as libtorrent does.
 func UnmarshalStrict(data []byte) (interface{}, error) {
 	d := decoder{tokens: DefaultMaxTokens, strict: true}
 	return d.unmarshal(data)
@@ -418,10 +419,23 @@ func findValueSpan(data []byte, depth int) (int, error) {
 }
 
 // FindRawValue scans a bencoded dictionary from the start of data and returns the exact raw byte span of targetKey's value at the root level.
+// A repeated key yields its first value, the one Unmarshal keeps.
 func FindRawValue(data []byte, targetKey string) ([]byte, error) {
+	return findRootValue(data, targetKey, false)
+}
+
+// FindUniqueRawValue is FindRawValue that also fails when the root dictionary
+// holds targetKey more than once, so no reader of data can pick another copy
+// of the value. It scans the whole dictionary.
+func FindUniqueRawValue(data []byte, targetKey string) ([]byte, error) {
+	return findRootValue(data, targetKey, true)
+}
+
+func findRootValue(data []byte, targetKey string, unique bool) ([]byte, error) {
 	if len(data) == 0 || data[0] != 'd' {
 		return nil, errors.New("input is not a bencoded dictionary")
 	}
+	var found []byte
 	rest := data[1:]
 	for len(rest) > 0 && rest[0] != 'e' {
 		// Key must be a string: <length>:<data>
@@ -445,7 +459,7 @@ func FindRawValue(data []byte, targetKey string) ([]byte, error) {
 			return nil, errors.New("dictionary key length exceeds remaining data")
 		}
 		keyEnd := keyStart + length
-		key := string(rest[keyStart:keyEnd])
+		key := rest[keyStart:keyEnd]
 		rest = rest[keyEnd:]
 
 		// Value starts here
@@ -454,11 +468,23 @@ func FindRawValue(data []byte, targetKey string) ([]byte, error) {
 			return nil, err
 		}
 
-		if key == targetKey {
-			return rest[:valSpan], nil
+		if string(key) == targetKey {
+			if found != nil {
+				return nil, fmt.Errorf("duplicate dictionary key %q", targetKey)
+			}
+			found = rest[:valSpan]
+			if !unique {
+				return found, nil
+			}
 		}
 
 		rest = rest[valSpan:]
 	}
-	return nil, fmt.Errorf("key %q not found in bencoded dictionary", targetKey)
+	if found == nil {
+		return nil, fmt.Errorf("key %q not found in bencoded dictionary", targetKey)
+	}
+	if len(rest) == 0 {
+		return nil, errors.New("unterminated dictionary")
+	}
+	return found, nil
 }
