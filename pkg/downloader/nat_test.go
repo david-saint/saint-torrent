@@ -2,12 +2,16 @@ package downloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/torrent"
 )
@@ -181,3 +185,102 @@ func TestNATCleanupDeletesTCPAndUDPConcurrently(t *testing.T) {
 			got, time.Since(start))
 	}
 }
+
+// hostileGatewayError is what a hostile or broken gateway can put in a SOAP
+// fault, only larger than maxNATResponseBytes allows: 300 KiB of terminal
+// escape sequences, bidi overrides and invalid UTF-8.
+func hostileGatewayError() error {
+	unit := "\x1b]0;owned\x07\x1b[2J\u202eevil\xff "
+	return errors.New(strings.Repeat(unit, (300<<10)/len(unit)+1))
+}
+
+// checkSanitizedNATError fails unless s is a bounded, printable rendering
+// that starts with prefix and was cut.
+func checkSanitizedNATError(t *testing.T, s, prefix string) {
+	t.Helper()
+	if s == "" || len(s) > maxNATErrorBytes {
+		t.Fatalf("LastError is %d bytes, want 1..%d", len(s), maxNATErrorBytes)
+	}
+	if !utf8.ValidString(s) || !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, "…") {
+		t.Fatalf("LastError = %q, want valid UTF-8 starting %q and ending in an ellipsis", s, prefix)
+	}
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			t.Fatalf("LastError keeps unprintable %U: %q", r, s)
+		}
+	}
+}
+
+func TestSanitizeNATError(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"UPnP (IP1) TCP mapping failed: ConflictInMappingEntry", "UPnP (IP1) TCP mapping failed: ConflictInMappingEntry"},
+		{"a\x1b[31mb\x07c\r\nd\te\x7f", "a?[31mb?c??d?e?"},
+		{"right\u202eleft\u200bzw", "right?left?zw"},
+		{"bad\xff\xfeutf8", "bad??utf8"},
+		{"café 名前", "café 名前"},
+		{strings.Repeat("a", maxNATErrorBytes), strings.Repeat("a", maxNATErrorBytes)},
+		{strings.Repeat("a", maxNATErrorBytes+1), strings.Repeat("a", maxNATErrorBytes-len("…")) + "…"},
+		// Two-byte runes: the cut must not split one.
+		{strings.Repeat("é", maxNATErrorBytes), strings.Repeat("é", (maxNATErrorBytes-len("…"))/2) + "…"},
+	} {
+		var err error
+		if tc.in != "" {
+			err = errors.New(tc.in)
+		}
+		if got := sanitizeNATError(err); got != tc.want {
+			t.Errorf("sanitizeNATError(%.40q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	checkSanitizedNATError(t, sanitizeNATError(hostileGatewayError()), "?]0;owned?")
+}
+
+// failingPortMapper refuses every mapping with err.
+type failingPortMapper struct {
+	fakePortMapper
+	err error
+}
+
+func (f *failingPortMapper) AddPortMapping(context.Context, string, int, int, string, time.Duration) (int, error) {
+	return 0, f.err
+}
+
+// NATStatus.LastError (shown by the TUI and the stats API) used to hold the
+// gateway's whole error text: up to 256 KiB, escape sequences included.
+func TestNATLastErrorFromGatewayIsSanitizedAndBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		discover func(context.Context) (portMapper, error)
+		prefix   string
+	}{
+		{"mapping", func(context.Context) (portMapper, error) {
+			return &failingPortMapper{err: hostileGatewayError()}, nil
+		}, "test-NAT TCP mapping failed: ?]0;owned?"},
+		{"discovery", func(context.Context) (portMapper, error) {
+			return nil, hostileGatewayError()
+		}, "?]0;owned?"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubNATDiscovery(t, tc.discover)
+			mgr := NewTorrentManager()
+			t.Cleanup(mgr.Close)
+			if err := mgr.StartNATTraversal(51413, 51413); err != nil {
+				t.Fatalf("failed to start NAT traversal: %v", err)
+			}
+			waitForNATStatus(t, mgr, func(s NATStatus) bool { return s.LastError != "" })
+			checkSanitizedNATError(t, mgr.NATStatus().LastError, tc.prefix)
+		})
+	}
+}
+
+// StubNATDiscoveryErrorForTest makes NAT discovery fail with err until t
+// ends. With HostileGatewayErrorForTest it is exported to the external test
+// package (piece_counts_test.go), which checks what the stats API shows.
+func StubNATDiscoveryErrorForTest(t *testing.T, err error) {
+	t.Helper()
+	stubNATDiscovery(t, func(context.Context) (portMapper, error) { return nil, err })
+}
+
+var HostileGatewayErrorForTest = hostileGatewayError

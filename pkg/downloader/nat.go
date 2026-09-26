@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"sainttorrent/pkg/logging"
 )
@@ -17,6 +19,10 @@ const (
 	natRenewInterval      = 15 * time.Minute
 	natRetryInterval      = 5 * time.Minute
 	natOperationTimeout   = 5 * time.Second
+	// maxNATErrorBytes bounds NATStatus.LastError, which the TUI and the
+	// stats API show. Its text can come from the gateway (a SOAP fault of up
+	// to maxNATResponseBytes).
+	maxNATErrorBytes = 256
 )
 
 // portMapper is one gateway's port-mapping service. Every method must return
@@ -352,16 +358,48 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 }
 
 func (m *TorrentManager) recordNATFailure(err error) {
+	msg := sanitizeNATError(err)
 	m.mu.Lock()
 	m.natStatus.TCPMapped = false
 	m.natStatus.UDPMapped = false
-	m.natStatus.LastError = err.Error()
+	m.natStatus.LastError = msg
 	m.mu.Unlock()
 	if logging.Enabled() {
 		logging.Warn("nat_mapping_failed",
-			logging.Err(err),
+			logging.String("error", msg),
 		)
 	}
+}
+
+// sanitizeNATError renders err for NATStatus.LastError. The text can carry a
+// gateway's SOAP fault or description, so runes that are not printable
+// (control characters, including ESC; format characters such as bidi
+// overrides; invalid UTF-8) become '?', and the result is cut on a rune
+// boundary to at most maxNATErrorBytes, ending in an ellipsis when cut.
+func sanitizeNATError(err error) string {
+	if err == nil {
+		return ""
+	}
+	const ellipsis = "…"
+	msg := err.Error()
+	out := make([]byte, 0, min(len(msg), maxNATErrorBytes))
+	cut := -1 // where to cut if the rest does not fit
+	for i := 0; i < len(msg); {
+		r, size := utf8.DecodeRuneInString(msg[i:])
+		i += size
+		if (r == utf8.RuneError && size == 1) || !unicode.IsPrint(r) {
+			r = '?'
+		}
+		n := utf8.RuneLen(r)
+		if cut < 0 && len(out)+n > maxNATErrorBytes-len(ellipsis) {
+			cut = len(out)
+		}
+		if len(out)+n > maxNATErrorBytes {
+			return string(out[:cut]) + ellipsis
+		}
+		out = utf8.AppendRune(out, r)
+	}
+	return string(out)
 }
 
 func waitForContext(ctx context.Context, delay time.Duration) bool {
