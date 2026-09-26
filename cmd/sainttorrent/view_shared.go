@@ -462,14 +462,23 @@ func (m model) viewFileExplorer() string {
 	bw := bodyWidth(m.width)
 	g := gutterStr(m.width)
 
+	help := m.fileExplorerHelp()
+
 	var sb strings.Builder
 	label := "File Explorer: "
 	sb.WriteString(g + st.Header.Render("File Explorer:") + " " +
-		truncateRight(data.name, bw-dispWidth(label)) + "\n\n")
+		truncateRight(data.name, bw-dispWidth(label)) + "\n")
 
 	if len(files) == 0 {
-		sb.WriteString(g + "No files in metadata.\n\n")
+		sb.WriteString("\n" + g + "No files in metadata.\n\n")
 	} else {
+		// Render only the window around the selection. A torrent can list
+		// hundreds of thousands of files; rendering them all froze the TUI, and
+		// the renderer then kept only the last screenful, hiding the header and
+		// the first files (the selection never scrolled into view).
+		start, end := visibleSessionRange(len(files), m.selectedFileIdx, m.fileRowCapacity())
+		sb.WriteString(g + st.Subtle.Render(truncateRight(
+			fmt.Sprintf("%d–%d of %d files", start+1, end, len(files)), bw)) + "\n")
 		priorities := data.priorities
 		const badgeW = 6 // " HIGH " / "NORMAL" / " SKIP "
 		const sizeW = 10
@@ -477,12 +486,13 @@ func (m model) viewFileExplorer() string {
 		if pathW < 4 {
 			pathW = 4
 		}
-		for i, f := range files {
+		for i := start; i < end; i++ {
+			f := files[i]
 			prio := downloader.PriorityNormal
 			if i < len(priorities) {
 				prio = priorities[i]
 			}
-			path := truncateMiddle(sanitizeText(filepath.Join(f.Path...)), pathW)
+			path := truncateMiddle(displayText(filepath.Join(f.Path...)), pathW)
 			row := padTo(path, pathW) + " " + padTo(formatBytes(f.Length), sizeW) + " " + priorityBadge(st, prio)
 			if i == m.selectedFileIdx {
 				sb.WriteString(g + st.SelectedRow.Render(row) + "\n")
@@ -493,11 +503,44 @@ func (m model) viewFileExplorer() string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(renderHelp([][2]string{
-		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"}, {"q", "Quit"},
-	}, helpColumns, st, m.width))
+	sb.WriteString(help)
 	sb.WriteString("\n")
 	return sb.String()
+}
+
+// defaultViewHeight stands in for the terminal height before the first
+// WindowSizeMsg, so an unknown height never means "render every file".
+const defaultViewHeight = 24
+
+func (m model) fileExplorerHelp() string {
+	return renderHelp([][2]string{
+		{"esc", "Back to Details"}, {"space/p", "Toggle Priority"},
+		{"pgup/pgdn", "Page"}, {"q", "Quit"},
+	}, helpColumns, m.theme.styles, m.width)
+}
+
+// fileRowCapacity reports how many file rows fit. When the help block does
+// not fit as well it is left to clip (View pins the top), so the rows keep
+// priority.
+func (m model) fileRowCapacity() int {
+	height := m.height
+	if height <= 0 {
+		height = defaultViewHeight
+	}
+	// Around the rows: the banner View draws, the header, the range line and
+	// the spacer above the help.
+	chrome := lineCount(m.secondaryBanner()) + 3
+	rows := height - chrome - lineCount(m.fileExplorerHelp())
+	if rows < 1 {
+		rows = height - chrome
+	}
+	return max(1, rows)
+}
+
+// moveFilePage moves the file selection by one screenful, keeping one row of
+// context.
+func (m *model) moveFilePage(dir int) {
+	m.moveFileSelection(dir * max(1, m.fileRowCapacity()-1))
 }
 
 func (m model) viewInputBox() string {
@@ -521,7 +564,7 @@ func (m model) viewInputBox() string {
 	sb.WriteString(dividerLine(st, m.width) + "\n\n")
 	sb.WriteString(g + m.textInput.View() + "\n\n")
 	if m.inputErr != "" {
-		sb.WriteString(g + st.Error.Render(truncateRight(sanitizeText(m.inputErr), bw)) + "\n\n")
+		sb.WriteString(g + st.Error.Render(truncateRight(displayText(m.inputErr), bw)) + "\n\n")
 	}
 	sb.WriteString(renderHelp([][2]string{{"enter", "Confirm"}, {"esc", "Cancel"}}, helpColumns, st, m.width))
 	sb.WriteString("\n")
@@ -546,7 +589,7 @@ func (m model) viewAddConfirm() string {
 	if m.addConfirmErr != nil {
 		label := "Error adding torrent: "
 		sb.WriteString(g + st.Error.Render("Error adding torrent") + ": " +
-			truncateRight(sanitizeText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
+			truncateRight(displayText(m.addConfirmErr.Error()), bw-dispWidth(label)) + "\n\n")
 		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Dismiss and continue"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")
 		return sb.String()
@@ -579,7 +622,7 @@ func (m model) viewDeleteConfirm() string {
 
 	header := func(label, name string) string {
 		return g + st.Header.Render(label) + " " +
-			truncateRight(sanitizeText(name), bw-dispWidth(label+" ")) + "\n\n"
+			truncateRight(displayText(name), bw-dispWidth(label+" ")) + "\n\n"
 	}
 
 	if m.deleteInProgress {
@@ -598,7 +641,7 @@ func (m model) viewDeleteConfirm() string {
 	if m.deleteErr != nil {
 		var sb strings.Builder
 		sb.WriteString(header("Deletion Failure:", m.deleteTargetName))
-		sb.WriteString(card.Render(st.Error.Render(sanitizeText(m.deleteErr.Error()))))
+		sb.WriteString(card.Render(st.Error.Render(displayText(m.deleteErr.Error()))))
 		sb.WriteString("\n\n")
 		sb.WriteString(renderHelp([][2]string{{"esc/n/y", "Back to Dashboard"}}, helpColumns, st, m.width))
 		sb.WriteString("\n")

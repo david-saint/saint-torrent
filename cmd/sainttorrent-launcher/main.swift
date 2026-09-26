@@ -120,7 +120,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     
+    // Only a magnet:? link of printable ASCII is handed on (browsers
+    // percent-encode everything else). Any other string could be taken for a
+    // file path by the CLI, and control characters would reach the shell's
+    // line editor in the Terminal fallback. The CLI enforces magnet:? as well.
+    func isForwardableMagnet(_ urlString: String) -> Bool {
+        let bytes = urlString.utf8
+        return bytes.count <= 60 * 1024 &&
+            bytes.allSatisfy { $0 >= 0x21 && $0 <= 0x7e } &&
+            urlString.lowercased().hasPrefix("magnet:?")
+    }
+
     func handleURL(_ urlString: String, startingRetry: Int) {
+        guard isForwardableMagnet(urlString) else {
+            showNSAlertAndExit(message: "saintTorrent only opens magnet:? links.")
+        }
+
         let config: Config
         do {
             config = try loadConfig()

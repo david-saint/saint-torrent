@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -95,7 +96,7 @@ func perfReport(w io.Writer) {
 	fmt.Fprintln(w, "── saintTorrent timing ──")
 	writeRows(w)
 	if logPath := os.Getenv("SAINTTORRENT_TIMING_LOG"); logPath != "" {
-		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		if f, err := logging.OpenPrivateFile(logPath); err == nil {
 			fmt.Fprintf(f, "── %s ──\n", time.Now().Format(time.RFC3339))
 			writeRows(f)
 			f.Close()
@@ -182,6 +183,7 @@ type cliOptions struct {
 	theme                string
 	listenPort           int
 	httpAddr             string
+	httpAllowRemote      bool
 	natEnabled           bool
 	encryption           mse.Policy
 	storage              storage.Backend
@@ -419,7 +421,7 @@ func (m *model) startDelete(withFiles bool, origin viewMode) {
 	m.deleteWithFiles = withFiles
 	m.deleteErr = nil
 	m.deleteOriginView = origin
-	m.deleteTargetName = sanitizeText(s.Name())
+	m.deleteTargetName = displayText(s.Name())
 	m.deleteTargetHash = fmt.Sprintf("%x", s.Torrent.InfoHash)
 }
 
@@ -735,6 +737,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.moveFileSelection(-1)
 			case "down", "j":
 				m.moveFileSelection(1)
+			case "pgup":
+				m.moveFilePage(-1)
+			case "pgdown":
+				m.moveFilePage(1)
+			case "home":
+				m.selectedFileIdx = 0
+			case "end":
+				m.selectedFileIdx = max(0, len(files)-1)
 			case " ", "p":
 				if len(files) > 0 && m.selectedFileIdx < len(files) {
 					priorities := s.GetFilePriorities()
@@ -918,7 +928,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err == nil && name != "" {
 				displayName = name
 			}
-			displayName = sanitizeText(displayName)
+			displayName = displayText(displayName)
 
 			pItem := pendingItem{
 				rawURL:        item,
@@ -983,7 +993,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshSessions()
 		m.recordSpeeds()
 		if m.viewMode == viewFiles {
-			m.buildFilesSnapshot()
+			m.refreshFilesSnapshot()
 		}
 		if m.viewMode == viewDetail {
 			// Refresh the cached body now so the following View reuses it and a
@@ -1025,7 +1035,6 @@ func (m model) View() string {
 		return "\nShutting down saintTorrent client...\n"
 	}
 
-	st := m.theme.styles
 	var out string
 	switch m.viewMode {
 	case viewList:
@@ -1036,7 +1045,7 @@ func (m model) View() string {
 	default:
 		// secondary screens share a layout under a themed banner.
 		var sb strings.Builder
-		sb.WriteString(st.Title.Render(" saintTorrent CLI v0.2 ") + "\n")
+		sb.WriteString(m.secondaryBanner())
 		switch m.viewMode {
 		case viewFiles:
 			sb.WriteString(m.viewFileExplorer())
@@ -1055,12 +1064,17 @@ func (m model) View() string {
 	switch m.viewMode {
 	case viewDetail:
 		out = verticalSlice(out, m.detailScroll, m.height)
-	case viewList:
-		// Keep the header + list (incl. the selected torrent) and let the help
+	case viewList, viewFiles:
+		// Keep the header + list (incl. the selected row) and let the help
 		// block clip from the bottom when the terminal is too short for all of it.
 		out = verticalSlice(out, 0, m.height)
 	}
 	return out
+}
+
+// secondaryBanner is the themed banner above the secondary screens.
+func (m model) secondaryBanner() string {
+	return m.theme.styles.Title.Render(" saintTorrent CLI v0.2 ") + "\n"
 }
 
 func newTUIProgram(m tea.Model, opts ...tea.ProgramOption) *tea.Program {
@@ -1146,31 +1160,66 @@ func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
 	}
 }
 
-func sanitizeText(s string) string {
-	var sb strings.Builder
-	for _, r := range s {
-		if r < 32 || r == 127 || (r >= 0x80 && r <= 0x9F) {
-			sb.WriteRune(' ')
-		} else {
-			sb.WriteRune(r)
+// magnetPrefix is the only magnet form accepted; torrent.ParseMagnet requires
+// this exact lowercase spelling.
+const magnetPrefix = "magnet:?"
+
+// maxTorrentFileSize bounds a .torrent read from disk. It is far above real
+// torrents (libtorrent's default limit is 10 MB) and stops a path such as
+// /dev/zero from growing the heap until the process is killed.
+const maxTorrentFileSize = 64 << 20
+
+// urlScheme returns the lowercased RFC 3986 scheme of item, or "" for a plain
+// path. A scheme needs at least two characters so Windows drive letters
+// (C:\x.torrent) stay paths.
+func urlScheme(item string) string {
+	for i := 0; i < len(item); i++ {
+		c := item[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		case c == ':' && i >= 2:
+			return strings.ToLower(item[:i])
+		default:
+			return ""
 		}
 	}
-	res := sb.String()
-	for strings.Contains(res, "  ") {
-		res = strings.ReplaceAll(res, "  ", " ")
+	return ""
+}
+
+// canonicalItem classifies a torrent source from the command line, the IPC
+// socket or the add prompt. A magnet link comes back with its scheme
+// lowercased; a plain path is returned as is. Any other URL is rejected,
+// including an opaque "magnet:x/../../dev/zero": the macOS launcher forwards
+// whatever a web page links to, and reading that as a relative path (which
+// filepath.Abs would clean to /dev/zero) would let a page pick a local file.
+func canonicalItem(item string) (canonical string, isMagnet bool, err error) {
+	switch urlScheme(item) {
+	case "":
+		return item, false, nil
+	case "magnet":
+		if len(item) >= len(magnetPrefix) && item[len(magnetPrefix)-1] == '?' {
+			return magnetPrefix + item[len(magnetPrefix):], true, nil
+		}
+		return "", false, fmt.Errorf("invalid magnet link %q: must start with %q", boundText(item, 128), magnetPrefix)
+	default:
+		return "", false, fmt.Errorf("unsupported URL %q: pass a .torrent file path (./name for a name with ':') or a %s link", boundText(item, 128), magnetPrefix)
 	}
-	return strings.TrimSpace(res)
 }
 
 func parseItem(item string) (name string, hashHex string, err error) {
-	if strings.HasPrefix(item, "magnet:?") {
+	item, isMagnet, err := canonicalItem(item)
+	if err != nil {
+		return "", "", err
+	}
+	if isMagnet {
 		mag, err := torrent.ParseMagnet(item)
 		if err != nil {
 			return "", "", err
 		}
 		return mag.Name, fmt.Sprintf("%x", mag.InfoHash), nil
 	}
-	data, err := os.ReadFile(item)
+	data, err := readTorrentFile(item)
 	if err != nil {
 		return "", "", err
 	}
@@ -1181,21 +1230,59 @@ func parseItem(item string) (name string, hashHex string, err error) {
 	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
 }
 
-func normalizeForwardedItems(items []string) []string {
+// readTorrentFile reads a .torrent from disk. parseItem can run on the TUI's
+// event loop, so it refuses anything but a regular file (opening a FIFO
+// blocks, and a device such as /dev/zero never ends) and anything larger than
+// maxTorrentFileSize.
+func readTorrentFile(path string) ([]byte, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	if fi.Size() > maxTorrentFileSize {
+		return nil, fmt.Errorf("%s: torrent file too large (%d bytes, max %d)", path, fi.Size(), maxTorrentFileSize)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxTorrentFileSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxTorrentFileSize {
+		return nil, fmt.Errorf("%s: torrent file too large (max %d bytes)", path, maxTorrentFileSize)
+	}
+	return data, nil
+}
+
+// normalizeForwardedItems prepares items for a running instance, whose working
+// directory differs: file paths are made absolute and magnet links are
+// canonicalized. Anything with another URL scheme is rejected here rather
+// than cleaned into a path.
+func normalizeForwardedItems(items []string) ([]string, error) {
 	normalized := make([]string, 0, len(items))
 	for _, item := range items {
-		if strings.HasPrefix(item, "magnet:?") {
-			normalized = append(normalized, item)
+		canonical, isMagnet, err := canonicalItem(item)
+		if err != nil {
+			return nil, err
+		}
+		if isMagnet {
+			normalized = append(normalized, canonical)
 			continue
 		}
-		absPath, err := filepath.Abs(item)
+		absPath, err := filepath.Abs(canonical)
 		if err != nil {
-			normalized = append(normalized, item)
+			normalized = append(normalized, canonical)
 			continue
 		}
 		normalized = append(normalized, absPath)
 	}
-	return normalized
+	return normalized, nil
 }
 
 // usageText returns the help message printed for -h/--help.
@@ -1220,6 +1307,9 @@ Options:
       --no-persist          Do not persist fast-resume state
       --recheck             Fully hash-check restored torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
+                            (loopback only, e.g. 127.0.0.1:16666)
+      --http-allow-remote   Allow --http-addr on a LAN or wildcard address; the
+                            API has no authentication
       --log <path>          Write JSON-lines debug logs to a rotating file
       --log-level <level>   Log level: debug, info, warn, or error
       --write-config <path> Write a default config file and exit
@@ -1303,6 +1393,8 @@ func parseCLIArgs(args []string) cliOptions {
 			}
 			opts.httpAddr = args[i+1]
 			i++
+		case "--http-allow-remote":
+			opts.httpAllowRemote = true
 		case "--no-nat":
 			opts.natEnabled = false
 		case "--encryption":
@@ -1657,6 +1749,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer logging.Close()
+	redirectStdLog()
 
 	downloadPaths := downloadPathOptions{
 		primary:   opts.downloadDir,
@@ -1699,7 +1792,11 @@ func main() {
 			os.Exit(0)
 		}
 
-		normalizedItems := normalizeForwardedItems(filesToAdd)
+		normalizedItems, err := normalizeForwardedItems(filesToAdd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", escapeForTerminal(err.Error()))
+			os.Exit(2)
+		}
 
 		var conn net.Conn
 		var connErr error
@@ -1783,7 +1880,7 @@ func main() {
 
 			if resp.Status != "ok" {
 				conn.Close()
-				fmt.Fprintf(os.Stderr, "Error from running instance: %s\n", resp.Message)
+				fmt.Fprintf(os.Stderr, "Error from running instance: %s\n", escapeForTerminal(resp.Message))
 				os.Exit(1)
 			}
 
@@ -1892,7 +1989,7 @@ func main() {
 
 	var statsServer *httpapi.Server
 	if opts.httpAddr != "" {
-		statsServer, err = httpapi.Start(opts.httpAddr, mgr)
+		statsServer, err = httpapi.Start(opts.httpAddr, mgr, httpapi.Options{AllowRemote: opts.httpAllowRemote})
 		if err != nil {
 			listener.Close()
 			acceptLoopWG.Wait()
@@ -1901,9 +1998,16 @@ func main() {
 			handlersWG.Wait()
 			mgr.Close()
 			fmt.Fprintf(os.Stderr, "Error starting HTTP stats endpoint on %s: %v\n", opts.httpAddr, err)
+			if errors.Is(err, httpapi.ErrNotLoopback) {
+				fmt.Fprintln(os.Stderr, "Use a loopback address such as 127.0.0.1:16666, or pass --http-allow-remote to expose it without authentication.")
+			}
 			os.Exit(1)
 		}
 		startupInfos = append(startupInfos, fmt.Sprintf("HTTP stats endpoint: http://%s/stats", statsServer.Addr()))
+		if !statsServer.Loopback() {
+			// First, so the TUI's one-line startup message cannot cut it off.
+			startupWarns = append([]string{fmt.Sprintf("HTTP stats API on %s is reachable from the network without authentication", statsServer.Addr())}, startupWarns...)
+		}
 	}
 	perfMarkf("http-stats")
 
@@ -1951,7 +2055,7 @@ func main() {
 		if err == nil && name != "" {
 			displayName = name
 		}
-		displayName = sanitizeText(displayName)
+		displayName = displayText(displayName)
 		initialPending = append(initialPending, pendingItem{
 			rawURL:        item,
 			displayName:   displayName,
@@ -1962,10 +2066,7 @@ func main() {
 		})
 	}
 
-	startupWarn := ""
-	if len(startupWarns) > 0 {
-		startupWarn = strings.Join(startupWarns, "; ")
-	}
+	startupWarn := tuiStartupLine(startupInfos, startupWarns)
 
 	var p *tea.Program
 	if !opts.headless {
@@ -2052,6 +2153,15 @@ func main() {
 	}
 }
 
+// redirectStdLog routes the standard library logger into the debug log. It
+// must run before NAT and DHT start: dependencies such as goupnp log raw
+// bytes from LAN replies through it, which would otherwise be written to the
+// terminal under the TUI with any escape sequences intact.
+func redirectStdLog() {
+	log.SetFlags(0) // debug log lines carry their own timestamp
+	log.SetOutput(logging.StdLogWriter())
+}
+
 func waitForShutdownSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -2059,11 +2169,22 @@ func waitForShutdownSignal() {
 	signal.Stop(sigCh)
 }
 
+// tuiStartupLine joins startup warnings and infos into the TUI's single
+// startup line, so a TUI user also sees where the stats API is listening.
+// Warnings come first because the line is cut to the terminal width. Headless
+// mode prints them separately via writeHeadlessStartupMessages.
+func tuiStartupLine(infos, warns []string) string {
+	return strings.Join(append(append([]string(nil), warns...), infos...), "; ")
+}
+
+// writeHeadlessStartupMessages prints startup infos and warnings. Warnings can
+// embed torrent-controlled text (failed-add errors quote file paths), so each
+// line is escaped before it reaches the terminal.
 func writeHeadlessStartupMessages(w io.Writer, infos []string, warns []string) {
 	for _, info := range infos {
-		fmt.Fprintln(w, info)
+		fmt.Fprintln(w, escapeForTerminal(info))
 	}
 	for _, warn := range warns {
-		fmt.Fprintf(w, "Warning: %s\n", warn)
+		fmt.Fprintf(w, "Warning: %s\n", escapeForTerminal(warn))
 	}
 }

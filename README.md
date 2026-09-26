@@ -158,15 +158,18 @@ JSON-lines logging to a rotating file with either `SAINTTORRENT_LOG` or
 `--log`:
 
 ```bash
-SAINTTORRENT_LOG=/tmp/sainttorrent-debug.log ./sainttorrent
-./sainttorrent --log /tmp/sainttorrent-debug.log --log-level debug
+SAINTTORRENT_LOG="$HOME/Library/Logs/sainttorrent/debug.log" ./sainttorrent   # macOS
+./sainttorrent --log ~/.cache/sainttorrent/debug.log --log-level debug        # Linux
 ```
 
-Log levels are `debug`, `info`, `warn`, and `error`. On Unix-like systems logs
-are created owner-readable only, but they can include local paths and peer
-addresses, so keep them in a private location. Rotation defaults to 10 MiB with
-3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for example `25mb`)
-and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
+Log levels are `debug`, `info`, `warn`, and `error`. Logs can include local
+paths, torrent names, and peer addresses, so keep them in a private per-user
+directory rather than a shared one such as `/tmp`. Missing parent directories
+are created owner-only (`0700`). On Unix-like systems the log file is
+owner-readable only, and saintTorrent refuses to open a log path that is a
+symlink, a hard link, or a file owned by another user. Rotation defaults to
+10 MiB with 3 backups and can be tuned with `SAINTTORRENT_LOG_MAX_SIZE` (for
+example `25mb`) and a positive `SAINTTORRENT_LOG_MAX_BACKUPS`.
 
 The HTTP stats endpoint is off by default. Enable the read-only JSON API with
 `--http-addr`:
@@ -180,10 +183,23 @@ curl http://127.0.0.1:16666/healthz
 
 `GET /stats` returns a snapshot of manager limits, listener/NAT ports, aggregate
 transfer counters, and per-torrent status, peer, piece, and file stats. The
-endpoint does not expose mutating controls; keep it bound to localhost unless
-you place it behind your own trusted network or reverse proxy. In headless mode,
-forwarded torrent requests that require confirmation are rejected; use
-`--no-confirm` when scripting additions into a headless instance.
+endpoint does not expose mutating controls, but it has no authentication and
+reveals torrent names, local paths, and peer addresses, so it only binds to a
+loopback address by default. Binding a LAN or wildcard address such as
+`0.0.0.0:16666` requires `--http-allow-remote`; the startup line then shows a
+warning. The bound address is shown on the startup line in both the TUI and
+headless mode.
+
+To resist DNS rebinding, the API answers only requests whose `Host` is an IP
+literal, `localhost`, or the host given to `--http-addr` (others get `421`),
+and it rejects browser requests from other sites (`Sec-Fetch-Site` of
+`cross-site`/`same-site`, or a foreign `Origin`) with `403`. `curl`, scripts,
+and a URL typed into the browser are unaffected. A reverse proxy in front of it
+must forward a `Host` of `127.0.0.1` or `localhost` (nginx's default does). At
+most 64 connections are served at once.
+
+In headless mode, forwarded torrent requests that require confirmation are
+rejected; use `--no-confirm` when scripting additions into a headless instance.
 
 ### macOS Magnet Handler
 

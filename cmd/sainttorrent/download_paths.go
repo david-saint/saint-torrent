@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"sainttorrent/pkg/downloader"
 	"sainttorrent/pkg/storage"
@@ -135,6 +134,10 @@ func addTorrentWithDownloadPaths(mgr torrentAdder, item string, paths downloadPa
 	// initialization can still fail for a specific disk (for example when it
 	// fills between the write probe and file preallocation), in which case the
 	// next usable fallback is tried.
+	item, isMagnet, err := canonicalItem(item)
+	if err != nil {
+		return nil, err
+	}
 	_, infoHash, err := parseItem(item)
 	if err != nil {
 		return nil, err
@@ -142,7 +145,6 @@ func addTorrentWithDownloadPaths(mgr torrentAdder, item string, paths downloadPa
 
 	var pathErrors []error
 	candidates := paths.candidates()
-	isMagnet := strings.HasPrefix(item, "magnet:?")
 	if isMagnet {
 		if existing := mgr.GetSession(infoHash); existing != nil {
 			existing.MergeFallbackDownloadDirs(candidates)
