@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-netroute"
@@ -254,12 +255,23 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 	cleanup := func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), natOperationTimeout)
 		defer cancel()
-		if tcpExternal != 0 {
-			_ = gateway.DeletePortMapping(cleanupCtx, "tcp", int(tcpPort), tcpExternal)
+		// Delete concurrently so a slow gateway costs one round trip, not two,
+		// of the shutdown budget.
+		var wg sync.WaitGroup
+		deleteMapping := func(protocol string, internalPort uint16, externalPort int) {
+			if externalPort == 0 {
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = gateway.DeletePortMapping(cleanupCtx, protocol, int(internalPort), externalPort)
+			}()
 		}
-		if udpExternal != 0 {
-			_ = gateway.DeletePortMapping(cleanupCtx, "udp", int(udpPort), udpExternal)
-		}
+		deleteMapping("tcp", tcpPort, tcpExternal)
+		deleteMapping("udp", udpPort, udpExternal)
+		wg.Wait()
+
 		m.mu.Lock()
 		if m.natGateway == gateway {
 			m.natGateway = nil

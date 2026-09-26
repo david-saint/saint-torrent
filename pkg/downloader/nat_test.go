@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -134,4 +135,49 @@ func containsString(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// concurrentDeleteMapper records whether the TCP and UDP deletes overlapped:
+// each waits (briefly) for the other to start.
+type concurrentDeleteMapper struct {
+	fakePortMapper
+	started    sync.WaitGroup
+	overlapped atomic.Int32
+}
+
+func (f *concurrentDeleteMapper) DeletePortMapping(ctx context.Context, protocol string, internalPort, externalPort int) error {
+	f.started.Done()
+	both := make(chan struct{})
+	go func() {
+		f.started.Wait()
+		close(both)
+	}()
+	select {
+	case <-both:
+		f.overlapped.Add(1)
+	case <-time.After(2 * time.Second):
+	}
+	return f.fakePortMapper.DeletePortMapping(ctx, protocol, internalPort, externalPort)
+}
+
+func TestNATCleanupDeletesTCPAndUDPConcurrently(t *testing.T) {
+	mapper := &concurrentDeleteMapper{}
+	mapper.started.Add(2)
+	stubNATDiscovery(t, func(context.Context) (portMapper, error) {
+		return mapper, nil
+	})
+
+	mgr := NewTorrentManager()
+	t.Cleanup(mgr.Close)
+	if err := mgr.StartNATTraversal(51413, 51413); err != nil {
+		t.Fatalf("failed to start NAT traversal: %v", err)
+	}
+	waitForNATStatus(t, mgr, func(s NATStatus) bool { return s.TCPMapped && s.UDPMapped })
+
+	start := time.Now()
+	mgr.Close()
+	if got := mapper.overlapped.Load(); got != 2 {
+		t.Fatalf("TCP and UDP deletes ran one after the other (overlapped=%d, took %v)",
+			got, time.Since(start))
+	}
 }
