@@ -74,10 +74,10 @@ func TestAddTorrentRefusesAnotherTorrentsFile(t *testing.T) {
 		t.Fatalf("first torrent's file changed to %d bytes by a refused add", len(got))
 	}
 
-	// The same torrent in another directory, and any torrent once the first is
-	// gone, are fine.
-	if _, err := mgr.AddTorrentFile(first, t.TempDir()); err != nil {
-		t.Fatalf("add the same torrent elsewhere: %v", err)
+	// The same file name in another directory is another file.
+	second, _ := writeTestTorrent(t, torrentDir, "shared.bin", 5000, "b")
+	if _, err := mgr.AddTorrentFile(second, t.TempDir()); err != nil {
+		t.Fatalf("add a same-named torrent into another directory: %v", err)
 	}
 }
 
