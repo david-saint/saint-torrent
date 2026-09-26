@@ -64,11 +64,9 @@ type Conn struct {
 	localSeq          uint16
 	remoteSeq         uint16
 	remoteSeqSet      bool
-	stateSent         bool
 	established       chan struct{}
 	establishedClosed bool
 	establishErr      error
-	accepted          bool
 	pending           map[uint16][]byte
 	pendingBytes      int
 	pendingFin        bool
@@ -96,8 +94,12 @@ func newOutboundConn(socket *Socket, remote *net.UDPAddr, baseID uint16) *Conn {
 	return newConn(socket, remote, baseID+1, baseID, seq, 0, false)
 }
 
-func newInboundConn(socket *Socket, remote *net.UDPAddr, recvID uint16, remoteSeq uint16) *Conn {
-	c := newConn(socket, remote, recvID, recvID+1, randomUint16(), remoteSeq, true)
+// newInboundConn builds the Conn for an inbound connection whose initiator has
+// acknowledged our SYN-ACK (see Socket.promoteLocked), so it starts
+// established. synConnID and synSeq come from the initiator's SYN; localSeq is
+// the seq_nr our first DATA will carry.
+func newInboundConn(socket *Socket, remote *net.UDPAddr, synConnID, synSeq, localSeq uint16) *Conn {
+	c := newConn(socket, remote, synConnID, synConnID+1, localSeq, synSeq, true)
 	c.inbound = true
 	c.establishedClosed = true
 	close(c.established)
@@ -179,7 +181,13 @@ func (c *Conn) handlePacket(p packet) {
 			c.flushAck()
 		}
 	case packetTypeState:
-		c.handleState(p)
+		if c.handleState(p) {
+			// Complete the handshake at once, like TCP's final ACK: an
+			// acceptor keeps the conn half-open until something acks its
+			// SYN-ACK, so this lets it hand the conn to Accept before our
+			// first write.
+			c.flushAck()
+		}
 	case packetTypeData:
 		switch c.handleData(p) {
 		case ackImmediate:
@@ -197,7 +205,9 @@ func (c *Conn) handlePacket(p packet) {
 }
 
 // handleSyn is meaningful only for an inbound conn; a SYN reaching any other
-// Conn is ignored. It reports whether a STATE ack is owed.
+// Conn is ignored. The first SYN was answered while the connection was still
+// half-open, so one reaching the Conn is a retransmit and only needs a re-ack.
+// It reports whether a STATE ack is owed.
 func (c *Conn) handleSyn(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -205,30 +215,27 @@ func (c *Conn) handleSyn(p packet) bool {
 		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	// Only the first SYN sets sequence state; a retransmit just re-acks.
-	if !c.stateSent {
-		c.remoteSeq = p.seqNr
-		c.remoteSeqSet = true
-		c.stateSent = true
-		c.localSeq++
-	}
 	return true
 }
 
-func (c *Conn) handleState(p packet) {
+// handleState reports whether p was the SYN-ACK that established this
+// outbound conn.
+func (c *Conn) handleState(p packet) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return
+		return false
 	}
 	c.updateTimestampDiffLocked(p)
-	if !c.establishedClosed {
-		c.remoteSeq = p.seqNr
-		c.remoteSeqSet = true
-		c.localSeq++
-		c.establishedClosed = true
-		close(c.established)
+	if c.establishedClosed {
+		return false
 	}
+	c.remoteSeq = p.seqNr
+	c.remoteSeqSet = true
+	c.localSeq++
+	c.establishedClosed = true
+	close(c.established)
+	return true
 }
 
 func (c *Conn) handleData(p packet) ackDisposition {
@@ -817,18 +824,6 @@ func (c *Conn) closeWithError(err error, sendFin bool) {
 		}
 		c.socket.unregister(c)
 	})
-}
-
-func (c *Conn) isAccepted() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.accepted
-}
-
-func (c *Conn) markAccepted() {
-	c.mu.Lock()
-	c.accepted = true
-	c.mu.Unlock()
 }
 
 func (c *Conn) signalReadLocked() {
