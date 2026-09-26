@@ -1273,11 +1273,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if bestIdx == -1 {
 			if s.endgameActiveLocked() {
 				owned := make(map[int64]bool, len(activeDownloads))
+				copies := 0
 				for _, dl := range activeDownloads {
 					owned[dl.pieceIndex] = true
+					if dl.endgame {
+						copies++
+					}
 				}
-				bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
-				endgame = true
+				if copies < maxEndgamePiecesPerPeer {
+					bestIdx = s.selectEndgamePieceLocked(canRequestPiece, owned)
+					endgame = true
+				}
 			}
 			if bestIdx == -1 {
 				return nil
@@ -1334,6 +1340,43 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	requestable := func(dl *activeDownload) bool {
 		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
 	}
+	anyRequestable := func() bool {
+		for _, dl := range activeDownloads {
+			if requestable(dl) {
+				return true
+			}
+		}
+		return false
+	}
+	endgameCopies := func() int {
+		n := 0
+		for _, dl := range activeDownloads {
+			if dl.endgame {
+				n++
+			}
+		}
+		return n
+	}
+	// roomForPiece reports whether one more piece fits in this connection's open
+	// piece bytes (peerOpenPieceBytesCap). The open bytes are summed here instead of
+	// counted per block: a piece is only opened once every open one is fully
+	// requested, and the block path stays free of accounting.
+	var torrentPieceLen int64
+	roomForPiece := func() bool {
+		if len(activeDownloads) < minOpenPiecesPerPeer {
+			return true
+		}
+		if torrentPieceLen <= 0 {
+			s.mu.RLock()
+			torrentPieceLen = s.Torrent.PieceLength
+			s.mu.RUnlock()
+		}
+		var open int64
+		for _, dl := range activeDownloads {
+			open += dl.length
+		}
+		return open+torrentPieceLen <= peerOpenPieceBytesCap(torrentPieceLen)
+	}
 	avgBlocksPerPiece := func() int {
 		if len(activeDownloads) > 0 {
 			var total int64
@@ -1351,12 +1394,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return max(1, int((pieceLength+BlockSize-1)/BlockSize))
 	}
 	requestableWorkAvailable := func(pieceCap int, canRequestPiece func(int64) bool) bool {
-		for _, dl := range activeDownloads {
-			if requestable(dl) {
-				return true
-			}
+		if anyRequestable() {
+			return true
 		}
-		if len(activeDownloads) >= pieceCap {
+		if len(activeDownloads) >= pieceCap || !roomForPiece() {
 			return false
 		}
 		s.mu.Lock()
@@ -1364,7 +1405,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if s.hasSelectableNeededPieceLocked(canRequestPiece) {
 			return true
 		}
-		if s.endgameActiveLocked() {
+		if s.endgameActiveLocked() && endgameCopies() < maxEndgamePiecesPerPeer {
 			for i := range s.downloadingPieces {
 				if canRequestPiece(int64(i)) && s.isPieceWanted(int64(i)) {
 					return true
@@ -1540,8 +1581,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		// for not leaking a stalled connection. Fast peers may still serve pieces
 		// they explicitly listed with allowed_fast — but only proceed when at least
 		// one such piece is still worth fetching, so a choked connection whose fast
-		// set is exhausted doesn't run the full piece scan on every message.
-		if choked && !hasAllowedFastWork() {
+		// set is exhausted doesn't run the full piece scan on every message. The
+		// allowed-fast pieces kept across the choke count too: a block of one that
+		// timed out must be re-sent, or it never runs out of retries and the peer
+		// could hold the piece (and its received blocks) forever.
+		if choked && !anyRequestable() && !hasAllowedFastWork() {
 			waitingForBandwidth = false
 			publishPipelineSnapshot(now, false)
 			return 0
@@ -1569,7 +1613,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				}
 			}
 			if chosen == nil {
-				if len(activeDownloads) >= pieceCap {
+				if len(activeDownloads) >= pieceCap || !roomForPiece() {
 					pipeline.OnPieceCapLimited(now)
 					break
 				}

@@ -23,28 +23,28 @@ const (
 	benchNumPieces = 64 // 16 MiB per iteration
 )
 
-func benchTorrentData() ([]byte, [][20]byte) {
-	data := make([]byte, benchPieceLen*benchNumPieces)
+func benchTorrentData(pieceLen, numPieces int) ([]byte, [][20]byte) {
+	data := make([]byte, pieceLen*numPieces)
 	for i := range data {
 		data[i] = byte(i*31 + 11)
 	}
-	hashes := make([][20]byte, benchNumPieces)
+	hashes := make([][20]byte, numPieces)
 	for i := range hashes {
-		hashes[i] = sha1.Sum(data[i*benchPieceLen : (i+1)*benchPieceLen])
+		hashes[i] = sha1.Sum(data[i*pieceLen : (i+1)*pieceLen])
 	}
 	return data, hashes
 }
 
-func benchSession(b *testing.B, data []byte, hashes [][20]byte, seed bool) *Session {
+func benchSession(b *testing.B, data []byte, hashes [][20]byte, pieceLen int, seed bool) *Session {
 	b.Helper()
 	tor := &torrent.Torrent{
 		Name:        "bench.bin",
 		InfoHash:    sha1.Sum([]byte("peer-loop-bench")),
-		PieceLength: benchPieceLen,
+		PieceLength: int64(pieceLen),
 		PieceHashes: hashes,
 		Files:       []torrent.File{{Length: int64(len(data)), Path: []string{"bench.bin"}}},
 	}
-	st, err := storage.NewMemStorage(b.TempDir(), []storage.FileInfo{{Path: "bench.bin", Length: int64(len(data))}}, benchPieceLen)
+	st, err := storage.NewMemStorage(b.TempDir(), []storage.FileInfo{{Path: "bench.bin", Length: int64(len(data))}}, int64(pieceLen))
 	if err != nil {
 		b.Fatalf("storage: %v", err)
 	}
@@ -53,13 +53,13 @@ func benchSession(b *testing.B, data []byte, hashes [][20]byte, seed bool) *Sess
 		b.Fatalf("session: %v", err)
 	}
 	if seed {
-		for i := 0; i < benchNumPieces; i++ {
-			if err := st.WriteBlock(int64(i), 0, data[i*benchPieceLen:(i+1)*benchPieceLen]); err != nil {
+		for i := range hashes {
+			if err := st.WriteBlock(int64(i), 0, data[i*pieceLen:(i+1)*pieceLen]); err != nil {
 				b.Fatalf("seed: %v", err)
 			}
 		}
 		sess.mu.Lock()
-		for i := 0; i < benchNumPieces; i++ {
+		for i := range hashes {
 			sess.setPieceStateLocked(i, PieceCompleted)
 		}
 		sess.mu.Unlock()
@@ -80,14 +80,24 @@ func benchRunLoop(sess *Session, reserved [8]byte) (net.Conn, chan struct{}) {
 
 // BenchmarkPeerLoopDownload downloads a 16 MiB torrent from one seed peer.
 func BenchmarkPeerLoopDownload(b *testing.B) {
-	data, hashes := benchTorrentData()
+	benchPeerLoopDownload(b, benchPieceLen, benchNumPieces)
+}
+
+// BenchmarkPeerLoopDownloadLargePieces downloads 128 MiB in 16 MiB pieces, where
+// peerOpenPieceBytesCap keeps the connection to four open pieces.
+func BenchmarkPeerLoopDownloadLargePieces(b *testing.B) {
+	benchPeerLoopDownload(b, 16<<20, 8)
+}
+
+func benchPeerLoopDownload(b *testing.B, pieceLen, numPieces int) {
+	data, hashes := benchTorrentData(pieceLen, numPieces)
 	var reserved [8]byte
 	peer.EnableFastExtension(&reserved)
 	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
-		sess := benchSession(b, data, hashes, false)
+		sess := benchSession(b, data, hashes, pieceLen, false)
 		remote, done := benchRunLoop(sess, reserved)
 		b.StartTimer()
 
@@ -113,7 +123,7 @@ func BenchmarkPeerLoopDownload(b *testing.B) {
 				index := binary.BigEndian.Uint32(req[0:4])
 				begin := binary.BigEndian.Uint32(req[4:8])
 				length := binary.BigEndian.Uint32(req[8:12])
-				off := int(index)*benchPieceLen + int(begin)
+				off := int(index)*pieceLen + int(begin)
 				frame := make([]byte, 13, 13+length)
 				binary.BigEndian.PutUint32(frame[0:4], 9+length)
 				frame[4] = byte(peer.MsgPiece)
@@ -138,7 +148,7 @@ func BenchmarkPeerLoopDownload(b *testing.B) {
 // BenchmarkPeerLoopUpload serves a 16 MiB torrent to one leecher that keeps
 // maxUploadQueue/2 requests in flight.
 func BenchmarkPeerLoopUpload(b *testing.B) {
-	data, hashes := benchTorrentData()
+	data, hashes := benchTorrentData(benchPieceLen, benchNumPieces)
 	var reserved [8]byte
 	peer.EnableFastExtension(&reserved)
 	const blocksPerPiece = benchPieceLen / BlockSize
@@ -147,7 +157,7 @@ func BenchmarkPeerLoopUpload(b *testing.B) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		b.StopTimer()
-		sess := benchSession(b, data, hashes, true)
+		sess := benchSession(b, data, hashes, benchPieceLen, true)
 		remote, done := benchRunLoop(sess, reserved)
 		unchoked := make(chan struct{})
 		served := make(chan struct{}, totalBlocks)

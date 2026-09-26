@@ -50,7 +50,7 @@ func settled(sess *Session) *Session {
 // kept for as long as the peer sent keep-alives (an inbound one is never stall
 // reaped). It must be dropped after peerInactivityTimeout; useful ones stay.
 func TestIdleConnectionIsDropped(t *testing.T) {
-	defer swapDuration(&peerInactivityTimeout, 300*time.Millisecond)()
+	t.Cleanup(swapDuration(&peerInactivityTimeout, 300*time.Millisecond))
 
 	t.Run("nobody interested", func(t *testing.T) {
 		sess, _ := newSeedingWireTestSession(t, 4, 16*1024)

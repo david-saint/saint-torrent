@@ -19,6 +19,33 @@ const (
 	maxConcurrentPiecesPerPeer         = 2048
 )
 
+// A connection keeps every received block of a piece in memory until the whole
+// piece is in, and the outstanding-request budgets above are released as each
+// block arrives. So the pieces a connection may have open at once are also bounded
+// by their total size, peerOpenPieceBytesCap: without it a peer that withholds one
+// block of each piece pins minConcurrentPiecesPerPeer whole pieces (256 MiB with
+// 16 MiB pieces). Up to 4 MiB pieces the piece-count cap binds first, so this only
+// changes torrents with larger pieces, where two or more open pieces still cover
+// the largest request window. peerOpenPieceBytesFloor is a var so tests can shrink
+// it; treat it as a constant.
+var peerOpenPieceBytesFloor = int64(64 << 20)
+
+const (
+	// minOpenPiecesPerPeer pieces may always be open, whatever their size, so the
+	// window can run across a piece boundary.
+	minOpenPiecesPerPeer = 2
+	// maxEndgamePiecesPerPeer bounds the redundant endgame copies one connection
+	// holds: each is a full piece fetched from block 0, and a couple per peer are
+	// enough to finish the tail.
+	maxEndgamePiecesPerPeer = 2
+)
+
+// peerOpenPieceBytesCap returns the most piece bytes one connection may have open
+// for a torrent with pieces of pieceLen bytes.
+func peerOpenPieceBytesCap(pieceLen int64) int64 {
+	return max(2*pieceLen, peerOpenPieceBytesFloor)
+}
+
 type pipelineByteBudget struct {
 	limit     atomic.Int64
 	used      atomic.Int64

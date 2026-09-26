@@ -131,10 +131,12 @@ func (job pieceWriteJob) sendResult(status pieceWriteStatus, err error) {
 	}
 }
 
-// pieceWriteQueueDepth bounds how many completed-piece buffers can be queued for the
-// write pool. Each entry holds a full piece, so this caps the pool's memory; once
-// full, submitting applies backpressure to the peer goroutine, which is the intended
-// bound (a peer can't outrun the disk without limit).
+// pieceWriteQueueDepth bounds how many completed-piece buffers wait in the channel
+// for the write pool. Once it is full, submitting blocks the peer goroutine, which
+// stops reading its socket, so disk backpressure reaches the peer. That does not
+// cap memory by itself: each peer goroutine blocked on the send still holds its
+// assembled piece (plus its open pieces, see peerOpenPieceBytesCap), so completed
+// pieces in flight are bounded by queue + workers + blocked connections, not by 8.
 const pieceWriteQueueDepth = 8
 
 // ensurePieceWritePool lazily starts the background hash/write workers. Idempotent.
