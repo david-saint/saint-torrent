@@ -25,6 +25,19 @@ const (
 	// acknowledged our SYN-ACK. Expiry is silent: no FIN or RESET goes to a
 	// source that has not proven it can receive them.
 	halfOpenTimeout = 10 * time.Second
+
+	// maxResetsPerSecond caps the RESETs sent for packets that belong to no
+	// connection. Each answers a packet from an unverified source one for
+	// one, so without a cap a spoofing sender can bounce any volume off us
+	// toward a third party; a peer that really lost its connection learns
+	// from the first few, or from its own timeout.
+	maxResetsPerSecond = 64
+
+	// maxDHTDatagram is the most of a non-uTP datagram handed to the DHT: its
+	// read loop (pkg/dht) reads into a 4096-byte buffer and never sees the
+	// rest, so copying more only costs the shared read loop a 64 KiB copy per
+	// junk datagram and lets the DHT queue pin up to 64 MiB.
+	maxDHTDatagram = 4096
 )
 
 var errListenerClosed = errors.New("utp: listener closed")
@@ -78,6 +91,11 @@ type Socket struct {
 	halfOpen     map[connKey]*halfOpenConn
 	halfOpenRing [maxHalfOpen]*halfOpenConn
 	halfOpenNext int
+
+	// resetWindow and resetsSent budget unsolicited RESETs per second (see
+	// maxResetsPerSecond).
+	resetWindow time.Time
+	resetsSent  int
 
 	// bufPool hands out scratch buffers for packet marshaling so writePacket
 	// does not allocate a fresh header+payload slice per send. sync.Pool keeps
@@ -243,8 +261,9 @@ func (s *Socket) readLoop() {
 			continue
 		}
 		// The DHT path hands the datagram to another goroutine via a channel,
-		// so it must own a copy that outlives the next ReadFromUDP.
-		data := append([]byte(nil), buf[:n]...)
+		// so it must own a copy that outlives the next ReadFromUDP. Only the
+		// part the DHT will ever read is copied.
+		data := append([]byte(nil), buf[:min(n, maxDHTDatagram)]...)
 		s.dhtConn.deliver(udpPacket{data: data, addr: cloneUDPAddr(addr)})
 	}
 }
@@ -265,21 +284,26 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	}
 
 	var (
-		c        *Conn
-		listener *Listener
-		halfOpen bool
+		c         *Conn
+		listener  *Listener
+		halfOpen  bool
+		sendReset bool
 	)
 	s.mu.Lock()
 	c = s.conns[key]
 	if c == nil {
-		// Only packets for unknown conns get here, so the half-open lookup
-		// and promotion cost established connections nothing.
-		if h := s.liveHalfOpenLocked(key, time.Now()); h != nil {
+		// Only packets for unknown conns get here, so the half-open lookup,
+		// the promotion and the reset budget cost established connections
+		// nothing.
+		now := time.Now()
+		if h := s.liveHalfOpenLocked(key, now); h != nil {
 			halfOpen = true
 			if h.acknowledgedBy(p) {
 				c = s.promoteLocked(h, p.ackNr)
 				listener = s.listener
 			}
+		} else if p.typ != packetTypeReset {
+			sendReset = s.allowResetLocked(now)
 		}
 	}
 	s.mu.Unlock()
@@ -287,8 +311,9 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 	if c == nil {
 		// A packet for a half-open entry that does not acknowledge our
 		// SYN-ACK came from a source that has not shown it receives what we
-		// send, so it is dropped without any reply.
-		if !halfOpen && p.typ != packetTypeReset {
+		// send, so it is dropped without any reply. Other stray packets get
+		// a RESET while the budget lasts.
+		if sendReset {
 			s.writeReset(p, addr)
 		}
 		return
@@ -326,14 +351,18 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 	// conns, so answering a retransmit with a RESET here would carry the
 	// initiator's connID and tear down a live inbound stream.
 	if existing := s.conns[key]; existing != nil {
-		s.mu.Unlock()
 		if existing.inbound {
+			s.mu.Unlock()
 			existing.handlePacket(p)
 			return
 		}
 		// An outbound conn whose recv_id collides with this key is left
 		// untouched and the SYN is refused.
-		s.writeReset(p, addr)
+		sendReset := s.allowResetLocked(now)
+		s.mu.Unlock()
+		if sendReset {
+			s.writeReset(p, addr)
+		}
 		return
 	}
 	h := s.liveHalfOpenLocked(key, now)
@@ -343,8 +372,11 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 		// replaces the entry rather than being answered with a SYN-ACK that
 		// acks the wrong SYN.
 		if s.listener == nil || s.listener.isClosed() {
+			sendReset := s.allowResetLocked(now)
 			s.mu.Unlock()
-			s.writeReset(p, addr)
+			if sendReset {
+				s.writeReset(p, addr)
+			}
 			return
 		}
 		h = &halfOpenConn{
@@ -365,8 +397,22 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 	_ = s.writePacket(reply, addr)
 }
 
+// allowResetLocked spends one unit of the unsolicited-RESET budget, reporting
+// false once the current second's budget is used up.
+func (s *Socket) allowResetLocked(now time.Time) bool {
+	if now.Sub(s.resetWindow) >= time.Second {
+		s.resetWindow = now
+		s.resetsSent = 0
+	}
+	if s.resetsSent >= maxResetsPerSecond {
+		return false
+	}
+	s.resetsSent++
+	return true
+}
+
 // writeReset answers p, which belongs to no connection we can serve, with a
-// RESET.
+// RESET. Callers spend the budget first (allowResetLocked).
 func (s *Socket) writeReset(p packet, addr *net.UDPAddr) {
 	_ = s.writePacket(packet{
 		typ:       packetTypeReset,
