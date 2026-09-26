@@ -609,9 +609,12 @@ func TestMetadataRejectedAndUnansweredBlocksAreReaskedA2(t *testing.T) {
 	sess, info := newMagnetTestSession(t, 2)
 
 	w := startWirePeerAtA2(t, sess, "203.0.113.50", 6341)
+	// The clock starts before the handshake that triggers the requests, so the
+	// session's request timers cannot start earlier than it and the lower-bound
+	// checks below cannot fail by the send-to-receive latency.
+	start := time.Now()
 	w.sendExtended(peer.ExtHandshake, extHandshakePayload(t, 3, len(info)))
 	w.expectMetadataRequests(3, 0, 1)
-	start := time.Now()
 	w.send(&peer.Message{ID: peer.MsgExtended, Payload: metadataReplyA2(peer.MetadataReject, 0, nil)})
 
 	reasked := make(map[int]time.Duration)
