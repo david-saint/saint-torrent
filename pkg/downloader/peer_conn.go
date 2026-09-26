@@ -879,7 +879,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.mu.Lock()
 		reconnectAfterResume := false
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
-			s.releasePeerLocked(hostKey, remoteID)
+			s.releasePeerLocked(peerAddr, hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Active = false
 				ps.Choked = true

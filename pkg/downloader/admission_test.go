@@ -238,6 +238,99 @@ func TestRefusedOutboundConnectionBacksOff(t *testing.T) {
 	})
 }
 
+// When we dial a peer while it dials us, both connections carry the same peer ID
+// from the same host. Refusing the second one on both ends dropped both; now each
+// end keeps the connection opened by the side with the lower peer ID, whichever
+// arrived first, and the loser's exit leaves the winner's ID entry in place.
+func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
+	lowID := peerIDFor(1) // "-TT0001-000000000001", below withPeerID's
+	var highID [20]byte
+	copy(highID[:], "-ZZ0001-000000000001")
+	for _, tc := range []struct {
+		name          string
+		remoteID      [20]byte
+		firstOutbound bool
+	}{
+		{"we are lower, outbound first", highID, true},
+		{"we are lower, inbound first", highID, false},
+		{"we are higher, outbound first", lowID, true},
+		{"we are higher, inbound first", lowID, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+			ourLower := string(sess.PeerID[:]) < string(tc.remoteID[:])
+			const ip = "10.6.6.6"
+			ports := map[bool]uint16{true: 6881, false: 51413} // outbound: listen port; inbound: source port
+			if tc.firstOutbound {
+				knownDialedPeerA1(sess, ip, ports[true])
+			}
+			first := startDirectedConnA1(t, sess, ip, ports[tc.firstOutbound], tc.remoteID, tc.firstOutbound)
+			firstAddr := net.JoinHostPort(ip, strconv.Itoa(int(ports[tc.firstOutbound])))
+			admitted(t, sess, firstAddr, first.client)
+
+			secondOutbound := !tc.firstOutbound
+			if secondOutbound {
+				knownDialedPeerA1(sess, ip, ports[true])
+			}
+			second := startDirectedConnA1(t, sess, ip, ports[secondOutbound], tc.remoteID, secondOutbound)
+			secondAddr := net.JoinHostPort(ip, strconv.Itoa(int(ports[secondOutbound])))
+
+			// The winner is our outbound connection when our ID is the lower one.
+			winner, winnerAddr, loser := second, secondAddr, first
+			if secondOutbound != ourLower {
+				winner, winnerAddr, loser = first, firstAddr, second
+			}
+			if winner == second {
+				admitted(t, sess, secondAddr, second.client)
+			}
+			loser.rejected(t) // its loop has exited
+			select {
+			case <-winner.done:
+				t.Fatal("the winning connection was closed too")
+			default:
+			}
+
+			sess.mu.RLock()
+			defer sess.mu.RUnlock()
+			if len(sess.activePeers) != 1 || sess.activePeers[winnerAddr] != winner.client {
+				t.Fatalf("active connections %v, want only %s", len(sess.activePeers), winnerAddr)
+			}
+			if owner, ok := sess.admission.peerIDs[tc.remoteID]; !ok || owner.addr != winnerAddr {
+				t.Fatalf("peer ID owner %+v (present %v), want %s", owner, ok, winnerAddr)
+			}
+			if n := sess.admission.perHost[ip]; n != 1 {
+				t.Fatalf("host counted %d times, want 1", n)
+			}
+		})
+	}
+}
+
+// Only a simultaneous open (same host, other direction) may replace a connection:
+// the same peer ID from another host, or from the same host in the same
+// direction, is refused, so a peer spoofing an ID cannot evict its owner.
+func TestDuplicatePeerIDFromAnotherHostIsRefused(t *testing.T) {
+	var highID [20]byte
+	copy(highID[:], "-ZZ0001-000000000001") // our outbound would win a tie-break
+	sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+	owner := startAdmissionConn(t, sess, "10.7.7.7", 51413, highID)
+	admitted(t, sess, "10.7.7.7:51413", owner.client)
+
+	knownDialedPeerA1(sess, "10.8.8.8", 6881)
+	startDirectedConnA1(t, sess, "10.8.8.8", 6881, highID, true).rejected(t)
+	startAdmissionConn(t, sess, "10.7.7.7", 51414, highID).rejected(t)
+
+	select {
+	case <-owner.done:
+		t.Fatal("a duplicate peer ID evicted the connection that owns it")
+	default:
+	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if o := sess.admission.peerIDs[highID]; o.addr != "10.7.7.7:51413" {
+		t.Fatalf("peer ID owner %+v, want the first connection", o)
+	}
+}
+
 // Dialling an address that answers with our own peer ID (our listener, handed
 // back by a tracker or the DHT) is detected, and the address is not dialled again.
 func TestSelfDialIsRememberedAndNotRepeated(t *testing.T) {

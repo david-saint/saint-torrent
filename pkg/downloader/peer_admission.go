@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"net"
 	"strings"
 	"time"
@@ -35,9 +36,16 @@ const (
 // is ready to use.
 type peerAdmission struct {
 	perHost   map[string]int
-	peerIDs   map[[20]byte]struct{}
+	peerIDs   map[[20]byte]peerIDOwner
 	selfAddrs map[string]struct{}
 	strikes   map[string]*hostStrikes
+}
+
+// peerIDOwner is the connection a remote peer ID is admitted under.
+type peerIDOwner struct {
+	addr     string // activePeers key
+	hostKey  string
+	outbound bool
 }
 
 // hostStrikes records a host's recent hash failures and any ban they earned.
@@ -77,6 +85,16 @@ func peerHostKey(ip string) (key string, loopback bool) {
 // PeerState would be shared), a banned host, a connection to ourselves, a second
 // connection to a peer ID we are already connected to, and a host over
 // maxConnectionsPerIP.
+//
+// The one exception to the peer ID rule is a simultaneous open: we dialled a
+// peer while it dialled us, so the same host holds the same ID in the other
+// direction. Refusing the second connection on both ends would drop both, so
+// each end keeps the connection opened by the side with the lower peer ID (the
+// rule libtorrent applies too) and closes the other; that replacement is not
+// held to the per-host cap. A duplicate from another host, or in the same
+// direction, is always refused, so a peer spoofing an ID cannot evict the
+// connection that owns it.
+//
 // A zero peer ID identifies nobody, so it is exempt from the ID checks. Caller
 // holds s.mu.
 func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remoteID [20]byte, outbound bool) string {
@@ -87,6 +105,7 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 	if a.bannedLocked(hostKey, time.Now()) {
 		return "banned"
 	}
+	replacing := false
 	if remoteID != ([20]byte{}) {
 		if remoteID == s.PeerID {
 			if outbound {
@@ -94,11 +113,23 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 			}
 			return "self_connection"
 		}
-		if _, dup := a.peerIDs[remoteID]; dup {
-			return "duplicate_peer_id"
+		if owner, dup := a.peerIDs[remoteID]; dup {
+			if owner.hostKey != hostKey || owner.outbound == outbound {
+				return "duplicate_peer_id"
+			}
+			keepOurOutbound := bytes.Compare(s.PeerID[:], remoteID[:]) < 0
+			if outbound != keepOurOutbound {
+				return "duplicate_peer_id"
+			}
+			// The new connection wins: close the one it replaces. Its loop
+			// releases its own slot when it exits, and leaves the ID to us.
+			if old := s.activePeers[owner.addr]; old != nil && old.Conn != nil {
+				_ = old.Conn.Close()
+			}
+			replacing = true
 		}
 	}
-	if !loopback && a.perHost[hostKey] >= maxConnectionsPerIP {
+	if !replacing && !loopback && a.perHost[hostKey] >= maxConnectionsPerIP {
 		return "per_ip_limit"
 	}
 	if a.perHost == nil {
@@ -107,16 +138,17 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 	a.perHost[hostKey]++
 	if remoteID != ([20]byte{}) {
 		if a.peerIDs == nil {
-			a.peerIDs = make(map[[20]byte]struct{})
+			a.peerIDs = make(map[[20]byte]peerIDOwner)
 		}
-		a.peerIDs[remoteID] = struct{}{}
+		a.peerIDs[remoteID] = peerIDOwner{addr: peerAddr, hostKey: hostKey, outbound: outbound}
 	}
 	return ""
 }
 
-// releasePeerLocked undoes admitPeerLocked when the connection ends. Caller holds
-// s.mu.
-func (s *Session) releasePeerLocked(hostKey string, remoteID [20]byte) {
+// releasePeerLocked undoes admitPeerLocked when the connection at peerAddr ends.
+// The peer ID is released only if that connection still owns it: a connection
+// replaced in a simultaneous open leaves it to its replacement. Caller holds s.mu.
+func (s *Session) releasePeerLocked(peerAddr, hostKey string, remoteID [20]byte) {
 	a := &s.admission
 	if a.perHost[hostKey] <= 1 {
 		delete(a.perHost, hostKey)
@@ -124,7 +156,9 @@ func (s *Session) releasePeerLocked(hostKey string, remoteID [20]byte) {
 		a.perHost[hostKey]--
 	}
 	if remoteID != ([20]byte{}) {
-		delete(a.peerIDs, remoteID)
+		if owner, ok := a.peerIDs[remoteID]; ok && owner.addr == peerAddr {
+			delete(a.peerIDs, remoteID)
+		}
 	}
 }
 
