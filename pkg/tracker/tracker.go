@@ -178,11 +178,12 @@ func ParseTrackerResponse(data []byte) (*TrackerResponse, error) {
 		return nil, fmt.Errorf("tracker error: %s", trackerMessage(failReason))
 	}
 
+	// A missing or non-integer interval is left 0, and the announcer applies its
+	// default. Rejecting the reply discarded its peers and put the tracker into
+	// failure backoff; libtorrent defaults the interval too.
 	var interval int
 	if intVal, ok := dict["interval"].(int64); ok {
 		interval = clampCount(intVal)
-	} else {
-		return nil, fmt.Errorf("missing or invalid interval")
 	}
 
 	var minInterval int
