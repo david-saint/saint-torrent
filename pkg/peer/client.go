@@ -75,8 +75,8 @@ func NewClient(conn net.Conn, infoHash, peerID [20]byte) *Client {
 }
 
 // SetWriteTimeout changes how long a write may make no progress before it fails
-// and the connection is closed (peerWriteTimeout by default). Call it before the
-// connection is in use.
+// and the connection is closed (peerWriteTimeout by default); zero or less turns
+// the timeout off. Call it before the connection is in use.
 func (c *Client) SetWriteTimeout(d time.Duration) {
 	c.writeMu.Lock()
 	c.writeTimeout = d
@@ -89,6 +89,9 @@ func (c *Client) SetWriteTimeout(d time.Duration) {
 // has passed costs one deadline update per connection every ~45 s instead of one
 // per block. Caller holds writeMu.
 func (c *Client) armWriteDeadlineLocked() {
+	if c.writeTimeout <= 0 {
+		return
+	}
 	now := time.Now()
 	if c.writeDeadline.Sub(now) >= c.writeTimeout/2 {
 		return
