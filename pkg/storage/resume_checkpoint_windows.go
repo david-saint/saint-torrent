@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"os"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -15,9 +16,10 @@ const (
 	resumeSyncOpenFlags = os.O_RDWR
 )
 
-// fileBasicInfo mirrors FILE_BASIC_INFO. Only ChangeTime is read: it is the
-// Windows equivalent of the Unix change timestamp and is what catches an in-place
-// edit whose author restored the modification time.
+// fileBasicInfo mirrors FILE_BASIC_INFO. ChangeTime is the Windows equivalent of
+// the Unix change timestamp and is what catches an in-place edit whose author
+// restored the modification time; LastWriteTime stands in for it only where the
+// file system keeps none (see formatFileIdentity).
 type fileBasicInfo struct {
 	CreationTime   int64
 	LastAccessTime int64
@@ -39,19 +41,50 @@ func fileIdentity(f *os.File, _ os.FileInfo) string {
 	if windows.GetFileInformationByHandleEx(windows.Handle(f.Fd()), windows.FileBasicInfo, (*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic))) != nil {
 		return ""
 	}
-	return formatFileIdentity(info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime)
+	// Only a file without a change time pays for the file system lookup.
+	fat := basic.ChangeTime == 0 && isFATVolume(windows.Handle(f.Fd()))
+	return formatFileIdentity(info.VolumeSerialNumber, info.FileIndexHigh, info.FileIndexLow, basic.ChangeTime, basic.LastWriteTime, fat)
 }
 
-// formatFileIdentity renders a checkpoint identity. Without a change timestamp
-// the identity cannot prove the content is unchanged, so it reports none and
-// the pieces are rechecked. FAT and exFAT keep no change time and report zero;
-// an identity built on it would reduce to a directory-entry position, and trust
-// would rest on size and a two-second mtime alone.
-func formatFileIdentity(volume, indexHigh, indexLow uint32, changeTime int64) string {
-	if changeTime == 0 {
+// formatFileIdentity renders a checkpoint identity. It carries the change
+// timestamp, which moves on any in-place edit, even one whose author restored
+// the modification time.
+//
+// FAT and exFAT keep no change time and report zero. On those volumes (fat)
+// the identity is recorded in a weaker, explicitly marked "mtime" form instead:
+// volume, file index and the exact last-write time, which with the size the
+// checkpoint also compares is what libtorrent trusts everywhere. Without it
+// every torrent on such a drive, typically an external one shared between
+// systems, was hashed in full on every launch. An in-place edit that restores
+// the modification time goes unnoticed there; see the README. Any other file
+// system reporting no change time, a file without an index (some network
+// redirectors) or one without a write time gets no identity, and its pieces
+// are rechecked.
+func formatFileIdentity(volume, indexHigh, indexLow uint32, changeTime, lastWriteTime int64, fat bool) string {
+	if changeTime != 0 {
+		return fmt.Sprintf("%d:%d:%d:%d", volume, indexHigh, indexLow, changeTime)
+	}
+	if !fat || indexHigh|indexLow == 0 || lastWriteTime == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d:%d:%d:%d", volume, indexHigh, indexLow, changeTime)
+	return fmt.Sprintf("mtime:%d:%d:%d:%d", volume, indexHigh, indexLow, lastWriteTime)
+}
+
+// isFATVolume reports whether the file open at h lives on a FAT or exFAT
+// volume, the file systems that keep no change time.
+func isFATVolume(h windows.Handle) bool {
+	var name [windows.MAX_PATH + 1]uint16
+	if windows.GetVolumeInformationByHandle(h, nil, 0, nil, nil, nil, &name[0], uint32(len(name))) != nil {
+		return false
+	}
+	return isFATFileSystem(windows.UTF16ToString(name[:]))
+}
+
+// isFATFileSystem reports whether name, as GetVolumeInformation reports it,
+// is FAT ("FAT", "FAT32") or exFAT.
+func isFATFileSystem(name string) bool {
+	return strings.EqualFold(name, "FAT") || strings.EqualFold(name, "FAT12") || strings.EqualFold(name, "FAT16") ||
+		strings.EqualFold(name, "FAT32") || strings.EqualFold(name, "exFAT")
 }
 
 // fileObjectKeyOf keys a file by volume serial number and file index, which

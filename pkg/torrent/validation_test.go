@@ -109,6 +109,21 @@ func TestCheckPieceCount(t *testing.T) {
 	}
 }
 
+// TestCheckFileCount exercises the file-count cap directly; a torrent that
+// actually lists MaxFileCount+1 files would be a 20 MiB fixture that decodes
+// into a million maps.
+func TestCheckFileCount(t *testing.T) {
+	if MaxFileCount < 1<<20 {
+		t.Fatalf("MaxFileCount = %d, want at least 1<<20 so large datasets still load", MaxFileCount)
+	}
+	if err := checkFileCount(MaxFileCount); err != nil {
+		t.Fatalf("checkFileCount(MaxFileCount) = %v, want success", err)
+	}
+	if err := checkFileCount(MaxFileCount + 1); err == nil || !strings.Contains(err.Error(), "more than the maximum") {
+		t.Fatalf("checkFileCount(MaxFileCount+1) = %v, want cap rejection", err)
+	}
+}
+
 // TestParsePieceCountComparedIn64Bits is the GOARCH=386 regression: the
 // expected count used to be converted to int before comparing, so 2^32+1
 // expected pieces truncated to 1 and matched a single hash. CI runs this test
@@ -158,13 +173,41 @@ func TestParseRejectsDuplicateKeys(t *testing.T) {
 	concat := func(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
 
 	for name, data := range map[string][]byte{
-		"two info dicts":        concat([]byte("d4:info"), good, []byte("4:info"), evil, []byte("e")),
-		"repeated top key":      concat([]byte("d8:announce5:a.com8:announce5:b.com4:info"), good, []byte("e")),
-		"repeated name in info": concat([]byte("d4:infod6:lengthi16e4:name9:movie.mkv4:name13:movie.mkv.exe12:piece lengthi16e6:pieces20:"), make([]byte, 20), []byte("ee")),
+		"two info dicts":           concat([]byte("d4:info"), good, []byte("4:info"), evil, []byte("e")),
+		"two info dicts, non-dict": concat([]byte("d4:info"), good, []byte("4:infoi1ee")),
+		"repeated name in info":    concat([]byte("d4:infod6:lengthi16e4:name9:movie.mkv4:name13:movie.mkv.exe12:piece lengthi16e6:pieces20:"), make([]byte, 20), []byte("ee")),
+		"repeated key in info file": concat([]byte("d4:infod5:filesld6:lengthi16e4:pathl1:ae4:pathl1:beee4:name1:x12:piece lengthi16e6:pieces20:"),
+			make([]byte, 20), []byte("ee")),
 	} {
 		if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "duplicate dictionary key") {
 			t.Errorf("%s: Parse() = %v, want duplicate key rejection", name, err)
 		}
+	}
+}
+
+// TestParseAcceptsRepeatedOuterKeys: the whole .torrent was decoded strictly,
+// so a key repeated outside the info dict, such as the second "comment" or
+// "announce" a torrent editor appends, made the torrent unloadable, and a
+// cached copy of it failed to restore. Those keys are not hashed; libtorrent
+// keeps the first value, and so does Parse.
+func TestParseAcceptsRepeatedOuterKeys(t *testing.T) {
+	info := marshalInfo(t, singleFileInfo("good.txt", 16, 16))
+	data := bytes.Join([][]byte{
+		[]byte("d8:announce15:http://a.com/an8:announce15:http://b.com/an7:comment1:a7:comment1:b4:info"), info,
+		[]byte("8:url-listl16:http://a.com/ws/e8:url-listl16:http://b.com/ws/ee"),
+	}, nil)
+	tor, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse() = %v, want repeated outer keys accepted", err)
+	}
+	if tor.Announce != "http://a.com/an" || len(tor.Trackers) != 1 || tor.Trackers[0] != "http://a.com/an" {
+		t.Fatalf("Announce=%q Trackers=%q, want the first announce", tor.Announce, tor.Trackers)
+	}
+	if len(tor.WebSeeds) != 1 || tor.WebSeeds[0] != "http://a.com/ws/" {
+		t.Fatalf("WebSeeds=%q, want the first url-list", tor.WebSeeds)
+	}
+	if tor.InfoHash != sha1.Sum(info) || tor.Name != "good.txt" {
+		t.Fatalf("InfoHash=%x Name=%q, want the info dict's", tor.InfoHash, tor.Name)
 	}
 }
 

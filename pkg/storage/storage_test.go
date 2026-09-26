@@ -556,7 +556,7 @@ func TestStorageWriteBlockCachesWriteHandle(t *testing.T) {
 	defer s.Close()
 
 	fs := s.(*FileStorage)
-	if fs.files[0].writeHandle != nil {
+	if fs.files[0].writeHandle.Load() != nil {
 		t.Fatal("write handle should be lazily opened, not present before first write")
 	}
 
@@ -564,7 +564,7 @@ func TestStorageWriteBlockCachesWriteHandle(t *testing.T) {
 	if err := s.WriteBlock(0, 0, data); err != nil {
 		t.Fatalf("first write: %v", err)
 	}
-	h1 := fs.files[0].writeHandle
+	h1 := fs.files[0].writeHandle.Load()
 	if h1 == nil {
 		t.Fatal("write handle should be cached after first write")
 	}
@@ -572,7 +572,7 @@ func TestStorageWriteBlockCachesWriteHandle(t *testing.T) {
 	if err := s.WriteBlock(1, 0, data); err != nil {
 		t.Fatalf("second write: %v", err)
 	}
-	if fs.files[0].writeHandle != h1 {
+	if fs.files[0].writeHandle.Load() != h1 {
 		t.Fatal("second write should reuse the cached write handle, not reopen it")
 	}
 }
@@ -588,13 +588,17 @@ func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 	}
 	defer s.Close()
 
+	// Cache a read handle bound to the current inode. It has to be opened before
+	// the first write: once a write handle is cached, reads reuse it instead.
+	if _, err := s.ReadBlock(0, 0, make([]byte, 16)); err != nil {
+		t.Fatalf("initial read: %v", err)
+	}
 	first := bytes.Repeat([]byte{'1'}, 16)
 	if err := s.WriteBlock(0, 0, first); err != nil {
 		t.Fatalf("initial write: %v", err)
 	}
-	// Cache a read handle bound to the current inode.
-	if _, err := s.ReadBlock(0, 0, make([]byte, 16)); err != nil {
-		t.Fatalf("initial read: %v", err)
+	if s.(*FileStorage).files[0].readHandle.Load() == nil {
+		t.Fatal("the initial read cached no read handle")
 	}
 
 	// Drop both cached handles so the next write reopens (and repairs) the file.

@@ -233,18 +233,50 @@ func (m *TorrentManager) claimFreePaths(infoHash [20]byte, baseDir string, relPa
 		}
 		free = append(free, relPaths[i])
 		freeKeys = append(freeKeys, key)
-		c.deleting++
-		if m.pathClaims == nil {
-			m.pathClaims = make(map[pathClaimKey]pathClaim)
-		}
-		m.pathClaims[key] = c
+		m.markDeletingLocked(key, c)
 	}
+	return free, kept, m.releaseDeletingFunc(freeKeys)
+}
+
+// claimUnheldPaths reserves, for moving files away, the relPaths under baseDir
+// that no torrent holds or is deleting, the caller included, and returns their
+// indexes. As for a deletion, no torrent can be added on them until release.
+func (m *TorrentManager) claimUnheldPaths(baseDir string, relPaths []string) (free []int, release func()) {
+	keys := pathClaimKeys(baseDir, relPaths)
+	freeKeys := make([]pathClaimKey, 0, len(keys))
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	for i, key := range keys {
+		// A path listed twice is reserved by its first entry, then held.
+		if c := m.pathClaims[key]; c.refs+c.shared+c.deleting == 0 {
+			free = append(free, i)
+			freeKeys = append(freeKeys, key)
+			m.markDeletingLocked(key, c)
+		}
+	}
+	return free, m.releaseDeletingFunc(freeKeys)
+}
+
+// markDeletingLocked records c, the claim at key, as reserved by one more
+// removal or move. Caller holds m.claimMu.
+func (m *TorrentManager) markDeletingLocked(key pathClaimKey, c pathClaim) {
+	c.deleting++
+	if m.pathClaims == nil {
+		m.pathClaims = make(map[pathClaimKey]pathClaim)
+	}
+	m.pathClaims[key] = c
+}
+
+// releaseDeletingFunc returns the idempotent release of the reservations
+// markDeletingLocked made on keys.
+func (m *TorrentManager) releaseDeletingFunc(keys []pathClaimKey) func() {
 	var once sync.Once
-	return free, kept, func() {
+	return func() {
 		once.Do(func() {
 			m.claimMu.Lock()
 			defer m.claimMu.Unlock()
-			for _, key := range freeKeys {
+			for _, key := range keys {
 				c, ok := m.pathClaims[key]
 				if !ok {
 					continue

@@ -68,6 +68,9 @@ type TorrentManager struct {
 	startPaused    bool // see SetStartPaused
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
+	// restoreMigrations tallies the files restore moved from their legacy
+	// names (see migrateLegacyPaths), for the startup notice.
+	restoreMigrations legacyMigrations
 	// removing holds the lowercase info-hash of every RemoveSession still
 	// deleting state and payload; the channel closes when it finishes. Adds of
 	// that hash are refused meanwhile so they cannot open files being deleted.
@@ -316,6 +319,9 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) error {
 	}
 	if sess.claimPaths == nil {
 		sess.claimPaths = m.claimPaths
+	}
+	if sess.migratePaths == nil {
+		sess.migratePaths = m.migrateLegacyPaths
 	}
 	if m.peerListener != nil {
 		sess.sharedInbound = true
@@ -894,6 +900,18 @@ func (m *TorrentManager) AddTorrentFile(torrentPath string, downloadDir string) 
 // one it was cached under.
 var errCachedTorrentMismatch = errors.New("cached torrent does not match its info hash")
 
+// torrentParseError is a .torrent that was read but does not parse. Parsing
+// the same bytes again fails the same way, so restore does not retry it.
+type torrentParseError struct{ err error }
+
+func (e torrentParseError) Error() string { return e.err.Error() }
+func (e torrentParseError) Unwrap() error { return e.err }
+
+func isTorrentParseError(err error) bool {
+	var parseErr torrentParseError
+	return errors.As(err, &parseErr)
+}
+
 // loadTorrentFile reads and parses a .torrent. When wantHashHex is set, the
 // torrent must have that info-hash: a cached copy is trusted only for the
 // torrent it was saved for.
@@ -904,7 +922,7 @@ func loadTorrentFile(torrentPath, wantHashHex string) (*torrent.Torrent, []byte,
 	}
 	tor, err := torrent.Parse(torrentData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, torrentParseError{err}
 	}
 	if wantHashHex != "" && !strings.EqualFold(fmt.Sprintf("%x", tor.InfoHash), wantHashHex) {
 		return nil, nil, fmt.Errorf("%w: %s holds %x, want %s", errCachedTorrentMismatch, torrentPath, tor.InfoHash, wantHashHex)
@@ -940,7 +958,8 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrRemovalInProgress, infoHashHex)
 	}
-	verifyOnStartup := m.verifyOnStartup && m.restoring
+	restoreAdd := m.restoring
+	verifyOnStartup := m.verifyOnStartup && restoreAdd
 	storageFactory := m.storageFactory
 	if storageFactory == nil {
 		storageFactory = storage.NewStorage
@@ -961,6 +980,11 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	releaseClaims, err := m.claimPaths(tor.InfoHash, downloadDir, files)
 	if err != nil {
 		return nil, err
+	}
+	// Files an older version wrote under their pre-sanitizer names move to
+	// the current ones before the factory would create them empty.
+	if moved := m.migrateLegacyPaths(tor.InfoHash, downloadDir, tor.Files); moved > 0 && restoreAdd {
+		m.noteRestoreMigration(tor.Name, moved)
 	}
 	st, err := storageFactory(downloadDir, files, tor.PieceLength)
 	if err == nil && isNilStorage(st) {
@@ -1535,7 +1559,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			for attempt := 1; ; attempt++ {
 				sess, cached, loadErr = m.addTorrentFile(cachedPath, absoluteDownloadDir, entry.InfoHashHex)
 				if loadErr == nil || attempt >= restoreMaxAttempts || errors.Is(loadErr, os.ErrPermission) ||
-					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) {
+					errors.Is(loadErr, errCachedTorrentMismatch) || errors.Is(loadErr, ErrPathInUse) || isTorrentParseError(loadErr) {
 					break
 				}
 				time.Sleep(time.Duration(attempt) * restoreRetryBackoff)
@@ -1689,20 +1713,34 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	if len(restoreFailures) > 0 {
 		sortRestoreFailures(restoreFailures)
 
-		details := make([]string, len(restoreFailures))
+		// A saved .torrent this version cannot parse fails the same way on every
+		// launch, so it is not reported as something a retry will fix.
+		var retried, unparsable []string
 		anyPermission := false
-		for i, f := range restoreFailures {
+		for _, f := range restoreFailures {
+			detail := f.name
 			if f.err != nil {
-				details[i] = fmt.Sprintf("%s (%v)", f.name, f.err)
+				detail = fmt.Sprintf("%s (%v)", f.name, f.err)
 				if errors.Is(f.err, os.ErrPermission) {
 					anyPermission = true
 				}
+			}
+			if isTorrentParseError(f.err) {
+				unparsable = append(unparsable, detail)
 			} else {
-				details[i] = f.name
+				retried = append(retried, detail)
 			}
 		}
-		failMsg := fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
-			len(restoreFailures), strings.Join(details, "; "))
+		var failMsgs []string
+		if len(retried) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore (kept and will retry next launch): %s",
+				len(retried), strings.Join(retried, "; ")))
+		}
+		if len(unparsable) > 0 {
+			failMsgs = append(failMsgs, fmt.Sprintf("%d torrent(s) failed to restore because this version cannot load the saved .torrent (kept; add the torrent again to replace it): %s",
+				len(unparsable), strings.Join(unparsable, "; ")))
+		}
+		failMsg := strings.Join(failMsgs, "; ")
 		if anyPermission {
 			// macOS TCC: the launching app lacks access to the download folder.
 			failMsg += ". Permission denied — grant your terminal app Full Disk Access " +
@@ -1751,6 +1789,9 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	}
 	if warning != "" {
 		crashNotices = append(crashNotices, warning)
+	}
+	if notice := m.takeRestoreMigrationNotice(); notice != "" {
+		crashNotices = append(crashNotices, notice)
 	}
 	warning = strings.Join(crashNotices, "; ")
 

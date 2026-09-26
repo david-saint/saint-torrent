@@ -21,16 +21,63 @@ import (
 // can truncate it) or the disk filled up while a sparse page was written.
 var errMappingFault = errors.New("memory-mapped file access faulted: the file shrank or the disk is full")
 
+// maxLiveMappings bounds the file mappings the mmap backend keeps across the
+// whole process. Each mapped file costs one entry of the per-process mapping
+// allowance (vm.max_map_count, 65530 by default on Linux), which the Go runtime
+// draws its heap and stacks from too and treats running out of as fatal. A
+// torrent with more files than this would otherwise map every one it touched.
+const maxLiveMappings = 32 << 10
+
+// liveMappings counts the mappings every MMapStorage holds. mappingLimit
+// overrides maxLiveMappings when positive (tests).
+var liveMappings, mappingLimit atomic.Int64
+
+// reserveMapping claims a slot for one more mapping, reporting false when the
+// process already holds as many as it may.
+func reserveMapping() bool {
+	limit := int64(maxLiveMappings)
+	if override := mappingLimit.Load(); override > 0 {
+		limit = override
+	}
+	if liveMappings.Add(1) > limit {
+		liveMappings.Add(-1)
+		return false
+	}
+	return true
+}
+
+// releaseMapping returns the slot of a mapping that has been unmapped.
+func releaseMapping() {
+	liveMappings.Add(-1)
+}
+
 // mappedFile pairs a layout with its mapping. MMapStorage.maps holds one per
 // FileStorage.files entry, in the same order, so a file index found in files
 // addresses maps too.
 type mappedFile struct {
 	layout *fileLayout
 	data   []byte
+	// viaHandles marks a file this storage serves through FileStorage's cached
+	// handles because the mapping budget was spent when it needed a mapping. It
+	// sticks for the storage's life, so a file is never mapped while writes reach
+	// it through a handle: without a unified buffer cache (OpenBSD) the two views
+	// of it are not coherent. Set under the exclusive lock, read under either.
+	viaHandles bool
 	// stale marks a mapping that faulted. It is set under the shared lock and the
 	// mapping is dropped and re-established under the exclusive one, so no copy
 	// can still be using it when it is unmapped.
 	stale atomic.Bool
+}
+
+// unmapLocked drops the mapping and returns its budget slot. The caller holds
+// s.mu exclusively.
+func (m *mappedFile) unmapLocked() error {
+	if err := unix.Munmap(m.data); err != nil {
+		return err
+	}
+	m.data = nil
+	releaseMapping()
+	return nil
 }
 
 // MMapStorage serves torrent content from shared file-backed memory mappings.
@@ -112,7 +159,9 @@ func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool
 		return false, nil
 	}
 	if err := s.copyFromMappingsLocked(globalStart, globalEnd, buf); err != nil {
-		s.markStaleLocked(globalStart, globalEnd)
+		if errors.Is(err, errMappingFault) {
+			s.markStaleLocked(globalStart, globalEnd)
+		}
 		return false, err
 	}
 	return true, nil
@@ -134,6 +183,12 @@ func (s *MMapStorage) copyFromMappingsLocked(globalStart, globalEnd int64, buf [
 			fileOffset := overlapStart - file.startOffset
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
+			if mapped.viaHandles {
+				if err := s.readFileAt(file, buf[bufOffset:bufOffset+nBytes], fileOffset); err != nil {
+					return err
+				}
+				continue
+			}
 			copy(buf[bufOffset:bufOffset+nBytes], mapped.data[fileOffset:fileOffset+nBytes])
 		}
 	}
@@ -247,6 +302,16 @@ func (s *MMapStorage) writeMappedLocked(globalStart, globalEnd int64, data []byt
 			fileOffset := overlapStart - file.startOffset
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
+			if mapped.viaHandles {
+				// The handle write marks the file dirty for FileStorage itself; the
+				// set below is only for files whose mtime a mapping holds back.
+				fileRepaired, err := s.writeFileAt(file, data[bufOffset:bufOffset+nBytes], fileOffset)
+				repaired = repaired || fileRepaired
+				if err != nil {
+					return repaired, err
+				}
+				continue
+			}
 			copy(mapped.data[fileOffset:fileOffset+nBytes], data[bufOffset:bufOffset+nBytes])
 			s.dirty[file] = struct{}{}
 		}
@@ -306,6 +371,14 @@ func (s *MMapStorage) hashMapped(globalStart, globalEnd int64) (bool, [20]byte, 
 func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int64) (err error) {
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
 	defer recoverMappingFault(&err)
+	// A file served through its handle is hashed through a pooled chunk buffer,
+	// taken only once such a file is reached.
+	var buffer *[]byte
+	defer func() {
+		if buffer != nil {
+			verifyBuffers.Put(buffer)
+		}
+	}()
 	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
 		if file.startOffset >= globalEnd {
@@ -316,6 +389,15 @@ func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int
 			overlapEnd := min(globalEnd, file.endOffset)
 			fileOffset := overlapStart - file.startOffset
 			nBytes := overlapEnd - overlapStart
+			if mapped.viaHandles {
+				if buffer == nil {
+					buffer = verifyBuffers.Get().(*[]byte)
+				}
+				if err := s.hashFileRange(h, file, fileOffset, nBytes, *buffer); err != nil {
+					return err
+				}
+				continue
+			}
 			if _, err := h.Write(mapped.data[fileOffset : fileOffset+nBytes]); err != nil {
 				return err
 			}
@@ -343,6 +425,7 @@ func (s *MMapStorage) Close() error {
 				firstErr = err
 			}
 			mapped.data = nil
+			releaseMapping()
 		}
 	}
 	for _, file := range s.files {
@@ -409,7 +492,7 @@ func (s *MMapStorage) rangeMappedLocked(globalStart, globalEnd int64) bool {
 			break
 		}
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
-			if file.length != 0 && (len(mapped.data) == 0 || mapped.stale.Load()) {
+			if file.length != 0 && !mapped.viaHandles && (len(mapped.data) == 0 || mapped.stale.Load()) {
 				return false
 			}
 		}
@@ -423,18 +506,27 @@ func (s *MMapStorage) ensureMappedFileLocked(mapped *mappedFile, repair bool) (b
 		// The mapping faulted. Drop it and map the file afresh, which checks (or,
 		// for a write, repairs) its size instead of faulting on every access.
 		if len(mapped.data) > 0 {
-			if err := unix.Munmap(mapped.data); err != nil {
+			if err := mapped.unmapLocked(); err != nil {
 				return false, fmt.Errorf("failed to release faulted mapping of %s: %w", layout.path, err)
 			}
-			mapped.data = nil
 		}
 		mapped.stale.Store(false)
 	}
-	if layout.length == 0 || len(mapped.data) > 0 {
+	if layout.length == 0 || len(mapped.data) > 0 || mapped.viaHandles {
+		return false, nil
+	}
+	if !reserveMapping() {
+		// Every mapping the process may hold is taken. Serve this file through the
+		// budgeted handles from now on; the block paths dispatch on viaHandles, and
+		// a write through its handle repairs the file as a mapping would.
+		mapped.viaHandles = true
 		return false, nil
 	}
 
 	data, repaired, err := mapOrRepairFile(layout, repair)
+	if err != nil || data == nil {
+		releaseMapping()
+	}
 	if err != nil {
 		return false, err
 	}
@@ -585,13 +677,12 @@ func (s *MMapStorage) unmapForCheckpoint() error {
 		if !wrote {
 			before, _ = layout.downloadRoot.Stat(layout.path)
 		}
-		if err := unix.Munmap(mapped.data); err != nil {
+		if err := mapped.unmapLocked(); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("failed to flush mapping for file %s: %w", layout.path, err)
 			}
 			continue
 		}
-		mapped.data = nil
 		mapped.stale.Store(false)
 		if wrote {
 			written = append(written, layout)

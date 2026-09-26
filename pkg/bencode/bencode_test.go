@@ -223,6 +223,34 @@ func TestUnmarshalDuplicateKeysFirstWins(t *testing.T) {
 	}
 }
 
+func TestFindUniqueRawValue(t *testing.T) {
+	for _, tc := range []struct {
+		in, want, err string
+	}{
+		{in: "d1:ai1e4:infod1:xi1ee1:zi2ee", want: "d1:xi1ee"},
+		// Other keys may repeat; only the requested one must be unique.
+		{in: "d1:ai1e1:ai2e4:infoi3ee", want: "i3e"},
+		{in: "d4:infoi1e1:ai1e4:infoi2ee", err: "duplicate dictionary key"},
+		{in: "d1:ai1ee", err: "not found"},
+		{in: "d4:infoi1e", err: "unterminated"},
+	} {
+		got, err := FindUniqueRawValue([]byte(tc.in), "info")
+		if tc.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("FindUniqueRawValue(%q) = %q, %v; want error %q", tc.in, got, err, tc.err)
+			}
+			continue
+		}
+		if err != nil || string(got) != tc.want {
+			t.Errorf("FindUniqueRawValue(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+	// FindRawValue still stops at the first copy.
+	if got, err := FindRawValue([]byte("d4:infoi1e4:infoi2ee"), "info"); err != nil || string(got) != "i1e" {
+		t.Fatalf("FindRawValue(repeated key) = %q, %v; want the first value", got, err)
+	}
+}
+
 func TestUnmarshalStrictRejectsDuplicateKeys(t *testing.T) {
 	for _, input := range []string{
 		"d1:ai1e1:ai2ee",                       // top level
