@@ -1607,6 +1607,12 @@ func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UD
 			return nil, errors.New("invalid responder id")
 		}
 		token, _ := rDict["token"].(string)
+		if len(token) > dhtMaxTokenLen {
+			// We echo the token in announce_peer; an oversized one would make
+			// us send the responder a large packet of its choosing. Dropping
+			// it means we never announce there (rakshasa/libtorrent@fa9812b).
+			token = ""
+		}
 		res := &GetPeersResult{Token: token}
 		copy(res.ID[:], idStr)
 
@@ -1748,6 +1754,9 @@ const (
 	// Honest nodes return at most this many (libtorrent's dht_max_peers_reply;
 	// we return 50), so one response cannot fill our dial slots with hundreds.
 	dhtMaxValuesPerResponse = 100
+	// dhtMaxTokenLen caps the get_peers token we are willing to echo back in
+	// announce_peer. Common implementations use 4 to 20 bytes (ours are 8).
+	dhtMaxTokenLen = 64
 )
 
 type candidateState uint8

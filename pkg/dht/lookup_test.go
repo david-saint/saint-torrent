@@ -662,6 +662,43 @@ func TestLookupFailsResponderWithMalformedNodes(t *testing.T) {
 	}
 }
 
+// TestLookupDoesNotEchoOversizedToken verifies a get_peers token longer than
+// dhtMaxTokenLen is never echoed back in announce_peer, while one at the cap
+// still is (rakshasa/libtorrent@fa9812b).
+func TestLookupDoesNotEchoOversizedToken(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "oversized-token-hash")
+	long := &net.UDPAddr{IP: net.ParseIP("203.0.113.8"), Port: 6881}
+	longID := idAtDistance(infoHash, 0x01, 1)
+	capped := &net.UDPAddr{IP: net.ParseIP("192.0.2.8"), Port: 6881}
+	cappedID := idAtDistance(infoHash, 0x02, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		switch {
+		case q == "announce_peer":
+			return map[string]interface{}{"id": idString(cappedID)}
+		case q != "get_peers":
+			return nil
+		case sameUDPAddr(to, long):
+			return map[string]interface{}{"id": idString(longID), "token": strings.Repeat("t", dhtMaxTokenLen+1)}
+		case sameUDPAddr(to, capped):
+			return map[string]interface{}{"id": idString(cappedID), "token": strings.Repeat("t", dhtMaxTokenLen)}
+		}
+		return nil
+	})
+	d.addNode(longID, long)
+	d.addNode(cappedID, capped)
+
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+
+	awaitQueryTo(t, conn, capped, "announce_peer")
+	time.Sleep(50 * time.Millisecond)
+	if got := conn.queriesTo(long, "announce_peer"); got != 0 {
+		t.Fatalf("a %d-byte token was echoed in %d announces", dhtMaxTokenLen+1, got)
+	}
+}
+
 // TestLookupSetOneCandidatePerSlash24 verifies a lookup keeps one public
 // candidate per /24 (libtorrent's dht_restrict_search_ips), while LAN
 // addresses keep one per IP and loopback one per port.
