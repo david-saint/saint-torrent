@@ -1921,11 +1921,21 @@ func (d *DHT) generateNodeID() [20]byte {
 	return id
 }
 
+// nodesFileName is the routing-table snapshot kept in the download directory.
+const nodesFileName = ".dht_nodes"
+
+// maxNodesFileSize bounds how much of a nodes file is read. A full routing
+// table encodes to well under 100 KiB.
+const maxNodesFileSize = 1 << 20
+
+var errNodesFileNotRegular = errors.New("dht nodes file is not a regular file")
+
+// saveNodes snapshots the routing table's contacts to the nodes file.
 func (d *DHT) saveNodes() {
 	if d.downloadDir == "" {
 		return
 	}
-	path := filepath.Join(d.downloadDir, ".dht_nodes")
+	path := filepath.Join(d.downloadDir, nodesFileName)
 	d.mu.RLock()
 	var nodesList []interface{}
 	for _, b := range d.buckets {
@@ -1949,7 +1959,58 @@ func (d *DHT) saveNodes() {
 		return
 	}
 
-	_ = os.WriteFile(path, data, 0644)
+	_ = writeNodesFile(path, data)
+}
+
+// writeNodesFile replaces path atomically with a private (0600) file. The data
+// goes to a new, randomly named file in the same directory that is renamed
+// over path, so a reader never sees a partial file and nothing is ever
+// written through an existing name: a symlink planted at path is replaced,
+// not followed.
+func writeNodesFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), nodesFileName+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	_, err = tmp.Write(data)
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmpName, path)
+	}
+	if err != nil {
+		_ = os.Remove(tmpName)
+	}
+	return err
+}
+
+// readNodesFile reads path only if it is a regular file of sane size, so a
+// symlink or device planted in a shared download directory is ignored rather
+// than followed.
+func readNodesFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxNodesFileSize {
+		return nil, errNodesFileNotRegular
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// The name may have been swapped between Lstat and Open.
+	opened, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(info, opened) {
+		return nil, errNodesFileNotRegular
+	}
+	return io.ReadAll(io.LimitReader(f, maxNodesFileSize))
 }
 
 // loadNodes seeds the routing table from contacts saved by an earlier run.
@@ -1958,8 +2019,7 @@ func (d *DHT) loadNodes() {
 	if d.downloadDir == "" {
 		return
 	}
-	path := filepath.Join(d.downloadDir, ".dht_nodes")
-	data, err := os.ReadFile(path)
+	data, err := readNodesFile(filepath.Join(d.downloadDir, nodesFileName))
 	if err != nil {
 		return
 	}
@@ -1998,12 +2058,16 @@ func (d *DHT) loadNodes() {
 		var id [20]byte
 		copy(id[:], nodeIDStr)
 
-		addr, err := net.ResolveUDPAddr("udp", addrStr)
-		if err == nil {
-			// A zero LastSeen leaves saved contacts questionable, so the first
-			// newcomer to their bucket re-checks them before they can keep it.
-			d.addNodeSeen(id, addr, time.Time{})
+		// Parse without resolving: the file holds literal addresses, and a
+		// hostname in it must not make startup wait on DNS.
+		ap, err := netip.ParseAddrPort(addrStr)
+		if err != nil || !ap.Addr().Unmap().Is4() {
+			continue
 		}
+		addr := &net.UDPAddr{IP: ap.Addr().Unmap().AsSlice(), Port: int(ap.Port())}
+		// A zero LastSeen leaves saved contacts questionable, so the first
+		// newcomer to their bucket re-checks them before they can keep it.
+		d.addNodeSeen(id, addr, time.Time{})
 	}
 }
 
