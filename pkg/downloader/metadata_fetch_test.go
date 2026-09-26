@@ -2,12 +2,14 @@ package downloader
 
 import (
 	"crypto/sha1"
+	"errors"
 	"net"
 	"testing"
 	"time"
 
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/peer"
+	"sainttorrent/pkg/storage"
 	"sainttorrent/pkg/torrent"
 )
 
@@ -231,4 +233,36 @@ func TestMetadataResetReRequestsConnectedPeers(t *testing.T) {
 	honest.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 0))
 	honest.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 1))
 	waitMetadataComplete(t, sess)
+}
+
+// TestMetadataNoRefetchLoopOnStorageFailure checks the new-round re-requests stop
+// while the session has a blocking error: when storage cannot be set up, every
+// completed fetch fails and resets the accumulator, and re-asking connected peers
+// each time would re-download the metadata in an endless loop.
+func TestMetadataNoRefetchLoopOnStorageFailure(t *testing.T) {
+	defer swapDuration(&metadataRetryInterval, 20*time.Millisecond)()
+	sess, info := newMagnetTestSession(t, 2)
+	sess.storageFactory = func(string, []storage.FileInfo, int64) (storage.Storage, error) {
+		return nil, errors.New("disk unavailable")
+	}
+	w := startWirePeer(t, sess, 6225, fastReserved())
+	w.sendExtended(peer.ExtHandshake, extHandshakePayload(t, 3, len(info)))
+	w.expectMetadataRequests(3, 0, 1)
+	w.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 0))
+	w.sendExtended(peer.LocalMetadataExtID, metadataDataPayload(t, info, 1))
+	// The barrier's own message already runs the new-round check.
+	after := w.barrier()
+
+	sess.mu.RLock()
+	statusErr := sess.statusErr
+	sess.mu.RUnlock()
+	if statusErr == nil {
+		t.Fatal("expected the storage failure to be reported")
+	}
+	after = append(after, w.collect(300*time.Millisecond)...)
+	for _, msg := range after {
+		if msg.ID == peer.MsgExtended {
+			t.Fatal("peer was asked for metadata again after a storage failure")
+		}
+	}
 }

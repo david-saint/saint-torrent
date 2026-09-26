@@ -1694,14 +1694,22 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// still lacks and that it has not been asked for this round. The session state
 	// is read in a single locked pass that re-checks the fetch is still running and
 	// sized as this peer advertised, and the requests go out after unlocking, so a
-	// concurrent reset can never leave us indexing a stale block list.
-	requestMetadataBlocks := func() {
+	// concurrent reset can never leave us indexing a stale block list. newRound
+	// marks a call made because a new fetch round began; those are skipped while
+	// the session has a blocking error (storage could not be set up), so a
+	// persistent failure does not turn into an endless re-download of metadata.
+	requestMetadataBlocks := func(newRound bool) {
 		if peerUtMetadataID == -1 || peerMetadataSize <= 0 {
 			return
 		}
 		var missing []int
 		s.mu.Lock()
 		if !s.metadataMode || s.metadataCompleted {
+			s.mu.Unlock()
+			return
+		}
+		if newRound && s.statusErr != nil {
+			metadataRound = s.metadataEpoch
 			s.mu.Unlock()
 			return
 		}
@@ -1877,7 +1885,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				return ""
 			}
 			peerMetadataSize = hs.MetadataSize
-			requestMetadataBlocks()
+			requestMetadataBlocks(false)
 			// Keep checking for a new fetch round while this peer idles, so an
 			// assembly reset re-asks it instead of waiting for fresh connections.
 			if metadataRetryTicker == nil && metadataRetryInterval > 0 {
@@ -2054,7 +2062,7 @@ peerLoop:
 				metadataRetryTicker = nil
 				metadataRetryTick = nil
 			case epoch != metadataRound:
-				requestMetadataBlocks()
+				requestMetadataBlocks(true)
 			}
 			continue
 		case <-rateRetry:
@@ -2091,7 +2099,7 @@ peerLoop:
 		// A failed metadata assembly started a new fetch round: re-ask this peer
 		// for the blocks that are still missing.
 		if inMetaNow && peerMetadataSize > 0 && metadataEpochNow != metadataRound {
-			requestMetadataBlocks()
+			requestMetadataBlocks(true)
 		}
 
 		if !inMetaNow && !initializedPeersAndBitfield {
