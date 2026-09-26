@@ -462,6 +462,7 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		s.mu.Unlock()
 		release()
 	}()
+	defer s.crashGuard("verify")() // after the s.mu-taking cleanup above
 
 	for _, idx := range toCheck {
 		select {

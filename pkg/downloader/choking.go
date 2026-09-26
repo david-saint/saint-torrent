@@ -24,6 +24,7 @@ func (s *Session) chokeLoop() {
 		}
 		s.mu.Unlock()
 	}()
+	defer s.crashGuard("choke")() // after the s.mu-taking cleanup above
 
 	var optimisticPeer string
 

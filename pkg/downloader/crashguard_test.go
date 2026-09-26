@@ -1,13 +1,19 @@
 package downloader
 
 import (
+	"bytes"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"sainttorrent/pkg/peer"
 )
 
 // crashGuardTestSession is a Session carrying just what crashGuard reads.
@@ -17,7 +23,7 @@ func crashGuardTestSession(infoHashHex string, rec *crashRecorder) *Session {
 	return s
 }
 
-// catchPanic runs fn and returns the value it panicked with.
+// catchPanic runs fn and returns the value it panicked with, if any.
 func catchPanic(fn func()) (recovered any) {
 	defer func() { recovered = recover() }()
 	fn()
@@ -40,6 +46,33 @@ func crashFilesIn(t *testing.T, dir string) []string {
 	return names
 }
 
+// runCrashGuarded runs fn on its own goroutine with crashTerminate replaced
+// by a stub that ends just that goroutine, and returns the panic value of each
+// call the stub got. A real guard ends the process there, so no deferred call
+// registered before it runs; runtime.Goexit keeps that for the rest of the
+// goroutine's guards, which see no panic left to recover.
+func runCrashGuarded(t *testing.T, fn func()) (terminated []any) {
+	t.Helper()
+	var mu sync.Mutex
+	prev := crashTerminate
+	crashTerminate = func(r any) {
+		mu.Lock()
+		terminated = append(terminated, r)
+		mu.Unlock()
+		runtime.Goexit()
+	}
+	defer func() { crashTerminate = prev }()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	return terminated
+}
+
 // crashGuardedPanic is a named frame the recorded stack must show.
 func crashGuardedPanic(s *Session) {
 	defer s.crashGuard("peer_loop")()
@@ -47,19 +80,22 @@ func crashGuardedPanic(s *Session) {
 	_ = table[len(table)+2] // index out of range
 }
 
-// TestCrashGuardRecordsAndRepanics: the guard writes one private crash file
+// TestCrashGuardRecordsAndTerminates: the guard writes one private crash file
 // named after the torrent and the component, holding the panic and the stack
-// of the panicking goroutine, and then panics again with the same value
+// of the panicking goroutine, and then ends the process with the same value
 // instead of letting the goroutine carry on.
-func TestCrashGuardRecordsAndRepanics(t *testing.T) {
+func TestCrashGuardRecordsAndTerminates(t *testing.T) {
 	dir := t.TempDir()
 	hash := strings.Repeat("ab", 20)
 	s := crashGuardTestSession(hash, &crashRecorder{dir: dir})
 
-	got := catchPanic(func() { crashGuardedPanic(s) })
-	rtErr, ok := got.(runtime.Error)
+	got := runCrashGuarded(t, func() { crashGuardedPanic(s) })
+	if len(got) != 1 {
+		t.Fatalf("terminated %d times, want once", len(got))
+	}
+	rtErr, ok := got[0].(runtime.Error)
 	if !ok || !strings.Contains(rtErr.Error(), "index out of range") {
-		t.Fatalf("re-panicked with %v (%T), want the original runtime error", got, got)
+		t.Fatalf("terminated with %v (%T), want the original runtime error", got[0], got[0])
 	}
 
 	files := crashFilesIn(t, dir)
@@ -89,16 +125,16 @@ func TestCrashGuardRecordsAndRepanics(t *testing.T) {
 	}
 }
 
-// TestCrashGuardWithoutRecorderRepanics: with persistence off there is
-// nowhere to record, and the panic still goes on.
-func TestCrashGuardWithoutRecorderRepanics(t *testing.T) {
+// TestCrashGuardWithoutRecorderTerminates: with persistence off there is
+// nowhere to record, and the process still ends.
+func TestCrashGuardWithoutRecorderTerminates(t *testing.T) {
 	s := crashGuardTestSession(strings.Repeat("cd", 20), nil)
-	got := catchPanic(func() {
+	got := runCrashGuarded(t, func() {
 		defer s.crashGuard("choke")()
 		panic("no recorder")
 	})
-	if got != "no recorder" {
-		t.Fatalf("re-panicked with %v, want the original value", got)
+	if len(got) != 1 || got[0] != "no recorder" {
+		t.Fatalf("terminated with %v, want the original value once", got)
 	}
 	if got := s.crash.Load().record("choke", "", "x", nil); got != "" {
 		t.Fatalf("nil recorder wrote %q", got)
@@ -106,42 +142,110 @@ func TestCrashGuardWithoutRecorderRepanics(t *testing.T) {
 }
 
 // TestNestedCrashGuardsRecordOnce: a peer loop runs inside a dial and an
-// inbound handler, each guarded, and the same panic reaches every guard. Only
-// the innermost records it, under its own component.
+// inbound handler, each guarded. The innermost guard sees the panic first,
+// records it under its own component and ends the process, so the outer
+// guards, and the deferred calls registered before it, never run for it.
 func TestNestedCrashGuardsRecordOnce(t *testing.T) {
 	dir := t.TempDir()
 	s := crashGuardTestSession(strings.Repeat("ef", 20), &crashRecorder{dir: dir})
-	got := catchPanic(func() {
+	cleanupRan := false
+	got := runCrashGuarded(t, func() {
 		defer s.crashGuard("peer_inbound")()
 		func() {
 			defer s.crashGuard("peer_dial")()
 			func() {
 				defer s.crashGuard("peer_loop")()
+				defer func() { cleanupRan = recover() != nil }()
 				func() {
-					defer s.crashGuard("peer_loop")()
+					defer s.crashGuard("peer_reader")()
 					panic("nested")
 				}()
 			}()
 		}()
 	})
-	if got != "nested" {
-		t.Fatalf("re-panicked with %v, want the original value", got)
+	if len(got) != 1 || got[0] != "nested" {
+		t.Fatalf("terminated with %v, want the original value once", got)
+	}
+	if cleanupRan {
+		t.Fatal("a deferred call registered before the guard ran with the panic")
 	}
 	files := crashFilesIn(t, dir)
 	if len(files) != 1 {
 		t.Fatalf("crash files = %v, want exactly one", files)
 	}
-	if _, _, component, _ := parseCrashFileName(files[0]); component != "peer_loop" {
+	if _, _, component, _ := parseCrashFileName(files[0]); component != "peer_reader" {
 		t.Fatalf("recorded component %q, want the innermost guard's", component)
 	}
 
 	// A later, separate panic is recorded again.
-	_ = catchPanic(func() {
+	_ = runCrashGuarded(t, func() {
 		defer s.crashGuard("choke")()
 		panic("second")
 	})
 	if files := crashFilesIn(t, dir); len(files) != 2 {
 		t.Fatalf("crash files after a second panic = %v, want two", files)
+	}
+}
+
+// crashUnderLockChildEnv marks the child process of
+// TestPeerLoopPanicUnderLockEndsProcess and names its crash directory.
+const crashUnderLockChildEnv = "SAINTTORRENT_CRASH_UNDER_LOCK_CHILD"
+
+// TestPeerLoopPanicUnderLockEndsProcess: a panic in the peer loop while it
+// holds s.mu must end the process. Cleanup deferred earlier in the loop takes
+// s.mu, and sync.RWMutex is not reentrant: were the panic to unwind into it,
+// the goroutine would block there for good, with s.mu held, and the whole
+// client would hang instead of crashing. The scenario runs in a child process,
+// which must die promptly with the original panic and a crash file.
+func TestPeerLoopPanicUnderLockEndsProcess(t *testing.T) {
+	if dir := os.Getenv(crashUnderLockChildEnv); dir != "" {
+		sess, _ := newSeedingWireTestSession(t, 4, 4*BlockSize)
+		sess.mu.Lock()
+		sess.started = true
+		sess.mu.Unlock()
+		sess.crash.Store(&crashRecorder{dir: dir})
+		// Called with s.mu write-locked by the Interested unchoke scan.
+		interestScanHook = func() { panic("crash-under-lock-probe") }
+		w := startWirePeer(t, sess, 6881, fastReserved())
+		w.send(&peer.Message{ID: peer.MsgInterested})
+		time.Sleep(30 * time.Second)
+		os.Exit(0) // still alive: the parent reports the hang
+	}
+	if testing.Short() {
+		t.Skip("runs a child process")
+	}
+
+	crashDir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPeerLoopPanicUnderLockEndsProcess$")
+	cmd.Env = append(os.Environ(), crashUnderLockChildEnv+"="+crashDir)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatalf("child still running 20s after the panic: it hung instead of crashing\n%s", out.String())
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() == 0 {
+		t.Fatalf("child exited with %v, want a crash\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "panic: crash-under-lock-probe") {
+		t.Fatalf("child output lacks the original panic:\n%s", out.String())
+	}
+	files := crashFilesIn(t, crashDir)
+	if len(files) != 1 {
+		t.Fatalf("crash files = %v, want exactly one", files)
+	}
+	if _, _, component, _ := parseCrashFileName(files[0]); component != "peer_loop" {
+		t.Fatalf("recorded component %q, want peer_loop", component)
 	}
 }
 

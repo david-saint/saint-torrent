@@ -452,6 +452,10 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 		s.mu.Unlock()
 	}()
+	// Deferred after the cleanup above so a panic below reaches it first: that
+	// cleanup takes s.mu, which the panicking code may still hold (see
+	// crashGuard).
+	defer s.crashGuard("peer_dial")()
 	if refused {
 		return
 	}
@@ -1122,6 +1126,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			logging.Info("peer_disconnected", fields...)
 		}
 	}()
+	// The disconnect handler above takes s.mu: a guard deferred after it
+	// handles a panic below before that handler could block on a lock the
+	// panicking code still holds (see crashGuard).
+	defer s.crashGuard("peer_loop")()
 
 	s.mu.RLock()
 	inMeta := s.metadataMode
@@ -1272,6 +1280,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.removePeerAvailability(peerBitfield)
 		}
 	}()
+	defer s.crashGuard("peer_loop")() // after the s.mu-taking cleanup above
 	// availabilityReceived is set by the peer's first bitfield, have_all or
 	// have_none. BEP 3/6 allow exactly one of them, right after the handshake, and
 	// each one rewrites the peer's whole contribution to availability under s.mu,
@@ -2635,10 +2644,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
 	// peerInterestScanInterval.
 	var lastInterestScanAt time.Time
-	// A second guard, deferred after the disconnect handler so it runs before
-	// it: a panic in the loop below while s.mu is held would deadlock that
-	// handler, and the guard at the top would then never record it. Only the
-	// first guard to see a panic records it.
+	// The loop's own guard, deferred last so it is the first to see a panic in
+	// the loop: it ends the process before any cleanup above runs, including
+	// the ones that take s.mu, which the panicking code may still hold.
 	defer s.crashGuard("peer_loop")()
 peerLoop:
 	for {

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
-	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -17,7 +15,7 @@ import (
 )
 
 // Crash handling. A panic in a session or restore goroutine is recorded under
-// <stateDir>/crash and then re-raised: the process never continues after a
+// <stateDir>/crash and then ends the process: it never continues after a
 // recover, because the goroutine may have died holding s.mu or m.mu, with some
 // of its unlocks deferred and some not. The next start works out what crashed
 // from the running sentinel and the crash files (see classifyPreviousRun) and
@@ -152,16 +150,23 @@ func isInfoHashHex(s string) bool {
 // crashGuard returns the deferred half of a crash guard for a session
 // goroutine: `defer s.crashGuard("peer_loop")()`, placed at the top of the
 // function so every caller is covered. On a panic it records the crash
-// against this torrent (when persistence is on) and panics again with the
-// same value; the process then dies with the original trace. It never
-// resumes the goroutine and never takes s.mu.
+// against this torrent (when persistence is on) and ends the process with the
+// original panic (see crashTerminate). It never resumes the goroutine, never
+// takes s.mu and never lets the panic unwind further.
+//
+// Deferred calls run last-registered first, and the first guard to see a
+// panic ends the process, so no deferred call registered before it runs. A
+// function that defers cleanup taking s.mu (or any lock the panicking code may
+// hold without a deferred unlock) defers another guard after that cleanup:
+// otherwise the cleanup would run first and, with the lock still held by the
+// panicking frame, block forever instead of letting the process die.
 func (s *Session) crashGuard(component string) func() {
 	return func() {
 		if r := recover(); r != nil {
 			if rec := s.crash.Load(); rec != nil {
-				recordAndRepanic(rec, component, s.infoHashHex, r)
+				rec.record(component, s.infoHashHex, r, debug.Stack())
 			}
-			panic(r)
+			crashTerminate(r)
 		}
 	}
 }
@@ -171,54 +176,30 @@ func (m *TorrentManager) crashGuard(component, infoHashHex string) func() {
 	return func() {
 		if r := recover(); r != nil {
 			if rec := m.crash.Load(); rec != nil {
-				recordAndRepanic(rec, component, infoHashHex, r)
+				rec.record(component, infoHashHex, r, debug.Stack())
 			}
-			panic(r)
+			crashTerminate(r)
 		}
 	}
 }
 
-// recordAndRepanic records the panic r and raises it again. Guards nest (a
-// peer loop runs inside a dial or an inbound handler, each guarded), and the
-// same panic reaches every one of them in turn; only the innermost records
-// it. An outer guard sees the inner one's recordAndRepanic still on the
-// stack, since a panic unwinds nothing until it is recovered for good.
-//
-//go:noinline
-func recordAndRepanic(rec *crashRecorder, component, infoHashHex string, r any) {
-	if !panicRecordedBelow() {
-		rec.record(component, infoHashHex, r, debug.Stack())
-	}
-	panic(r)
-}
+// crashTerminate ends the process after a guard recovered the panic r. A var
+// so tests can end just the panicking goroutine instead; treat it as a
+// constant.
+var crashTerminate = terminateCrashed
 
-// recordAndRepanicName is recordAndRepanic's symbol name as tracebacks show it.
-// Set in init: a variable initializer referring to recordAndRepanic would be
-// an initialization cycle.
-var recordAndRepanicName string
-
-func init() {
-	recordAndRepanicName = runtime.FuncForPC(reflect.ValueOf(recordAndRepanic).Pointer()).Name()
-}
-
-// panicRecordedBelow reports whether the calling recordAndRepanic handles a
-// panic an inner guard already recorded and raised again: a second
-// recordAndRepanic frame on this goroutine's stack.
-func panicRecordedBelow() bool {
-	var pcs [64]uintptr
-	frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs[:])])
-	seen := 0
-	for {
-		frame, more := frames.Next()
-		if frame.Function == recordAndRepanicName {
-			if seen++; seen > 1 {
-				return true
-			}
-		}
-		if !more {
-			return false
-		}
-	}
+// terminateCrashed raises r again on a fresh goroutine, which has no deferred
+// calls to run, so the process dies at once with r as its panic. Raising it
+// again on the crashed goroutine would first run every deferred call
+// registered before the guard, and one taking a lock the panicking frame
+// still holds would block forever: the process would hang, not crash. The
+// crashed goroutine stays parked here, under the frames that panicked, and
+// traceback "all" prints it with the rest (the crash file already holds its
+// stack).
+func terminateCrashed(r any) {
+	debug.SetTraceback("all")
+	go func() { panic(r) }()
+	select {}
 }
 
 // RecordCrash records a crash the caller recovered itself (the TUI's), with
