@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -506,6 +507,88 @@ func TestHandshakeSourceGroupsAddresses(t *testing.T) {
 	}
 	if _, ok := handshakeSource(&net.UnixAddr{Name: "sock", Net: "unix"}); ok {
 		t.Error("a non-IP address was given a source")
+	}
+}
+
+// TestIPv6SubscriberCannotTakeTheWholeHandshakeBudget reproduces the IPv6
+// variant of inbound starvation: counted per /64 alone, one subscriber with a
+// /56 (or a /48) held every handshake slot through 17 of its /64s, turning
+// every other inbound peer away. Its /56 and /48 now have shares too, so it
+// holds half the budget, as one IPv4 host can, and peers on other IPv6
+// networks, several connections each, and IPv4 hosts get the other half.
+func TestIPv6SubscriberCannotTakeTheWholeHandshakeBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		addr func(block, host int) string // host within one of the attacker's blocks
+	}{
+		{"/64s of one /56", func(b, h int) string { return fmt.Sprintf("2001:db8:0:%x::%x", b, h+1) }},
+		{"/56s of one /48", func(b, h int) string { return fmt.Sprintf("2001:db8:0:%x00::%x", b, h+1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewTorrentManager()
+			t.Cleanup(mgr.Close)
+			var admitted []netip.Addr
+			// admit does what handleRoutedIncomingConnection does before
+			// reading a handshake, reporting whether the connection may wait.
+			admit := func(addr string) bool {
+				t.Helper()
+				select {
+				case mgr.inboundHandshakeSlots <- struct{}{}:
+				default:
+					return false
+				}
+				src, ok := handshakeSource(&net.TCPAddr{IP: net.ParseIP(addr), Port: 6881})
+				if !ok {
+					t.Fatalf("no handshake source for %s", addr)
+				}
+				if !mgr.admitHandshakeSource(src) {
+					<-mgr.inboundHandshakeSlots
+					return false
+				}
+				admitted = append(admitted, src)
+				return true
+			}
+
+			// The attacker opens idle sockets from each of its blocks in turn
+			// until that block is refused.
+			for b := 0; b < 256; b++ {
+				for h := 0; h < 256; h++ {
+					if !admit(tc.addr(b, h)) {
+						break
+					}
+				}
+			}
+			if held := len(admitted); held != maxInboundHandshakes/2 {
+				t.Fatalf("one subscriber holds %d of %d handshake slots, want %d", held, maxInboundHandshakes, maxInboundHandshakes/2)
+			}
+
+			// The rest serves everyone else: hosts on 15 other IPv6 networks,
+			// each with its per-/64 share, and an IPv4 host.
+			for n := 1; n <= 15; n++ {
+				for h := 0; h < maxInboundHandshakesPerSource; h++ {
+					if addr := fmt.Sprintf("2001:db8:%x::%x", n, h+1); !admit(addr) {
+						t.Fatalf("%s was refused with %d slots in use", addr, len(admitted))
+					}
+				}
+			}
+			for h := 0; h < maxInboundHandshakesPerSource; h++ {
+				if !admit("192.0.2.7") {
+					t.Fatalf("an IPv4 host was refused with %d slots in use", len(admitted))
+				}
+			}
+			if n := len(mgr.inboundHandshakeSlots); n != maxInboundHandshakes {
+				t.Fatalf("%d of %d handshake slots in use, want all", n, maxInboundHandshakes)
+			}
+
+			for _, src := range admitted {
+				mgr.releaseHandshakeSource(src)
+			}
+			mgr.handshakeSourcesMu.Lock()
+			defer mgr.handshakeSourcesMu.Unlock()
+			if len(mgr.handshakeSources) != 0 || mgr.sourcedHandshakes != 0 {
+				t.Fatalf("after releasing every source: %d blocks counted, %d handshakes; want none", len(mgr.handshakeSources), mgr.sourcedHandshakes)
+			}
+		})
 	}
 }
 

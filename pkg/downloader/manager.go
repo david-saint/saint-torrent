@@ -41,8 +41,8 @@ type TorrentManager struct {
 	globalInboundSlots    chan struct{}
 	inboundHandshakeSlots chan struct{} // see maxInboundHandshakes
 	handshakeSourcesMu    sync.Mutex
-	handshakeSources      map[netip.Addr]int // pre-handshake conns per source; see admitHandshakeSource
-	sourcedHandshakes     int                // sum of handshakeSources
+	handshakeSources      map[netip.Prefix]int // pre-handshake conns per address block; see admitHandshakeSource
+	sourcedHandshakes     int                  // pre-handshake conns counted in handshakeSources
 	peerListener          net.Listener
 	utpListener           net.Listener
 	peerListenPort        uint16
@@ -134,7 +134,7 @@ func NewTorrentManager() *TorrentManager {
 		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
 		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
 		inboundHandshakeSlots: make(chan struct{}, maxInboundHandshakes),
-		handshakeSources:      make(map[netip.Addr]int),
+		handshakeSources:      make(map[netip.Prefix]int),
 		storageFactory:        storage.NewStorage,
 		ctx:                   ctx,
 		cancel:                cancel,
