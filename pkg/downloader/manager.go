@@ -63,6 +63,7 @@ type TorrentManager struct {
 
 	stateDir       string
 	restoring      bool
+	startPaused    bool // see SetStartPaused
 	writeMu        sync.Mutex
 	failedTorrents []PersistedTorrent
 	// removing holds the lowercase info-hash of every RemoveSession still
@@ -81,6 +82,13 @@ type TorrentManager struct {
 	// crash records panics under <stateDir>/crash once persistence is on;
 	// sessions get it in AddSession. See crashguard.go.
 	crash atomic.Pointer[crashRecorder]
+	// The running sentinel (see startRunningSentinel), guarded by sentinelMu.
+	// uncleanExit keeps it on Close; see MarkUncleanExit.
+	sentinelMu    sync.Mutex
+	sentinelPath  string
+	sentinelTimer *time.Timer
+	sentinelDone  bool
+	uncleanExit   atomic.Bool
 }
 
 // SetVerifyOnStartup forces full hashing of the torrents restored on this launch,
@@ -676,6 +684,9 @@ func (m *TorrentManager) Close() {
 	}
 
 	m.saveStateInternal(true)
+	// The state is saved: from here this run counts as a clean exit, even if
+	// the teardown below overruns the CLI's forced-exit deadline.
+	m.finishRunningSentinel()
 
 	m.mu.Lock()
 	sessions := make([]*Session, 0, len(m.sessions))
@@ -976,6 +987,14 @@ type PersistedTorrent struct {
 	// Private records BEP 27, so a restore that falls back to the magnet URI
 	// keeps the torrent off DHT and PEX.
 	Private bool `json:"private,omitempty"`
+	// Quarantined marks a torrent a crash was attributed to; it is restored
+	// paused and unchecked, with CrashNote as its error, on every start until
+	// the user resumes it. CrashComponent is set only on an entry that is not
+	// loaded at all because it crashed saintTorrent while being restored
+	// ("restore"); --start-paused loads it.
+	Quarantined    bool   `json:"quarantined,omitempty"`
+	CrashNote      string `json:"crash_note,omitempty"`
+	CrashComponent string `json:"crash_component,omitempty"`
 }
 
 type PersistedState struct {
@@ -1010,6 +1029,8 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		paused := sess.paused
 		addedAt := sess.AddedAt
 		private := sess.Torrent.Private
+		quarantined := sess.quarantined
+		crashNote := sess.quarantineNote
 		sess.mu.RUnlock()
 
 		var addedAtPtr *time.Time
@@ -1027,6 +1048,8 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 			FilePriorities:       priorities,
 			AddedAt:              addedAtPtr,
 			Private:              private,
+			Quarantined:          quarantined,
+			CrashNote:            crashNote,
 		})
 	}
 
@@ -1234,6 +1257,11 @@ func restoreDisplayName(entry PersistedTorrent, cachedPath string) string {
 
 // EnablePersistence initializes the manager state directory and restores previous torrents.
 // It returns a non-fatal warning message (if any recovery was needed) and a fatal error.
+//
+// It also contains a crash of the previous run (see classifyPreviousRun): a
+// torrent a crash was attributed to is restored paused and quarantined, or not
+// loaded at all if it crashed while being restored, and after two unexplained
+// crashes in a row every torrent is restored paused.
 func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	// 1. Directory creation outside lock. The state is private to the user; a
 	// torrents directory left 0755 by an older version is tightened, since the
@@ -1244,19 +1272,25 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	}
 	_ = os.Chmod(torrentsDir, 0700)
 
-	// Record crashes under the state directory from here on, including one
-	// while restoring.
+	// Work out what the last run left behind before this one marks itself as
+	// running: the sentinel must be in place before restoring, which can crash
+	// too. Without a crash directory nothing is recorded, but the sentinel
+	// still counts unclean exits.
+	crashDir := CrashDir(stateDir)
 	var recorder *crashRecorder
-	if crashDir := CrashDir(stateDir); os.MkdirAll(crashDir, 0700) == nil {
+	if err := os.MkdirAll(crashDir, 0700); err == nil {
 		_ = os.Chmod(crashDir, 0700)
 		recorder = &crashRecorder{dir: crashDir}
 	}
+	prevRun := classifyPreviousRun(stateDir, crashDir)
 	m.mu.Lock()
 	m.crash.Store(recorder)
 	for _, sess := range m.sessions {
 		sess.crash.Store(recorder)
 	}
+	startPaused := m.startPaused
 	m.mu.Unlock()
+	m.startRunningSentinel(stateDir)
 
 	statePath := filepath.Join(stateDir, "session.json")
 	var savedState PersistedState
@@ -1307,10 +1341,43 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	}
 	var restoreFailMu sync.Mutex
 	var restoreFailures []restoreFailure
+	// Quarantined entries, under restoreFailMu: the notes of those left
+	// unloaded, and how many were loaded paused for a crash of the last run.
+	var unloadedQuarantine []string
+	var crashPausedCount int
 
 	restoreOne := func(entry PersistedTorrent) {
-		// A crash while restoring entry is recorded against it.
+		// A crash while restoring entry is blamed on it, so the next start
+		// leaves it unloaded instead of crashing again.
 		defer m.crashGuard(crashComponentRestore, entry.InfoHashHex)()
+
+		quarantined, note, component := entry.Quarantined, entry.CrashNote, entry.CrashComponent
+		freshCrash := false
+		if crash, ok := prevRun.crashes[strings.ToLower(entry.InfoHashHex)]; ok {
+			quarantined, note, component, freshCrash = true, quarantineNote(crash), crash.component, true
+		}
+		if !quarantined {
+			note, component = "", ""
+		}
+		if quarantined && component == crashComponentRestore && !startPaused {
+			// Loading it would crash again while parsing it or building its
+			// storage. Keep it, unloaded, until --start-paused loads it.
+			kept := entry
+			kept.Quarantined, kept.CrashNote, kept.CrashComponent = true, note, component
+			m.mu.Lock()
+			m.failedTorrents = append(m.failedTorrents, kept)
+			m.mu.Unlock()
+			shortHash := entry.InfoHashHex
+			if len(shortHash) > 12 {
+				shortHash = shortHash[:12]
+			}
+			restoreFailMu.Lock()
+			unloadedQuarantine = append(unloadedQuarantine, fmt.Sprintf(
+				"torrent %s was not loaded (%s); start with --start-paused to load it paused", shortHash, note))
+			restoreFailMu.Unlock()
+			return
+		}
+		pause := entry.Paused || quarantined || startPaused || prevRun.pauseAll
 
 		absoluteDownloadDir, err := filepath.Abs(entry.DownloadDir)
 		if err != nil {
@@ -1377,9 +1444,14 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			}
 
 			// Restore pause state
-			if entry.Paused {
+			if pause {
 				sess.mu.Lock()
 				sess.paused = true
+				if quarantined {
+					// Loaded now, so only the quarantine is kept, not the
+					// component that kept it unloaded.
+					sess.setQuarantinedLocked(note)
+				}
 				var newEvents []string
 				for _, ev := range sess.trackerEvents {
 					if ev != "started" {
@@ -1408,10 +1480,19 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 				}
 				sess.mu.Unlock()
 			}
+			if quarantined && freshCrash {
+				restoreFailMu.Lock()
+				crashPausedCount++
+				restoreFailMu.Unlock()
+			}
 		} else {
-			// Restore failed, save the entry to failedTorrents so it is not lost
+			// Restore failed, save the entry to failedTorrents so it is not lost,
+			// with the pause and quarantine this start gave it.
+			failed := entry
+			failed.Paused = pause
+			failed.Quarantined, failed.CrashNote, failed.CrashComponent = quarantined, note, component
 			m.mu.Lock()
-			m.failedTorrents = append(m.failedTorrents, entry)
+			m.failedTorrents = append(m.failedTorrents, failed)
 			m.mu.Unlock()
 
 			restoreFailMu.Lock()
@@ -1514,6 +1595,24 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			}
 		}
 	}
+
+	// Crash containment comes first: the TUI shows one line, cut to its width.
+	var crashNotices []string
+	if prevRun.pauseAll {
+		crashNotices = append(crashNotices, fmt.Sprintf(
+			"saintTorrent stopped unexpectedly twice in a row; all torrents were restored paused. Crash details: %s", crashDir))
+	}
+	if crashPausedCount > 0 {
+		crashNotices = append(crashNotices, fmt.Sprintf(
+			"saintTorrent crashed while running %d torrent(s); they were restored paused (\"Paused after crash\"). Crash details: %s",
+			crashPausedCount, crashDir))
+	}
+	sort.Strings(unloadedQuarantine)
+	crashNotices = append(crashNotices, unloadedQuarantine...)
+	if warning != "" {
+		crashNotices = append(crashNotices, warning)
+	}
+	warning = strings.Join(crashNotices, "; ")
 
 	// 5. Turn off restoring and save initial state
 	m.mu.Lock()

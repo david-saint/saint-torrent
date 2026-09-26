@@ -246,6 +246,15 @@ type Session struct {
 	completedAnnounced bool
 	stoppedAnnounced   bool
 
+	// quarantined marks a torrent restored paused because the last run crashed
+	// in its code (see classifyPreviousRun). Its status is "Paused after
+	// crash", LastError is quarantineErr (quarantineNote as an error), and it
+	// is not verified: storage or verification may be what crashed. Resuming
+	// clears it. Guarded by mu.
+	quarantined    bool
+	quarantineNote string
+	quarantineErr  error
+
 	// Background verification of legacy hints and changed files. Durable pieces
 	// whose metadata still matches are restored immediately.
 	verifyOnStartup    bool
@@ -576,8 +585,11 @@ func (s *Session) Start() {
 	}
 	if s.started {
 		wasPaused := s.paused
+		wasQuarantined := false
 		if wasPaused {
 			s.paused = false
+			// Resuming is the user's go-ahead for a quarantined torrent too.
+			wasQuarantined = s.clearQuarantineLocked()
 			// Wake pause-state waiters (webseeds, the DHT loop) as Resume does.
 			s.renewPauseStateChLocked()
 			s.queueTrackerEventLocked("started")
@@ -602,6 +614,9 @@ func (s *Session) Start() {
 			select {
 			case s.resumeCh <- struct{}{}:
 			default:
+			}
+			if wasQuarantined {
+				s.maybeStartVerification()
 			}
 		}
 		return
@@ -698,7 +713,8 @@ func (s *Session) Start() {
 		)
 	}
 
-	// Kick off background fast-resume verification (no-op if nothing to verify).
+	// Kick off background fast-resume verification (no-op if nothing to verify,
+	// or while the session is quarantined).
 	s.maybeStartVerification()
 }
 
@@ -945,6 +961,9 @@ func (s *Session) IsPaused() bool {
 func (s *Session) LastError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.quarantined {
+		return s.quarantineErr
+	}
 	if s.statusErr != nil {
 		return s.statusErr
 	}
@@ -1012,6 +1031,10 @@ func (s *Session) IsCompleted() bool {
 }
 
 func (s *Session) statusLocked() string {
+	if s.quarantined {
+		// Paused, and never checking: verification waits for a resume.
+		return statusPausedAfterCrash
+	}
 	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
 		if s.verifyQueued {
 			return "Queued"
@@ -1038,7 +1061,11 @@ func (s *Session) statusLocked() string {
 	return "Downloading"
 }
 
-// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
+// statusPausedAfterCrash is the status of a quarantined session.
+const statusPausedAfterCrash = "Paused after crash"
+
+// Status returns the current status text (Downloading, Seeding, Paused,
+// Paused after crash, Stopped, or Error).
 func (s *Session) Status() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1142,7 +1169,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	// same condition statusLocked uses. The opportunistic full scan of a freshly
 	// added torrent runs alongside a normal download, so surfacing it would replace
 	// real transfer progress with disk-scan progress for the length of the scan.
-	checking := s.verifying && !s.verifyFullScan
+	checking := s.verifying && !s.verifyFullScan && !s.quarantined
 	snap.Verification = VerificationSnapshot{Active: checking, Queued: checking && s.verifyQueued, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
 	if checking && !s.verifyStartTime.IsZero() {
 		elapsed := time.Since(s.verifyStartTime).Seconds()
@@ -1164,7 +1191,9 @@ func (s *Session) Snapshot() SessionSnapshot {
 		}
 	}
 	// Mirror LastError()'s precedence exactly.
-	if s.statusErr != nil {
+	if s.quarantined {
+		snap.LastError = s.quarantineErr
+	} else if s.statusErr != nil {
 		snap.LastError = s.statusErr
 	} else if s.lastErr == nil {
 		snap.LastError = s.lastTrackerErr
@@ -1358,6 +1387,7 @@ func (s *Session) Resume() {
 		return
 	}
 	s.paused = false
+	wasQuarantined := s.clearQuarantineLocked()
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("started")
 	for _, pState := range s.Peers {
@@ -1382,10 +1412,40 @@ func (s *Session) Resume() {
 	default:
 		// Already signaled
 	}
+	// The check a quarantine held back runs now.
+	if wasQuarantined {
+		s.maybeStartVerification()
+	}
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()
 	}
+}
+
+// setQuarantinedLocked quarantines a paused session with note (see
+// Session.quarantined). Caller holds s.mu.
+func (s *Session) setQuarantinedLocked(note string) {
+	s.quarantined = true
+	s.quarantineNote = note
+	s.quarantineErr = errors.New(note)
+}
+
+// clearQuarantineLocked lifts a quarantine and reports whether there was one.
+// Caller holds s.mu.
+func (s *Session) clearQuarantineLocked() bool {
+	was := s.quarantined
+	s.quarantined = false
+	s.quarantineNote = ""
+	s.quarantineErr = nil
+	return was
+}
+
+// IsQuarantined reports whether the session was restored paused after a crash
+// attributed to it and has not been resumed since.
+func (s *Session) IsQuarantined() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quarantined
 }
 
 // SetFilePriority sets the download priority for a specific file.

@@ -1,6 +1,9 @@
 package downloader
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,9 +19,13 @@ import (
 // Crash handling. A panic in a session or restore goroutine is recorded under
 // <stateDir>/crash and then re-raised: the process never continues after a
 // recover, because the goroutine may have died holding s.mu or m.mu, with some
-// of its unlocks deferred and some not. Nothing here runs on a hot path: a
+// of its unlocks deferred and some not. The next start works out what crashed
+// from the running sentinel and the crash files (see classifyPreviousRun) and
+// contains it: the torrent the crash is attributed to comes back paused
+// ("quarantined") without being checked, and after two unexplained crashes in
+// a row every torrent comes back paused. Nothing here runs on a hot path: a
 // guard is one deferred closure per goroutine, and disk I/O happens only on a
-// crash and at startup.
+// crash, at startup and once when the run is marked stable.
 
 const (
 	crashDirName = "crash"
@@ -33,7 +40,8 @@ const (
 	maxCrashValueLen = 64 << 10
 
 	// crashComponentRestore names a crash while a persisted torrent was being
-	// restored.
+	// restored. Loading that torrent again would crash again, so it is not
+	// loaded until the user starts with --start-paused.
 	crashComponentRestore = "restore"
 	// unattributedCrash stands in for the info-hash of a crash no torrent is
 	// blamed for.
@@ -315,4 +323,226 @@ func pruneCrashFiles(dir string, keep int) {
 	for _, f := range files[:len(files)-keep] {
 		_ = os.Remove(filepath.Join(dir, f.name))
 	}
+}
+
+// The state files that tell a crashed run from a clean one.
+const (
+	sentinelName   = "running"
+	crashStateName = "crash-state.json"
+)
+
+// sentinelStableAfter is how long a run must last before its sentinel is
+// marked stable: a stable run that dies (SIGKILL, power loss) does not count
+// toward the unexplained-crash streak. A var so tests can shorten it; treat it
+// as a constant.
+var sentinelStableAfter = 10 * time.Minute
+
+// processNonce identifies this process in the running sentinel, so a state
+// directory reopened by the same process (tests) is not taken for the
+// leftovers of a crashed run. A pid can be reused; 128 random bits cannot.
+var processNonce = newProcessNonce()
+
+func newProcessNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// MarkUncleanExit makes Close keep the running sentinel, so the next start
+// treats this run as a crash even though it shuts down normally.
+func (m *TorrentManager) MarkUncleanExit() {
+	m.uncleanExit.Store(true)
+}
+
+// SetStartPaused makes EnablePersistence restore every torrent paused, and
+// load paused the ones quarantined for crashing saintTorrent while they were
+// being restored, which a normal start leaves unloaded. Call before
+// EnablePersistence.
+func (m *TorrentManager) SetStartPaused(startPaused bool) {
+	m.mu.Lock()
+	m.startPaused = startPaused
+	m.mu.Unlock()
+}
+
+// crashFile is a crash file attributed to one torrent.
+type crashFile struct {
+	component string
+	path      string
+}
+
+// runningSentinel is <stateDir>/running. It exists while a run is live: Close
+// removes it, so one left behind by another process means that run died.
+type runningSentinel struct {
+	PID       int    `json:"pid"`
+	Nonce     string `json:"nonce"`
+	StartedAt string `json:"started_at"`
+	Stable    bool   `json:"stable"`
+}
+
+// crashState is <stateDir>/crash-state.json.
+type crashState struct {
+	// UnattributedStreak counts consecutive runs that died with no crash
+	// blamed on a torrent before they were marked stable.
+	UnattributedStreak int `json:"unattributed_streak"`
+}
+
+// previousRun is what EnablePersistence learned about the last run.
+type previousRun struct {
+	// crashes holds the crashes of the last run attributed to a torrent, by
+	// lower-case info-hash; those torrents are quarantined.
+	crashes map[string]crashFile
+	// pauseAll is set after two unexplained crashes in a row.
+	pauseAll bool
+}
+
+// classifyPreviousRun reads the sentinel the last run left in stateDir and
+// the crash files it wrote to crashDir, and updates the unexplained-crash
+// streak in crash-state.json. A sentinel written by this process (same nonce)
+// or none at all means the last run exited cleanly.
+func classifyPreviousRun(stateDir, crashDir string) previousRun {
+	var run previousRun
+	statePath := filepath.Join(stateDir, crashStateName)
+	var stored crashState
+	if data, err := os.ReadFile(statePath); err == nil {
+		_ = json.Unmarshal(data, &stored)
+	}
+	streak := max(stored.UnattributedStreak, 0)
+
+	sentinel, found := readRunningSentinel(stateDir)
+	switch {
+	case !found || sentinel.Nonce == processNonce:
+		streak = 0
+	default:
+		// Crash files from runs before the last one are older than its start.
+		if startedAt, err := time.Parse(time.RFC3339Nano, sentinel.StartedAt); err == nil {
+			run.crashes = attributedCrashes(crashDir, startedAt.UnixNano())
+		}
+		switch {
+		case len(run.crashes) > 0:
+			streak = 0
+		case !sentinel.Stable:
+			streak = min(streak+1, 1<<20)
+		default:
+			streak = 0
+		}
+	}
+	run.pauseAll = streak >= 2
+	if streak != stored.UnattributedStreak {
+		if data, err := json.Marshal(crashState{UnattributedStreak: streak}); err == nil {
+			_ = atomicWriteFile(statePath, data)
+		}
+	}
+	return run
+}
+
+// readRunningSentinel reads stateDir's sentinel. found is false when there is
+// none; one that cannot be parsed still counts, as an unclean exit whose start
+// is unknown.
+func readRunningSentinel(stateDir string) (sentinel runningSentinel, found bool) {
+	data, err := os.ReadFile(filepath.Join(stateDir, sentinelName))
+	if err != nil {
+		return runningSentinel{}, !os.IsNotExist(err)
+	}
+	if err := json.Unmarshal(data, &sentinel); err != nil {
+		return runningSentinel{}, true
+	}
+	return sentinel, true
+}
+
+// attributedCrashes returns the crash files in crashDir written at or after
+// sinceNano that name a torrent, by info-hash. A crash while restoring a
+// torrent takes precedence over its other crashes, then the earliest one.
+func attributedCrashes(crashDir string, sinceNano int64) map[string]crashFile {
+	entries, err := os.ReadDir(crashDir)
+	if err != nil {
+		return nil
+	}
+	var crashes map[string]crashFile
+	for _, e := range entries { // sorted by name, so oldest first
+		if !e.Type().IsRegular() {
+			continue
+		}
+		nano, infoHashHex, component, ok := parseCrashFileName(e.Name())
+		if !ok || infoHashHex == "" || nano < sinceNano {
+			continue
+		}
+		prev, seen := crashes[infoHashHex]
+		if seen && (prev.component == crashComponentRestore || component != crashComponentRestore) {
+			continue
+		}
+		if crashes == nil {
+			crashes = make(map[string]crashFile)
+		}
+		crashes[infoHashHex] = crashFile{component: component, path: filepath.Join(crashDir, e.Name())}
+	}
+	return crashes
+}
+
+// writeRunningSentinel atomically writes this process's sentinel.
+func writeRunningSentinel(path string, startedAt time.Time, stable bool) error {
+	data, err := json.Marshal(runningSentinel{
+		PID:       os.Getpid(),
+		Nonce:     processNonce,
+		StartedAt: startedAt.Format(time.RFC3339Nano),
+		Stable:    stable,
+	})
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, data)
+}
+
+// startRunningSentinel marks this run as live in stateDir, after the
+// previous run has been classified, and arms the timer that marks it stable.
+func (m *TorrentManager) startRunningSentinel(stateDir string) {
+	path := filepath.Join(stateDir, sentinelName)
+	startedAt := time.Now()
+	m.sentinelMu.Lock()
+	defer m.sentinelMu.Unlock()
+	if m.sentinelTimer != nil {
+		m.sentinelTimer.Stop()
+	}
+	m.sentinelPath = ""
+	m.sentinelTimer = nil
+	if err := writeRunningSentinel(path, startedAt, false); err != nil {
+		return
+	}
+	m.sentinelPath = path
+	m.sentinelDone = false
+	m.sentinelTimer = time.AfterFunc(sentinelStableAfter, func() {
+		m.sentinelMu.Lock()
+		defer m.sentinelMu.Unlock()
+		if m.sentinelDone || m.sentinelPath != path {
+			return
+		}
+		_ = writeRunningSentinel(path, startedAt, true)
+	})
+}
+
+// finishRunningSentinel ends this run's sentinel on a clean shutdown: it is
+// removed, unless MarkUncleanExit asked for the run to count as a crash.
+func (m *TorrentManager) finishRunningSentinel() {
+	m.sentinelMu.Lock()
+	defer m.sentinelMu.Unlock()
+	if m.sentinelDone {
+		return
+	}
+	m.sentinelDone = true
+	if m.sentinelTimer != nil {
+		m.sentinelTimer.Stop()
+		m.sentinelTimer = nil
+	}
+	if m.sentinelPath != "" && !m.uncleanExit.Load() {
+		_ = os.Remove(m.sentinelPath)
+	}
+}
+
+// quarantineNote is the note shown on, and persisted with, a torrent
+// quarantined because the crash described by crash was attributed to it.
+func quarantineNote(crash crashFile) string {
+	if crash.component == crashComponentRestore {
+		return fmt.Sprintf("saintTorrent crashed while restoring this torrent. Crash details: %s", crash.path)
+	}
+	return fmt.Sprintf("saintTorrent crashed (%s) while running this torrent, so it was restored paused "+
+		"and is not checked until you resume it. Crash details: %s", crash.component, crash.path)
 }

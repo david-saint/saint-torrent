@@ -328,9 +328,11 @@ func (s *Session) loadResumeState() {
 
 // maybeStartVerification launches the background verification goroutine exactly once.
 // Idempotent; safe to call from Start() for both restored and freshly added torrents.
+// A quarantined session is not verified until it is resumed: reading its storage or
+// hashing its pieces may be what crashed the last run.
 func (s *Session) maybeStartVerification() {
 	s.mu.Lock()
-	if !s.verifying || s.verifyStarted || s.closed {
+	if !s.verifying || s.verifyStarted || s.closed || s.quarantined {
 		s.mu.Unlock()
 		return
 	}
