@@ -3,6 +3,7 @@ package dht
 import (
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,7 +49,7 @@ func TestLookupStoresResponderUnderReportedID(t *testing.T) {
 	copy(infoHash[:], "lookup-target-hash--")
 	start := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
 	startID := idInBucket(d.nodeID, 3, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.2"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("198.51.100.2"), Port: 6881}
 	honestID := idInBucket(d.nodeID, 50, 1)
 	forged := infoHash
 	forged[19] ^= 1
@@ -115,9 +116,9 @@ func TestLookupTraversalResistsHijack(t *testing.T) {
 	copy(infoHash[:], "hijacked-info-hash--")
 	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
 	attackerID := idAtDistance(infoHash, 0x80, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 6881}
 	honestID := idAtDistance(infoHash, 0x81, 1)
-	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	closest := &net.UDPAddr{IP: net.ParseIP("198.18.0.20"), Port: 6881}
 	victim := net.ParseIP("198.51.100.7")
 
 	special := []*net.UDPAddr{
@@ -184,16 +185,18 @@ func TestLookupResponderCannotFloodCandidateSet(t *testing.T) {
 	copy(infoHash[:], "flooded-lookup-hash-")
 	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
 	attackerID := idAtDistance(infoHash, 0x80, 1)
-	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honest := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 6881}
 	honestID := idAtDistance(infoHash, 0x81, 1)
-	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	closest := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 6881}
 	closestID := idAtDistance(infoHash, 0x01, 0)
 
+	// Each junk referral sits on its own /24, so per-subnet dedup alone
+	// cannot absorb the flood.
 	var junk []Node
 	for i := 0; i < 150; i++ {
 		junk = append(junk, Node{
 			ID:   idAtDistance(infoHash, 0, byte(i+1)),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, byte(100+i/100), byte(i%100+1)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
@@ -236,12 +239,13 @@ func TestLookupQueriesClosestAndConverges(t *testing.T) {
 	seedID := idAtDistance(infoHash, 0xFF, 1)
 
 	// Referrals arrive farthest first, so a FIFO crawl would query them in
-	// the wrong order.
+	// the wrong order. Each is on its own /24, and its third octet is its
+	// distance.
 	var referrals []Node
 	for i := 40; i >= 1; i-- {
 		referrals = append(referrals, Node{
 			ID:   idAtDistance(infoHash, byte(i), 0),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
@@ -251,14 +255,14 @@ func TestLookupQueriesClosestAndConverges(t *testing.T) {
 		if sameUDPAddr(to, seed) {
 			return map[string]interface{}{"id": idString(seedID), "nodes": compactNodes(referrals)}
 		}
-		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
 	})
 	d.addNode(seedID, seed)
 
 	d.lookup(infoHash, 0, LookupOptions{})
 
 	for i := 1; i <= 40; i++ {
-		addr := &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881}
+		addr := &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881}
 		got := conn.queriesTo(addr, "get_peers")
 		if i <= dhtLookupK && got != 1 {
 			t.Fatalf("one of the %d closest candidates (distance %d) was queried %d times", dhtLookupK, i, got)
@@ -278,17 +282,18 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 	copy(infoHash[:], "announced-info-hash-")
 	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
 	seedID := idAtDistance(infoHash, 0xFF, 1)
+	// Each referral is on its own /24, and its third octet is its distance.
 	var referrals []Node
 	for i := 1; i <= 20; i++ {
 		referrals = append(referrals, Node{
 			ID:   idAtDistance(infoHash, byte(i), 0),
-			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
 		})
 	}
 	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
 		switch {
 		case q == "announce_peer":
-			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
 		case q != "get_peers":
 			return nil
 		case sameUDPAddr(to, seed):
@@ -296,7 +301,7 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 			// holders in all.
 			return map[string]interface{}{"id": idString(seedID), "token": "tok", "nodes": compactNodes(referrals)}
 		}
-		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0)), "token": "tok"}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0)), "token": "tok"}
 	})
 	d.addNode(seedID, seed)
 
@@ -320,7 +325,7 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 	}
 	for _, a := range announced {
 		ip := a.IP.To4()
-		if ip[0] != 198 || int(ip[3]) > dhtLookupK {
+		if ip[0] != 198 || int(ip[2]) > dhtLookupK {
 			t.Fatalf("announced to %s, which is not among the %d closest", a, dhtLookupK)
 		}
 	}
@@ -448,7 +453,7 @@ func TestLookupFiltersCapsAndDedupsValues(t *testing.T) {
 	copy(infoHash[:], "valued-info-hash----")
 	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.5"), Port: 6881}
 	seedID := idAtDistance(infoHash, 0x80, 1)
-	second := &net.UDPAddr{IP: net.ParseIP("203.0.113.6"), Port: 6881}
+	second := &net.UDPAddr{IP: net.ParseIP("192.0.2.6"), Port: 6881}
 	secondID := idAtDistance(infoHash, 0x01, 1)
 
 	special := []string{
@@ -540,5 +545,39 @@ func TestLookupLoopbackResponderMayHandOutLoopbackPeers(t *testing.T) {
 	peers := drainDiscovered(d)
 	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("127.0.0.1")) || peers[0].Port != 6881 {
 		t.Fatalf("loopback responder's loopback peer was not published: %v", peers)
+	}
+}
+
+// TestLookupSetOneCandidatePerSlash24 verifies a lookup keeps one public
+// candidate per /24 (libtorrent's dht_restrict_search_ips), while LAN
+// addresses keep one per IP and loopback one per port.
+func TestLookupSetOneCandidatePerSlash24(t *testing.T) {
+	var target, self [20]byte
+	copy(target[:], "subnet-lookup-target")
+	self[0] = 0xFF
+	l := newLookupSet(target, self)
+	add := func(ip string, port int, d byte) {
+		k, ok := endpointKey(net.ParseIP(ip), port)
+		if !ok {
+			t.Fatalf("bad endpoint %s:%d", ip, port)
+		}
+		l.add(idAtDistance(target, d, 0), k)
+	}
+	add("198.51.100.1", 6881, 10)
+	add("198.51.100.2", 6881, 1) // closer, but its /24 is taken
+	add("198.51.101.1", 6881, 11)
+	add("192.168.1.1", 6881, 12)
+	add("192.168.1.2", 6881, 13)
+	add("192.168.1.2", 6882, 14) // same LAN IP
+	add("127.0.0.1", 7001, 15)
+	add("127.0.0.1", 7002, 16) // loopback: one per port
+
+	var got []string
+	for _, c := range l.list {
+		got = append(got, c.key.udpAddr().String())
+	}
+	want := []string{"198.51.100.1:6881", "198.51.101.1:6881", "192.168.1.1:6881", "192.168.1.2:6881", "127.0.0.1:7001", "127.0.0.1:7002"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("candidates %v, want %v", got, want)
 	}
 }

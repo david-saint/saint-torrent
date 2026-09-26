@@ -722,6 +722,43 @@ func onePerIP(ip [4]byte) bool {
 	return ip[0] != 127
 }
 
+// diverse reports whether ip is held to one contact per /24 in each bucket
+// and one candidate per /24 in each lookup, like libtorrent's
+// dht_restrict_routing_ips and dht_restrict_search_ips, so a host controlling
+// a whole /24 still cannot fill the buckets or steer the lookups near a chosen
+// ID. Loopback, link-local and private (LAN) addresses are exempt, so local and
+// test DHTs, which often share one subnet, keep working.
+func diverse(ip [4]byte) bool {
+	return !netpolicy.IsLocal(netip.AddrFrom4(ip))
+}
+
+// sameSlash24 reports whether a and b are in the same IPv4 /24.
+func sameSlash24(a, b [4]byte) bool {
+	return a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+// slash24Taken reports whether b bars a contact at k for subnet diversity: k
+// is a diverse address and b already holds a contact on its /24, other than
+// one stored at k itself or under skip (the contact k would replace). The
+// bucket holds at most bucketSize contacts, so the scan is short. Callers
+// hold d.mu.
+func slash24Taken(b *bucket, k nodeAddrKey, skip *[20]byte) bool {
+	if b == nil || !diverse(k.ip) {
+		return false
+	}
+	for i := range b.nodes {
+		n := &b.nodes[i]
+		if skip != nil && n.ID == *skip {
+			continue
+		}
+		nk, ok := nodeAddrKeyOf(n.Addr)
+		if ok && nk != k && sameSlash24(nk.ip, k.ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // endpointAllowed reports whether we may contact k after source told us about
 // it: per netpolicy, a remote node may only point us at addresses no more local
 // than itself, and never at one that cannot be a unicast peer.
@@ -866,9 +903,11 @@ func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 		return
 	}
 
-	n := Node{ID: id, Addr: k.udpAddr(), LastSeen: seen}
 	if len(b.nodes) < bucketSize {
-		d.appendNodeLocked(b, n)
+		if slash24Taken(b, k, nil) {
+			return
+		}
+		d.appendNodeLocked(b, Node{ID: id, Addr: k.udpAddr(), LastSeen: seen})
 		return
 	}
 	// BEP 5: a bucket full of good contacts simply discards the newcomer; only
@@ -877,6 +916,12 @@ func (d *DHT) addNodeSeen(id [20]byte, addr *net.UDPAddr, seen time.Time) {
 	if b.pingInProgress || !questionable(stale, time.Now()) {
 		return
 	}
+	// The challenged contact may be what holds the newcomer's /24; if it is
+	// replaced, that /24 is free again.
+	if slash24Taken(b, k, &stale.ID) {
+		return
+	}
+	n := Node{ID: id, Addr: k.udpAddr(), LastSeen: seen}
 	b.pingInProgress = true
 	d.goTracked(func() {
 		d.challenge(idx, stale, n)
@@ -950,6 +995,9 @@ func (d *DHT) replaceNode(idx int, old, newcomer Node) {
 	if onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
 		return
 	}
+	if slash24Taken(b, k, nil) {
+		return
+	}
 	d.appendNodeLocked(b, newcomer)
 }
 
@@ -1002,16 +1050,23 @@ func (d *DHT) noteQuerySender(id [20]byte, addr *net.UDPAddr) {
 // mightAdmitLocked reports whether a verified contact at k with an ID in bucket
 // idx could be admitted, so a probe is only spent when it could matter. An
 // endpoint held by another ID is still probed: its answer settles which ID
-// lives there now.
+// lives there now. It mirrors addNodeSeen's admission rules.
 func (d *DHT) mightAdmitLocked(idx int, k nodeAddrKey) bool {
 	if _, held := d.nodeAddrs[k]; !held && onePerIP(k.ip) && d.nodeIPs[k.ip] > 0 {
 		return false
 	}
 	b := d.buckets[idx]
-	if b == nil || len(b.nodes) < bucketSize {
+	if b == nil {
 		return true
 	}
-	return !b.pingInProgress && questionable(b.oldest(), time.Now())
+	if len(b.nodes) < bucketSize {
+		return !slash24Taken(b, k, nil)
+	}
+	if b.pingInProgress {
+		return false
+	}
+	stale := b.oldest()
+	return questionable(stale, time.Now()) && !slash24Taken(b, k, &stale.ID)
 }
 
 // considerAddressChange queues a candidate address for a node ID already in the
@@ -1242,8 +1297,8 @@ func (d *DHT) dropNode(id [20]byte, addr *net.UDPAddr) {
 
 // repointNode moves a verified node from oldAddr to newAddr, leaving the entry
 // alone if it no longer points at oldAddr, or if newAddr is already taken by
-// another contact or would give its IP a second one. It reports whether the
-// move applied.
+// another contact, would give its IP a second one, or would give its bucket a
+// second contact on a diverse /24. It reports whether the move applied.
 func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
 	nk, ok := nodeAddrKeyOf(newAddr)
 	if !ok {
@@ -1270,6 +1325,9 @@ func (d *DHT) repointNode(id [20]byte, oldAddr, newAddr *net.UDPAddr) bool {
 		others-- // the node itself, moving to another port on the same IP
 	}
 	if onePerIP(nk.ip) && others > 0 {
+		return false
+	}
+	if slash24Taken(b, nk, &id) {
 		return false
 	}
 
@@ -1692,13 +1750,14 @@ type lookupCandidate struct {
 
 // lookupSet is a Kademlia traversal's candidate set: at most
 // dhtLookupCandidates nodes ordered by XOR distance to the target, with at
-// most one per IP (libtorrent's dht_restrict_search_ips), so one host cannot
-// steer the query budget with many ports or IDs.
+// most one per /24 for public addresses and one per IP for local ones
+// (libtorrent's dht_restrict_search_ips), so one host, or one subnet, cannot
+// steer the query budget with many ports, IDs or addresses.
 type lookupSet struct {
 	target [20]byte
 	self   [20]byte
 	list   []lookupCandidate
-	seen   map[nodeAddrKey]struct{} // probeKey of every candidate ever admitted
+	seen   map[nodeAddrKey]struct{} // lookupKey of every candidate ever admitted
 }
 
 func newLookupSet(target, self [20]byte) *lookupSet {
@@ -1710,13 +1769,23 @@ func newLookupSet(target, self [20]byte) *lookupSet {
 	}
 }
 
-// add offers a node as a candidate. It is dropped if its IP was already seen,
-// or if the set is full and it is no closer than the farthest candidate.
+// lookupKey is a candidate's identity in a lookup: its /24 for a diverse
+// address, its probeKey (the IP, or the endpoint on loopback) otherwise.
+func lookupKey(k nodeAddrKey) nodeAddrKey {
+	if diverse(k.ip) {
+		return nodeAddrKey{ip: [4]byte{k.ip[0], k.ip[1], k.ip[2], 0}}
+	}
+	return probeKey(k)
+}
+
+// add offers a node as a candidate. It is dropped if its /24 (or, for a local
+// address, its IP) was already seen, or if the set is full and it is no closer
+// than the farthest candidate.
 func (l *lookupSet) add(id [20]byte, k nodeAddrKey) {
 	if id == l.self {
 		return
 	}
-	sk := probeKey(k)
+	sk := lookupKey(k)
 	if _, dup := l.seen[sk]; dup {
 		return
 	}
