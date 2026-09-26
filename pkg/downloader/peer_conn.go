@@ -208,32 +208,18 @@ func (s *Session) markPeerAttemptFailed(peerAddr string) {
 	s.mu.Unlock()
 }
 
+// broadcastHave queues a Have for piece index on every active connection. Each
+// connection's own message loop sends it, batched with any other queued Haves, so
+// completing a piece starts no goroutines and never waits on a peer's socket: a
+// peer that reads slowly cannot pile up senders.
 func (s *Session) broadcastHave(index uint32) {
-	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed || s.ctx.Err() != nil {
-		s.mu.RUnlock()
 		return
 	}
-	var clients []*peer.Client
 	for _, client := range s.activePeers {
-		clients = append(clients, client)
-	}
-	s.mu.RUnlock()
-
-	for _, client := range clients {
-		s.wg.Add(1)
-		go func(c *peer.Client) {
-			defer s.wg.Done()
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-			}
-			_ = c.SendHave(index)
-		}(client)
+		client.QueueHave(index)
 	}
 }
 
@@ -721,6 +707,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		pState.Dialable = true
 	}
 	pState.Active = true
+	// Choke and interest start over on every connection (BEP 3); an entry kept
+	// from an earlier connection to this address still holds that one's state.
+	pState.AmChoking = true
+	pState.Choked = true
+	pState.Interested = false
 	s.activePeers[peerAddr] = client
 	if logEnabled {
 		logInfoHash, logName = s.logIdentityLocked()
@@ -1393,6 +1384,26 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		uploadQueue = kept
 	}
+	// wireAmChoking is the choke state last sent to the peer. The choker only
+	// updates pState.AmChoking and wakes this loop (peer.Client.Notify); syncChoke
+	// sends the change from here, in order with everything else the loop writes.
+	wireAmChoking := true // connections start choked
+	syncChoke := func() {
+		s.mu.RLock()
+		amChoking := pState.AmChoking
+		s.mu.RUnlock()
+		if amChoking == wireAmChoking {
+			return
+		}
+		wireAmChoking = amChoking
+		if amChoking {
+			_ = client.SendChoke()
+		} else {
+			_ = client.SendUnchoke()
+		}
+		noteUploadChoke(amChoking)
+	}
+
 	// refreshUploadChoke reads AmChoking for paths that do not already hold s.mu;
 	// it only takes the lock when there is a queue to drop.
 	refreshUploadChoke := func() {
@@ -2056,6 +2067,17 @@ peerLoop:
 			}
 			msg = result.msg
 			pooledMsg = msg // release its pooled buffer at the top of the next iteration
+		case <-client.Notified():
+			// The choker changed our choke state or pieces completed.
+			syncChoke()
+			if initializedPeersAndBitfield {
+				_ = client.SendQueuedHaves()
+			} else {
+				// Nothing may precede the bitfield, which is sent once metadata
+				// is in and already covers these pieces.
+				client.DropQueuedHaves()
+			}
+			continue
 		case <-pexTick:
 			sendPEXDelta()
 			continue
@@ -2210,14 +2232,11 @@ peerLoop:
 					unchokedInterested++
 				}
 			}
-			shouldUnchoke := pState.AmChoking && unchokedInterested < 4
-			if shouldUnchoke {
+			if pState.AmChoking && unchokedInterested < 4 {
 				pState.AmChoking = false
 			}
 			s.mu.Unlock()
-			if shouldUnchoke {
-				_ = client.SendUnchoke()
-			}
+			syncChoke()
 
 		case peer.MsgNotInterested:
 			s.mu.Lock()
@@ -2658,23 +2677,6 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 		}
 	}
 	return stats
-}
-
-// sendPeerControlLocked queues a peer control message while s.mu is held.
-func (s *Session) sendPeerControlLocked(c *peer.Client, fn func(*peer.Client) error) {
-	if s.closed {
-		return
-	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-		_ = fn(c)
-	}()
 }
 
 func (s *Session) dhtLoop() {

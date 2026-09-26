@@ -35,6 +35,7 @@ type Client struct {
 	w           *bufio.Writer // buffers outbound messages; flushed explicitly
 	reqBuf      [17]byte      // reusable scratch for WriteRequest framing
 	pieceHdrBuf [13]byte      // reusable scratch for SendPiece header framing
+	haveBuf     [9]byte       // reusable scratch for SendQueuedHaves framing
 	readLenBuf  [4]byte       // reusable 4-byte length-prefix scratch for ReadMessage
 	DisableDHT  bool          // Disable advertising DHT support in handshake
 
@@ -43,7 +44,17 @@ type Client struct {
 	// guarded by writeMu.
 	writeTimeout  time.Duration
 	writeDeadline time.Time
+
+	// Haves queued by other goroutines for the goroutine that owns the connection
+	// to send (see QueueHave). queueMu guards queuedHaves.
+	queueMu     sync.Mutex
+	queuedHaves []uint32
+	notify      chan struct{} // capacity 1; see Notified
 }
+
+// maxReusedHaveQueue bounds the Have queue capacity a client keeps for reuse
+// after a drain, so one large burst (a recheck) does not pin its array.
+const maxReusedHaveQueue = 1024
 
 // NewClient initializes a new peer wire client.
 func NewClient(conn net.Conn, infoHash, peerID [20]byte) *Client {
@@ -55,6 +66,7 @@ func NewClient(conn net.Conn, infoHash, peerID [20]byte) *Client {
 		w:        bufio.NewWriterSize(conn, peerWriteBufferSize),
 
 		writeTimeout: peerWriteTimeout,
+		notify:       make(chan struct{}, 1),
 	}
 }
 
@@ -174,6 +186,93 @@ func (c *Client) Flush() error {
 		c.armWriteDeadlineLocked()
 	}
 	return c.writeFailedLocked(c.w.Flush())
+}
+
+// QueueHave queues a Have for piece index and wakes the goroutine that owns the
+// connection through Notified; that goroutine sends it with SendQueuedHaves. It
+// never blocks and never writes: completing a piece costs one append per
+// connected peer instead of a goroutine and a socket write, and a peer that
+// reads slowly holds up nobody but its own connection.
+func (c *Client) QueueHave(index uint32) {
+	c.queueMu.Lock()
+	c.queuedHaves = append(c.queuedHaves, index)
+	c.queueMu.Unlock()
+	c.Notify()
+}
+
+// Notify wakes the goroutine that owns the connection through Notified without
+// queueing anything, for state it reads itself (such as whether we choke the
+// peer). It never blocks.
+func (c *Client) Notify() {
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
+}
+
+// Notified receives after QueueHave or Notify. Wakeups coalesce: one receive
+// covers everything queued before it.
+func (c *Client) Notified() <-chan struct{} {
+	return c.notify
+}
+
+// takeQueuedHaves removes and returns the queued Haves.
+func (c *Client) takeQueuedHaves() []uint32 {
+	c.queueMu.Lock()
+	haves := c.queuedHaves
+	c.queuedHaves = nil
+	c.queueMu.Unlock()
+	return haves
+}
+
+// recycleHaveQueue hands a drained queue back for reuse.
+func (c *Client) recycleHaveQueue(haves []uint32) {
+	if cap(haves) > maxReusedHaveQueue {
+		return
+	}
+	c.queueMu.Lock()
+	if c.queuedHaves == nil {
+		c.queuedHaves = haves[:0]
+	}
+	c.queueMu.Unlock()
+}
+
+// SendQueuedHaves sends every queued Have with one flush.
+func (c *Client) SendQueuedHaves() error {
+	haves := c.takeQueuedHaves()
+	if len(haves) == 0 {
+		return nil
+	}
+	c.writeMu.Lock()
+	buf := &c.haveBuf // 4-byte length prefix + 1-byte ID + 4-byte index
+	binary.BigEndian.PutUint32(buf[0:4], 5)
+	buf[4] = byte(MsgHave)
+	var err error
+	for _, index := range haves {
+		binary.BigEndian.PutUint32(buf[5:9], index)
+		// A long queue fills the buffer several times; each of those writes
+		// reaches the socket.
+		if c.w.Available() < len(buf) {
+			c.armWriteDeadlineLocked()
+		}
+		if _, err = c.w.Write(buf[:]); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		c.armWriteDeadlineLocked()
+		err = c.w.Flush()
+	}
+	err = c.writeFailedLocked(err)
+	c.writeMu.Unlock()
+	c.recycleHaveQueue(haves)
+	return err
+}
+
+// DropQueuedHaves discards the queued Haves, for an owner that has not sent its
+// bitfield yet: the bitfield it sends later covers them.
+func (c *Client) DropQueuedHaves() {
+	c.recycleHaveQueue(c.takeQueuedHaves())
 }
 
 // SendKeepAlive sends a keep-alive message (zero-length prefix).
