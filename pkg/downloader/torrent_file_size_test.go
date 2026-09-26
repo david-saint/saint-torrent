@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"sainttorrent/pkg/torrent"
 )
 
 // TestAddTorrentFileRefusesOversizedFile: AddTorrentFile read a .torrent of any
@@ -18,7 +20,7 @@ func TestAddTorrentFileRefusesOversizedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Sparse: refusing it must not require reading it.
-	if err := f.Truncate(maxTorrentFileSize + 1); err != nil {
+	if err := f.Truncate(torrent.MaxFileSize + 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
@@ -28,20 +30,6 @@ func TestAddTorrentFileRefusesOversizedFile(t *testing.T) {
 	mgr := NewTorrentManager()
 	defer mgr.Close()
 	if _, err := mgr.AddTorrentFile(path, t.TempDir()); err == nil || !strings.Contains(err.Error(), "larger than the maximum") {
-		t.Fatalf("AddTorrentFile of a %d-byte file = %v, want a size error", maxTorrentFileSize+1, err)
-	}
-}
-
-// TestReadTorrentFileReturnsWholeFile: a torrent under the bound is read
-// exactly.
-func TestReadTorrentFileReturnsWholeFile(t *testing.T) {
-	data, _ := testTorrent(t, "small.bin", false)
-	path := filepath.Join(t.TempDir(), "small.torrent")
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	got, err := readTorrentFile(path)
-	if err != nil || string(got) != string(data) {
-		t.Fatalf("readTorrentFile = %d bytes, %v; want the %d-byte file", len(got), err, len(data))
+		t.Fatalf("AddTorrentFile of a %d-byte file = %v, want a size error", torrent.MaxFileSize+1, err)
 	}
 }
