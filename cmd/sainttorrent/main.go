@@ -1295,8 +1295,8 @@ Options:
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
       --no-persist          Do not persist fast-resume state
-      --start-paused        Restore every torrent paused, including any a crash
-                            left unloaded
+      --start-paused        Restore every torrent paused for this run, including
+                            any a crash left unloaded
       --recheck             Fully hash-check restored torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
                             (loopback only, e.g. 127.0.0.1:16666)

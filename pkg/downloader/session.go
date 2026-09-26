@@ -254,6 +254,12 @@ type Session struct {
 	quarantined    bool
 	quarantineNote string
 	quarantineErr  error
+	// autoPaused marks a pause this start applied on its own, to every
+	// torrent (--start-paused, or two unexplained crashes in a row), rather
+	// than the user: session.json keeps the torrent's own pause state, so the
+	// next start restores it as it was. Pause makes it the user's; Resume
+	// clears it. Guarded by mu.
+	autoPaused bool
 
 	// Background verification of legacy hints and changed files. Durable pieces
 	// whose metadata still matches are restored immediately.
@@ -588,6 +594,7 @@ func (s *Session) Start() {
 		wasQuarantined := false
 		if wasPaused {
 			s.paused = false
+			s.autoPaused = false
 			// Resuming is the user's go-ahead for a quarantined torrent too.
 			wasQuarantined = s.clearQuarantineLocked()
 			// Wake pause-state waiters (webseeds, the DHT loop) as Resume does.
@@ -1332,7 +1339,14 @@ func (s *Session) IsMetadataMode() bool {
 func (s *Session) Pause() {
 	s.mu.Lock()
 	if s.paused {
+		// A pause this start applied on its own becomes the user's, and is
+		// persisted from now on.
+		madeUsers := s.autoPaused
+		s.autoPaused = false
 		s.mu.Unlock()
+		if madeUsers && s.OnStateChange != nil {
+			s.OnStateChange()
+		}
 		return
 	}
 	s.paused = true
@@ -1387,6 +1401,7 @@ func (s *Session) Resume() {
 		return
 	}
 	s.paused = false
+	s.autoPaused = false
 	wasQuarantined := s.clearQuarantineLocked()
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("started")

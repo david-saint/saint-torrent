@@ -1730,23 +1730,49 @@ func TestRestoreCrashLeavesTorrentUnloaded(t *testing.T) {
 }
 
 // TestStartPausedRestoresEverythingPaused: --start-paused restores every
-// torrent paused, and persists it so.
+// torrent paused for that run only. session.json keeps each torrent's own
+// pause state, so the next start restores it as it was: a running torrent
+// running, one the user paused still paused. Pausing an auto-paused torrent
+// explicitly makes the pause the user's, and it is kept.
 func TestStartPausedRestoresEverythingPaused(t *testing.T) {
-	data, hash := testTorrent(t, "startpaused.bin", false)
-	hashHex := fmt.Sprintf("%x", hash)
-	stateDir := writeRestoreState(t, []PersistedTorrent{{InfoHashHex: hashHex, DownloadDir: t.TempDir()}}, map[string][]byte{hashHex: data})
+	runningData, runningHash := testTorrent(t, "startpaused.bin", false)
+	userData, userHash := testTorrent(t, "userpaused.bin", false)
+	keptData, keptHash := testTorrent(t, "keptpaused.bin", false)
+	running, user, kept := fmt.Sprintf("%x", runningHash), fmt.Sprintf("%x", userHash), fmt.Sprintf("%x", keptHash)
+	stateDir := writeRestoreState(t, []PersistedTorrent{
+		{InfoHashHex: running, DownloadDir: t.TempDir()},
+		{InfoHashHex: user, DownloadDir: t.TempDir(), Paused: true},
+		{InfoHashHex: kept, DownloadDir: t.TempDir()},
+	}, map[string][]byte{running: runningData, user: userData, kept: keptData})
+
 	mgr := NewTorrentManager()
 	mgr.SetStartPaused(true)
 	if _, err := mgr.EnablePersistence(stateDir); err != nil {
 		t.Fatal(err)
 	}
-	sess := mgr.GetSession(hashHex)
-	if sess == nil || !sess.IsPaused() || sess.IsQuarantined() {
-		t.Fatalf("session %v, want it restored paused and not quarantined", sess)
+	for _, hashHex := range []string{running, user, kept} {
+		if sess := mgr.GetSession(hashHex); sess == nil || !sess.IsPaused() || sess.IsQuarantined() {
+			t.Fatalf("session %s = %v, want it restored paused and not quarantined", hashHex, sess)
+		}
 	}
+	mgr.GetSession(kept).Pause() // the user pauses it too
 	mgr.Close()
-	if entry := readCrashTestState(t, stateDir)[hashHex]; !entry.Paused {
-		t.Fatalf("persisted entry %+v, want it paused", entry)
+	state := readCrashTestState(t, stateDir)
+	if state[running].Paused || !state[user].Paused || !state[kept].Paused {
+		t.Fatalf("persisted paused = %v, %v, %v; want false (its own state), true (the user's), true (paused again by the user)",
+			state[running].Paused, state[user].Paused, state[kept].Paused)
+	}
+
+	again := NewTorrentManager()
+	defer again.Close()
+	if _, err := again.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if sess := again.GetSession(running); sess == nil || sess.IsPaused() {
+		t.Fatalf("session %v on a normal start after --start-paused, want it restored running", sess)
+	}
+	if sess := again.GetSession(user); sess == nil || !sess.IsPaused() {
+		t.Fatalf("session %v on a normal start, want the user's pause kept", sess)
 	}
 }
 
@@ -1781,15 +1807,22 @@ func TestTwoUnexplainedCrashesRestoreEverythingPaused(t *testing.T) {
 		}
 		mgr.Close()
 	}
-	if entry := readCrashTestState(t, stateDir)[hashHex]; !entry.Paused || entry.Quarantined {
-		t.Fatalf("persisted entry %+v, want it plainly paused", entry)
+	// The pause was this run's alone: session.json keeps the torrent as the
+	// user left it.
+	if entry := readCrashTestState(t, stateDir)[hashHex]; entry.Paused || entry.Quarantined {
+		t.Fatalf("persisted entry %+v, want it neither paused nor quarantined", entry)
 	}
 
-	// A clean exit (the Close above) resets the streak.
+	// A clean exit (the Close above) resets the streak, and the torrent comes
+	// back running.
 	mgr := NewTorrentManager()
 	defer mgr.Close()
-	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+	warning, err := mgr.EnablePersistence(stateDir)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if sess := mgr.GetSession(hashHex); sess == nil || sess.IsPaused() || warning != "" {
+		t.Fatalf("session %v (warning %q) after a clean exit from safe mode, want it restored running", sess, warning)
 	}
 	stateData, err := os.ReadFile(filepath.Join(stateDir, crashStateName))
 	if err != nil {

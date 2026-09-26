@@ -1061,7 +1061,9 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 		magnetURI := sess.MagnetURI
 		downloadDir := sess.downloadDir
 		fallbackDownloadDirs := append([]string(nil), sess.fallbackDownloadDirs...)
-		paused := sess.paused
+		// A pause this start applied to every torrent is not the user's:
+		// persist the torrent's own state (see Session.autoPaused).
+		paused := sess.paused && !sess.autoPaused
 		addedAt := sess.AddedAt
 		private := sess.Torrent.Private
 		quarantined := sess.quarantined
@@ -1485,6 +1487,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			if pause {
 				sess.mu.Lock()
 				sess.paused = true
+				// Paused only because of how this run started: not persisted.
+				sess.autoPaused = !entry.Paused && !quarantined
 				if quarantined {
 					// Loaded now, so only the quarantine is kept, not the
 					// component that kept it unloaded.
@@ -1527,7 +1531,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 			// Restore failed, save the entry to failedTorrents so it is not lost,
 			// with the pause and quarantine this start gave it.
 			failed := entry
-			failed.Paused = pause
+			failed.Paused = entry.Paused || quarantined
 			failed.Quarantined, failed.CrashNote, failed.CrashComponent = quarantined, note, component
 			m.mu.Lock()
 			m.failedTorrents = append(m.failedTorrents, failed)
@@ -1638,7 +1642,8 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 	var crashNotices []string
 	if prevRun.pauseAll {
 		crashNotices = append(crashNotices, fmt.Sprintf(
-			"saintTorrent stopped unexpectedly twice in a row; all torrents were restored paused. Crash details: %s", crashDir))
+			"saintTorrent stopped unexpectedly twice in a row; all torrents were restored paused for this run "+
+				"(the next start restores them as they were). Crash details: %s", crashDir))
 	}
 	if crashPausedCount > 0 {
 		crashNotices = append(crashNotices, fmt.Sprintf(
