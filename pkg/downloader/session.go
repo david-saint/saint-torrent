@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -88,6 +89,10 @@ type PeerState struct {
 	// FailCount counts connection attempts that failed in a row; past
 	// maxPeerFailCount the peer is rarely redialed.
 	FailCount uint8
+	// seenAt is when DHT, PEX or a tracker last listed the address. An entry
+	// recorded while every outbound slot was busy has no LastAttempt yet, and
+	// prunePeersLocked ages it by this instead of evicting it first.
+	seenAt time.Time
 
 	WindowBlocks         int
 	TargetWindowBlocks   int
@@ -187,10 +192,23 @@ type Session struct {
 	stateDirty bool
 	closing    bool
 	stats      completionStats
-	flushMu    sync.Mutex
+	// statsRanges caches wantedStatsRangesLocked (sorted, non-overlapping) so a
+	// piece completion finds its wanted bytes with a binary search instead of
+	// rebuilding every file's range under s.mu. statsRangesValid is cleared by
+	// every change to the file priorities, the file list or the storage (see
+	// invalidateStatsRangesLocked); statsRangesLocked rebuilds it on next use.
+	statsRanges      []byteRange
+	statsRangesValid bool
+	flushMu          sync.Mutex
 	// stateFlushCh wakes the persistence goroutine so a pause checkpoints promptly
 	// without running the flush (and its file syncs) on the caller's goroutine.
 	stateFlushCh chan struct{}
+
+	// infoHashHex is the info-hash in hex, fixed at creation so a crash guard
+	// can name the torrent without taking s.mu. crash is the manager's crash
+	// recorder (nil without persistence); see crashGuard.
+	infoHashHex string
+	crash       atomic.Pointer[crashRecorder]
 
 	lifecycleMu         sync.Mutex
 	ctx                 context.Context
@@ -227,6 +245,15 @@ type Session struct {
 	trackerEvents      []string // Queue of pending tracker events
 	completedAnnounced bool
 	stoppedAnnounced   bool
+
+	// quarantined marks a torrent restored paused because the last run crashed
+	// in its code (see classifyPreviousRun). Its status is "Paused after
+	// crash", LastError is quarantineErr (quarantineNote as an error), and it
+	// is not verified: storage or verification may be what crashed. Resuming
+	// clears it. Guarded by mu.
+	quarantined    bool
+	quarantineNote string
+	quarantineErr  error
 
 	// Background verification of legacy hints and changed files. Durable pieces
 	// whose metadata still matches are restored immediately.
@@ -270,14 +297,38 @@ type Session struct {
 	optimisticTimer *time.Ticker
 
 	// Metadata exchange state
-	metadataSize         int
-	metadataBuf          []byte
-	metadataPieces       []bool
-	metadataCompleted    bool
-	metadataMode         bool
-	metadataEpoch        uint64    // advances whenever the accumulator is discarded; peers re-request
-	metadataProgressAt   time.Time // when the accumulator was last sized or took a block
-	metadataCompletedCh  chan struct{}
+	metadataSize        int
+	metadataBuf         []byte
+	metadataPieces      []bool
+	metadataCompleted   bool
+	metadataMode        bool
+	metadataEpoch       uint64    // advances whenever the accumulator is discarded; peers re-request
+	metadataProgressAt  time.Time // when the accumulator was last sized or took a block
+	metadataCompletedCh chan struct{}
+	// Blame for failed ut_metadata assemblies (see noteMetadataRoundFailedLocked).
+	// metadataFrom is the admission host key that supplied each accepted block
+	// (parallel to metadataPieces; "" for loopback, which is never blamed).
+	// metadataSizedBy, metadataSizedAt and metadataRoundBlocks describe the
+	// current round: who sized the accumulator, when, and how many blocks it has
+	// taken since, which is how a round fed too slowly is told from a live one.
+	// metadataResetAt is when the last failed round was discarded. After a failed
+	// round several hosts fed, metadataSolo makes every later round come from a
+	// single connection, metadataOwner (since metadataOwnedAt), so the next
+	// failure has exactly one supplier. metadataSuspects holds the hosts that
+	// sized or fed a failed round (see maxMetadataSuspects), and
+	// metadataFailStreak and metadataNextRoundAt back off new rounds after
+	// consecutive failures. All guarded by mu.
+	metadataFrom         []string
+	metadataSizedBy      string
+	metadataSizedAt      time.Time
+	metadataRoundBlocks  int
+	metadataResetAt      time.Time
+	metadataSolo         bool
+	metadataOwner        *peer.Client
+	metadataOwnedAt      time.Time
+	metadataSuspects     map[string]time.Time
+	metadataFailStreak   int
+	metadataNextRoundAt  time.Time
 	DHT                  *dht.DHT
 	downloadDir          string
 	fallbackDownloadDirs []string
@@ -345,6 +396,7 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 	}
 
 	sess := &Session{
+		infoHashHex:         hex.EncodeToString(tor.InfoHash[:]),
 		verifyOnStartup:     verifyOnStartup,
 		Torrent:             tor,
 		Storage:             st,
@@ -533,8 +585,13 @@ func (s *Session) Start() {
 	}
 	if s.started {
 		wasPaused := s.paused
+		wasQuarantined := false
 		if wasPaused {
 			s.paused = false
+			// Resuming is the user's go-ahead for a quarantined torrent too.
+			wasQuarantined = s.clearQuarantineLocked()
+			// Wake pause-state waiters (webseeds, the DHT loop) as Resume does.
+			s.renewPauseStateChLocked()
 			s.queueTrackerEventLocked("started")
 			for _, pState := range s.Peers {
 				if !pState.Active {
@@ -557,6 +614,9 @@ func (s *Session) Start() {
 			select {
 			case s.resumeCh <- struct{}{}:
 			default:
+			}
+			if wasQuarantined {
+				s.maybeStartVerification()
 			}
 		}
 		return
@@ -632,7 +692,10 @@ func (s *Session) Start() {
 	}
 	for _, seed := range webseeds {
 		seed := seed
-		go s.webseedLoop(seed)
+		go func() {
+			defer s.crashGuard("webseed")()
+			s.webseedLoop(seed)
+		}()
 	}
 	if logging.Enabled() {
 		s.mu.RLock()
@@ -650,7 +713,8 @@ func (s *Session) Start() {
 		)
 	}
 
-	// Kick off background fast-resume verification (no-op if nothing to verify).
+	// Kick off background fast-resume verification (no-op if nothing to verify,
+	// or while the session is quarantined).
 	s.maybeStartVerification()
 }
 
@@ -765,6 +829,7 @@ func (s *Session) Close() {
 
 func (s *Session) speedMonitorLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("speed_monitor")()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -896,6 +961,9 @@ func (s *Session) IsPaused() bool {
 func (s *Session) LastError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.quarantined {
+		return s.quarantineErr
+	}
 	if s.statusErr != nil {
 		return s.statusErr
 	}
@@ -963,6 +1031,10 @@ func (s *Session) IsCompleted() bool {
 }
 
 func (s *Session) statusLocked() string {
+	if s.quarantined {
+		// Paused, and never checking: verification waits for a resume.
+		return statusPausedAfterCrash
+	}
 	if s.verifying && !s.verifyFullScan && s.statusErr == nil {
 		if s.verifyQueued {
 			return "Queued"
@@ -989,7 +1061,11 @@ func (s *Session) statusLocked() string {
 	return "Downloading"
 }
 
-// Status returns the current status text (Downloading, Seeding, Paused, Stopped, or Error).
+// statusPausedAfterCrash is the status of a quarantined session.
+const statusPausedAfterCrash = "Paused after crash"
+
+// Status returns the current status text (Downloading, Seeding, Paused,
+// Paused after crash, Stopped, or Error).
 func (s *Session) Status() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1093,7 +1169,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	// same condition statusLocked uses. The opportunistic full scan of a freshly
 	// added torrent runs alongside a normal download, so surfacing it would replace
 	// real transfer progress with disk-scan progress for the length of the scan.
-	checking := s.verifying && !s.verifyFullScan
+	checking := s.verifying && !s.verifyFullScan && !s.quarantined
 	snap.Verification = VerificationSnapshot{Active: checking, Queued: checking && s.verifyQueued, CheckedBytes: s.verifyCheckedBytes, TotalBytes: s.verifyTotalBytes}
 	if checking && !s.verifyStartTime.IsZero() {
 		elapsed := time.Since(s.verifyStartTime).Seconds()
@@ -1115,7 +1191,9 @@ func (s *Session) Snapshot() SessionSnapshot {
 		}
 	}
 	// Mirror LastError()'s precedence exactly.
-	if s.statusErr != nil {
+	if s.quarantined {
+		snap.LastError = s.quarantineErr
+	} else if s.statusErr != nil {
 		snap.LastError = s.statusErr
 	} else if s.lastErr == nil {
 		snap.LastError = s.lastTrackerErr
@@ -1309,6 +1387,7 @@ func (s *Session) Resume() {
 		return
 	}
 	s.paused = false
+	wasQuarantined := s.clearQuarantineLocked()
 	s.renewPauseStateChLocked()
 	s.queueTrackerEventLocked("started")
 	for _, pState := range s.Peers {
@@ -1333,10 +1412,40 @@ func (s *Session) Resume() {
 	default:
 		// Already signaled
 	}
+	// The check a quarantine held back runs now.
+	if wasQuarantined {
+		s.maybeStartVerification()
+	}
 
 	if s.OnStateChange != nil {
 		s.OnStateChange()
 	}
+}
+
+// setQuarantinedLocked quarantines a paused session with note (see
+// Session.quarantined). Caller holds s.mu.
+func (s *Session) setQuarantinedLocked(note string) {
+	s.quarantined = true
+	s.quarantineNote = note
+	s.quarantineErr = errors.New(note)
+}
+
+// clearQuarantineLocked lifts a quarantine and reports whether there was one.
+// Caller holds s.mu.
+func (s *Session) clearQuarantineLocked() bool {
+	was := s.quarantined
+	s.quarantined = false
+	s.quarantineNote = ""
+	s.quarantineErr = nil
+	return was
+}
+
+// IsQuarantined reports whether the session was restored paused after a crash
+// attributed to it and has not been resumed since.
+func (s *Session) IsQuarantined() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.quarantined
 }
 
 // SetFilePriority sets the download priority for a specific file.
@@ -1363,6 +1472,7 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 		return false
 	}
 	s.filePriorities[fileIndex] = priority
+	s.invalidateStatsRangesLocked()
 	s.onFilePriorityChangedLocked()
 	return true
 }
@@ -1379,6 +1489,9 @@ func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
 				changed = true
 			}
 		}
+	}
+	if changed {
+		s.invalidateStatsRangesLocked()
 	}
 	return changed
 }
@@ -1408,6 +1521,7 @@ func newFilePriorities(numFiles int) []FilePriority {
 // the pending slice. Caller holds s.mu.
 func (s *Session) installFilePrioritiesLocked(priorities []FilePriority) {
 	s.filePriorities = priorities
+	s.invalidateStatsRangesLocked()
 	if len(s.pendingFilePriorities) > 0 {
 		s.applyFilePrioritiesNoRebuild(s.pendingFilePriorities)
 		s.pendingFilePriorities = nil
@@ -1565,6 +1679,7 @@ func (s *Session) PipelineStats() SessionPipelineStats {
 // onMetadataDownloaded handles processing of the downloaded metadata info dictionary.
 func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	keepAccumulator := false
+	hashMismatch := false
 	defer func() {
 		if err != nil && !keepAccumulator {
 			// A full assembly that fails the infohash check means the size/blocks we
@@ -1574,10 +1689,17 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 			// the next peer's advertised size can take over instead of every honest peer
 			// being rejected forever by the size-mismatch guard.
 			s.mu.Lock()
+			if hashMismatch {
+				s.noteMetadataRoundFailedLocked(time.Now())
+			}
 			s.metadataCompleted = false
 			s.metadataSize = 0
 			s.metadataBuf = nil
 			s.metadataPieces = nil
+			s.metadataFrom = nil
+			s.metadataSizedBy = ""
+			s.metadataOwner = nil
+			s.metadataRoundBlocks = 0
 			s.metadataEpoch++
 			s.mu.Unlock()
 		}
@@ -1585,6 +1707,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 
 	hash := sha1.Sum(infoBytes)
 	if hash != s.Torrent.InfoHash {
+		hashMismatch = true
 		return fmt.Errorf("metadata hash mismatch: expected %x, got %x", s.Torrent.InfoHash, hash)
 	}
 
@@ -1604,8 +1727,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		// metadataSize and metadataPieces stay: a handshake handler that sized
 		// its request loop from them before this point still indexes them.
 		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
 		s.lastErr = err
 		s.statusErr = err
+		s.closeActivePeersLocked() // the session is metadata-stalled now
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return err
@@ -1702,8 +1827,10 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		keepAccumulator = true
 		s.metadataCompleted = true
 		s.metadataBuf = nil
+		s.clearMetadataBlameLocked()
 		s.verifiedMetadata = infoBytes
 		s.scheduleMetadataStorageRetryLocked()
+		s.closeActivePeersLocked() // the session is metadata-stalled now
 		s.broadcastPieceWaitersLocked()
 		s.mu.Unlock()
 		return statusErr
@@ -1740,11 +1867,13 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.PieceStates = pieceStates
 	s.pieceAvailability = pieceAvailability
 	s.Storage = st
+	s.invalidateStatsRangesLocked() // new file list and storage
 	s.releaseClaims = releaseClaims
 	s.statusErr = nil
 	// The info dict now lives in Torrent.InfoBytes; the accumulator's copy and
 	// any bytes kept for a retry are no longer needed.
 	s.metadataBuf = nil
+	s.clearMetadataBlameLocked()
 	s.verifiedMetadata = nil
 	s.metadataRetryDelay = 0
 	if s.metadataRetryTimer != nil {
@@ -1804,11 +1933,176 @@ func (s *Session) scheduleMetadataStorageRetryLocked() {
 // kept. It runs on the retry timer; onMetadataDownloaded re-checks the session
 // under s.mu and arms the next retry if the build fails again.
 func (s *Session) retryMetadataStorage() {
+	defer s.crashGuard("metadata_retry")()
 	s.mu.Lock()
 	infoBytes := s.verifiedMetadata
 	ready := infoBytes != nil && s.metadataMode && s.Storage == nil && !s.closing && !s.closed
 	s.mu.Unlock()
-	if ready {
-		_ = s.onMetadataDownloaded(infoBytes)
+	if ready && s.onMetadataDownloaded(infoBytes) == nil {
+		// The session dropped and refused every peer while metadata-stalled:
+		// let maintenance dial the known ones again at once.
+		s.mu.Lock()
+		for _, ps := range s.Peers {
+			if !ps.Active && !ps.Dialing {
+				ps.LastAttempt = time.Time{}
+			}
+		}
+		s.mu.Unlock()
 	}
+}
+
+// metadataStalledLocked reports whether a magnet has its info dict but cannot
+// use it: it failed to parse, or storage could not be built from it (a retry
+// is armed). Peers are of no use until that changes, so the session dials
+// none, drops the ones it has and refuses new ones, instead of holding shared
+// outbound slots with connections that sit idle. Caller holds s.mu (read or
+// write).
+func (s *Session) metadataStalledLocked() bool {
+	return s.metadataMode && s.metadataCompleted && s.statusErr != nil
+}
+
+// closeActivePeersLocked closes every active peer connection; each loop's
+// disconnect handler then releases it. Caller holds s.mu.
+func (s *Session) closeActivePeersLocked() {
+	for _, client := range s.activePeers {
+		if client.Conn != nil {
+			_ = client.Conn.Close()
+		}
+	}
+}
+
+// maxMetadataSuspects bounds the hosts remembered for sizing or feeding a failed
+// ut_metadata assembly; metadataSuspectTTL is how long one is remembered.
+const (
+	maxMetadataSuspects = 64
+	metadataSuspectTTL  = time.Hour
+)
+
+// Backoff between fetch rounds after consecutive failed assemblies: from the
+// second failure in a row, metadataRoundBackoffBase doubling up to
+// metadataRoundBackoffMax. Vars so tests can shorten them; treat them as
+// constants.
+var (
+	metadataRoundBackoffBase = 2 * time.Second
+	metadataRoundBackoffMax  = time.Minute
+)
+
+// noteMetadataRoundFailedLocked blames a ut_metadata assembly that failed the
+// infohash check, before the accumulator is discarded. A round fed entirely by
+// one host proves that host lied: it is banned and its connections closed. A
+// round fed by several cannot be pinned on one of them, so the contributors
+// become suspects and later rounds run solo (one connection feeds a whole
+// round), which makes the next failure attributable. The host that sized the
+// round is a suspect too, as a bogus metadata_size fails whoever supplies the
+// blocks. Suspects wait before they may size or own a new round (see
+// requestMetadataBlocks), and failures in a row back off new rounds. Loopback
+// ("") is never blamed. Caller holds s.mu.
+func (s *Session) noteMetadataRoundFailedLocked(now time.Time) {
+	// Blocks are attributed only for a whole assembly; one discarded part-way
+	// (a round replaced in the meantime) has no complete supplier list.
+	complete := len(s.metadataPieces) > 0 && len(s.metadataFrom) == len(s.metadataPieces)
+	for _, have := range s.metadataPieces {
+		if !have {
+			complete = false
+			break
+		}
+	}
+	if complete {
+		hosts := make(map[string]struct{}, 4)
+		for _, host := range s.metadataFrom {
+			hosts[host] = struct{}{}
+		}
+		for host := range hosts {
+			s.addMetadataSuspectLocked(host, now)
+		}
+		if len(hosts) == 1 {
+			if host := s.metadataFrom[0]; host != "" {
+				s.banHostLocked(host, now)
+				s.closeHostConnsLocked(host)
+			}
+		} else {
+			s.metadataSolo = true
+		}
+	}
+	s.addMetadataSuspectLocked(s.metadataSizedBy, now)
+	s.metadataFailStreak++
+	if s.metadataFailStreak >= 2 {
+		s.metadataNextRoundAt = now.Add(metadataRoundBackoff(s.metadataFailStreak))
+	}
+	s.metadataResetAt = now
+}
+
+// metadataRoundBackoff is the pause before a new fetch round after streak
+// failed assemblies in a row (streak >= 2).
+func metadataRoundBackoff(streak int) time.Duration {
+	d := metadataRoundBackoffBase
+	for i := 2; i < streak && d < metadataRoundBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, metadataRoundBackoffMax)
+}
+
+// clearMetadataBlameLocked forgets the blame state once the fetched info dict
+// passed the infohash check: nobody lied about it. Caller holds s.mu.
+func (s *Session) clearMetadataBlameLocked() {
+	s.metadataFrom = nil
+	s.metadataSolo = false
+	s.metadataOwner = nil
+	s.metadataSuspects = nil
+	s.metadataFailStreak = 0
+	s.metadataNextRoundAt = time.Time{}
+}
+
+// addMetadataSuspectLocked records host as a suspect of a failed assembly. The
+// set holds at most maxMetadataSuspects hosts: expired entries go first, then
+// the one recorded longest ago. Caller holds s.mu.
+func (s *Session) addMetadataSuspectLocked(host string, now time.Time) {
+	if host == "" {
+		return
+	}
+	if _, known := s.metadataSuspects[host]; !known && len(s.metadataSuspects) >= maxMetadataSuspects {
+		var oldestHost string
+		var oldest time.Time
+		for h, at := range s.metadataSuspects {
+			if now.Sub(at) >= metadataSuspectTTL {
+				delete(s.metadataSuspects, h)
+				continue
+			}
+			if oldestHost == "" || at.Before(oldest) {
+				oldestHost, oldest = h, at
+			}
+		}
+		if len(s.metadataSuspects) >= maxMetadataSuspects {
+			delete(s.metadataSuspects, oldestHost)
+		}
+	}
+	if s.metadataSuspects == nil {
+		s.metadataSuspects = make(map[string]time.Time)
+	}
+	s.metadataSuspects[host] = now
+}
+
+// metadataSuspectLocked reports whether host sized or fed a failed assembly
+// within metadataSuspectTTL. Caller holds s.mu (read or write).
+func (s *Session) metadataSuspectLocked(host string, now time.Time) bool {
+	if host == "" {
+		return false
+	}
+	at, ok := s.metadataSuspects[host]
+	return ok && now.Sub(at) < metadataSuspectTTL
+}
+
+// metadataFeedSlow reports whether a ut_metadata feed that began at since, has
+// taken blocks blocks and last took one at lastBlock has become too slow to
+// wait on: nothing for metadataSizeStallTimeout, or, after a first
+// metadataSizeStallTimeout of grace, fewer than one block per
+// metadataMinBlockPeriod on average. Honest peers deliver a whole info dict in
+// seconds, so only a feed dripping blocks to hold on to the round fails this.
+func metadataFeedSlow(now, since, lastBlock time.Time, blocks int) bool {
+	if now.Sub(lastBlock) >= metadataSizeStallTimeout {
+		return true
+	}
+	elapsed := now.Sub(since)
+	return elapsed >= metadataSizeStallTimeout &&
+		time.Duration(blocks)*metadataMinBlockPeriod < elapsed-metadataSizeStallTimeout
 }

@@ -277,6 +277,68 @@ SAINTTORRENT_BENCH=1 ./sainttorrent -d /path/to/downloads
 go test -bench='BenchmarkColdStartup|BenchmarkShutdown' -benchmem ./pkg/downloader
 ```
 
+### State, crashes and recovery
+
+saintTorrent keeps its state in `os.UserConfigDir()/sainttorrent`
+(`~/.config/sainttorrent` on Linux, `~/Library/Application Support/sainttorrent`
+on macOS), or in the directory given to `--config`. saintTorrent creates what it
+keeps there private to your user (directories `0700`, files `0600`):
+
+| Path | What it holds |
+| --- | --- |
+| `session.json` | Every torrent: download directory, paused state, file priorities, and any crash quarantine |
+| `torrents/` | A cached copy of each `.torrent` (these can carry private-tracker passkeys) |
+| `restore-failures.log` | Why a torrent failed to restore at startup, one line per failure |
+| `crash/` | One `<time>-<info-hash>-<component>.txt` file per recorded crash (the newest 32 are kept), and `fatal.txt`, where the Go runtime writes fatal errors (rotated to `fatal.txt.1` past 1 MiB) |
+| `running` | Present while saintTorrent runs; removed on a clean exit |
+| `crash-state.json` | How many runs in a row ended in a crash no torrent was blamed for |
+
+Pass `--no-persist` to keep no state at all: nothing is restored on the next
+launch, and no crash handling applies.
+
+When a goroutine working for a torrent panics (a peer connection, a tracker
+announce, piece writing or checking, a web seed, restoring it at startup),
+saintTorrent records the crash in `crash/` under that torrent's info-hash and
+exits with the full trace, rather than carrying on in a state it cannot trust.
+On the next launch a leftover `running` file shows that the previous run did
+not exit cleanly, and:
+
+- A torrent a crash was recorded for is restored **Paused after crash**
+  (quarantined). It is not checked or started, since its data or its peers may
+  be what crashed; its error line points at the crash file. Resuming it lifts
+  the quarantine. Until then it stays quarantined across restarts.
+- A torrent that crashed saintTorrent *while being restored* is not loaded at
+  all, since loading it would crash again. It stays in `session.json`, the
+  startup line names its info-hash, and `--start-paused` loads it paused and
+  quarantined.
+- A crash no torrent is blamed for (the terminal UI, the DHT, a fatal runtime
+  error, or the process being killed outright by `SIGKILL`, the OOM killer or
+  a power cut) in the first 10 minutes of a run is counted. After two such
+  crashes in a row, every torrent is restored paused, and the startup line
+  says `saintTorrent stopped unexpectedly twice in a row; all torrents were
+  restored paused`. A clean exit, or a run that lasted 10 minutes, resets the
+  count. Quitting with `q`, `Ctrl+C` or `SIGTERM`, or closing the terminal
+  window (`SIGHUP`), is a clean exit.
+
+Start with `--start-paused` to restore every torrent paused regardless, for
+example to get past a crash loop and resume torrents one at a time.
+
+---
+
+## Known limitations
+
+- **SHA-1 only (BitTorrent v1).** Pieces and info-hashes are SHA-1. Its
+  collision attacks (SHAttered, and BitErrant against BitTorrent) let the author
+  of a torrent build two payloads that share piece hashes, so only the person
+  who made the torrent can exploit them, not other peers. v2 torrents (BEP 52,
+  SHA-256) are not supported.
+- **DHT lookups are not private.** A DHT lookup sends the torrent's real
+  info-hash to the nodes it queries, so they learn what you are downloading.
+- **Peer IDs are linkable within a torrent.** The peer ID starts with
+  `-ST0001-`, which identifies the client, and stays the same for every
+  connection of a torrent, so peers can link those connections to each other.
+  Each torrent gets its own random peer ID.
+
 ---
 
 ## Project Structure

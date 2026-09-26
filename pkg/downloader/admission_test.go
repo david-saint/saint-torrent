@@ -170,6 +170,175 @@ func TestActiveConnectionIsNotOverwritten(t *testing.T) {
 	}
 }
 
+// startDirectedConnA1 is startAdmissionConn with a choice of direction: an
+// outbound connection runs as connectToPeer runs it after a successful dial.
+func startDirectedConnA1(t *testing.T, sess *Session, ip string, port uint16, remoteID [20]byte, outbound bool) *admissionConn {
+	t.Helper()
+	local, remote := net.Pipe()
+	client := peer.NewClient(local, sess.Torrent.InfoHash, sess.PeerID)
+	client.RemotePeerID = remoteID
+	c := &admissionConn{client: client, remote: remote, done: make(chan struct{})}
+	go func() { _, _ = io.Copy(io.Discard, remote) }()
+	addr := net.JoinHostPort(ip, strconv.Itoa(int(port)))
+	go func() {
+		sess.runPeerMessageLoop(client, local, addr, ip, port, fastReserved(), outbound)
+		close(c.done)
+	}()
+	t.Cleanup(func() {
+		_ = remote.Close()
+		select {
+		case <-c.done:
+		case <-time.After(5 * time.Second):
+			t.Error("peer loop did not exit")
+		}
+	})
+	return c
+}
+
+// knownDialedPeerA1 records addr as connectToPeer leaves a peer it just
+// handshook with: dialable, failure count cleared, attempted long ago.
+func knownDialedPeerA1(sess *Session, ip string, port uint16) *PeerState {
+	ps := &PeerState{IP: ip, Port: port, Dialable: true, AmChoking: true, Choked: true, LastAttempt: time.Now().Add(-time.Hour)}
+	sess.mu.Lock()
+	sess.Peers[net.JoinHostPort(ip, strconv.Itoa(int(port)))] = ps
+	sess.mu.Unlock()
+	return ps
+}
+
+// An outbound connection refused at admission (the host is at its connection
+// cap, or the peer ID is connected already) counts as a failed attempt, so the
+// address backs off like one that failed to dial instead of being redialled
+// every peerRedialBackoff.
+func TestRefusedOutboundConnectionBacksOff(t *testing.T) {
+	t.Run("per_ip_limit", func(t *testing.T) {
+		sess := newWireTestSession(t, 4, 16*1024)
+		for i := 0; i < maxConnectionsPerIP; i++ {
+			c := startAdmissionConn(t, sess, "10.3.3.3", uint16(8100+i), peerIDFor(8100+i))
+			admitted(t, sess, fmt.Sprintf("10.3.3.3:%d", 8100+i), c.client)
+		}
+		ps := knownDialedPeerA1(sess, "10.3.3.3", 6881)
+		startDirectedConnA1(t, sess, "10.3.3.3", 6881, peerIDFor(8199), true).rejected(t)
+		sess.mu.RLock()
+		defer sess.mu.RUnlock()
+		if ps.FailCount != 1 || time.Since(ps.LastAttempt) > time.Minute {
+			t.Fatalf("after a per_ip_limit refusal: FailCount %d, LastAttempt %v ago; want 1, just now", ps.FailCount, time.Since(ps.LastAttempt))
+		}
+	})
+	t.Run("duplicate_peer_id", func(t *testing.T) {
+		sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+		c := startAdmissionConn(t, sess, "10.4.4.4", 8200, peerIDFor(1))
+		admitted(t, sess, "10.4.4.4:8200", c.client)
+		ps := knownDialedPeerA1(sess, "10.5.5.5", 6881)
+		startDirectedConnA1(t, sess, "10.5.5.5", 6881, peerIDFor(1), true).rejected(t)
+		sess.mu.RLock()
+		defer sess.mu.RUnlock()
+		if ps.FailCount != 1 || time.Since(ps.LastAttempt) > time.Minute {
+			t.Fatalf("after a duplicate_peer_id refusal: FailCount %d, LastAttempt %v ago; want 1, just now", ps.FailCount, time.Since(ps.LastAttempt))
+		}
+	})
+}
+
+// When we dial a peer while it dials us, both connections carry the same peer ID
+// from the same host. Refusing the second one on both ends dropped both; now each
+// end keeps the connection opened by the side with the greater peer ID, whichever
+// arrived first, and the loser's exit leaves the winner's ID entry in place. The
+// survivor is worked out with libtorrent's rule from the remote's side, so a
+// libtorrent peer that resolves the duplicate by ID closes the same connection.
+func TestSimultaneousOpenKeepsOneConnection(t *testing.T) {
+	lowID := peerIDFor(1) // "-TT0001-000000000001", below withPeerID's
+	var highID [20]byte
+	copy(highID[:], "-ZZ0001-000000000001")
+	for _, tc := range []struct {
+		name          string
+		remoteID      [20]byte
+		firstOutbound bool
+	}{
+		{"we are lower, outbound first", highID, true},
+		{"we are lower, inbound first", highID, false},
+		{"we are higher, outbound first", lowID, true},
+		{"we are higher, inbound first", lowID, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+			// libtorrent keeps a new connection over an existing one with the
+			// same ID iff (pid < our_peer_id) == is_outgoing()
+			// (bt_peer_connection.cpp). On the remote's side pid is our ID,
+			// our_peer_id its own, and our outbound connection is incoming, so
+			// it keeps its own outgoing connection (our inbound one) iff our ID
+			// is the lower.
+			remoteKeepsItsOutgoing := string(sess.PeerID[:]) < string(tc.remoteID[:])
+			const ip = "10.6.6.6"
+			ports := map[bool]uint16{true: 6881, false: 51413} // outbound: listen port; inbound: source port
+			if tc.firstOutbound {
+				knownDialedPeerA1(sess, ip, ports[true])
+			}
+			first := startDirectedConnA1(t, sess, ip, ports[tc.firstOutbound], tc.remoteID, tc.firstOutbound)
+			firstAddr := net.JoinHostPort(ip, strconv.Itoa(int(ports[tc.firstOutbound])))
+			admitted(t, sess, firstAddr, first.client)
+
+			secondOutbound := !tc.firstOutbound
+			if secondOutbound {
+				knownDialedPeerA1(sess, ip, ports[true])
+			}
+			second := startDirectedConnA1(t, sess, ip, ports[secondOutbound], tc.remoteID, secondOutbound)
+			secondAddr := net.JoinHostPort(ip, strconv.Itoa(int(ports[secondOutbound])))
+
+			// We must keep the connection the remote keeps.
+			ourOutboundWins := !remoteKeepsItsOutgoing
+			winner, winnerAddr, loser := second, secondAddr, first
+			if secondOutbound != ourOutboundWins {
+				winner, winnerAddr, loser = first, firstAddr, second
+			}
+			if winner == second {
+				admitted(t, sess, secondAddr, second.client)
+			}
+			loser.rejected(t) // its loop has exited
+			select {
+			case <-winner.done:
+				t.Fatal("the winning connection was closed too")
+			default:
+			}
+
+			sess.mu.RLock()
+			defer sess.mu.RUnlock()
+			if len(sess.activePeers) != 1 || sess.activePeers[winnerAddr] != winner.client {
+				t.Fatalf("active connections %v, want only %s", len(sess.activePeers), winnerAddr)
+			}
+			if owner, ok := sess.admission.peerIDs[tc.remoteID]; !ok || owner.addr != winnerAddr {
+				t.Fatalf("peer ID owner %+v (present %v), want %s", owner, ok, winnerAddr)
+			}
+			if n := sess.admission.perHost[ip]; n != 1 {
+				t.Fatalf("host counted %d times, want 1", n)
+			}
+		})
+	}
+}
+
+// Only a simultaneous open (same host, other direction) may replace a connection:
+// the same peer ID from another host, or from the same host in the same
+// direction, is refused, so a peer spoofing an ID cannot evict its owner.
+func TestDuplicatePeerIDFromAnotherHostIsRefused(t *testing.T) {
+	lowID := peerIDFor(1) // below withPeerID's, so our outbound would win a tie-break
+	sess := withPeerID(newWireTestSession(t, 4, 16*1024))
+	owner := startAdmissionConn(t, sess, "10.7.7.7", 51413, lowID)
+	admitted(t, sess, "10.7.7.7:51413", owner.client)
+
+	knownDialedPeerA1(sess, "10.8.8.8", 6881)
+	startDirectedConnA1(t, sess, "10.8.8.8", 6881, lowID, true).rejected(t)
+	startAdmissionConn(t, sess, "10.7.7.7", 51414, lowID).rejected(t)
+
+	select {
+	case <-owner.done:
+		t.Fatal("a duplicate peer ID evicted the connection that owns it")
+	default:
+	}
+	sess.mu.RLock()
+	defer sess.mu.RUnlock()
+	if o := sess.admission.peerIDs[lowID]; o.addr != "10.7.7.7:51413" {
+		t.Fatalf("peer ID owner %+v, want the first connection", o)
+	}
+}
+
 // Dialling an address that answers with our own peer ID (our listener, handed
 // back by a tracker or the DHT) is detected, and the address is not dialled again.
 func TestSelfDialIsRememberedAndNotRepeated(t *testing.T) {

@@ -3,11 +3,15 @@ package downloader
 import (
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,9 +25,9 @@ import (
 // startStalledMockPeer accepts one connection, completes the handshake, advertises
 // all pieces, unchokes on Interested, and then deliberately delivers NO piece data
 // while keeping the socket warm with frequent keep-alives. It is the canonical
-// "dead weight" peer: it holds its connection slot and resets the read deadline
-// forever without ever giving us a block. The single read goroutine sends a
-// keep-alive whenever the read deadline elapses, so writes never race.
+// "dead weight" peer: it holds its connection slot and looks alive forever
+// without ever giving us a block. The single read goroutine sends a keep-alive
+// whenever its own read deadline elapses, so writes never race.
 func startStalledMockPeer(t *testing.T, ln net.Listener, fullBitfield []byte) {
 	t.Helper()
 	go func() {
@@ -659,4 +663,79 @@ func TestStalledInboundPeerIsNotReaped(t *testing.T) {
 
 func trackerPeer(ip string, port uint16) tracker.Peer {
 	return tracker.Peer{IP: net.ParseIP(ip), Port: port}
+}
+
+// waitActiveA2 waits until the session has an active connection keyed addr.
+func waitActiveA2(t *testing.T, sess *Session, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sess.mu.RLock()
+		_, active := sess.activePeers[addr]
+		sess.mu.RUnlock()
+		if active {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connection %s never became active", addr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestMetadataErrorStopsPeerChurnA2 covers a magnet whose verified metadata
+// cannot be used (storage cannot be built, or the dict does not parse). It kept
+// dialing up to maxOutboundPeers of the shared outbound slots for peers that
+// then sat idle until the stall reaper dropped them and maintenance redialed.
+// It now drops its connections, dials nobody, refuses new connections, and
+// dials its known peers again as soon as a storage retry succeeds.
+func TestMetadataErrorStopsPeerChurnA2(t *testing.T) {
+	infoBytes := testInfoDict(t, "stalled.bin")
+	var unavailable atomic.Bool
+	unavailable.Store(true)
+	sess := newTestMagnetSession(t, infoBytes, func(dir string, files []storage.FileInfo, pieceLength int64) (storage.Storage, error) {
+		if unavailable.Load() {
+			return nil, errors.New("volume not mounted")
+		}
+		return memStorageFactory(dir, files, pieceLength)
+	})
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+
+	fetching := startWirePeerAtA2(t, sess, "203.0.113.80", 6401)
+	waitActiveA2(t, sess, "203.0.113.80:6401")
+	ln, port, accepted := acceptCountingListener(t)
+	defer ln.Close()
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	sess.mu.Lock()
+	sess.Peers[addr] = &PeerState{IP: "127.0.0.1", Port: uint16(port), AmChoking: true, Choked: true, Dialable: true}
+	sess.mu.Unlock()
+
+	if err := sess.onMetadataDownloaded(infoBytes); err == nil {
+		t.Fatal("metadata was applied although no storage could be built")
+	}
+	fetching.waitClosed(2 * time.Second)
+
+	sess.maintainPeerConnections()
+	sess.addPeer(addr, false)
+	sess.connectTrackerPeers([]netip.AddrPort{netip.MustParseAddrPort(addr)})
+	if n := accepted(); n != 0 {
+		t.Fatalf("a metadata-stalled session dialed %d peer(s)", n)
+	}
+	startWirePeerAtA2(t, sess, "203.0.113.81", 6402).waitClosed(2 * time.Second)
+
+	// A successful storage retry makes the known peers dialable at once.
+	sess.mu.Lock()
+	sess.Peers[addr].LastAttempt = time.Now()
+	sess.mu.Unlock()
+	unavailable.Store(false)
+	sess.retryMetadataStorage()
+	if sess.IsMetadataMode() {
+		t.Fatal("storage retry did not publish the torrent")
+	}
+	sess.maintainPeerConnections()
+	if n := accepted(); n == 0 {
+		t.Fatal("known peers were not dialed again after the storage retry succeeded")
+	}
 }

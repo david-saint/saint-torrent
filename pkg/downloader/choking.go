@@ -8,6 +8,7 @@ import (
 
 func (s *Session) chokeLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("choke")()
 	s.mu.Lock()
 	s.chokeTimer = time.NewTicker(10 * time.Second)
 	s.optimisticTimer = time.NewTicker(30 * time.Second)

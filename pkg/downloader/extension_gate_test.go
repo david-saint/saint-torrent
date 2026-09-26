@@ -38,7 +38,12 @@ func TestPeerLoopDropsOversizedExtensionMessages(t *testing.T) {
 			w.sendExtended(tc.extID, flatListPayload((tc.size-2)/2))
 			w.barrier()
 
-			w.sendExtended(tc.extID, flatListPayload(tc.size/2))
+			// Over it the peer is dropped. A message over the largest extended
+			// frame is refused from its header, so the connection may close
+			// while the payload is still being written.
+			over := &peer.Message{ID: peer.MsgExtended, Payload: append([]byte{tc.extID}, flatListPayload(tc.size/2)...)}
+			_ = w.remote.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, _ = w.remote.Write(over.Serialize())
 			w.waitClosed(2 * time.Second)
 		})
 	}

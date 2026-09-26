@@ -8,7 +8,7 @@ import (
 )
 
 // keepAlive sends msg (nil: a keep-alive) every interval until stop closes,
-// keeping the connection's read deadline fresh the way an idle slot-holder would.
+// keeping the connection alive the way an idle slot-holder would.
 func (w *wirePeer) keepAlive(msg *peer.Message, interval time.Duration, stop <-chan struct{}) {
 	go func() {
 		ticker := time.NewTicker(interval)

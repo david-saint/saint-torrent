@@ -5,14 +5,18 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
+	"os"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/tracker"
 	"sainttorrent/pkg/utp"
+	"slices"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,8 +24,9 @@ import (
 // peerStallTimeout bounds how long an outbound peer may hold its connection slot
 // without delivering a single block of data we want. A connection's slot is held
 // for the whole life of its read loop, and a peer that chokes us forever — or
-// trickles only keep-alives/Have messages — resets the socket read deadline
-// without ever giving us data, so without this it would occupy a slot indefinitely.
+// trickles only keep-alives/Have messages, or sends nothing at all — keeps its
+// socket alive without ever giving us data, so without this it would occupy a
+// slot indefinitely. The loop's liveness ticker runs the check for a silent peer.
 // In a slow swarm those dead-weight connections accumulate until the (shared,
 // manager-wide) outbound pool is full and NO session can dial a fresh peer, which
 // flatlines every torrent at once until a restart clears the pools. Any single
@@ -34,10 +39,58 @@ var peerStallTimeout = 60 * time.Second
 
 // peerInactivityTimeout drops a connection, in either direction, on which neither
 // side has been interested and no payload has moved for this long (libtorrent's
-// inactivity_timeout). The stall reaper only covers outbound connections while we
-// download, so without this an idle peer sending keep-alives could hold an inbound
-// slot for good. A var so tests can shorten it; treat it as a constant.
+// inactivity_timeout): the idle drop. The stall reaper only covers outbound
+// connections while we download, so without this an idle peer sending keep-alives
+// could hold an inbound slot for good. A var so tests can shorten it; treat it as
+// a constant.
 var peerInactivityTimeout = 10 * time.Minute
+
+// peerReadTimeout is how long a connection may go without receiving a byte before
+// its read fails: the backstop for a dead socket, not the silent-peer timeout
+// (the stall reaper and the inactivity drop are). BEP 3 peers send a keep-alive
+// at least every two minutes, and libtorrent drops a peer after 120 s of silence,
+// so 150 s leaves slack. The reader arms the deadline lazily, 1.5x this far out
+// once less than this remains, so a silent peer is dropped 150-225 s after its
+// last byte at a cost of one deadline update per 75 s, not one per message. A var
+// so tests can shorten it; treat it as a constant.
+var peerReadTimeout = 150 * time.Second
+
+// peerKeepAliveInterval is how often a connection checks whether it wrote
+// anything to the peer and sends a keep-alive if not, so the gap between two of
+// our writes stays under twice this (plus one liveness tick), well within the
+// 120 s after which libtorrent drops a silent peer. A write to a peer that stopped
+// reading is bounded by the peer write timeout (pkg/peer). A var so tests can
+// shorten it; treat it as a constant.
+var peerKeepAliveInterval = 30 * time.Second
+
+// peerIdleTickInterval is the period of a connection's liveness ticker while it
+// has no piece in flight; with pieces in flight it ticks every pumpSweepInterval
+// so request timeouts fire on time. Each tick runs the loop's top-of-loop checks
+// (stall reaper, inactivity drop, request-timeout sweep) for a peer that sends
+// nothing, and the keep-alive check. A var so tests can shorten it; treat it as a
+// constant.
+var peerIdleTickInterval = 30 * time.Second
+
+// peerInterestScanInterval bounds how often an Interested from one connection may
+// scan every known peer to decide whether to unchoke it at once. Between scans
+// the peer is only marked interested and the next choke round (every 10 s)
+// decides, so a peer flipping Interested and NotInterested cannot make us walk
+// the peer map under the session write lock per 5-byte message. A var so tests
+// can change it; treat it as a constant.
+var peerInterestScanInterval = 10 * time.Second
+
+// interestScanHook, when set, is called each time an Interested runs the unchoke
+// scan. Tests use it to count scans.
+var interestScanHook func()
+
+// chokeTransitionHook, when set, is called each time a peer's choke state changes
+// (a choke or unchoke that is not a repeat). Tests use it to count them.
+var chokeTransitionHook func(choked bool)
+
+// unsolicitedFloodSlack is how many bytes of piece data we did not ask for (or no
+// longer wait for) a connection may send beyond the late-block allowance before
+// it is dropped as a flood; see the MsgPiece handler.
+const unsolicitedFloodSlack = 4 << 20
 
 // peerMaintenanceInterval is how often peerMaintenanceLoop redials toward a full
 // outbound connection set. New dials previously happened ONLY on a tracker
@@ -80,9 +133,32 @@ var metadataRetryInterval = 2 * time.Second
 // replace it. The first peer to advertise a size fixes it for everyone and peers
 // advertising another size are not asked, so without this one peer advertising a
 // bogus size and never answering would stall a magnet for good; honest peers,
-// which all advertise the true size, deliver a block well within it. A var so
-// tests can shorten it; treat it as a constant in production.
+// which all advertise the true size, deliver a block well within it. It is also
+// how long an owner of a solo round may go without a block before another
+// connection takes the round over, and how long a suspect host waits after a
+// failed round before it may size or own the next. A var so tests can shorten
+// it; treat it as a constant in production.
 var metadataSizeStallTimeout = 20 * time.Second
+
+// metadataMinBlockPeriod is the slowest average feed (one 16 KiB block per
+// period, 8 KiB/s) a ut_metadata round may run at, past its first
+// metadataSizeStallTimeout, before a peer advertising another size may replace
+// it (see metadataFeedSlow). Without it a peer that sized the round with a bogus
+// size could hold it for hours by answering one block just inside every stall
+// timeout. A var so tests can change it; treat it as a constant.
+var metadataMinBlockPeriod = 2 * time.Second
+
+// metadataRejectRetryAfter is how long after a peer rejected a ut_metadata
+// request (libtorrent does so while rate limiting) we ask it for that block
+// again, as libtorrent waits a minute after a reject; metadataRequestTimeout is
+// how long a request may go unanswered before it is asked again. Without them a
+// single-source magnet whose peer dropped or refused one request stalled until
+// the connection was replaced. Vars so tests can shorten them; treat them as
+// constants.
+var (
+	metadataRejectRetryAfter = time.Minute
+	metadataRequestTimeout   = 30 * time.Second
+)
 
 // metadataServeWindow and metadataServeRequestsPerBlock bound how many ut_metadata
 // blocks one connection may have us serve: an honest fetcher asks for each block
@@ -169,10 +245,20 @@ func minRetry(a, b time.Duration) time.Duration {
 	}
 }
 
+// laterTime returns the later of a and b.
+func laterTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
 // prunePeersLocked evicts inactive known-peer entries when the Peers map grows past
 // maxKnownPeers: first those past maxPeerFailCount, so a flood of dead addresses
-// cannot push out peers that work, then oldest-attempt-first. Active peers are
-// never evicted. Caller holds s.mu.
+// cannot push out peers that work, then the ones least recently tried or listed
+// (the later of LastAttempt and seenAt), so a peer recorded undialed because
+// every slot was busy is not the first to go. Active peers are never evicted.
+// Caller holds s.mu.
 func (s *Session) prunePeersLocked() {
 	if len(s.Peers) <= maxKnownPeers {
 		return
@@ -187,7 +273,7 @@ func (s *Session) prunePeersLocked() {
 		if ps.Active {
 			continue
 		}
-		inactive = append(inactive, agedPeer{addr: addr, at: ps.LastAttempt, failed: ps.FailCount >= maxPeerFailCount})
+		inactive = append(inactive, agedPeer{addr: addr, at: laterTime(ps.LastAttempt, ps.seenAt), failed: ps.FailCount >= maxPeerFailCount})
 	}
 	sort.Slice(inactive, func(i, j int) bool {
 		if inactive[i].failed != inactive[j].failed {
@@ -262,6 +348,7 @@ func (s *Session) broadcastHave(index uint32) {
 // than wedging at zero once the initial connections go stale.
 func (s *Session) peerMaintenanceLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("peer_maintenance")()
 	ticker := time.NewTicker(peerMaintenanceInterval)
 	defer ticker.Stop()
 	for {
@@ -289,7 +376,8 @@ func (s *Session) maintainPeerConnections() {
 	// Only maintain download connections while there is still something to fetch.
 	// When seeding, inbound connections and the normal announce flow cover uploads;
 	// isCompletedLocked is false in metadata mode, so metadata fetches still churn.
-	if s.isCompletedLocked() {
+	// A magnet whose metadata cannot be used yet has no use for peers.
+	if s.isCompletedLocked() || s.metadataStalledLocked() {
 		return
 	}
 
@@ -339,6 +427,7 @@ func (s *Session) maintainPeerConnections() {
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
+	defer s.crashGuard("peer_dial")()
 	// Keyed like addPeer, PEX, DHT and inbound connections (net.JoinHostPort), so
 	// an IPv6 peer's entry is found here too.
 	peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
@@ -404,7 +493,7 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	}
 	acquiredSlots = true
 
-	conn, err := s.dialPeer(peerAddr)
+	conn, transport, err := s.dialPeer(peerAddr)
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
 		if logging.Enabled() {
@@ -415,7 +504,6 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 		return
 	}
-	tunePeerConn(conn)
 
 	// Spawn context monitor before encryption negotiation so shutdown interrupts
 	// both MSE handshakes and the later peer-wire message loop.
@@ -436,39 +524,37 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 	}()
 
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	conn, err = s.negotiateOutgoingPeerConn(peerAddr, conn, connMonitor)
+	out, step, err := s.handshakeOutgoingPeer(peerAddr, conn, transport, connMonitor, s.dialPeer)
+	if err != nil && out.transport == "utp" && isTimeoutErr(err) && s.ctx.Err() == nil {
+		// The uTP connection came up but the handshake over it timed out: most
+		// often a peer running an older saintTorrent, whose uTP numbering
+		// stalls against ours, or a path that passes uTP's SYN but not its
+		// data. Retry once, straight away and over TCP only, in the slots
+		// already held, instead of charging the peer a failed attempt.
+		if tcpConn, _, tcpErr := s.dialPeerTCP(peerAddr); tcpErr != nil {
+			err = errors.Join(err, tcpErr)
+		} else {
+			out, step, err = s.handshakeOutgoingPeer(peerAddr, tcpConn, "tcp", connMonitor, s.dialPeerTCP)
+		}
+	}
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
 		if logging.Enabled() {
-			logging.Debug("peer_negotiation_failed",
+			event := "peer_handshake_failed"
+			if step == "negotiation" {
+				event = "peer_negotiation_failed"
+			}
+			logging.Debug(event,
 				logging.String("peer", peerAddr),
+				logging.String("transport", out.transport),
 				logging.Err(err),
 			)
 		}
 		return
 	}
-	connMonitor.set(conn)
+	conn = out.conn
 	defer conn.Close()
-
-	// Handshake with deadline
-	_ = conn.SetDeadline(time.Now().Add(peerHandshakeTimeout))
-	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
-	s.mu.RLock()
-	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
-	s.mu.RUnlock()
-	handshake, err := client.Handshake()
-	if err != nil {
-		s.markPeerAttemptFailed(peerAddr)
-		if logging.Enabled() {
-			logging.Debug("peer_handshake_failed",
-				logging.String("peer", peerAddr),
-				logging.Err(err),
-			)
-		}
-		return
-	}
-	_ = conn.SetDeadline(time.Time{}) // clear deadline
+	client, handshake := out.client, out.handshake
 
 	if handshake.InfoHash != s.Torrent.InfoHash {
 		s.markPeerAttemptFailed(peerAddr)
@@ -493,51 +579,186 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	s.runPeerMessageLoop(client, conn, peerAddr, p.IP.String(), p.Port, handshake.Reserved, true)
 }
 
-func (s *Session) dialPeer(peerAddr string) (net.Conn, error) {
-	// Transport policy: prefer TCP for existing swarm compatibility, then fall
-	// back to uTP on the same endpoint. Race both when uTP is available so a
-	// firewalled TCP path does not hold the bounded outbound slot for two full
-	// dial timeouts before uTP gets a chance.
-	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
+// outgoingPeer is an outbound connection that completed its handshake.
+type outgoingPeer struct {
+	conn      net.Conn
+	transport string // "tcp" or "utp"; set on failure too
+	client    *peer.Client
+	handshake *peer.Handshake
+}
+
+// handshakeOutgoingPeer runs the encryption negotiation (per the session's
+// policy) and the BitTorrent handshake on conn, a fresh connection to peerAddr
+// over transport, each bounded by peerDialHandshakeTimeout. redial dials the
+// peer again for a plaintext fallback after a failed MSE handshake. On failure
+// the connection is closed, and step names the step that failed
+// ("negotiation" or "handshake").
+func (s *Session) handshakeOutgoingPeer(peerAddr string, conn net.Conn, transport string, monitor *monitoredPeerConn, redial func(string) (net.Conn, string, error)) (out outgoingPeer, step string, err error) {
+	tunePeerConn(conn)
+	monitor.set(conn)
+	_ = conn.SetDeadline(time.Now().Add(peerDialHandshakeTimeout))
+	conn, transport, err = s.negotiateOutgoingPeerConn(peerAddr, conn, transport, monitor, redial)
+	if err != nil {
+		return outgoingPeer{transport: transport}, "negotiation", err
+	}
+	monitor.set(conn)
+
+	_ = conn.SetDeadline(time.Now().Add(peerDialHandshakeTimeout))
+	client := peer.NewClient(conn, s.Torrent.InfoHash, s.PeerID)
+	s.mu.RLock()
+	client.DisableDHT = !s.allowsDecentralizedPeerDiscoveryLocked()
+	s.mu.RUnlock()
+	handshake, err := client.Handshake()
+	if err != nil {
+		_ = conn.Close()
+		return outgoingPeer{transport: transport}, "handshake", err
+	}
+	_ = conn.SetDeadline(time.Time{}) // clear deadline
+	return outgoingPeer{conn: conn, transport: transport, client: client, handshake: handshake}, "", nil
+}
+
+// isTimeoutErr reports whether err is, or wraps, an I/O timeout.
+func isTimeoutErr(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// peerDialTimeout bounds one dial attempt, whatever the transport.
+const peerDialTimeout = 5 * time.Second
+
+// peerDialHandshakeTimeout bounds each of an outbound connection's encryption
+// negotiation and BitTorrent handshake. A var so tests can shorten it; treat it
+// as a constant.
+var peerDialHandshakeTimeout = peerHandshakeTimeout
+
+// dialTCPGraceMin and dialTCPGraceMax bound how long a uTP connection that came
+// up first waits for the TCP dial to the same peer (see pickDialResult). Vars
+// so tests can change them; treat them as constants.
+var (
+	dialTCPGraceMin = 250 * time.Millisecond
+	dialTCPGraceMax = time.Second
+)
+
+// peerTCPDial dials addr over TCP. A var so tests can slow or fail it.
+var peerTCPDial = func(ctx context.Context, addr string) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "tcp", addr)
+}
+
+// dialPeer connects to peerAddr and reports the transport it used. TCP is
+// preferred: our uTP has no congestion control or fast retransmit yet, so it
+// recovers from loss far more slowly, and it stalls against older
+// saintTorrent peers. When uTP is available both are dialed at once, so a
+// firewalled TCP path does not hold the bounded outbound slot for a whole dial
+// timeout before uTP gets a chance; pickDialResult then keeps uTP only if TCP
+// fails or does not connect soon after it.
+func (s *Session) dialPeer(peerAddr string) (net.Conn, string, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, peerDialTimeout)
 	defer cancel()
 
 	s.mu.RLock()
 	udpSocket := s.utpSocket
 	s.mu.RUnlock()
 
-	dialCount := 1
-	if udpSocket != nil {
-		dialCount = 2
+	if udpSocket == nil {
+		conn, err := peerTCPDial(ctx, peerAddr)
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, "tcp", nil
 	}
-	results := make(chan transportDialResult, dialCount)
 
+	dialStart := time.Now()
+	tcpCtx, cancelTCP := context.WithCancel(ctx)
+	defer cancelTCP()
+	utpCtx, cancelUTP := context.WithCancel(ctx)
+	defer cancelUTP()
+	results := make(chan transportDialResult, 2)
 	go func() {
-		dialer := net.Dialer{}
-		conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
+		defer s.crashGuard("peer_dial_transport")()
+		conn, err := peerTCPDial(tcpCtx, peerAddr)
 		results <- transportDialResult{transport: "tcp", conn: conn, err: err}
 	}()
-
-	if udpSocket == nil {
-		res := <-results
-		return res.conn, res.err
-	}
-
 	go func() {
-		conn, err := udpSocket.DialContext(ctx, peerAddr)
+		defer s.crashGuard("peer_dial_transport")()
+		conn, err := udpSocket.DialContext(utpCtx, peerAddr)
 		results <- transportDialResult{transport: "utp", conn: conn, err: err}
 	}()
+	return pickDialResult(results, 2, dialStart, cancelTCP, cancelUTP)
+}
 
-	var errs []error
-	for i := 0; i < dialCount; i++ {
-		res := <-results
-		if res.err == nil {
-			cancel()
-			go closeLateDialSuccesses(results, dialCount-i-1)
-			return res.conn, nil
-		}
-		errs = append(errs, fmt.Errorf("%s dial failed: %w", res.transport, res.err))
+// dialPeerTCP connects to peerAddr over TCP only.
+func (s *Session) dialPeerTCP(peerAddr string) (net.Conn, string, error) {
+	ctx, cancel := context.WithTimeout(s.ctx, peerDialTimeout)
+	defer cancel()
+	conn, err := peerTCPDial(ctx, peerAddr)
+	if err != nil {
+		return nil, "", fmt.Errorf("tcp dial failed: %w", err)
 	}
-	return nil, errors.Join(errs...)
+	return conn, "tcp", nil
+}
+
+// pickDialResult picks the connection dialPeer uses from the pending results of
+// its TCP and uTP dials, started at dialStart. A TCP connection wins at once
+// and cancels the uTP dial. A uTP connection that comes first waits up to
+// dialTCPGrace for TCP: TCP still wins if it connects within that, and uTP is
+// used if TCP fails or the grace runs out, which cancels the TCP dial. A
+// failure waits for the other transport. Every connection that loses is
+// closed, including ones that complete after the pick.
+func pickDialResult(results <-chan transportDialResult, pending int, dialStart time.Time, cancelTCP, cancelUTP func()) (net.Conn, string, error) {
+	var errs []error
+	var utpConn net.Conn
+	var grace *time.Timer
+	var graceC <-chan time.Time
+	defer func() {
+		if grace != nil {
+			grace.Stop()
+		}
+	}()
+	for pending > 0 {
+		var res transportDialResult
+		select {
+		case res = <-results:
+			pending--
+		case <-graceC:
+			cancelTCP()
+			go closeLateDialSuccesses(results, pending)
+			return utpConn, "utp", nil
+		}
+		switch {
+		case res.err != nil:
+			errs = append(errs, fmt.Errorf("%s dial failed: %w", res.transport, res.err))
+			if utpConn != nil {
+				return utpConn, "utp", nil // TCP failed within the grace
+			}
+		case res.transport == "tcp":
+			cancelUTP()
+			if utpConn != nil {
+				_ = utpConn.Close()
+			}
+			if pending > 0 {
+				go closeLateDialSuccesses(results, pending)
+			}
+			return res.conn, "tcp", nil
+		case pending == 0:
+			return res.conn, "utp", nil // TCP already failed
+		default:
+			utpConn = res.conn
+			grace = time.NewTimer(dialTCPGrace(time.Since(dialStart)))
+			graceC = grace.C
+		}
+	}
+	return nil, "", errors.Join(errs...)
+}
+
+// dialTCPGrace is how long a uTP connection that took utpConnect to come up
+// waits for the TCP dial: twice that (TCP's handshake needs about the same
+// round trip), within [dialTCPGraceMin, dialTCPGraceMax].
+func dialTCPGrace(utpConnect time.Duration) time.Duration {
+	return min(max(2*utpConnect, dialTCPGraceMin), dialTCPGraceMax)
 }
 
 func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {
@@ -550,8 +771,18 @@ func closeLateDialSuccesses(results <-chan transportDialResult, remaining int) {
 }
 
 // inboundListenerLoop accepts incoming peer connections on the already-bound listener.
+//
+// Only a standalone session (tests, or a Session used without a
+// TorrentManager) owns a listener. The CLI and TUI serve every torrent from the
+// manager's shared listener, which reads the handshake under a bounded
+// pre-handshake budget (inboundHandshakeSlots, with a per-source share) before
+// any session slot is taken; see TorrentManager.handleRoutedIncomingConnection.
+// This path has no such budget: handleIncomingConnection takes the session's
+// and the global inbound slots before the handshake is read, so connections
+// that never send one can fill them for up to peerHandshakeTimeout.
 func (s *Session) inboundListenerLoop() {
 	defer s.wg.Done()
+	defer s.crashGuard("inbound_listener")()
 
 	s.mu.RLock()
 	listener := s.listener
@@ -588,7 +819,12 @@ func (s *Session) inboundListenerLoop() {
 	}
 }
 
+// handleIncomingConnection serves a connection from a standalone session's own
+// listener (see inboundListenerLoop). It holds an inbound slot from before the
+// handshake is read, unlike the manager's shared listener, which the CLI uses
+// and which budgets pre-handshake connections separately.
 func (s *Session) handleIncomingConnection(conn net.Conn) {
+	defer s.crashGuard("peer_inbound")()
 	defer conn.Close()
 
 	// Bound concurrent inbound connections (see maxInboundPeers); drop new ones once
@@ -620,6 +856,7 @@ func (s *Session) handleIncomingConnection(conn net.Conn) {
 // by the manager's shared listener. The manager already holds the global inbound
 // slot, so only the per-session budget is acquired here.
 func (s *Session) handleRoutedIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
+	defer s.crashGuard("peer_inbound")()
 	if s.inboundSlots != nil {
 		select {
 		case s.inboundSlots <- struct{}{}:
@@ -632,14 +869,16 @@ func (s *Session) handleRoutedIncomingConnection(conn net.Conn, handshake *peer.
 }
 
 func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handshake) {
+	defer s.crashGuard("peer_inbound")()
 	tunePeerConn(conn)
 
 	s.mu.RLock()
 	paused := s.paused
 	closed := s.closed
 	banned := s.refusesIncomingLocked(conn.RemoteAddr())
+	stalled := s.metadataStalledLocked()
 	s.mu.RUnlock()
-	if paused || closed || banned {
+	if paused || closed || banned || stalled {
 		return
 	}
 
@@ -713,6 +952,7 @@ func (s *Session) serveIncomingConnection(conn net.Conn, handshake *peer.Handsha
 }
 
 func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAddr string, ip string, port uint16, peerReserved [8]byte, outbound bool) {
+	defer s.crashGuard("peer_loop")()
 	fastEnabled := peer.SupportsFastExtension(peerReserved)
 	direction := "inbound"
 	if outbound {
@@ -736,16 +976,28 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// here, under the same lock that registers the connection, so none slips
 	// past purgeDiscoveryPeersLocked.
 	var reason string
-	if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
+	if s.metadataStalledLocked() {
+		reason = "metadata_error"
+	} else if outbound && s.privateRefusesDialLocked(s.Peers[peerAddr]) {
 		reason = "private_discovery_peer"
 		s.forgetRefusedPeerLocked(peerAddr)
 	} else {
 		reason = s.admitPeerLocked(peerAddr, hostKey, loopback, remoteID, outbound)
 	}
 	if reason != "" {
-		if reason == "self_connection" {
+		switch reason {
+		case "self_connection":
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Dialable = false
+			}
+		case "per_ip_limit", "duplicate_peer_id":
+			// The dial worked but the connection cannot be used. connectToPeer
+			// cleared the failure count once the handshake succeeded, so count the
+			// refusal here, or the address would be redialled (TCP, encryption and
+			// handshake) every peerRedialBackoff for as long as the refusal holds.
+			if ps, ok := s.Peers[peerAddr]; ok && outbound {
+				ps.noteDialFailed()
+				ps.LastAttempt = time.Now()
 			}
 		}
 		s.mu.Unlock()
@@ -796,7 +1048,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	if logEnabled {
 		logInfoHash, logName = s.logIdentityLocked()
 	}
+	registeredPieces := len(s.PieceStates)
 	s.mu.Unlock()
+	// Size the largest bitfield the reader accepts to this torrent before the
+	// reader starts. Before metadata the client's default (the largest bitfield a
+	// magnet can need) applies until the piece count is known.
+	if registeredPieces > 0 {
+		client.SetBitfieldLimit(registeredPieces)
+	}
 	if logEnabled {
 		logging.Info("peer_connected",
 			logging.String("info_hash", logInfoHash),
@@ -812,8 +1071,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	defer func() {
 		s.mu.Lock()
 		reconnectAfterResume := false
+		if s.metadataOwner == client {
+			s.metadataOwner = nil // the next connection to ask takes the solo round over
+		}
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
-			s.releasePeerLocked(hostKey, remoteID)
+			s.releasePeerLocked(peerAddr, hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
 				ps.Active = false
 				ps.Choked = true
@@ -1067,6 +1329,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		requestFinishAbandon
 	)
 
+	// Unsolicited-data accounting. A peer that has pieces we want is never
+	// inactive, and an inbound one is never stall-reaped, so without these it
+	// could stream piece messages we never asked for at wire speed for good.
+	// usefulBytes counts the block bytes we accepted; lateAllowance the bytes of
+	// requests we stopped waiting for (timed out, cancelled, dropped on a choke),
+	// which an honest peer may still deliver; unsolicitedBytes every block we
+	// discarded. The peer is dropped once the discarded bytes pass both the
+	// allowance plus unsolicitedFloodSlack and the useful bytes.
+	var unsolicitedBytes, usefulBytes, lateAllowance int64
+
 	findDownload := func(index int64) *activeDownload {
 		for _, dl := range activeDownloads {
 			if dl.pieceIndex == index {
@@ -1134,6 +1406,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		s.pipelineBudget.release(req.pipelineBudgetBytes)
 		req.pipelineBudgetBytes = 0
 	}
+	// finishRequest ends our wait for an outstanding request. It is the only place
+	// a requested, not yet received block stops being outstanding: every path that
+	// gives one up (a timeout, a cancel, a reject, a choke, another peer finishing
+	// the piece) goes through it, which is what keeps lateAllowance complete.
 	finishRequest := func(req *blockRequest, reason requestFinishReason, now time.Time) {
 		if req == nil || !req.requested || req.received {
 			return
@@ -1144,8 +1420,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			pipeline.OnBlockAccepted(req, req.length, now)
 		case requestFinishTimeout:
 			pipeline.OnRequestTimeout(req, now)
+			lateAllowance += req.length
 		case requestFinishCancel, requestFinishAbandon:
 			pipeline.OnCancel(req, now)
+			lateAllowance += req.length
 		}
 		req.requested = false
 	}
@@ -1577,7 +1855,8 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// message — INCLUDING keep-alives — so the pipeline stays full across piece
 	// boundaries and, crucially, so the timeout sweep below still runs when a peer
 	// that already took our requests goes quiet but keeps the socket warm with
-	// keep-alives (which otherwise reset the read deadline and skipped pump).
+	// keep-alives. For a peer that sends nothing at all, the liveness ticker runs
+	// the sweep from the top of the loop.
 	pump := func() time.Duration {
 		// Block requests below are queued into the client's write buffer; flush the
 		// whole burst in one syscall on the way out, regardless of which branch
@@ -1831,9 +2110,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		// While fetching metadata or rechecking we cannot tell yet what the peer
-		// has that we need.
-		if pState.Interested || s.metadataMode || s.verifying {
+		if pState.Interested {
+			return true
+		}
+		// While fetching metadata we cannot tell yet what the peer has that we
+		// need, but a peer that cannot serve the metadata is of no use until we
+		// have it; without this an inbound one would never be dropped.
+		if s.metadataMode {
+			return peerUtMetadataID != -1
+		}
+		// While rechecking we cannot tell yet what we still need.
+		if s.verifying {
 			return true
 		}
 		if s.isCompletedLocked() {
@@ -1857,12 +2144,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// in-progress piece that another peer has finished (so its state is no longer
 	// PieceDownloading) and sends a Cancel for each of our still-outstanding blocks so
 	// the peer stops feeding us data the swarm no longer needs. Bounded by
-	// the adaptive per-peer piece cap, so it is cheap to run every message.
+	// the adaptive per-peer piece cap, so it is cheap to run every message: it
+	// takes only the read lock unless it has something to drop (pump publishes
+	// the pipeline snapshot, throttled, after every message anyway).
 	dropCompletedElsewhere := func() {
 		if len(activeDownloads) == 0 {
 			return
 		}
-		now := time.Now()
 		var finished []int64
 		s.mu.RLock()
 		for _, dl := range activeDownloads {
@@ -1872,6 +2160,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 		}
 		s.mu.RUnlock()
+		if len(finished) == 0 {
+			return
+		}
+		now := time.Now()
 		for _, idx := range finished {
 			dl := findDownload(idx)
 			if dl == nil {
@@ -1893,9 +2185,14 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// peer in fetch round metadataRound (the session's metadataEpoch, which moves on
 	// whenever a failed assembly discards the accumulator). A block is accepted from
 	// this peer only if it was asked for in the current round, so a peer cannot slip
-	// unsolicited blocks into an assembly other peers are feeding.
+	// unsolicited blocks into an assembly other peers are feeding. metadataAskedAt
+	// is when each block was last asked for, or when the peer rejected it
+	// (metadataRejected), so the retry tick can ask again for a block the peer
+	// dropped or refused.
 	peerMetadataSize := 0
 	var metadataRequested []bool
+	var metadataAskedAt []time.Time
+	var metadataRejected []bool
 	var metadataRound uint64
 	var metadataRetryTicker *time.Ticker
 	var metadataRetryTick <-chan time.Time
@@ -1913,11 +2210,18 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// marks a call made because a new fetch round began; those are skipped while
 	// the session has a blocking error (storage could not be set up), so a
 	// persistent failure does not turn into an endless re-download of metadata.
+	//
+	// After failed assemblies (see noteMetadataRoundFailedLocked) a host that
+	// sized or fed one waits metadataSizeStallTimeout before it may size or own a
+	// new round, so a peer that has not failed us gets the round first, and new
+	// rounds back off after failures in a row; in a solo round only the owner is
+	// asked. Each is re-checked from the retry tick.
 	requestMetadataBlocks := func(newRound bool) {
 		if peerUtMetadataID == -1 || peerMetadataSize <= 0 {
 			return
 		}
 		var missing []int
+		now := time.Now()
 		s.mu.Lock()
 		if !s.metadataMode || s.metadataCompleted {
 			s.mu.Unlock()
@@ -1928,29 +2232,74 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.mu.Unlock()
 			return
 		}
-		resize := s.metadataSize == 0 // the first sized peer, or the first after a reset
-		if !resize && s.metadataSize != peerMetadataSize && s.statusErr == nil &&
-			time.Since(s.metadataProgressAt) >= metadataSizeStallTimeout {
-			// Whoever sized the accumulator has delivered nothing for a while: start
-			// a new round at this peer's size. Peers on the old size are no longer
-			// asked, and their late blocks fail the round check.
+		suspect := s.metadataSuspectLocked(source.host, now)
+		suspectWaiting := suspect && now.Sub(s.metadataResetAt) < metadataSizeStallTimeout
+		stalled := now.Sub(s.metadataProgressAt) >= metadataSizeStallTimeout
+		resize := false
+		switch {
+		case s.metadataSize == 0:
+			// The first sized peer, or the first after a reset.
+			resize = !now.Before(s.metadataNextRoundAt) && !suspectWaiting
+		case s.metadataSize != peerMetadataSize && s.statusErr == nil &&
+			((stalled && !suspectWaiting) ||
+				(!suspect && metadataFeedSlow(now, s.metadataSizedAt, s.metadataProgressAt, s.metadataRoundBlocks))):
+			// Whoever sized the accumulator delivers nothing, or too little to be
+			// an honest peer: start a new round at this peer's size, and suspect
+			// the old sizer. Peers on the old size are no longer asked, and their
+			// late blocks fail the round check. A suspect may replace only a
+			// round that takes no blocks at all, never one that is merely slow,
+			// so it cannot keep taking a slow honest peer's round away, while a
+			// peer made a suspect by a mixed round can still replace a silent
+			// sizer.
 			resize = true
 			s.metadataEpoch++
+			s.addMetadataSuspectLocked(s.metadataSizedBy, now)
 		}
 		if resize {
+			numBlocks := (peerMetadataSize + peer.MetadataBlockSize - 1) / peer.MetadataBlockSize
 			s.metadataSize = peerMetadataSize
 			s.metadataBuf = make([]byte, peerMetadataSize)
-			s.metadataPieces = make([]bool, (peerMetadataSize+peer.MetadataBlockSize-1)/peer.MetadataBlockSize)
-			s.metadataProgressAt = time.Now()
+			s.metadataPieces = make([]bool, numBlocks)
+			s.metadataFrom = make([]string, numBlocks)
+			s.metadataProgressAt = now
+			s.metadataSizedBy = source.host
+			s.metadataSizedAt = now
+			s.metadataRoundBlocks = 0
+			s.metadataOwner = nil
+		}
+		ask := s.metadataSize == peerMetadataSize
+		if ask && s.metadataSolo && s.metadataOwner != client {
+			// A solo round is fed by its owner alone. Another connection takes it
+			// over once the owner is gone or has taken no block for
+			// metadataSizeStallTimeout, dropping what the owner supplied, so the
+			// round keeps a single supplier to blame. A slow owner keeps the
+			// round: taking it away would restart a slow swarm's fetch for good.
+			ownerGone := s.metadataOwner == nil ||
+				now.Sub(laterTime(s.metadataOwnedAt, s.metadataProgressAt)) >= metadataSizeStallTimeout
+			if ownerGone && !suspectWaiting {
+				if slices.Contains(s.metadataPieces, true) {
+					clear(s.metadataPieces)
+					clear(s.metadataFrom)
+					s.metadataEpoch++ // every connection's requests start over
+				}
+				s.metadataOwner = client
+				s.metadataOwnedAt = now
+			} else {
+				ask = false
+			}
 		}
 		if s.metadataEpoch != metadataRound || len(metadataRequested) != len(s.metadataPieces) {
 			metadataRound = s.metadataEpoch
 			metadataRequested = make([]bool, len(s.metadataPieces))
+			metadataAskedAt = make([]time.Time, len(s.metadataPieces))
+			metadataRejected = make([]bool, len(s.metadataPieces))
 		}
-		if s.metadataSize == peerMetadataSize {
+		if ask {
 			for i, have := range s.metadataPieces {
 				if !have && !metadataRequested[i] {
 					metadataRequested[i] = true
+					metadataAskedAt[i] = now
+					metadataRejected[i] = false
 					missing = append(missing, i)
 				}
 			}
@@ -1967,17 +2316,21 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// acceptMetadataBlock stores a ut_metadata data block this peer was asked for
 	// and, once every block is in, hands the assembled info dict to
 	// onMetadataDownloaded (which discards the accumulator and advances
-	// metadataEpoch if it fails the infohash check).
+	// metadataEpoch if it fails the infohash check). The block is recorded
+	// against this connection's host, so a failed assembly can be blamed; in a
+	// solo round only the owner's blocks count.
 	acceptMetadataBlock := func(metaMsg *peer.MetadataMessage) {
 		piece := metaMsg.Piece
 		if piece < 0 || piece >= len(metadataRequested) || !metadataRequested[piece] {
 			return // unsolicited, or asked for in an earlier round
 		}
 		metadataRequested[piece] = false
+		metadataRejected[piece] = false
 		s.mu.Lock()
 		if s.metadataEpoch != metadataRound || !s.metadataMode || s.metadataCompleted ||
 			s.metadataSize == 0 || piece >= len(s.metadataPieces) || s.metadataPieces[piece] ||
-			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) {
+			(metaMsg.TotalSize > 0 && metaMsg.TotalSize != s.metadataSize) ||
+			(s.metadataSolo && s.metadataOwner != client) {
 			s.mu.Unlock()
 			return
 		}
@@ -1989,6 +2342,10 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		}
 		copy(s.metadataBuf[offset:], metaMsg.Data)
 		s.metadataPieces[piece] = true
+		if piece < len(s.metadataFrom) {
+			s.metadataFrom[piece] = source.host
+		}
+		s.metadataRoundBlocks++
 		lastProgressAt = time.Now() // metadata progress; keeps the stall reaper off
 		lastActiveAt = lastProgressAt
 		s.metadataProgressAt = lastProgressAt
@@ -2134,8 +2491,13 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			case peer.MetadataData:
 				acceptMetadataBlock(metaMsg)
 			case peer.MetadataReject:
-				// The block stays marked as asked of this peer, so it is not re-asked
-				// this round; other peers can still supply it.
+				// The block stays marked as asked of this peer, so other peers
+				// supply it first; the retry tick asks this peer again after
+				// metadataRejectRetryAfter.
+				if p := metaMsg.Piece; p >= 0 && p < len(metadataRequested) && metadataRequested[p] && !metadataRejected[p] {
+					metadataRejected[p] = true
+					metadataAskedAt[p] = time.Now()
+				}
 			}
 
 		case extMsgID == peer.LocalPEXExtID && s.pexEnabled():
@@ -2165,9 +2527,19 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	readDone := make(chan struct{})
 	readStop := make(chan struct{})
 	go func() {
+		defer s.crashGuard("peer_reader")()
 		defer close(readDone)
+		// The read deadline is the dead-socket backstop (see peerReadTimeout). It
+		// is moved only once less than peerReadTimeout remains, so a busy
+		// connection updates it once per peerReadTimeout/2 instead of per message.
+		// time.Until on a deadline with a monotonic reading is cheaper than
+		// time.Now.
+		var readDeadline time.Time
 		for {
-			_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if time.Until(readDeadline) < peerReadTimeout {
+				readDeadline = time.Now().Add(peerReadTimeout * 3 / 2)
+				_ = conn.SetReadDeadline(readDeadline)
+			}
 			msg, err := client.ReadMessage()
 			if err != nil {
 				// Close before handing the error over: if the loop is blocked in a
@@ -2231,6 +2603,43 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// themselves (pooledMsg = nil) and are released after piece assembly instead.
 	var pooledMsg *peer.Message
 	defer func() { pooledMsg.Release() }()
+
+	// The liveness ticker wakes the loop when the peer sends nothing, so the checks
+	// at the top of the loop (stall reaper, inactivity drop, request-timeout sweep)
+	// still run for a silent peer, and drives our keep-alives. It ticks every
+	// pumpSweepInterval while pieces are in flight, so their requests time out on
+	// time, and every peerIdleTickInterval otherwise: one timer per connection,
+	// reset only when the period changes.
+	livenessInterval := func() time.Duration {
+		if len(activeDownloads) > 0 && pumpSweepInterval > 0 {
+			return pumpSweepInterval
+		}
+		return peerIdleTickInterval
+	}
+	tickInterval := livenessInterval()
+	lastKeepAliveCheck := time.Now()
+	livenessTicker := time.NewTicker(tickInterval)
+	defer livenessTicker.Stop()
+	// keepAliveDue reports whether a keep-alive check is due at now. Ticks are not
+	// exact, so half a tick of slack keeps a tick that lands a hair early from
+	// putting the check off by a whole tick: checks stay about
+	// peerKeepAliveInterval apart, and our writes at most two of those.
+	keepAliveDue := func(now time.Time) bool {
+		return now.Sub(lastKeepAliveCheck) >= peerKeepAliveInterval-tickInterval/2
+	}
+
+	// peerChoking mirrors pState.Choked, which only this loop changes once the
+	// connection is registered (choked, as every connection starts), so a repeated
+	// choke or unchoke is recognised without the session lock.
+	peerChoking := true
+	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
+	// peerInterestScanInterval.
+	var lastInterestScanAt time.Time
+	// A second guard, deferred after the disconnect handler so it runs before
+	// it: a panic in the loop below while s.mu is held would deadlock that
+	// handler, and the guard at the top would then never record it. Only the
+	// first guard to see a panic records it.
+	defer s.crashGuard("peer_loop")()
 peerLoop:
 	for {
 		pooledMsg.Release()
@@ -2296,9 +2705,28 @@ peerLoop:
 		// unsolicited blocks, requests we reject) skip it. Run it here once it is
 		// overdue, or a peer that took our requests could stream only such messages,
 		// never time out, and hold the requested pieces (and their received blocks)
-		// for good; an inbound peer has no stall reaper to fall back on.
+		// for good; an inbound peer has no stall reaper to fall back on. The
+		// liveness ticker brings a peer that sends nothing here too. Pieces another
+		// peer finished are cancelled first, as after every message.
 		if len(activeDownloads) > 0 && loopNow.Sub(lastPumpAt) >= pumpSweepInterval {
+			dropCompletedElsewhere()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
+		}
+
+		if want := livenessInterval(); want != tickInterval {
+			tickInterval = want
+			livenessTicker.Reset(want)
+			// A switch to the longer idle period restarts the tick phase; check
+			// now if a check is due, so the switch cannot stretch the gap between
+			// two checks by a whole idle period.
+			if keepAliveDue(loopNow) {
+				lastKeepAliveCheck = loopNow
+				if err := client.SendKeepAliveIfIdle(); err != nil {
+					disconnectReason = "write_error"
+					disconnectErr = err
+					break
+				}
+			}
 		}
 
 		var msg *peer.Message
@@ -2306,6 +2734,9 @@ peerLoop:
 		case result := <-readCh:
 			if result.err != nil {
 				disconnectReason = "read_error"
+				if errors.Is(result.err, peer.ErrInvalidMessageLength) {
+					disconnectReason = "invalid_message_length"
+				}
 				disconnectErr = result.err
 				break peerLoop
 			}
@@ -2322,25 +2753,49 @@ peerLoop:
 				client.DropQueuedHaves()
 			}
 			continue
+		case now := <-livenessTicker.C:
+			if keepAliveDue(now) {
+				lastKeepAliveCheck = now
+				if err := client.SendKeepAliveIfIdle(); err != nil {
+					disconnectReason = "write_error"
+					disconnectErr = err
+					break peerLoop
+				}
+			}
+			// Back to the top of the loop, which runs the reaper, the inactivity
+			// check and any overdue request-timeout sweep.
+			continue
 		case <-pexTick:
 			sendPEXDelta()
 			continue
-		case <-metadataRetryTick:
+		case now := <-metadataRetryTick:
 			s.mu.RLock()
 			fetching := s.metadataMode && !s.metadataCompleted
-			epoch := s.metadataEpoch
-			otherSize := s.metadataSize != peerMetadataSize
 			s.mu.RUnlock()
-			switch {
-			case !fetching:
+			if !fetching {
 				metadataRetryTicker.Stop()
 				metadataRetryTicker = nil
 				metadataRetryTick = nil
-			case epoch != metadataRound || otherSize:
-				// A new round began, or the accumulator is sized differently from
-				// what this peer advertised and may have stalled.
-				requestMetadataBlocks(true)
+				continue
 			}
+			// Ask again for blocks this peer rejected a while ago or never
+			// answered, then re-run the round checks: a new round may have begun,
+			// a stalled or too-slow round may be ours to replace or own, or a
+			// suspect's wait may be over. Blocks already in are not re-asked.
+			for i, asked := range metadataRequested {
+				if !asked {
+					continue
+				}
+				wait := metadataRequestTimeout
+				if metadataRejected[i] {
+					wait = metadataRejectRetryAfter
+				}
+				if now.Sub(metadataAskedAt[i]) >= wait {
+					metadataRequested[i] = false
+					metadataRejected[i] = false
+				}
+			}
+			requestMetadataBlocks(false)
 			continue
 		case <-rateRetry:
 			rateRetry = nil
@@ -2356,10 +2811,10 @@ peerLoop:
 		}
 
 		if msg == nil {
-			// Keep alive: still run pump so outstanding requests to a now-silent peer
-			// time out (and the peer is dropped after its retry budget) instead of the
-			// keep-alive merely resetting the read deadline and stalling forever. Also
-			// drain any queued uploads that have since accrued bandwidth.
+			// Keep alive: still run pump so outstanding requests to a peer that now
+			// sends only keep-alives time out (and the peer is dropped after its
+			// retry budget) instead of stalling forever. Also drain any queued
+			// uploads that have since accrued bandwidth.
 			refreshUploadChoke()
 			scheduleRateRetry(minRetry(pump(), uploadPump()))
 			continue
@@ -2381,6 +2836,9 @@ peerLoop:
 
 		if !inMetaNow && !initializedPeersAndBitfield {
 			// Initialize now that metadata is downloaded!
+			if numPiecesNow > 0 {
+				client.SetBitfieldLimit(numPiecesNow)
+			}
 			sendInitialPeerState()
 
 			// onMetadataDownloaded installs the piece table before it leaves
@@ -2430,6 +2888,16 @@ peerLoop:
 			}
 
 		case peer.MsgChoke:
+			// A repeat changes nothing: skip the session lock, the release pass and
+			// the forced snapshot, which a peer re-sending chokes would otherwise
+			// cost us per 5-byte message. Like any message it still runs pump below.
+			if peerChoking {
+				break
+			}
+			peerChoking = true
+			if chokeTransitionHook != nil {
+				chokeTransitionHook(true)
+			}
 			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = true
@@ -2456,6 +2924,13 @@ peerLoop:
 			publishPipelineSnapshot(now, true)
 
 		case peer.MsgUnchoke:
+			if !peerChoking {
+				break // a repeat changes nothing; see MsgChoke
+			}
+			peerChoking = false
+			if chokeTransitionHook != nil {
+				chokeTransitionHook(false)
+			}
 			now := time.Now()
 			s.mu.Lock()
 			pState.Choked = false
@@ -2481,28 +2956,46 @@ peerLoop:
 			if alreadyInterested {
 				break
 			}
-			lastActiveAt = time.Now()
+			now := time.Now()
+			lastActiveAt = now
+			// Unchoking a newly interested peer at once, when fewer than four
+			// interested peers are unchoked, takes a walk over every known peer. A
+			// peer flipping its interest gets that walk at most once per
+			// peerInterestScanInterval; in between it is only marked interested
+			// and the choke round decides.
+			scan := lastInterestScanAt.IsZero() || now.Sub(lastInterestScanAt) >= peerInterestScanInterval
 			s.mu.Lock()
 			pState.Interested = true
-			unchokedInterested := 0
-			for _, candidate := range s.Peers {
-				if candidate.Active && candidate.Interested && !candidate.AmChoking {
-					unchokedInterested++
+			if scan && pState.AmChoking {
+				lastInterestScanAt = now
+				if interestScanHook != nil {
+					interestScanHook()
+				}
+				unchokedInterested := 0
+				for _, candidate := range s.Peers {
+					if candidate.Active && candidate.Interested && !candidate.AmChoking {
+						unchokedInterested++
+					}
+				}
+				if unchokedInterested < 4 {
+					pState.AmChoking = false
 				}
 			}
-			if pState.AmChoking && unchokedInterested < 4 {
-				pState.AmChoking = false
-			}
+			amChoking := pState.AmChoking
 			s.mu.Unlock()
-			syncChoke()
+			applyChoke(amChoking)
 
 		case peer.MsgNotInterested:
-			s.mu.Lock()
-			if pState.Interested {
-				// Only a change counts as activity: repeating not-interested
-				// must not keep an idle connection alive.
-				lastActiveAt = time.Now()
+			// Only a change takes the write lock (and counts as activity:
+			// repeating not-interested must not keep an idle connection alive).
+			s.mu.RLock()
+			wasInterested := pState.Interested
+			s.mu.RUnlock()
+			if !wasInterested {
+				break
 			}
+			lastActiveAt = time.Now()
+			s.mu.Lock()
 			pState.Interested = false
 			s.mu.Unlock()
 
@@ -2636,42 +3129,42 @@ peerLoop:
 			blockData := msg.Payload[8:]
 			now := time.Now()
 
-			// Validate against our outstanding requests for this piece.
+			// Validate against our outstanding requests: the block must belong to a
+			// piece we are downloading from this peer, start on a block boundary, be
+			// requested and not yet received, and have the requested length.
+			var req *blockRequest
+			var blockIndex int64
+			valid, duplicate := false, false
 			dl := findDownload(index)
-			if dl == nil {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue // not a piece we're currently downloading; discard
+			if dl != nil && begin%BlockSize == 0 {
+				r, exists := dl.pending[begin]
+				switch {
+				case exists && r.requested && !r.received:
+					req, blockIndex = r, begin/BlockSize
+					valid = int64(len(blockData)) == r.length && blockIndex < int64(len(dl.blocks))
+				case exists && r.received:
+					duplicate = true
+				}
 			}
-
-			// Validate begin is block-aligned
-			if begin%BlockSize != 0 {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue
-			}
-
-			// Validate this block was requested and not already received
-			req, exists := dl.pending[begin]
-			if !exists || !req.requested || req.received {
-				if exists && req.received {
+			if !valid {
+				// Discard it. A peer may still deliver blocks we stopped waiting
+				// for (lateAllowance) and repeat a few, but one that keeps sending
+				// data we never asked for, more of it than useful data, is a flood.
+				if duplicate {
 					pipeline.OnDuplicate(int64(len(blockData)), now)
 				} else {
 					pipeline.OnUnsolicited(int64(len(blockData)), now)
 				}
-				continue // Unsolicited or duplicate block
-			}
-
-			// Validate block length matches expected
-			if int64(len(blockData)) != req.length {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
+				unsolicitedBytes += int64(len(blockData))
+				if unsolicitedBytes > lateAllowance+unsolicitedFloodSlack && unsolicitedBytes > usefulBytes {
+					disconnectReason = "unsolicited_flood"
+					break peerLoop
+				}
 				continue
 			}
 
 			// Accept the block
-			blockIndex := begin / BlockSize
-			if blockIndex >= int64(len(dl.blocks)) {
-				pipeline.OnUnsolicited(int64(len(blockData)), now)
-				continue
-			}
+			usefulBytes += int64(len(blockData))
 			finishRequest(req, requestFinishAccepted, now)
 			dl.blocks[blockIndex] = blockData
 			// Ownership of the pooled wire buffer passes to this download until the
@@ -2945,19 +3438,82 @@ func (s *Session) GetUploadPeerStats() UploadPeerStats {
 	return stats
 }
 
+// DHT lookup cadence (see dhtLoop). Every torrent used to look up 1 s after
+// start and every 30 s after that, seeding or not, so a restart with many
+// torrents sent hundreds of lookups in the same second, again every 30 s in
+// lockstep, and libtorrent nodes' DoS blockers began ignoring us. Vars so tests
+// can shorten them; treat them as constants.
+var (
+	// dhtFirstLookupDelay is how soon a session first looks up its torrent. A
+	// magnet fetching metadata does so right then; any other session takes the
+	// next free first-lookup slot, dhtStartupSpreadStep after the one before,
+	// at most dhtStartupSpreadMax away (see dhtFirstLookupAfter), so restored
+	// torrents start, and stay, out of phase.
+	dhtFirstLookupDelay  = time.Second
+	dhtStartupSpreadStep = 250 * time.Millisecond
+	dhtStartupSpreadMax  = time.Minute
+	// Intervals between lookups, each jittered by ±20%: while fetching
+	// metadata; while downloading with fewer than dhtWellConnectedPeers
+	// connections; and while seeding or well connected, when the swarm keeps
+	// finding us anyway (libtorrent's dht_announce_interval is 15 minutes).
+	dhtMetadataLookupInterval = 30 * time.Second
+	dhtDownloadLookupInterval = time.Minute
+	dhtIdleLookupInterval     = 15 * time.Minute
+	// dhtResumeLookupDelay is how soon after a resume the next lookup runs,
+	// plus up to as long again at random.
+	dhtResumeLookupDelay = time.Second
+)
+
+// dhtWellConnectedPeers is the connection count from which a downloading
+// session looks up as rarely as a seed.
+const dhtWellConnectedPeers = 50
+
+// dhtFirstLookupSlots hands out first-lookup times (see dhtFirstLookupAfter):
+// next is the earliest time the next session may take.
+var dhtFirstLookupSlots struct {
+	mu   sync.Mutex
+	next time.Time
+}
+
+// startDHTLookup starts a get_peers lookup for infoHash, announcing peerPort
+// when announce is set. A var so tests can observe lookups.
+var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, announce bool) {
+	d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: announce})
+}
+
+// dhtLoop looks the torrent up on the DHT on the cadence dhtLookupIntervalLocked
+// picks, and soon after a resume.
 func (s *Session) dhtLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	defer s.crashGuard("dht")()
 
-	// Initial lookup
-	select {
-	case <-time.After(1 * time.Second):
-	case <-s.ctx.Done():
-		return
-	}
 	s.mu.RLock()
-	paused := s.paused
+	metadataMode := s.metadataMode
+	s.mu.RUnlock()
+	timer := time.NewTimer(dhtFirstLookupAfter(metadataMode, time.Now()))
+	defer timer.Stop()
+	for {
+		_, pauseChanged := s.pauseStateSignal()
+		select {
+		case <-timer.C:
+			timer.Reset(s.dhtLookupTick())
+		case <-pauseChanged:
+			// Lookups are skipped while paused; after a resume the next one runs
+			// soon instead of up to a whole interval later.
+			if paused, _ := s.pauseStateSignal(); !paused {
+				timer.Reset(dhtResumeLookupDelay + randDuration(dhtResumeLookupDelay))
+			}
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+// dhtLookupTick runs one lookup unless the session is paused or cannot use
+// peers, and returns the delay until the next tick.
+func (s *Session) dhtLookupTick() time.Duration {
+	s.mu.RLock()
+	interval, skip := s.dhtLookupIntervalLocked()
 	d := s.DHT
 	peerPort := s.Port
 	hasInbound := s.hasInboundListenerLocked()
@@ -2969,32 +3525,67 @@ func (s *Session) dhtLoop() {
 	}
 	s.mu.RUnlock()
 
-	if !paused && d != nil && hasTorrent && hasInbound {
-		d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
+	if !skip && d != nil && hasTorrent && hasInbound {
+		startDHTLookup(d, infoHash, peerPort, allowAnnounce)
 	}
+	return jitterDHTInterval(interval)
+}
 
-	for {
-		select {
-		case <-ticker.C:
-			s.mu.RLock()
-			paused = s.paused
-			d = s.DHT
-			peerPort = s.Port
-			hasInbound = s.hasInboundListenerLocked()
-			hasTorrent = s.Torrent != nil
-			allowAnnounce = s.allowsDHTAnnounceLocked()
-			if hasTorrent {
-				infoHash = s.Torrent.InfoHash
-			}
-			s.mu.RUnlock()
-
-			if !paused && d != nil && hasTorrent && hasInbound {
-				d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: allowAnnounce})
-			}
-		case <-s.ctx.Done():
-			return
-		}
+// dhtLookupIntervalLocked returns the time from one DHT lookup to the next,
+// and whether to skip lookups for now (paused, or metadata-stalled), in which
+// case it is when to check again. Caller holds s.mu (read or write).
+func (s *Session) dhtLookupIntervalLocked() (interval time.Duration, skip bool) {
+	switch {
+	case s.paused || s.metadataStalledLocked():
+		return dhtMetadataLookupInterval, true
+	case s.metadataMode:
+		return dhtMetadataLookupInterval, false
+	case s.isCompletedLocked() || len(s.activePeers) >= dhtWellConnectedPeers:
+		return dhtIdleLookupInterval, false
+	default:
+		return dhtDownloadLookupInterval, false
 	}
+}
+
+// dhtFirstLookupAfter is the delay from now before a session's first DHT
+// lookup. Sessions that start together (a restore) take consecutive slots
+// dhtStartupSpreadStep apart, each at a random point within its slot, so their
+// first lookups spread over dhtStartupSpreadStep per session; past
+// dhtStartupSpreadMax a session picks a random point in that window instead. A
+// session started on its own (a torrent added later) finds the slots drained
+// and looks up after dhtFirstLookupDelay, however many sessions run: sizing
+// the spread by the running sessions made a new download in a large library
+// wait up to a minute for its first DHT peers.
+func dhtFirstLookupAfter(metadataMode bool, now time.Time) time.Duration {
+	if metadataMode {
+		return dhtFirstLookupDelay
+	}
+	first := now.Add(dhtFirstLookupDelay)
+	dhtFirstLookupSlots.mu.Lock()
+	defer dhtFirstLookupSlots.mu.Unlock()
+	slot := first
+	if dhtFirstLookupSlots.next.After(slot) {
+		slot = dhtFirstLookupSlots.next
+	}
+	if slot.Sub(first) >= dhtStartupSpreadMax {
+		return dhtFirstLookupDelay + randDuration(dhtStartupSpreadMax)
+	}
+	dhtFirstLookupSlots.next = slot.Add(dhtStartupSpreadStep)
+	return slot.Sub(now) + randDuration(dhtStartupSpreadStep)
+}
+
+// jitterDHTInterval spreads d uniformly over ±20%, so sessions that started
+// together drift apart.
+func jitterDHTInterval(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
+
+// randDuration returns a uniformly random duration in [0, d), or 0 when d <= 0.
+func randDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return rand.N(d)
 }
 
 // AddPeerFromDiscovery adds a peer learned via a decentralized discovery mechanism
@@ -3047,6 +3638,7 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 	if fromDiscovery {
 		source = PeerSourceDiscovery
 	}
+	now := time.Now()
 	var shouldDial bool
 	if !exists {
 		shouldDial = true
@@ -3055,14 +3647,34 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 		// same address becomes eligible for maintenance retries.
 		pState.Dialable = true
 		pState.Source |= source
-		if !pState.Active && !pState.Dialing && time.Since(pState.LastAttempt) > pState.redialBackoff() {
+		if fromDiscovery {
+			pState.seenAt = now
+		}
+		if !pState.Active && !pState.Dialing && now.Sub(pState.LastAttempt) > pState.redialBackoff() {
 			shouldDial = true
 		}
 	}
 
-	// Don't exceed the outbound connection cap.
-	if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.refusesDialLocked(peerAddr, host)) {
+	// Never dial a refused address. Don't exceed the outbound connection cap, and
+	// dial nobody while the metadata cannot be used; a new peer is recorded then
+	// (with no LastAttempt), so maintenance dials it once that changes instead of
+	// losing it until DHT or PEX happen to list it again.
+	if shouldDial && s.refusesDialLocked(peerAddr, host) {
 		shouldDial = false
+	} else if shouldDial && (len(s.outboundSlots) >= maxOutboundPeers || s.metadataStalledLocked()) {
+		shouldDial = false
+		if !exists {
+			s.prunePeersLocked()
+			s.Peers[peerAddr] = &PeerState{
+				IP:        host,
+				Port:      uint16(port),
+				AmChoking: true,
+				Choked:    true,
+				Dialable:  true,
+				Source:    source,
+				seenAt:    now,
+			}
+		}
 	}
 
 	if shouldDial {
@@ -3073,13 +3685,14 @@ func (s *Session) addPeer(peerAddr string, fromDiscovery bool) {
 				Port:        uint16(port),
 				AmChoking:   true,
 				Choked:      true,
-				LastAttempt: time.Now(),
+				LastAttempt: now,
 				Dialable:    true,
 				Dialing:     true,
 				Source:      source,
+				seenAt:      now,
 			}
 		} else {
-			s.Peers[peerAddr].LastAttempt = time.Now()
+			s.Peers[peerAddr].LastAttempt = now
 			s.Peers[peerAddr].Dialing = true
 		}
 		s.wg.Add(1)

@@ -105,8 +105,9 @@ func TestPrunePeersLockedNoOpUnderCap(t *testing.T) {
 }
 
 // dialInboundTestPeer opens a real TCP connection to addr and completes a minimal
-// BitTorrent handshake + empty bitfield, so the session's inbound accept path
-// creates a genuine PeerState keyed by this dial's ephemeral source port. It
+// BitTorrent handshake + have_none (an empty bitfield is not a valid message and
+// drops the connection), so the session's inbound accept path creates a genuine
+// PeerState keyed by this dial's ephemeral source port. It
 // returns the connection (so the test controls exactly when it closes) and that
 // source address, which is the s.Peers key the session will use.
 func dialInboundTestPeer(t *testing.T, addr string, infoHash [20]byte) (net.Conn, string) {
@@ -122,9 +123,9 @@ func dialInboundTestPeer(t *testing.T, addr string, infoHash [20]byte) (net.Conn
 		conn.Close()
 		t.Fatalf("handshake: %v", err)
 	}
-	if err := client.SendBitfield(nil); err != nil {
+	if err := client.SendHaveNone(); err != nil {
 		conn.Close()
-		t.Fatalf("send bitfield: %v", err)
+		t.Fatalf("send have_none: %v", err)
 	}
 	return conn, conn.LocalAddr().String()
 }

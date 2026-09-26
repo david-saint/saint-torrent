@@ -18,7 +18,7 @@ const (
 
 	// MaxPEXMessageSize caps a ut_pex payload before it is decoded. MaxPEXPeers
 	// IPv6 entries plus their flags come to about 19 KiB, so this leaves ample
-	// headroom while keeping a peer from making us decode a 2 MiB tree.
+	// headroom while keeping a peer from making us decode a large tree.
 	MaxPEXMessageSize = 64 * 1024
 )
 

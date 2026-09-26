@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,6 +179,7 @@ type cliOptions struct {
 	configDir            string
 	verifyOnStartup      bool
 	persist              bool
+	startPaused          bool
 	confirm              bool
 	headless             bool
 	theme                string
@@ -966,6 +968,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.deleteInProgress = false
 		m.refreshSessions()
+		if errors.Is(msg.err, downloader.ErrFilesKept) {
+			// Removed; only files a cross-seed still uses were kept.
+			m.flash = "Removed; " + msg.err.Error()
+			m.resumePendingOr(viewList)
+			return m, nil
+		}
 		if msg.err != nil {
 			m.deleteErr = msg.err
 			m.viewMode = viewDeleteConfirm
@@ -1164,11 +1172,6 @@ func applyUserDownloadConfig(opts *cliOptions, cfg appConfig) {
 // this exact lowercase spelling.
 const magnetPrefix = "magnet:?"
 
-// maxTorrentFileSize bounds a .torrent read from disk. It is far above real
-// torrents (libtorrent's default limit is 10 MB) and stops a path such as
-// /dev/zero from growing the heap until the process is killed.
-const maxTorrentFileSize = 64 << 20
-
 // urlScheme returns the lowercased RFC 3986 scheme of item, or "" for a plain
 // path. A scheme needs at least two characters so Windows drive letters
 // (C:\x.torrent) stay paths.
@@ -1230,10 +1233,12 @@ func parseItem(item string) (name string, hashHex string, err error) {
 	return tor.Name, fmt.Sprintf("%x", tor.InfoHash), nil
 }
 
-// readTorrentFile reads a .torrent from disk. parseItem can run on the TUI's
-// event loop, so it refuses anything but a regular file (opening a FIFO
-// blocks, and a device such as /dev/zero never ends) and anything larger than
-// maxTorrentFileSize.
+// readTorrentFile reads a .torrent from disk the way the manager does
+// (torrent.ReadFile: at most torrent.MaxFileSize, regular files only).
+// parseItem can run on the TUI's event loop, where opening a FIFO blocks and
+// a device such as /dev/zero never ends. torrent.ReadFile checks what it
+// opened; the Stat here also refuses those before any open, which keeps the
+// event loop safe with a torrent.ReadFile that opens before it checks.
 func readTorrentFile(path string) ([]byte, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -1242,22 +1247,7 @@ func readTorrentFile(path string) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s: not a regular file", path)
 	}
-	if fi.Size() > maxTorrentFileSize {
-		return nil, fmt.Errorf("%s: torrent file too large (%d bytes, max %d)", path, fi.Size(), maxTorrentFileSize)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxTorrentFileSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxTorrentFileSize {
-		return nil, fmt.Errorf("%s: torrent file too large (max %d bytes)", path, maxTorrentFileSize)
-	}
-	return data, nil
+	return torrent.ReadFile(path)
 }
 
 // normalizeForwardedItems prepares items for a running instance, whose working
@@ -1305,6 +1295,8 @@ Options:
       --confirm             Require confirmation before adding forwarded torrents
       --no-confirm          Skip confirmation when adding forwarded torrents
       --no-persist          Do not persist fast-resume state
+      --start-paused        Restore every torrent paused, including any a crash
+                            left unloaded
       --recheck             Fully hash-check restored torrents on this launch
       --http-addr <addr>    Enable the read-only JSON stats API on this address
                             (loopback only, e.g. 127.0.0.1:16666)
@@ -1363,6 +1355,8 @@ func parseCLIArgs(args []string) cliOptions {
 			opts.verifyOnStartup = true
 		case "--no-persist":
 			opts.persist = false
+		case "--start-paused":
+			opts.startPaused = true
 		case "--confirm":
 			opts.confirm = true
 		case "--no-confirm":
@@ -1911,6 +1905,25 @@ func main() {
 	var startupInfos []string
 	var startupWarns []string
 
+	// Resolve the state directory before anything starts goroutines, so a
+	// fatal error from here on also lands in <configDir>/crash/fatal.txt.
+	if persist {
+		if configDir == "" {
+			userConfig, err := os.UserConfigDir()
+			if err == nil {
+				configDir = filepath.Join(userConfig, "sainttorrent")
+			} else {
+				configDir = ".sainttorrent"
+			}
+		}
+		if crashLog, err := setUpCrashOutput(configDir); err != nil {
+			startupWarns = append(startupWarns, fmt.Sprintf("Crash log unavailable: %v", err))
+		} else {
+			// Open for the life of the process.
+			defer crashLog.Close()
+		}
+	}
+
 	selectedDownloadDir, pathErr := selectDownloadPath(downloadPaths)
 	if pathErr != nil {
 		startupWarns = append(startupWarns, pathErr.Error())
@@ -1924,6 +1937,7 @@ func main() {
 	mgr := downloader.NewTorrentManager()
 	mgr.SetEncryptionPolicy(opts.encryption)
 	mgr.SetVerifyOnStartup(opts.verifyOnStartup)
+	mgr.SetStartPaused(opts.startPaused)
 	if err := mgr.SetStorageBackend(opts.storage); err != nil {
 		fmt.Fprintf(os.Stderr, "Error configuring storage backend: %v\n", err)
 		mgr.Close()
@@ -2012,14 +2026,6 @@ func main() {
 	perfMarkf("http-stats")
 
 	if persist {
-		if configDir == "" {
-			userConfig, err := os.UserConfigDir()
-			if err == nil {
-				configDir = filepath.Join(userConfig, "sainttorrent")
-			} else {
-				configDir = ".sainttorrent"
-			}
-		}
 		warning, err := mgr.EnablePersistence(configDir)
 		if err != nil {
 			startupWarns = append(startupWarns, fmt.Sprintf("Failed to initialize persistence: %v", err))
@@ -2068,6 +2074,7 @@ func main() {
 
 	startupWarn := tuiStartupLine(startupInfos, startupWarns)
 
+	exitCode := 0
 	var p *tea.Program
 	if !opts.headless {
 		startModel := initialModel(mgr, downloadDir, startupWarn, initialPending)
@@ -2105,8 +2112,30 @@ func main() {
 		writeHeadlessStartupMessages(os.Stderr, startupInfos, startupWarns)
 		waitForShutdownSignal()
 	} else {
+		// Closing the terminal window quits like q does (see notifyHangup).
+		hangup := make(chan os.Signal, 1)
+		if notifyHangup(hangup) {
+			go func() {
+				<-hangup
+				p.Quit()
+			}()
+		}
 		if _, err := p.Run(); err != nil {
-			fmt.Printf("Error running UI: %v\n", err)
+			if errors.Is(err, tea.ErrProgramPanic) {
+				// Bubble Tea recovered the panic, printed it and restored the
+				// terminal. Record it and keep the running sentinel, so the next
+				// start counts this run as a crash; still shut down normally, as
+				// the torrents' state is intact, then exit non-zero.
+				exitCode = 1
+				mgr.MarkUncleanExit()
+				if mgr.RecordCrash("tui", "", err) != "" {
+					fmt.Fprintf(os.Stderr, "saintTorrent's UI crashed; details in %s\n", downloader.CrashDir(configDir))
+				} else {
+					fmt.Fprintf(os.Stderr, "saintTorrent's UI crashed: %v\n", err)
+				}
+			} else {
+				fmt.Printf("Error running UI: %v\n", err)
+			}
 		}
 		perfMarkf("quit")
 	}
@@ -2149,8 +2178,30 @@ func main() {
 			fmt.Printf("shutdown_ms=%.1f (forced)\n", msOf(time.Since(shutdownStart)))
 		}
 		perfReport(os.Stderr)
-		os.Exit(0)
+		os.Exit(exitCode)
 	}
+	if exitCode != 0 {
+		logging.Close()
+		os.Exit(exitCode)
+	}
+}
+
+// setUpCrashOutput makes the runtime write fatal errors (panics no crash
+// guard caught, in DHT, uTP, NAT and HTTP goroutines; concurrent map writes;
+// running out of memory or stack) to <configDir>/crash/fatal.txt as well as
+// to stderr, which the TUI's alternate screen hides, and returns that file.
+// Call it only while holding the single-instance lock: it prunes and rotates
+// that directory.
+func setUpCrashOutput(configDir string) (*os.File, error) {
+	f, err := downloader.OpenCrashLog(configDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := debug.SetCrashOutput(f, debug.CrashOptions{}); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // redirectStdLog routes the standard library logger into the debug log. It
@@ -2165,8 +2216,29 @@ func redirectStdLog() {
 func waitForShutdownSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	hangup := make(chan os.Signal, 1)
+	notifyHangup(hangup)
+	select {
+	case <-sigCh:
+	case <-hangup:
+	}
 	signal.Stop(sigCh)
+}
+
+// notifyHangup relays SIGHUP to ch for the rest of the run and reports whether
+// it does. Closing the terminal window hangs saintTorrent up, and Go's default
+// for SIGHUP is to exit at once: the session state goes unsaved and the running
+// sentinel stays behind, so the next start takes the close for a crash, and two
+// in a row restore every torrent paused. The caller shuts down cleanly on the
+// first SIGHUP; later ones land in the full channel and are dropped instead of
+// killing the shutdown. A SIGHUP ignored at startup (nohup) stays ignored,
+// which Notify would undo.
+func notifyHangup(ch chan<- os.Signal) bool {
+	if signal.Ignored(syscall.SIGHUP) {
+		return false
+	}
+	signal.Notify(ch, syscall.SIGHUP)
+	return true
 }
 
 // tuiStartupLine joins startup warnings and infos into the TUI's single

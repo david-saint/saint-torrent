@@ -5,6 +5,7 @@ package main
 import (
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -96,5 +97,41 @@ func TestForwardedFIFOOrDeviceIsRefusedWithoutReading(t *testing.T) {
 		if _, _, err := parseItem(item); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 			t.Fatalf("parseItem(%q) err = %v; want not a regular file", item, err)
 		}
+	}
+}
+
+// TestHangupShutsDownInsteadOfKilling: closing the terminal window sends
+// SIGHUP. It must reach notifyHangup's channel (main then shuts down cleanly)
+// rather than kill the process, which the next start would count as a crash.
+// A SIGHUP ignored at startup (nohup) is left ignored.
+func TestHangupShutsDownInsteadOfKilling(t *testing.T) {
+	if signal.Ignored(syscall.SIGHUP) {
+		t.Skip("SIGHUP is ignored in this test process")
+	}
+	hangup := make(chan os.Signal, 1)
+	if !notifyHangup(hangup) {
+		t.Fatal("notifyHangup did not take SIGHUP")
+	}
+	defer signal.Stop(hangup)
+	// Without the handler this would end the test binary.
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case sig := <-hangup:
+		if sig != syscall.SIGHUP {
+			t.Fatalf("got %v, want SIGHUP", sig)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGHUP never reached the channel")
+	}
+
+	signal.Ignore(syscall.SIGHUP)
+	defer signal.Reset(syscall.SIGHUP)
+	if notifyHangup(make(chan os.Signal, 1)) {
+		t.Fatal("notifyHangup took over a SIGHUP ignored at startup")
+	}
+	if !signal.Ignored(syscall.SIGHUP) {
+		t.Fatal("an ignored SIGHUP is no longer ignored")
 	}
 }

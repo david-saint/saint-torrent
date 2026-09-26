@@ -21,6 +21,7 @@ import (
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/storage"
+	"sainttorrent/pkg/torrent"
 )
 
 func TestGetSpaceActionHelp(t *testing.T) {
@@ -1478,13 +1479,14 @@ func TestParseItemBoundsTorrentFileReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Truncate(maxTorrentFileSize + 1); err != nil {
+	// The same bound as the manager's (torrent.MaxFileSize).
+	if err := f.Truncate(torrent.MaxFileSize + 1); err != nil {
 		f.Close()
 		t.Fatal(err)
 	}
 	f.Close()
-	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "too large") {
-		t.Fatalf("oversized file: err = %v; want too large", err)
+	if _, _, err := parseItem(big); err == nil || !strings.Contains(err.Error(), "larger than the maximum") {
+		t.Fatalf("oversized file: err = %v; want larger than the maximum", err)
 	}
 
 	if _, _, err := parseItem(t.TempDir()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
@@ -1645,5 +1647,54 @@ func TestLockErrors(t *testing.T) {
 	}
 	if errors.Is(err3, errLockContention) {
 		t.Error("expected fatal error to not be errLockContention")
+	}
+}
+
+// TestParseCLIArgsStartPaused: --start-paused restores every torrent paused
+// after a crash loop; it is off by default and listed in --help.
+func TestParseCLIArgsStartPaused(t *testing.T) {
+	if parseCLIArgs(nil).startPaused {
+		t.Fatal("startPaused set by default")
+	}
+	opts := parseCLIArgs([]string{"--start-paused", "-d", "/tmp/x"})
+	if !opts.startPaused || opts.err != nil || opts.downloadDir != "/tmp/x" {
+		t.Fatalf("parseCLIArgs(--start-paused) = %+v, want startPaused and the other flags intact", opts)
+	}
+	if !strings.Contains(usageText(), "--start-paused") {
+		t.Fatal("usage text does not list --start-paused")
+	}
+}
+
+// TestDeleteKeepingCrossSeedFilesIsNotAnError: a removal that kept files a
+// cross-seed still uses went through, so the TUI shows it as a note and
+// returns to the list instead of showing a deletion error.
+func TestDeleteKeepingCrossSeedFilesIsNotAnError(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+	m := initialModel(mgr, ".", "", nil)
+	const infoHashHex = "642e85596f7a0dd05eefdb78b0ac1736496f8626"
+	m.viewMode = viewDeleteConfirm
+	m.deleteTargetHash = infoHashHex
+	m.deleteInProgress = true
+
+	updated, _ := m.Update(deleteFinishedMsg{
+		infoHashHex: infoHashHex,
+		err:         &downloader.FilesKeptError{Kept: 1, Example: "shared.bin"},
+	})
+	m = updated.(model)
+	if m.deleteErr != nil || m.viewMode != viewList || m.deleteInProgress {
+		t.Fatalf("after a removal that kept files: deleteErr=%v view=%v inProgress=%v, want the list and no error", m.deleteErr, m.viewMode, m.deleteInProgress)
+	}
+	if !strings.Contains(m.flash, "kept 1 file(s)") {
+		t.Fatalf("flash %q does not mention the kept file", m.flash)
+	}
+
+	// A real failure still stops on the error.
+	m.viewMode = viewDeleteConfirm
+	m.deleteInProgress = true
+	updated, _ = m.Update(deleteFinishedMsg{infoHashHex: infoHashHex, err: errors.New("disk on fire")})
+	m = updated.(model)
+	if m.deleteErr == nil || m.viewMode != viewDeleteConfirm {
+		t.Fatalf("after a failed removal: deleteErr=%v view=%v, want the error shown", m.deleteErr, m.viewMode)
 	}
 }
