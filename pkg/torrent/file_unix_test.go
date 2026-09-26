@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build unix
 
 package torrent
 
@@ -6,9 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestReadFileRefusesFIFOWithoutBlocking: os.Open of a FIFO waits for a
@@ -16,7 +17,7 @@ import (
 // adds a torrent synchronously) indefinitely. ReadFile must refuse it at once.
 func TestReadFileRefusesFIFOWithoutBlocking(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fifo.torrent")
-	if err := syscall.Mkfifo(path, 0600); err != nil {
+	if err := unix.Mkfifo(path, 0600); err != nil {
 		t.Skipf("cannot create a FIFO here: %v", err)
 	}
 	type result struct {
@@ -36,7 +37,7 @@ func TestReadFileRefusesFIFOWithoutBlocking(t *testing.T) {
 	case <-time.After(time.Second):
 		// Opening the write end releases the blocked reader, so a failing
 		// run does not leak it.
-		if w, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+		if w, err := os.OpenFile(path, os.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
 			w.Close()
 		}
 		t.Fatal("ReadFile blocked on a FIFO")
