@@ -3,9 +3,39 @@ package dht
 import (
 	"net"
 	"testing"
+	"time"
+
+	"sainttorrent/pkg/bencode"
 )
 
 func idString(id [20]byte) string { return string(id[:]) }
+
+// queried returns every address that received a query of type q.
+func (c *fakeConn) queried(q string) []*net.UDPAddr {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []*net.UDPAddr
+	for _, p := range c.sent {
+		parsed, err := bencode.Unmarshal(p.data)
+		if err != nil {
+			continue
+		}
+		if dict, ok := parsed.(map[string]interface{}); ok && dict["y"] == "q" && dict["q"] == q {
+			out = append(out, p.addr)
+		}
+	}
+	return out
+}
+
+// idAtDistance returns an ID whose XOR distance to target is d in the first
+// byte, so candidates can be ordered deterministically; salt varies the last
+// byte to keep IDs distinct.
+func idAtDistance(target [20]byte, d byte, salt byte) [20]byte {
+	id := target
+	id[0] ^= d
+	id[19] ^= salt
+	return id
+}
 
 // TestLookupStoresResponderUnderReportedID is the reported forgery: a referrer
 // pairs a live node's address with an ID next to the info-hash. The node must
@@ -69,5 +99,218 @@ func TestLookupIgnoresResponsesWithoutValidID(t *testing.T) {
 
 	if got := d.NodesCount(); got != 1 || storedAddrFor(d, startID) == nil {
 		t.Fatalf("a response without a valid ID changed the table: %d contacts", got)
+	}
+}
+
+// TestLookupTraversalResistsHijack is the reported hijack: one responder
+// answering with 150 referrals (special-purpose addresses first, then 145
+// ports on one victim IP) must not reach any special address, must spend at
+// most one query on the victim IP, and must not stop the lookup reaching the
+// genuinely closest node.
+func TestLookupTraversalResistsHijack(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "hijacked-info-hash--")
+	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
+	attackerID := idAtDistance(infoHash, 0x80, 1)
+	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honestID := idAtDistance(infoHash, 0x81, 1)
+	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	victim := net.ParseIP("198.51.100.7")
+
+	special := []*net.UDPAddr{
+		{IP: net.ParseIP("0.0.0.0"), Port: 53},
+		{IP: net.ParseIP("127.0.0.1"), Port: 631},
+		{IP: net.ParseIP("192.168.1.1"), Port: 1900},
+		{IP: net.ParseIP("224.0.0.251"), Port: 5353},
+		{IP: net.ParseIP("198.51.100.9"), Port: 0},
+	}
+	var flood []Node
+	for i, a := range special {
+		flood = append(flood, Node{ID: idAtDistance(infoHash, 0, byte(10+i)), Addr: a})
+	}
+	for i := 0; i < 145; i++ {
+		flood = append(flood, Node{ID: idAtDistance(infoHash, 0, byte(100+i)), Addr: &net.UDPAddr{IP: victim, Port: 1000 + i}})
+	}
+
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		switch {
+		case sameUDPAddr(to, attacker):
+			return map[string]interface{}{"id": idString(attackerID), "nodes": compactNodes(flood)}
+		case sameUDPAddr(to, honest):
+			return map[string]interface{}{"id": idString(honestID), "nodes": compactNodes([]Node{{ID: infoHash, Addr: closest}})}
+		case sameUDPAddr(to, closest):
+			return map[string]interface{}{"id": idString(infoHash), "token": "tok"}
+		case to.IP.Equal(victim):
+			return map[string]interface{}{"id": idString(idAtDistance(infoHash, 0, byte(to.Port)))}
+		}
+		return nil
+	})
+	d.addNode(attackerID, attacker)
+	d.addNode(honestID, honest)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	for _, a := range special {
+		if got := conn.queriesTo(a, "get_peers"); got != 0 {
+			t.Fatalf("a public responder steered %d queries to %s", got, a)
+		}
+	}
+	if got := conn.queriesToIP(victim, "get_peers"); got > 1 {
+		t.Fatalf("one responder spent %d queries on a single victim IP", got)
+	}
+	if got := conn.queriesTo(closest, "get_peers"); got != 1 {
+		t.Fatalf("the genuinely closest node was queried %d times, want 1", got)
+	}
+	if got := len(conn.queried("get_peers")); got > 2*dhtLookupK {
+		t.Fatalf("the lookup spent %d queries on a four-host network", got)
+	}
+}
+
+// TestLookupQueriesClosestAndConverges verifies the traversal queries the
+// closest candidates first and stops once the K closest have answered, instead
+// of crawling every referral in arrival order.
+func TestLookupQueriesClosestAndConverges(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "converging-info-hash")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0xFF, 1)
+
+	// Referrals arrive farthest first, so a FIFO crawl would query them in
+	// the wrong order.
+	var referrals []Node
+	for i := 40; i >= 1; i-- {
+		referrals = append(referrals, Node{
+			ID:   idAtDistance(infoHash, byte(i), 0),
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+		})
+	}
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		if sameUDPAddr(to, seed) {
+			return map[string]interface{}{"id": idString(seedID), "nodes": compactNodes(referrals)}
+		}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	for i := 1; i <= 40; i++ {
+		addr := &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881}
+		got := conn.queriesTo(addr, "get_peers")
+		if i <= dhtLookupK && got != 1 {
+			t.Fatalf("one of the %d closest candidates (distance %d) was queried %d times", dhtLookupK, i, got)
+		}
+		if i > dhtLookupK && got != 0 {
+			t.Fatalf("the lookup kept querying past convergence: distance %d queried %d times", i, got)
+		}
+	}
+}
+
+// TestLookupAnnouncesOnlyToClosestK verifies announce_peer goes to the K
+// closest responders that returned a token, not to every responder.
+func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "announced-info-hash-")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0xFF, 1)
+	var referrals []Node
+	for i := 1; i <= 20; i++ {
+		referrals = append(referrals, Node{
+			ID:   idAtDistance(infoHash, byte(i), 0),
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, 100, byte(i)), Port: 6881},
+		})
+	}
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		switch {
+		case q == "announce_peer":
+			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0))}
+		case q != "get_peers":
+			return nil
+		case sameUDPAddr(to, seed):
+			// The seed returns a token too, like all its referrals: 21 token
+			// holders in all.
+			return map[string]interface{}{"id": idString(seedID), "token": "tok", "nodes": compactNodes(referrals)}
+		}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[3], 0)), "token": "tok"}
+	})
+	d.addNode(seedID, seed)
+
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+
+	// Announces are sent from tracked goroutines once the lookup converges;
+	// wait for them, then give any stray extra ones a moment to show up.
+	deadline := time.After(5 * time.Second)
+	for len(conn.queried("announce_peer")) < dhtLookupK {
+		select {
+		case <-deadline:
+			t.Fatalf("announced to %d nodes, want the %d closest", len(conn.queried("announce_peer")), dhtLookupK)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	announced := conn.queried("announce_peer")
+	if len(announced) != dhtLookupK {
+		t.Fatalf("announced to %d nodes, want the %d closest", len(announced), dhtLookupK)
+	}
+	for _, a := range announced {
+		ip := a.IP.To4()
+		if ip[0] != 198 || int(ip[3]) > dhtLookupK {
+			t.Fatalf("announced to %s, which is not among the %d closest", a, dhtLookupK)
+		}
+	}
+}
+
+// TestLookupReferralScope verifies referrals are filtered by the responder's
+// own scope: a loopback or LAN responder may refer its neighbours, a public
+// one may not.
+func TestLookupReferralScope(t *testing.T) {
+	cases := []struct {
+		name      string
+		responder string
+		referral  string
+		allowed   bool
+	}{
+		{"loopback refers loopback", "127.0.0.1", "127.0.0.1", true},
+		{"lan refers lan", "192.168.1.20", "192.168.1.30", true},
+		{"public refers lan", "203.0.113.5", "192.168.1.30", false},
+		{"public refers loopback", "203.0.113.5", "127.0.0.1", false},
+		{"public refers public", "203.0.113.5", "198.51.100.30", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, conn := newFakeDHT(t)
+			var infoHash [20]byte
+			copy(infoHash[:], "scoped-info-hash----")
+			responder := &net.UDPAddr{IP: net.ParseIP(tc.responder), Port: 7001}
+			referral := &net.UDPAddr{IP: net.ParseIP(tc.referral), Port: 7002}
+			responderID := idAtDistance(infoHash, 0x80, 1)
+			conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+				if q != "get_peers" {
+					return nil
+				}
+				if sameUDPAddr(to, responder) {
+					return map[string]interface{}{"id": idString(responderID), "nodes": compactNodes([]Node{{ID: infoHash, Addr: referral}})}
+				}
+				return map[string]interface{}{"id": idString(infoHash)}
+			})
+			d.addNode(responderID, responder)
+			d.lookup(infoHash, 0, LookupOptions{})
+			if got := conn.queriesTo(referral, "get_peers") == 1; got != tc.allowed {
+				t.Fatalf("referral %s from %s queried = %v, want %v", referral, responder, got, tc.allowed)
+			}
+		})
 	}
 }
