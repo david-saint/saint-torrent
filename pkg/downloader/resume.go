@@ -173,7 +173,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 	// is deleting. Also drop a piece already completed by another peer (#8 endgame
 	// produces redundant copies) so we don't re-write storage or re-announce Have.
 	s.mu.RLock()
-	closed := s.closed
+	closed := s.closing || s.closed
 	alreadyDone := job.index >= 0 && job.index < int64(len(s.PieceStates)) &&
 		s.PieceStates[job.index] == PieceCompleted
 	s.mu.RUnlock()
@@ -518,7 +518,7 @@ func (s *Session) finishVerify() {
 	s.verifyFullScan = false
 	// Skip the state write if the session is closing so a late finish can't resurrect a
 	// .state file that RemoveSession is deleting.
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 
@@ -818,7 +818,7 @@ func (s *Session) markPieceCompleted(index int64) {
 	// Skip the resume persist if the session is closing so a late piece write (the
 	// async pool is not awaited by Close) cannot recreate a .state file a remove is
 	// deleting — mirroring finishVerify.
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 
@@ -855,7 +855,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 	s.lastErr = nil
 	s.statusErr = nil
 	s.signalPieceWaitersLocked(index)
-	if !s.closed {
+	if !s.closing && !s.closed {
 		s.stateDirty = true
 	}
 

@@ -231,3 +231,41 @@ func TestMetadataRefusesNilPointerStorage(t *testing.T) {
 		t.Fatalf("storage=%T pieces=%d metadataMode=%v, want the pre-metadata session", sess.Storage, len(sess.PieceStates), sess.metadataMode)
 	}
 }
+
+// TestPieceCompletingWhileClosingIsDropped: Close takes its shutdown checkpoint
+// after setting closing but before closed. The write workers checked only
+// closed, so a piece finishing in between was written and marked after the
+// checkpoint: nothing persisted it, and the write moved the file's identity so
+// the next launch rehashed the torrent.
+func TestPieceCompletingWhileClosingIsDropped(t *testing.T) {
+	data := []byte("a piece that arrives during shutdown")
+	sess := newPieceTestSession(t, int64(len(data)), [][]byte{data})
+	sess.mu.Lock()
+	sess.PieceStates[0] = PieceDownloading
+	sess.removeNeededLocked(0)
+	sess.closing = true
+	sess.stateDirty = false
+	sess.mu.Unlock()
+
+	result := make(chan pieceWriteResult, 1)
+	sess.processCompletedPiece(pieceWriteJob{index: 0, hash: sha1.Sum(data), data: data, result: result})
+	if r := <-result; r.status != pieceWriteSkipped {
+		t.Fatalf("piece write status = %v, want skipped while closing", r.status)
+	}
+	buf := make([]byte, len(data))
+	if _, err := sess.Storage.ReadBlock(0, 0, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) == string(data) {
+		t.Fatal("piece was written after the session started closing")
+	}
+
+	// A write already past that check must not re-arm the checkpoint either.
+	sess.markPieceCompleted(0)
+	sess.mu.RLock()
+	dirty := sess.stateDirty
+	sess.mu.RUnlock()
+	if dirty {
+		t.Fatal("a piece completed while closing re-armed the resume checkpoint")
+	}
+}
