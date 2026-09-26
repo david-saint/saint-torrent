@@ -320,32 +320,40 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 	if len(initialPayload) > math.MaxUint16 {
 		return nil, Result{}, errors.New("mse: initial payload too large")
 	}
-	if err := h.establishSecret(); err != nil {
+	x, ya, err := newKeyPair()
+	if err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.postRandomPad(); err != nil {
+	// Ya and PadA leave as one write: the pad exists to hide the fixed
+	// 96-byte key length, which a lone 96-byte first segment gives away.
+	if err := h.postPadded(ya); err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.out.post(hash(req1, h.s[:])); err != nil {
-		return nil, Result{}, err
+	var yb [keyLen]byte
+	if _, err := io.ReadFull(h.conn, yb[:]); err != nil {
+		return nil, Result{}, fmt.Errorf("mse: read public key: %w", err)
 	}
-	req2Hash := hash(req2, h.skey)
-	req3Hash := hash(req3, h.s[:])
-	xorInPlace(req2Hash, req2Hash, req3Hash)
-	if err := h.out.post(req2Hash); err != nil {
+	if err := h.deriveSecret(x, yb[:]); err != nil {
 		return nil, Result{}, err
 	}
 
+	// HASH('req1', S), HASH('req2', SKEY) xor HASH('req3', S) and
+	// ENCRYPT(VC, crypto_provide, len(PadC), PadC, len(IA), IA) also leave
+	// as one write, as libtorrent sends them; over uTP each write otherwise
+	// costs its own round of acks.
 	writeCipher, err := h.newCipher(true)
 	if err != nil {
 		return nil, Result{}, err
 	}
-	var encrypted bytes.Buffer
-	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildCryptoFrame(methods, initialPayload, true)); err != nil {
-		return nil, Result{}, err
-	}
-	if err := h.out.post(encrypted.Bytes()); err != nil {
+	req2Hash := hash(req2, h.skey)
+	xorInPlace(req2Hash, req2Hash, hash(req3, h.s[:]))
+	frame := buildCryptoFrame(methods, initialPayload, true)
+	flight := make([]byte, 0, 2*sha1.Size+len(frame))
+	flight = append(flight, hash(req1, h.s[:])...)
+	flight = append(flight, req2Hash...)
+	flight = append(flight, frame...)
+	writeCipher.XORKeyStream(flight[2*sha1.Size:], flight[2*sha1.Size:])
+	if err := h.out.post(flight); err != nil {
 		return nil, Result{}, err
 	}
 
@@ -380,10 +388,22 @@ func (h *handshaker) doInitiator(initialPayload []byte, methods CryptoMethod) (*
 }
 
 func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*Conn, Result, error) {
-	if err := h.establishSecret(); err != nil {
+	// Nothing is sent until the initiator's key has arrived, as the spec and
+	// libtorrent order it. Answering first would let one spoofed uTP packet
+	// make us send, and retransmit, Yb to its forged source.
+	var ya [keyLen]byte
+	if _, err := io.ReadFull(h.conn, ya[:]); err != nil {
+		return nil, Result{}, fmt.Errorf("mse: read public key: %w", err)
+	}
+	x, yb, err := newKeyPair()
+	if err != nil {
 		return nil, Result{}, err
 	}
-	if err := h.postRandomPad(); err != nil {
+	if err := h.deriveSecret(x, ya[:]); err != nil {
+		return nil, Result{}, err
+	}
+	// Yb and PadB leave as one write, for the same reason as Ya and PadA.
+	if err := h.postPadded(yb); err != nil {
 		return nil, Result{}, err
 	}
 	if err := readUntil(io.LimitReader(h.conn, maxPadLen+sha1.Size), hash(req1, h.s[:])); err != nil {
@@ -441,32 +461,30 @@ func (h *handshaker) doReceiver(selectMethod func(CryptoMethod) CryptoMethod) (*
 	if err != nil {
 		return nil, Result{}, err
 	}
-	var encrypted bytes.Buffer
-	ew := &cipherWriter{c: writeCipher, w: &encrypted}
-	if _, err := writeFull(ew, buildCryptoFrame(selected, nil, false)); err != nil {
-		return nil, Result{}, err
-	}
-	if err := h.out.post(encrypted.Bytes()); err != nil {
+	frame := buildCryptoFrame(selected, nil, false)
+	writeCipher.XORKeyStream(frame, frame)
+	if err := h.out.post(frame); err != nil {
 		return nil, Result{}, err
 	}
 
 	return h.wrapConn(selected, initialPayload, readCipher, writeCipher), Result{Method: selected, SecretKey: append([]byte(nil), h.skey...)}, nil
 }
 
-func (h *handshaker) establishSecret() error {
+// newKeyPair returns a fresh DH private key and its public key, left-padded to
+// keyLen bytes.
+func newKeyPair() (*big.Int, []byte, error) {
 	x, err := randomPrivate()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	y := new(big.Int).Exp(dhGenerator, x, dhPrime)
-	if err := h.out.post(leftPad(y.Bytes(), keyLen)); err != nil {
-		return err
-	}
-	var peerYBytes [keyLen]byte
-	if _, err := io.ReadFull(h.conn, peerYBytes[:]); err != nil {
-		return fmt.Errorf("mse: read public key: %w", err)
-	}
-	peerY := new(big.Int).SetBytes(peerYBytes[:])
+	return x, leftPad(y.Bytes(), keyLen), nil
+}
+
+// deriveSecret checks the peer's public key and sets S from it and our
+// private key x.
+func (h *handshaker) deriveSecret(x *big.Int, peerKey []byte) error {
+	peerY := new(big.Int).SetBytes(peerKey)
 	if !validPeerPublicKey(peerY) {
 		return errors.New("mse: invalid peer public key")
 	}
@@ -479,16 +497,18 @@ func validPeerPublicKey(peerY *big.Int) bool {
 	return peerY.Cmp(dhMinPeerKey) >= 0 && peerY.Cmp(dhMaxPeerKey) < 0
 }
 
-func (h *handshaker) postRandomPad() error {
+// postPadded posts key followed by 0-512 random pad bytes as one write.
+func (h *handshaker) postPadded(key []byte) error {
 	n, err := randomPadLen()
 	if err != nil {
 		return err
 	}
-	pad := make([]byte, n)
-	if _, err := io.ReadFull(rand.Reader, pad); err != nil {
+	b := make([]byte, len(key)+n)
+	copy(b, key)
+	if _, err := io.ReadFull(rand.Reader, b[len(key):]); err != nil {
 		return err
 	}
-	return h.out.post(pad)
+	return h.out.post(b)
 }
 
 func (h *handshaker) matchSecretKey(got []byte) error {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"sainttorrent/pkg/mse"
 	"sainttorrent/pkg/peer"
 	"sainttorrent/pkg/torrent"
 	"sainttorrent/pkg/utp"
@@ -161,6 +162,57 @@ func TestManagerSharedUTPListenerRoutesByInfoHash(t *testing.T) {
 	}
 	if len(first.GetActivePeers()) != 0 {
 		t.Fatal("shared uTP listener routed connection to the wrong session")
+	}
+}
+
+// TestManagerSharedUTPListenerRoutesEncryptedConnection runs a required-MSE
+// handshake over uTP end to end: the dialer's handshake ACK promotes the
+// half-open conn, the receiver waits for Ya before answering, and both sides'
+// coalesced flights cross a transport whose writes wait for acks.
+func TestManagerSharedUTPListenerRoutesEncryptedConnection(t *testing.T) {
+	mgr := NewTorrentManager()
+	mgr.SetEncryptionPolicy(mse.PolicyRequire)
+	if err := mgr.StartPeerListener(0); err != nil {
+		t.Fatalf("failed to start shared peer listener: %v", err)
+	}
+	if err := mgr.StartDHT(t.TempDir(), int(mgr.PeerListenPort())); err != nil {
+		t.Fatalf("failed to start shared UDP/DHT listener: %v", err)
+	}
+	defer mgr.Close()
+	sess := newEncryptionTestManagedSession(t, mgr, "encrypted-utp")
+
+	clientSocket, err := utp.NewSocket(0)
+	if err != nil {
+		t.Fatalf("failed to create client uTP socket: %v", err)
+	}
+	defer clientSocket.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := clientSocket.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", mgr.DHTListenPort()))
+	if err != nil {
+		t.Fatalf("failed to dial shared uTP listener: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	wrapped, _, err := mse.Initiate(conn, sess.Torrent.InfoHash[:], nil, mse.CryptoMethodRC4)
+	if err != nil {
+		t.Fatalf("MSE initiate over uTP failed: %v", err)
+	}
+	client := peer.NewClient(wrapped, sess.Torrent.InfoHash, [20]byte{9, 9, 9})
+	response, err := client.Handshake()
+	if err != nil {
+		t.Fatalf("encrypted peer handshake over uTP failed: %v", err)
+	}
+	if response.InfoHash != sess.Torrent.InfoHash {
+		t.Fatalf("expected response for %x, got %x", sess.Torrent.InfoHash, response.InfoHash)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(sess.GetActivePeers()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("shared uTP listener did not route the encrypted connection")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -274,6 +275,93 @@ func TestParsePolicy(t *testing.T) {
 	}
 	if _, err := ParsePolicy("bogus"); err == nil {
 		t.Fatal("expected invalid policy error")
+	}
+}
+
+// recordingConn records the size of every Write, which is how the handshake
+// is cut into segments on the wire (peer conns run with TCP_NODELAY).
+type recordingConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes []int
+}
+
+func (c *recordingConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes = append(c.writes, len(p))
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *recordingConn) writeSizes() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]int(nil), c.writes...)
+}
+
+// TestReceiverWaitsForInitiatorKey checks that the receiver sends nothing
+// until the initiator's public key has arrived. Sending Yb first let a single
+// spoofed uTP packet make us send (and retransmit) 96+ bytes to its forged
+// source.
+func TestReceiverWaitsForInitiatorKey(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := Receive(serverConn, singleSecret(bytes.Repeat([]byte{0x44}, 20)), SelectRC4)
+		done <- err
+	}()
+	_ = clientConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	n, err := clientConn.Read(make([]byte, keyLen))
+	var ne net.Error
+	if n != 0 || !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("receiver sent %d bytes (err=%v) before the initiator sent anything", n, err)
+	}
+	_ = clientConn.Close()
+	if err := <-done; err == nil {
+		t.Fatal("Receive succeeded on a closed conn")
+	}
+}
+
+// TestHandshakeFlightsAreCoalesced checks that each side's handshake leaves in
+// two writes: its key with its pad, then everything after the key exchange.
+// Separate writes put an exact 96-byte segment at the start of every stream,
+// which undoes the length obfuscation the pads exist for, and over uTP each
+// write waits for its own acks.
+func TestHandshakeFlightsAreCoalesced(t *testing.T) {
+	clientPipe, serverPipe := net.Pipe()
+	defer clientPipe.Close()
+	defer serverPipe.Close()
+	_ = clientPipe.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = serverPipe.SetDeadline(time.Now().Add(2 * time.Second))
+	client := &recordingConn{Conn: clientPipe}
+	server := &recordingConn{Conn: serverPipe}
+
+	skey := bytes.Repeat([]byte{0x55}, 20)
+	errs := make(chan error, 2)
+	go func() {
+		_, _, err := Initiate(client, skey, []byte("initial"), CryptoMethodRC4)
+		errs <- err
+	}()
+	go func() {
+		_, _, err := Receive(server, singleSecret(skey), SelectRC4)
+		errs <- err
+	}()
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("handshake: %v", err)
+		}
+	}
+	for name, c := range map[string]*recordingConn{"initiator": client, "receiver": server} {
+		sizes := c.writeSizes()
+		if len(sizes) != 2 {
+			t.Fatalf("%s wrote the handshake in %d writes %v, want 2", name, len(sizes), sizes)
+		}
+		if sizes[0] < keyLen || sizes[0] > keyLen+maxPadLen {
+			t.Fatalf("%s first write is %d bytes, want its key and pad (%d-%d)", name, sizes[0], keyLen, keyLen+maxPadLen)
+		}
 	}
 }
 
