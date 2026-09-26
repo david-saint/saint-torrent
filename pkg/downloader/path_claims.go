@@ -30,24 +30,43 @@ type pathClaim struct {
 	refs     int
 }
 
-// pathClaimKeys returns the claim keys of relPaths under baseDir. An existing
-// base is resolved through symlinks so two spellings of one directory collide.
-// The whole path is folded, which can over-report only on a case-sensitive
+// pathClaimKeys returns the claim keys of relPaths under baseDir. The base is
+// resolved through symlinks so two spellings of one directory collide. The
+// whole path is folded, which can over-report only on a case-sensitive
 // filesystem holding two download directories that differ only in case.
 func pathClaimKeys(baseDir string, relPaths []string) []pathClaimKey {
-	base := baseDir
-	if abs, err := filepath.Abs(base); err == nil {
-		base = abs
-	}
-	if resolved, err := filepath.EvalSymlinks(base); err == nil {
-		base = resolved
-	}
+	base := resolveClaimBase(baseDir)
 	keys := make([]pathClaimKey, len(relPaths))
 	for i, rel := range relPaths {
 		key := storage.PathKey(filepath.Join(base, rel))
 		keys[i] = pathClaimKey{maphash.String(pathClaimSeeds[0], key), maphash.String(pathClaimSeeds[1], key)}
 	}
 	return keys
+}
+
+// resolveClaimBase makes baseDir absolute and resolves the symlinks of its
+// longest existing prefix. A download directory the first add is about to
+// create does not exist yet when its paths are claimed; resolving only a base
+// that exists keyed that add under the unresolved spelling and a later add
+// through the resolved one (macOS /tmp is /private/tmp) under another, so the
+// two never collided.
+func resolveClaimBase(baseDir string) string {
+	base := baseDir
+	if abs, err := filepath.Abs(base); err == nil {
+		base = abs
+	}
+	var missing []string
+	for dir := base; ; {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return base
+		}
+		missing = append([]string{filepath.Base(dir)}, missing...)
+		dir = parent
+	}
 }
 
 // claimPaths reserves files under baseDir for infoHash before any storage is

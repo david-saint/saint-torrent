@@ -140,3 +140,32 @@ func TestMagnetMetadataRefusesAnotherTorrentsFile(t *testing.T) {
 		t.Fatalf("existing torrent's file = %v, %v; want it untouched at 1000 bytes", info, err)
 	}
 }
+
+// TestClaimsResolveADownloadDirectoryCreatedLater: the base was resolved
+// through symlinks only when it already existed. The first add into a new
+// directory under a symlinked parent was keyed by the link spelling; once the
+// add had created the directory, an add through the real path was keyed by
+// the resolved one, and the two torrents shared a file.
+func TestClaimsResolveADownloadDirectoryCreatedLater(t *testing.T) {
+	parent := t.TempDir()
+	realDir := filepath.Join(parent, "real")
+	if err := os.Mkdir(realDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	torrentDir := t.TempDir()
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	first, _ := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "a")
+	if _, err := mgr.AddTorrentFile(first, filepath.Join(link, "new")); err != nil {
+		t.Fatalf("add into a directory that does not exist yet: %v", err)
+	}
+	second, _ := writeTestTorrent(t, torrentDir, "shared.bin", 1000, "b")
+	if _, err := mgr.AddTorrentFile(second, filepath.Join(realDir, "new")); !errors.Is(err, ErrPathInUse) {
+		t.Fatalf("add over the same file through the resolved path: err = %v, want ErrPathInUse", err)
+	}
+}
