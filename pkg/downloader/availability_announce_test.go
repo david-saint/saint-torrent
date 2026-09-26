@@ -167,6 +167,49 @@ func TestPeerLoopReplaysPreMetadataBitfield(t *testing.T) {
 	}
 }
 
+// TestPeerLoopKeepsAnnouncementMadeWhileMetadataCompletes covers the window in
+// onMetadataDownloaded between installing the piece table and leaving metadata
+// mode (storage setup, resume load). A bitfield or have_all handled then is
+// applied at once, as the piece count is already known, but the post-metadata
+// initialisation used to replace the peer's bitfield with an empty one: we then
+// never asked a seed for anything, and a partial bitfield's availability was
+// never withdrawn.
+func TestPeerLoopKeepsAnnouncementMadeWhileMetadataCompletes(t *testing.T) {
+	const numPieces = 16
+	for _, tc := range []struct {
+		name     string
+		announce *peer.Message
+	}{
+		{"have_all", &peer.Message{ID: peer.MsgHaveAll}},
+		{"bitfield", &peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80, 0x01}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := newWireTestSession(t, numPieces, 16)
+			sess.mu.Lock()
+			sess.metadataMode = true // pieces known, metadata not yet marked complete
+			sess.mu.Unlock()
+			w := startWirePeer(t, sess, 6205, fastReserved())
+			w.send(tc.announce)
+			w.barrier()
+
+			sess.mu.Lock()
+			sess.metadataMode = false
+			sess.mu.Unlock()
+			w.send(&peer.Message{ID: peer.MsgUnchoke})
+			w.expect(peer.MsgRequest, 2*time.Second)
+
+			if tc.name == "bitfield" {
+				w.close()
+				for i, avail := range availabilitySnapshot(sess) {
+					if avail != 0 {
+						t.Fatalf("availability[%d] = %d after disconnect, want 0", i, avail)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestBitfieldHelpers(t *testing.T) {
 	for _, n := range []int{1, 7, 8, 9, 15, 16, 17, 100} {
 		full := fullPieceBitfield(n)

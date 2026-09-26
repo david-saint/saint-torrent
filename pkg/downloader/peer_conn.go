@@ -2332,7 +2332,13 @@ peerLoop:
 			// Initialize now that metadata is downloaded!
 			sendInitialPeerState()
 
-			peerBitfield = make([]byte, (numPiecesNow+7)/8)
+			// onMetadataDownloaded installs the piece table before it leaves
+			// metadata mode, so a bitfield or have_all handled in between was
+			// applied at its real length already; replacing it with an empty one
+			// would hide the peer's pieces and leak their availability.
+			if len(peerBitfield) != (numPiecesNow+7)/8 {
+				peerBitfield = make([]byte, (numPiecesNow+7)/8)
+			}
 			initializedPeersAndBitfield = true
 
 			// Replay any availability the peer announced before we had metadata
