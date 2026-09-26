@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -1729,6 +1730,29 @@ func (l *lookupSet) add(id [20]byte, k nodeAddrKey) {
 	l.list[i] = lookupCandidate{id: id, key: k, dist: dist}
 }
 
+// addReferrals offers the nodes one responder referred us to. A responder may
+// only point us at addresses no more local than itself, so a public node
+// cannot aim our queries at loopback or LAN services. Only the dhtLookupK
+// closest are taken: a BEP 5 answer carries at most K nodes, so this never
+// trims an honest one, but a single responder can no longer fill the whole
+// candidate set with close-sounding junk on many IPs and push out everything
+// other responders told us about.
+func (l *lookupSet) addReferrals(nodes []Node, responder *net.UDPAddr) {
+	refs := make([]lookupCandidate, 0, len(nodes))
+	for _, n := range nodes {
+		if k, ok := nodeAddrKeyOf(n.Addr); ok && endpointAllowed(k, responder) {
+			refs = append(refs, lookupCandidate{id: n.ID, key: k, dist: xorDistance(n.ID, l.target)})
+		}
+	}
+	if len(refs) > dhtLookupK {
+		sort.Slice(refs, func(i, j int) bool { return lessXor(refs[i].dist, refs[j].dist) })
+		refs = refs[:dhtLookupK]
+	}
+	for _, r := range refs {
+		l.add(r.id, r.key)
+	}
+}
+
 // next marks up to max of the closest unqueried candidates as queried and
 // returns them. Only the dhtLookupK closest candidates that have not failed
 // are eligible, so an empty result means the lookup has converged: the K
@@ -1924,14 +1948,7 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 				}
 			}
 
-			// A responder may only refer us to addresses no more local than
-			// itself, so a public node cannot aim our queries at loopback
-			// or LAN services.
-			for _, n := range result.res.Nodes {
-				if k, ok := nodeAddrKeyOf(n.Addr); ok && endpointAllowed(k, responder) {
-					set.add(n.ID, k)
-				}
-			}
+			set.addReferrals(result.res.Nodes, responder)
 		}
 	}
 

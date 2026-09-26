@@ -172,6 +172,58 @@ func TestLookupTraversalResistsHijack(t *testing.T) {
 	}
 }
 
+// TestLookupResponderCannotFloodCandidateSet is the denial variant of the
+// hijack: one responder answers with 150 referrals on distinct IPs, every one
+// closer to the target than any honest node and none of them usable. They
+// must not push the honest referral out of the bounded candidate set, so the
+// genuinely closest node is still queried.
+func TestLookupResponderCannotFloodCandidateSet(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "flooded-lookup-hash-")
+	attacker := &net.UDPAddr{IP: net.ParseIP("203.0.113.66"), Port: 6881}
+	attackerID := idAtDistance(infoHash, 0x80, 1)
+	honest := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	honestID := idAtDistance(infoHash, 0x81, 1)
+	closest := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	closestID := idAtDistance(infoHash, 0x01, 0)
+
+	var junk []Node
+	for i := 0; i < 150; i++ {
+		junk = append(junk, Node{
+			ID:   idAtDistance(infoHash, 0, byte(i+1)),
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 51, byte(100+i/100), byte(i%100+1)), Port: 6881},
+		})
+	}
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		switch {
+		case sameUDPAddr(to, attacker):
+			return map[string]interface{}{"id": idString(attackerID), "nodes": compactNodes(junk)}
+		case sameUDPAddr(to, honest):
+			return map[string]interface{}{"id": idString(honestID), "nodes": compactNodes([]Node{{ID: closestID, Addr: closest}})}
+		case sameUDPAddr(to, closest):
+			return map[string]interface{}{"id": idString(closestID), "token": "tok"}
+		}
+		// The junk answers at once but unusably, so the test runs fast.
+		return map[string]interface{}{"id": "junk"}
+	})
+	d.addNode(attackerID, attacker)
+	d.addNode(honestID, honest)
+
+	d.lookup(infoHash, 0, LookupOptions{})
+
+	if got := conn.queriesTo(closest, "get_peers"); got != 1 {
+		t.Fatalf("one responder's referrals kept the genuinely closest node from being queried (%d queries)", got)
+	}
+	if got := len(conn.queried("get_peers")); got > 3+dhtLookupK {
+		t.Fatalf("one responder's referrals cost %d queries, want at most one round", got)
+	}
+}
+
 // TestLookupQueriesClosestAndConverges verifies the traversal queries the
 // closest candidates first and stops once the K closest have answered, instead
 // of crawling every referral in arrival order.
