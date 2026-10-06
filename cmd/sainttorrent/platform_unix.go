@@ -85,6 +85,16 @@ func killProcess(pid int) error {
 	return proc.Kill()
 }
 
+// isSaintTorrentProcess reports whether pid is a live process whose command is
+// sainttorrent (ps prints a full path on some platforms).
+func isSaintTorrentProcess(pid int) bool {
+	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	return filepath.Base(strings.TrimSpace(string(out))) == "sainttorrent"
+}
+
 func findProcessPIDs() []int {
 	cmd := exec.Command("pgrep", "-x", "sainttorrent")
 	out, err := cmd.Output()

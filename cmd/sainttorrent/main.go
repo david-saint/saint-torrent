@@ -1512,34 +1512,59 @@ func resolveIPCDir() (string, error) {
 	return dir, nil
 }
 
-func writePID(ipcDir string, lockFile *os.File) {
-	pid := os.Getpid()
-	pidPath := filepath.Join(ipcDir, "sainttorrent.pid")
-	_ = os.WriteFile(pidPath, []byte(strconv.Itoa(pid)+"\n"), 0600)
-	if lockFile != nil {
-		_ = lockFile.Truncate(0)
-		_, _ = lockFile.Seek(0, 0)
-		_, _ = fmt.Fprintf(lockFile, "%d\n", pid)
-	}
+// The PID file names the process holding sainttorrent.lock, so `sainttorrent
+// kill` can signal it when the IPC socket does not answer. It sits beside the
+// lock rather than inside it: Windows locks the lock file's first byte, so no
+// other process can read a PID stored there.
+func pidFilePath(ipcDir string) string {
+	return filepath.Join(ipcDir, "sainttorrent.pid")
+}
+
+func writePID(ipcDir string) {
+	_ = os.WriteFile(pidFilePath(ipcDir), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600)
 }
 
 func removePID(ipcDir string) {
-	_ = os.Remove(filepath.Join(ipcDir, "sainttorrent.pid"))
+	_ = os.Remove(pidFilePath(ipcDir))
 }
 
-func readPID(ipcDir string, lockPath string) int {
-	pidPath := filepath.Join(ipcDir, "sainttorrent.pid")
-	if data, err := os.ReadFile(pidPath); err == nil {
-		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
-			return pid
+func readPID(ipcDir string) int {
+	data, err := os.ReadFile(pidFilePath(ipcDir))
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// lockHolderPID picks the process to signal when the instance holding lockPath
+// did not stop over IPC. The PID file is trusted only while it names a running
+// saintTorrent process: a crash leaves it behind, and its PID may since have
+// been reused. Without a usable PID file (an instance started before PID files
+// existed), a process search is accepted only when it finds exactly one other
+// saintTorrent process, since it cannot tell which IPC directory each serves.
+func lockHolderPID(ipcDir, lockPath string, isSaintTorrent func(int) bool, findPIDs func() []int) (int, error) {
+	self := os.Getpid()
+	if pid := readPID(ipcDir); pid > 0 && pid != self && isSaintTorrent(pid) {
+		return pid, nil
+	}
+	var candidates []int
+	for _, pid := range findPIDs() {
+		if pid != self {
+			candidates = append(candidates, pid)
 		}
 	}
-	if data, err := os.ReadFile(lockPath); err == nil {
-		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
-			return pid
-		}
+	switch len(candidates) {
+	case 0:
+		return 0, fmt.Errorf("running instance detected, but process ID could not be determined")
+	case 1:
+		return candidates[0], nil
+	default:
+		return 0, fmt.Errorf("running instance detected, but %d saintTorrent processes are running (PIDs %v) and the one holding %s cannot be identified; stop it manually", len(candidates), candidates, lockPath)
 	}
-	return 0
 }
 
 func killRunningInstance() error {
@@ -1553,9 +1578,11 @@ func killRunningInstance() error {
 
 	lockFile, lockErr := acquireLock(lockPath)
 	if lockErr == nil {
-		_ = lockFile.Close()
+		// Clear stale files while still holding the lock, so an instance that
+		// starts right now cannot have its fresh socket or PID file deleted.
 		_ = os.Remove(socketPath)
 		removePID(ipcDir)
+		_ = lockFile.Close()
 		fmt.Println("No running saintTorrent instance found.")
 		return nil
 	}
@@ -1590,26 +1617,11 @@ func killRunningInstance() error {
 	}
 
 	// If socket failed or instance did not stop within deadline, terminate by PID.
-	pid := readPID(ipcDir, lockPath)
-	var pids []int
-	if pid > 0 && pid != os.Getpid() {
-		pids = append(pids, pid)
+	pid, err := lockHolderPID(ipcDir, lockPath, isSaintTorrentProcess, findProcessPIDs)
+	if err != nil {
+		return err
 	}
-	if len(pids) == 0 {
-		for _, p := range findProcessPIDs() {
-			if p != os.Getpid() {
-				pids = append(pids, p)
-			}
-		}
-	}
-
-	if len(pids) == 0 {
-		return fmt.Errorf("running instance detected, but process ID could not be determined")
-	}
-
-	for _, p := range pids {
-		_ = terminateProcess(p)
-	}
+	_ = terminateProcess(pid)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1621,9 +1633,7 @@ func killRunningInstance() error {
 		}
 	}
 
-	for _, p := range pids {
-		_ = killProcess(p)
-	}
+	_ = killProcess(pid)
 
 	time.Sleep(200 * time.Millisecond)
 	if testLock, testErr := acquireLock(lockPath); testErr == nil {
@@ -2067,7 +2077,7 @@ func main() {
 			lockFile.Close()
 		}
 	}()
-	writePID(ipcDir, lockFile)
+	writePID(ipcDir)
 	defer removePID(ipcDir)
 
 	var startupInfos []string
@@ -2260,15 +2270,7 @@ func main() {
 		p = newTUIProgram(startModel)
 		perfMarkf("tui-build")
 
-		programMu.Lock()
-		teaProgram = p
-		programMu.Unlock()
-
-		shutdownReqMu.Lock()
-		if shutdownRequested {
-			go p.Quit()
-		}
-		shutdownReqMu.Unlock()
+		setTeaProgram(p)
 	} else {
 		perfMarkf("headless-ready")
 	}
@@ -2335,7 +2337,8 @@ func main() {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Error removing socket file: %v\n", err)
 	}
-	removePID(ipcDir)
+	// The PID file stays until mgr.Close finishes, so `sainttorrent kill` can
+	// still find this process if a slow close outlasts its graceful wait.
 	// H3: hard ceiling on close. mgr.Close persists state before any network/teardown,
 	// so if a hung tracker or stuck join blows past the deadline we force-exit safely.
 	const shutdownForceDeadline = 2 * time.Second
@@ -2358,9 +2361,11 @@ func main() {
 			fmt.Printf("shutdown_ms=%.1f (forced)\n", msOf(time.Since(shutdownStart)))
 		}
 		perfReport(os.Stderr)
+		removePID(ipcDir)
 		os.Exit(exitCode)
 	}
 	if exitCode != 0 {
+		removePID(ipcDir)
 		logging.Close()
 		os.Exit(exitCode)
 	}
@@ -2417,16 +2422,19 @@ func triggerShutdown() {
 	}
 }
 
-func resetShutdownStateForTest() {
-	shutdownReqMu.Lock()
-	shutdownRequested = false
-	headlessShutdownChan = make(chan struct{})
-	shutdownOnce = sync.Once{}
-	shutdownReqMu.Unlock()
-
+// setTeaProgram publishes p to the socket handlers and replays a shutdown that
+// was requested over IPC before p existed.
+func setTeaProgram(p *tea.Program) {
 	programMu.Lock()
-	teaProgram = nil
+	teaProgram = p
 	programMu.Unlock()
+
+	shutdownReqMu.Lock()
+	requested := shutdownRequested
+	shutdownReqMu.Unlock()
+	if requested {
+		go p.Quit()
+	}
 }
 
 func waitForShutdownSignal() {

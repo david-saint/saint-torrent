@@ -139,24 +139,73 @@ func TestUsageTextMentionsKeyFlags(t *testing.T) {
 
 func TestPIDFileReadWriteRemove(t *testing.T) {
 	tmpDir := t.TempDir()
-	lockPath := filepath.Join(tmpDir, "sainttorrent.lock")
-	lockFile, err := acquireLock(lockPath)
+	// Hold the instance lock as a running instance would: on Windows it locks
+	// the lock file's first byte, which must not hide the PID from readers.
+	lockFile, err := acquireLock(filepath.Join(tmpDir, "sainttorrent.lock"))
 	if err != nil {
 		t.Fatalf("failed to acquire lock: %v", err)
 	}
 	defer lockFile.Close()
 
-	writePID(tmpDir, lockFile)
-	pid := readPID(tmpDir, lockPath)
-	if pid != os.Getpid() {
+	writePID(tmpDir)
+	if pid := readPID(tmpDir); pid != os.Getpid() {
 		t.Fatalf("expected pid %d, got %d", os.Getpid(), pid)
 	}
 
 	removePID(tmpDir)
-	// Reading from lockFile should still work as fallback
-	pidFallback := readPID(tmpDir, lockPath)
-	if pidFallback != os.Getpid() {
-		t.Fatalf("expected pid %d from lockfile fallback, got %d", os.Getpid(), pidFallback)
+	if pid := readPID(tmpDir); pid != 0 {
+		t.Fatalf("expected no pid after removal, got %d", pid)
+	}
+}
+
+func TestIsSaintTorrentProcessRejectsOtherProcesses(t *testing.T) {
+	// The test binary is sainttorrent.test, so a PID reused by any process
+	// not named sainttorrent must not be accepted as the instance.
+	if isSaintTorrentProcess(os.Getpid()) {
+		t.Fatal("test binary accepted as a saintTorrent process")
+	}
+}
+
+func TestLockHolderPID(t *testing.T) {
+	stalePID := os.Getppid() // live, but not a saintTorrent process
+	isSaintTorrent := func(pid int) bool { return pid != stalePID }
+	none := func() []int { return nil }
+	tests := []struct {
+		name     string
+		pidFile  int
+		search   func() []int
+		wantPID  int
+		wantErrs []string
+	}{
+		{name: "pid file names instance", pidFile: 4242, search: none, wantPID: 4242},
+		{name: "stale pid file, one search match", pidFile: stalePID, search: func() []int { return []int{os.Getpid(), 777} }, wantPID: 777},
+		{name: "stale pid file, no search match", pidFile: stalePID, search: none, wantErrs: []string{"could not be determined"}},
+		{name: "no pid file, several search matches", search: func() []int { return []int{777, 888} }, wantErrs: []string{"2 saintTorrent processes", "777", "888", "stop it manually"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ipcDir := t.TempDir()
+			if tt.pidFile != 0 {
+				if err := os.WriteFile(pidFilePath(ipcDir), []byte(fmt.Sprintf("%d\n", tt.pidFile)), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pid, err := lockHolderPID(ipcDir, filepath.Join(ipcDir, "sainttorrent.lock"), isSaintTorrent, tt.search)
+			if len(tt.wantErrs) > 0 {
+				if err == nil {
+					t.Fatalf("expected error, got pid %d", pid)
+				}
+				for _, want := range tt.wantErrs {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q missing %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil || pid != tt.wantPID {
+				t.Fatalf("lockHolderPID = %d, %v; want %d", pid, err, tt.wantPID)
+			}
+		})
 	}
 }
 
@@ -284,24 +333,56 @@ func TestHandleSocketConnectionKillActions(t *testing.T) {
 	}
 }
 
-func TestShutdownRequestedReplayOnTUIProgramAssign(t *testing.T) {
+// waitForQuitModel runs until the program is told to quit from outside.
+type waitForQuitModel struct{}
+
+func (waitForQuitModel) Init() tea.Cmd                       { return nil }
+func (waitForQuitModel) Update(tea.Msg) (tea.Model, tea.Cmd) { return waitForQuitModel{}, nil }
+func (waitForQuitModel) View() string                        { return "" }
+
+func TestSetTeaProgramReplaysEarlyShutdown(t *testing.T) {
 	resetShutdownStateForTest()
+	t.Cleanup(resetShutdownStateForTest)
 
-	// Simulate a kill that arrives before teaProgram is created
+	// A kill that arrives while the TUI is still being built.
 	triggerShutdown()
-
-	shutdownReqMu.Lock()
-	requested := shutdownRequested
-	shutdownReqMu.Unlock()
-	if !requested {
-		t.Fatal("expected shutdownRequested to be true after triggerShutdown")
-	}
-
 	select {
 	case <-headlessShutdownChan:
 	default:
 		t.Fatal("expected headlessShutdownChan to be closed after triggerShutdown")
 	}
+
+	p := tea.NewProgram(waitForQuitModel{}, tea.WithInput(nil), tea.WithOutput(io.Discard))
+	setTeaProgram(p)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("program run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		p.Kill()
+		t.Fatal("early shutdown request was not replayed once the TUI program existed")
+	}
+}
+
+// resetShutdownStateForTest restores the package-level shutdown state that
+// triggerShutdown consumes, so each test starts from a fresh instance.
+func resetShutdownStateForTest() {
+	shutdownReqMu.Lock()
+	shutdownRequested = false
+	headlessShutdownChan = make(chan struct{})
+	shutdownOnce = sync.Once{}
+	shutdownReqMu.Unlock()
+
+	programMu.Lock()
+	teaProgram = nil
+	programMu.Unlock()
 }
 
 func TestLoadAndApplyUserDownloadConfig(t *testing.T) {
