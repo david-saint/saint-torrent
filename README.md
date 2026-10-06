@@ -79,6 +79,7 @@ List all available flags or print the version:
 ```bash
 ./sainttorrent --help
 ./sainttorrent --version
+./sainttorrent kill             # stop a running instance (or --kill)
 ```
 
 Start the client with the configured download directory (`~/Downloads` when no

@@ -114,17 +114,120 @@ func TestParseCLIArgsHelpAndVersion(t *testing.T) {
 	}
 
 	defaults := parseCLIArgs(nil)
-	if defaults.help || defaults.showVersion {
-		t.Fatalf("expected help/version unset by default, got %+v", defaults)
+	if defaults.help || defaults.showVersion || defaults.kill {
+		t.Fatalf("expected help/version/kill unset by default, got %+v", defaults)
+	}
+}
+
+func TestParseCLIArgsKill(t *testing.T) {
+	for _, arg := range []string{"-k", "--kill", "--stop", "kill", "stop"} {
+		opts := parseCLIArgs([]string{arg})
+		if !opts.kill || opts.err != nil {
+			t.Fatalf("expected kill flag for %q, got %+v", arg, opts)
+		}
 	}
 }
 
 func TestUsageTextMentionsKeyFlags(t *testing.T) {
 	usage := usageText()
-	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote"} {
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote", "--kill", "kill"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage text missing %q", want)
 		}
+	}
+}
+
+func TestPIDFileReadWriteRemove(t *testing.T) {
+	tmpDir := t.TempDir()
+	lockPath := filepath.Join(tmpDir, "sainttorrent.lock")
+	lockFile, err := acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+	defer lockFile.Close()
+
+	writePID(tmpDir, lockFile)
+	pid := readPID(tmpDir, lockPath)
+	if pid != os.Getpid() {
+		t.Fatalf("expected pid %d, got %d", os.Getpid(), pid)
+	}
+
+	removePID(tmpDir)
+	// Reading from lockFile should still work as fallback
+	pidFallback := readPID(tmpDir, lockPath)
+	if pidFallback != os.Getpid() {
+		t.Fatalf("expected pid %d from lockfile fallback, got %d", os.Getpid(), pidFallback)
+	}
+}
+
+func TestKillRunningInstanceNoInstance(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "st-ipc-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SAINTTORRENT_IPC_DIR", tmpDir)
+
+	err = killRunningInstance("")
+	if err != nil {
+		t.Fatalf("expected no error when killing nonexistent instance, got: %v", err)
+	}
+}
+
+func TestKillRunningInstanceGracefulIPC(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "st-ipc-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SAINTTORRENT_IPC_DIR", tmpDir)
+
+	lockPath := filepath.Join(tmpDir, "sainttorrent.lock")
+	socketPath := filepath.Join(tmpDir, "sainttorrent.sock")
+
+	lockFile, err := acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		lockFile.Close()
+		t.Fatalf("failed to listen on socket: %v", err)
+	}
+
+	killReceived := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		n, _ := conn.Read(buf)
+		var msg socketMessage
+		_ = json.Unmarshal(buf[:n], &msg)
+		if msg.Action == "kill" {
+			close(killReceived)
+		}
+		resp := socketResponse{Status: "ok", Message: "shutting down"}
+		respBytes, _ := json.Marshal(resp)
+		_ = writeFrame(conn, respBytes)
+		// Simulate graceful shutdown
+		listener.Close()
+		_ = os.Remove(socketPath)
+		lockFile.Close()
+	}()
+
+	err = killRunningInstance("")
+	if err != nil {
+		t.Fatalf("killRunningInstance failed: %v", err)
+	}
+
+	select {
+	case <-killReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for kill message")
 	}
 }
 
