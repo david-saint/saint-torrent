@@ -168,7 +168,7 @@ func TestKillRunningInstanceNoInstance(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	t.Setenv("SAINTTORRENT_IPC_DIR", tmpDir)
 
-	err = killRunningInstance("")
+	err = killRunningInstance()
 	if err != nil {
 		t.Fatalf("expected no error when killing nonexistent instance, got: %v", err)
 	}
@@ -189,12 +189,17 @@ func TestKillRunningInstanceGracefulIPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to acquire lock: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = lockFile.Close()
+	})
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		lockFile.Close()
 		t.Fatalf("failed to listen on socket: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
 
 	killReceived := make(chan struct{})
 	go func() {
@@ -214,12 +219,12 @@ func TestKillRunningInstanceGracefulIPC(t *testing.T) {
 		respBytes, _ := json.Marshal(resp)
 		_ = writeFrame(conn, respBytes)
 		// Simulate graceful shutdown
-		listener.Close()
+		_ = listener.Close()
 		_ = os.Remove(socketPath)
-		lockFile.Close()
+		_ = lockFile.Close()
 	}()
 
-	err = killRunningInstance("")
+	err = killRunningInstance()
 	if err != nil {
 		t.Fatalf("killRunningInstance failed: %v", err)
 	}
@@ -228,6 +233,74 @@ func TestKillRunningInstanceGracefulIPC(t *testing.T) {
 	case <-killReceived:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for kill message")
+	}
+}
+
+func TestHandleSocketConnectionKillActions(t *testing.T) {
+	for _, action := range []string{"kill", "quit", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			resetShutdownStateForTest()
+
+			serverConn, clientConn := net.Pipe()
+			defer clientConn.Close()
+
+			mgr := downloader.NewTorrentManager()
+			defer mgr.Close()
+
+			var handlersWG sync.WaitGroup
+			handlersWG.Add(1)
+			go handleSocketConnection(serverConn, make(chan struct{}), mgr, &handlersWG, terminalIdentity{}, true, downloadPathOptions{primary: "."})
+
+			data, _ := json.Marshal(socketMessage{Action: action})
+			_, _ = clientConn.Write(append(data, '\n'))
+
+			buf := make([]byte, 1024)
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			var resp socketResponse
+			if err := json.Unmarshal(buf[:n], &resp); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+			if resp.Status != "ok" {
+				t.Fatalf("expected status=ok, got %s: %s", resp.Status, resp.Message)
+			}
+
+			select {
+			case <-headlessShutdownChan:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s action did not close headlessShutdownChan", action)
+			}
+
+			shutdownReqMu.Lock()
+			requested := shutdownRequested
+			shutdownReqMu.Unlock()
+			if !requested {
+				t.Fatalf("%s action did not set shutdownRequested", action)
+			}
+			handlersWG.Wait()
+		})
+	}
+}
+
+func TestShutdownRequestedReplayOnTUIProgramAssign(t *testing.T) {
+	resetShutdownStateForTest()
+
+	// Simulate a kill that arrives before teaProgram is created
+	triggerShutdown()
+
+	shutdownReqMu.Lock()
+	requested := shutdownRequested
+	shutdownReqMu.Unlock()
+	if !requested {
+		t.Fatal("expected shutdownRequested to be true after triggerShutdown")
+	}
+
+	select {
+	case <-headlessShutdownChan:
+	default:
+		t.Fatal("expected headlessShutdownChan to be closed after triggerShutdown")
 	}
 }
 

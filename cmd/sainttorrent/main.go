@@ -1520,7 +1520,6 @@ func writePID(ipcDir string, lockFile *os.File) {
 		_ = lockFile.Truncate(0)
 		_, _ = lockFile.Seek(0, 0)
 		_, _ = fmt.Fprintf(lockFile, "%d\n", pid)
-		_ = lockFile.Sync()
 	}
 }
 
@@ -1543,7 +1542,7 @@ func readPID(ipcDir string, lockPath string) int {
 	return 0
 }
 
-func killRunningInstance(configDir string) error {
+func killRunningInstance() error {
 	ipcDir, err := resolveIPCDir()
 	if err != nil {
 		return fmt.Errorf("resolving IPC directory: %w", err)
@@ -1882,7 +1881,7 @@ func main() {
 		os.Exit(2)
 	}
 	if opts.kill {
-		if err := killRunningInstance(opts.configDir); err != nil {
+		if err := killRunningInstance(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -2416,6 +2415,18 @@ func triggerShutdown() {
 	if p != nil {
 		go p.Quit()
 	}
+}
+
+func resetShutdownStateForTest() {
+	shutdownReqMu.Lock()
+	shutdownRequested = false
+	headlessShutdownChan = make(chan struct{})
+	shutdownOnce = sync.Once{}
+	shutdownReqMu.Unlock()
+
+	programMu.Lock()
+	teaProgram = nil
+	programMu.Unlock()
 }
 
 func waitForShutdownSignal() {
