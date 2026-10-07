@@ -151,6 +151,7 @@ type deleteFinishedMsg struct {
 }
 
 type socketMessage struct {
+	Action               string   `json:"action,omitempty"`
 	Items                []string `json:"items"`
 	Confirm              bool     `json:"confirm"`
 	DownloadDir          string   `json:"download_dir"`
@@ -195,6 +196,7 @@ type cliOptions struct {
 	logLevelSet          bool
 	help                 bool
 	showVersion          bool
+	kill                 bool
 	err                  error
 	items                []string
 }
@@ -1282,11 +1284,16 @@ func usageText() string {
 
 Usage:
   sainttorrent [options] [torrent-file-or-magnet-uri ...]
+  sainttorrent kill
+
+Commands:
+  kill, stop                Stop the running saintTorrent instance and exit
 
 Options:
   -d, --dir <path>          Preferred download directory (default ~/Downloads)
       --fallback-dir <path> Fallback download directory (repeatable)
   -c, --config <path>       Configuration/IPC directory
+  -k, --kill                Stop the running saintTorrent instance and exit
   -p, --port <port>         Peer listen port (0 for ephemeral, default 51413)
       --no-nat              Disable automatic UPnP/NAT-PMP port mapping
       --encryption <mode>   Peer encryption: prefer, require, or disable (default prefer)
@@ -1319,6 +1326,7 @@ Examples:
   sainttorrent -d "/Volumes/External SSD/Downloads" --fallback-dir ~/Downloads
   sainttorrent -d ~/Downloads "magnet:?xt=urn:btih:..."
   sainttorrent --headless --http-addr 127.0.0.1:16666
+  sainttorrent kill
 `
 }
 
@@ -1453,6 +1461,10 @@ func parseCLIArgs(args []string) cliOptions {
 			}
 			opts.logLevel = level
 			opts.logLevelSet = true
+		case "-k", "--kill", "--stop":
+			opts.kill = true
+		case "kill", "stop":
+			opts.kill = true
 		case "-h", "--help":
 			opts.help = true
 		case "-v", "--version":
@@ -1498,6 +1510,139 @@ func resolveIPCDir() (string, error) {
 		return "", fmt.Errorf("resolved socket path %q too long (%d bytes, max 103)", sockPath, len(sockPath))
 	}
 	return dir, nil
+}
+
+// The PID file names the process holding sainttorrent.lock, so `sainttorrent
+// kill` can signal it when the IPC socket does not answer. It sits beside the
+// lock rather than inside it: Windows locks the lock file's first byte, so no
+// other process can read a PID stored there.
+func pidFilePath(ipcDir string) string {
+	return filepath.Join(ipcDir, "sainttorrent.pid")
+}
+
+func writePID(ipcDir string) {
+	_ = os.WriteFile(pidFilePath(ipcDir), []byte(strconv.Itoa(os.Getpid())+"\n"), 0600)
+}
+
+func removePID(ipcDir string) {
+	_ = os.Remove(pidFilePath(ipcDir))
+}
+
+func readPID(ipcDir string) int {
+	data, err := os.ReadFile(pidFilePath(ipcDir))
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// lockHolderPID picks the process to signal when the instance holding lockPath
+// did not stop over IPC. The PID file is trusted only while it names a running
+// saintTorrent process: a crash leaves it behind, and its PID may since have
+// been reused. Without a usable PID file (an instance started before PID files
+// existed), a process search is accepted only when it finds exactly one other
+// saintTorrent process, since it cannot tell which IPC directory each serves.
+func lockHolderPID(ipcDir, lockPath string, isSaintTorrent func(int) bool, findPIDs func() []int) (int, error) {
+	self := os.Getpid()
+	if pid := readPID(ipcDir); pid > 0 && pid != self && isSaintTorrent(pid) {
+		return pid, nil
+	}
+	var candidates []int
+	for _, pid := range findPIDs() {
+		if pid != self {
+			candidates = append(candidates, pid)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return 0, fmt.Errorf("running instance detected, but process ID could not be determined")
+	case 1:
+		return candidates[0], nil
+	default:
+		return 0, fmt.Errorf("running instance detected, but %d saintTorrent processes are running (PIDs %v) and the one holding %s cannot be identified; stop it manually", len(candidates), candidates, lockPath)
+	}
+}
+
+func killRunningInstance() error {
+	ipcDir, err := resolveIPCDir()
+	if err != nil {
+		return fmt.Errorf("resolving IPC directory: %w", err)
+	}
+
+	lockPath := filepath.Join(ipcDir, "sainttorrent.lock")
+	socketPath := filepath.Join(ipcDir, "sainttorrent.sock")
+
+	lockFile, lockErr := acquireLock(lockPath)
+	if lockErr == nil {
+		// Clear stale files while still holding the lock, so an instance that
+		// starts right now cannot have its fresh socket or PID file deleted.
+		_ = os.Remove(socketPath)
+		removePID(ipcDir)
+		_ = lockFile.Close()
+		fmt.Println("No running saintTorrent instance found.")
+		return nil
+	}
+
+	if !errors.Is(lockErr, errLockContention) {
+		return fmt.Errorf("checking lock: %w", lockErr)
+	}
+
+	// Instance is holding the lock. First, try graceful stop via IPC socket.
+	conn, dialErr := net.DialTimeout("unix", socketPath, 1*time.Second)
+	if dialErr == nil {
+		msg := socketMessage{Action: "kill"}
+		if data, err := json.Marshal(msg); err == nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			if err := writeFrame(conn, data); err == nil {
+				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 256)
+				_, _ = conn.Read(buf)
+			}
+		}
+		_ = conn.Close()
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			if testLock, testErr := acquireLock(lockPath); testErr == nil {
+				_ = testLock.Close()
+				fmt.Println("saintTorrent instance stopped.")
+				return nil
+			}
+		}
+	}
+
+	// If socket failed or instance did not stop within deadline, terminate by PID.
+	pid, err := lockHolderPID(ipcDir, lockPath, isSaintTorrentProcess, findProcessPIDs)
+	if err != nil {
+		return err
+	}
+	_ = terminateProcess(pid)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+		if testLock, testErr := acquireLock(lockPath); testErr == nil {
+			_ = testLock.Close()
+			fmt.Println("saintTorrent instance stopped.")
+			return nil
+		}
+	}
+
+	_ = killProcess(pid)
+
+	time.Sleep(200 * time.Millisecond)
+	if testLock, testErr := acquireLock(lockPath); testErr == nil {
+		_ = testLock.Close()
+		fmt.Println("saintTorrent instance killed.")
+		return nil
+	}
+
+	return fmt.Errorf("failed to kill running saintTorrent instance")
 }
 
 var activeConns struct {
@@ -1589,6 +1734,12 @@ func handleSocketConnection(conn net.Conn, shutdownChan chan struct{}, mgr *down
 	var msg socketMessage
 	if err := json.Unmarshal(requestData, &msg); err != nil {
 		sendResponse(conn, "error", fmt.Sprintf("invalid JSON payload: %v", err), terminal)
+		return
+	}
+
+	if msg.Action == "kill" || msg.Action == "quit" || msg.Action == "stop" {
+		sendResponse(conn, "ok", "shutting down", terminal)
+		triggerShutdown()
 		return
 	}
 
@@ -1738,6 +1889,13 @@ func main() {
 	if opts.err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", opts.err)
 		os.Exit(2)
+	}
+	if opts.kill {
+		if err := killRunningInstance(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 	userConfig, userConfigPath, configErr := loadUserConfig(opts.configDir)
 	if configErr != nil {
@@ -1919,6 +2077,8 @@ func main() {
 			lockFile.Close()
 		}
 	}()
+	writePID(ipcDir)
+	defer removePID(ipcDir)
 
 	var startupInfos []string
 	var startupWarns []string
@@ -2110,9 +2270,7 @@ func main() {
 		p = newTUIProgram(startModel)
 		perfMarkf("tui-build")
 
-		programMu.Lock()
-		teaProgram = p
-		programMu.Unlock()
+		setTeaProgram(p)
 	} else {
 		perfMarkf("headless-ready")
 	}
@@ -2179,6 +2337,8 @@ func main() {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Error removing socket file: %v\n", err)
 	}
+	// The PID file stays until mgr.Close finishes, so `sainttorrent kill` can
+	// still find this process if a slow close outlasts its graceful wait.
 	// H3: hard ceiling on close. mgr.Close persists state before any network/teardown,
 	// so if a hung tracker or stuck join blows past the deadline we force-exit safely.
 	const shutdownForceDeadline = 2 * time.Second
@@ -2201,9 +2361,11 @@ func main() {
 			fmt.Printf("shutdown_ms=%.1f (forced)\n", msOf(time.Since(shutdownStart)))
 		}
 		perfReport(os.Stderr)
+		removePID(ipcDir)
 		os.Exit(exitCode)
 	}
 	if exitCode != 0 {
+		removePID(ipcDir)
 		logging.Close()
 		os.Exit(exitCode)
 	}
@@ -2236,6 +2398,45 @@ func redirectStdLog() {
 	log.SetOutput(logging.StdLogWriter())
 }
 
+var (
+	headlessShutdownChan = make(chan struct{})
+	shutdownOnce         sync.Once
+	shutdownRequested    bool
+	shutdownReqMu        sync.Mutex
+)
+
+func triggerShutdown() {
+	shutdownReqMu.Lock()
+	shutdownRequested = true
+	shutdownReqMu.Unlock()
+
+	shutdownOnce.Do(func() {
+		close(headlessShutdownChan)
+	})
+
+	programMu.RLock()
+	p := teaProgram
+	programMu.RUnlock()
+	if p != nil {
+		go p.Quit()
+	}
+}
+
+// setTeaProgram publishes p to the socket handlers and replays a shutdown that
+// was requested over IPC before p existed.
+func setTeaProgram(p *tea.Program) {
+	programMu.Lock()
+	teaProgram = p
+	programMu.Unlock()
+
+	shutdownReqMu.Lock()
+	requested := shutdownRequested
+	shutdownReqMu.Unlock()
+	if requested {
+		go p.Quit()
+	}
+}
+
 func waitForShutdownSignal() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -2244,6 +2445,7 @@ func waitForShutdownSignal() {
 	select {
 	case <-sigCh:
 	case <-hangup:
+	case <-headlessShutdownChan:
 	}
 	signal.Stop(sigCh)
 }

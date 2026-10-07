@@ -114,18 +114,275 @@ func TestParseCLIArgsHelpAndVersion(t *testing.T) {
 	}
 
 	defaults := parseCLIArgs(nil)
-	if defaults.help || defaults.showVersion {
-		t.Fatalf("expected help/version unset by default, got %+v", defaults)
+	if defaults.help || defaults.showVersion || defaults.kill {
+		t.Fatalf("expected help/version/kill unset by default, got %+v", defaults)
+	}
+}
+
+func TestParseCLIArgsKill(t *testing.T) {
+	for _, arg := range []string{"-k", "--kill", "--stop", "kill", "stop"} {
+		opts := parseCLIArgs([]string{arg})
+		if !opts.kill || opts.err != nil {
+			t.Fatalf("expected kill flag for %q, got %+v", arg, opts)
+		}
 	}
 }
 
 func TestUsageTextMentionsKeyFlags(t *testing.T) {
 	usage := usageText()
-	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote"} {
+	for _, want := range []string{"Usage:", "--help", "--version", "--dir", "--fallback-dir", "--encryption", "--storage", "--http-addr", "--http-allow-remote", "--kill", "kill"} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage text missing %q", want)
 		}
 	}
+}
+
+func TestPIDFileReadWriteRemove(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Hold the instance lock as a running instance would: on Windows it locks
+	// the lock file's first byte, which must not hide the PID from readers.
+	lockFile, err := acquireLock(filepath.Join(tmpDir, "sainttorrent.lock"))
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+	defer lockFile.Close()
+
+	writePID(tmpDir)
+	if pid := readPID(tmpDir); pid != os.Getpid() {
+		t.Fatalf("expected pid %d, got %d", os.Getpid(), pid)
+	}
+
+	removePID(tmpDir)
+	if pid := readPID(tmpDir); pid != 0 {
+		t.Fatalf("expected no pid after removal, got %d", pid)
+	}
+}
+
+func TestIsSaintTorrentProcessRejectsOtherProcesses(t *testing.T) {
+	// The test binary is sainttorrent.test, so a PID reused by any process
+	// not named sainttorrent must not be accepted as the instance.
+	if isSaintTorrentProcess(os.Getpid()) {
+		t.Fatal("test binary accepted as a saintTorrent process")
+	}
+}
+
+func TestLockHolderPID(t *testing.T) {
+	stalePID := os.Getppid() // live, but not a saintTorrent process
+	isSaintTorrent := func(pid int) bool { return pid != stalePID }
+	none := func() []int { return nil }
+	tests := []struct {
+		name     string
+		pidFile  int
+		search   func() []int
+		wantPID  int
+		wantErrs []string
+	}{
+		{name: "pid file names instance", pidFile: 4242, search: none, wantPID: 4242},
+		{name: "stale pid file, one search match", pidFile: stalePID, search: func() []int { return []int{os.Getpid(), 777} }, wantPID: 777},
+		{name: "stale pid file, no search match", pidFile: stalePID, search: none, wantErrs: []string{"could not be determined"}},
+		{name: "no pid file, several search matches", search: func() []int { return []int{777, 888} }, wantErrs: []string{"2 saintTorrent processes", "777", "888", "stop it manually"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ipcDir := t.TempDir()
+			if tt.pidFile != 0 {
+				if err := os.WriteFile(pidFilePath(ipcDir), []byte(fmt.Sprintf("%d\n", tt.pidFile)), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pid, err := lockHolderPID(ipcDir, filepath.Join(ipcDir, "sainttorrent.lock"), isSaintTorrent, tt.search)
+			if len(tt.wantErrs) > 0 {
+				if err == nil {
+					t.Fatalf("expected error, got pid %d", pid)
+				}
+				for _, want := range tt.wantErrs {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q missing %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil || pid != tt.wantPID {
+				t.Fatalf("lockHolderPID = %d, %v; want %d", pid, err, tt.wantPID)
+			}
+		})
+	}
+}
+
+func TestKillRunningInstanceNoInstance(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "st-ipc-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SAINTTORRENT_IPC_DIR", tmpDir)
+
+	err = killRunningInstance()
+	if err != nil {
+		t.Fatalf("expected no error when killing nonexistent instance, got: %v", err)
+	}
+}
+
+func TestKillRunningInstanceGracefulIPC(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "st-ipc-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	t.Setenv("SAINTTORRENT_IPC_DIR", tmpDir)
+
+	lockPath := filepath.Join(tmpDir, "sainttorrent.lock")
+	socketPath := filepath.Join(tmpDir, "sainttorrent.sock")
+
+	lockFile, err := acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = lockFile.Close()
+	})
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("failed to listen on socket: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	killReceived := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 1024)
+		n, _ := conn.Read(buf)
+		var msg socketMessage
+		_ = json.Unmarshal(buf[:n], &msg)
+		if msg.Action == "kill" {
+			close(killReceived)
+		}
+		resp := socketResponse{Status: "ok", Message: "shutting down"}
+		respBytes, _ := json.Marshal(resp)
+		_ = writeFrame(conn, respBytes)
+		// Simulate graceful shutdown
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
+		_ = lockFile.Close()
+	}()
+
+	err = killRunningInstance()
+	if err != nil {
+		t.Fatalf("killRunningInstance failed: %v", err)
+	}
+
+	select {
+	case <-killReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for kill message")
+	}
+}
+
+func TestHandleSocketConnectionKillActions(t *testing.T) {
+	for _, action := range []string{"kill", "quit", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			resetShutdownStateForTest()
+
+			serverConn, clientConn := net.Pipe()
+			defer clientConn.Close()
+
+			mgr := downloader.NewTorrentManager()
+			defer mgr.Close()
+
+			var handlersWG sync.WaitGroup
+			handlersWG.Add(1)
+			go handleSocketConnection(serverConn, make(chan struct{}), mgr, &handlersWG, terminalIdentity{}, true, downloadPathOptions{primary: "."})
+
+			data, _ := json.Marshal(socketMessage{Action: action})
+			_, _ = clientConn.Write(append(data, '\n'))
+
+			buf := make([]byte, 1024)
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			var resp socketResponse
+			if err := json.Unmarshal(buf[:n], &resp); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+			if resp.Status != "ok" {
+				t.Fatalf("expected status=ok, got %s: %s", resp.Status, resp.Message)
+			}
+
+			select {
+			case <-headlessShutdownChan:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s action did not close headlessShutdownChan", action)
+			}
+
+			shutdownReqMu.Lock()
+			requested := shutdownRequested
+			shutdownReqMu.Unlock()
+			if !requested {
+				t.Fatalf("%s action did not set shutdownRequested", action)
+			}
+			handlersWG.Wait()
+		})
+	}
+}
+
+// waitForQuitModel runs until the program is told to quit from outside.
+type waitForQuitModel struct{}
+
+func (waitForQuitModel) Init() tea.Cmd                       { return nil }
+func (waitForQuitModel) Update(tea.Msg) (tea.Model, tea.Cmd) { return waitForQuitModel{}, nil }
+func (waitForQuitModel) View() string                        { return "" }
+
+func TestSetTeaProgramReplaysEarlyShutdown(t *testing.T) {
+	resetShutdownStateForTest()
+	t.Cleanup(resetShutdownStateForTest)
+
+	// A kill that arrives while the TUI is still being built.
+	triggerShutdown()
+	select {
+	case <-headlessShutdownChan:
+	default:
+		t.Fatal("expected headlessShutdownChan to be closed after triggerShutdown")
+	}
+
+	p := tea.NewProgram(waitForQuitModel{}, tea.WithInput(nil), tea.WithOutput(io.Discard))
+	setTeaProgram(p)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Run()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("program run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		p.Kill()
+		t.Fatal("early shutdown request was not replayed once the TUI program existed")
+	}
+}
+
+// resetShutdownStateForTest restores the package-level shutdown state that
+// triggerShutdown consumes, so each test starts from a fresh instance.
+func resetShutdownStateForTest() {
+	shutdownReqMu.Lock()
+	shutdownRequested = false
+	headlessShutdownChan = make(chan struct{})
+	shutdownOnce = sync.Once{}
+	shutdownReqMu.Unlock()
+
+	programMu.Lock()
+	teaProgram = nil
+	programMu.Unlock()
 }
 
 func TestLoadAndApplyUserDownloadConfig(t *testing.T) {

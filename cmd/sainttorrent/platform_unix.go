@@ -5,7 +5,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -64,4 +67,49 @@ func findTerminalTTY(input *os.File, patterns []string) string {
 
 func setSocketPermissions(socketPath string) error {
 	return os.Chmod(socketPath, 0600)
+}
+
+func terminateProcess(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGTERM)
+}
+
+func killProcess(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Kill()
+}
+
+// isSaintTorrentProcess reports whether pid is a live process whose command is
+// sainttorrent (ps prints a full path on some platforms).
+func isSaintTorrentProcess(pid int) bool {
+	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	return filepath.Base(strings.TrimSpace(string(out))) == "sainttorrent"
+}
+
+func findProcessPIDs() []int {
+	cmd := exec.Command("pgrep", "-x", "sainttorrent")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if pid, err := strconv.Atoi(line); err == nil && pid > 0 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
