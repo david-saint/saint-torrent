@@ -357,3 +357,79 @@ func TestHandleLimitFor(t *testing.T) {
 		}
 	}
 }
+
+// blockingCloser is an io.Closer whose Close does not return until release is
+// closed, like an os.File close stuck on a leaked reference.
+type blockingCloser struct{ release chan struct{} }
+
+func (c blockingCloser) Close() error {
+	<-c.release
+	return nil
+}
+
+// TestCloseWithinBoundsAStuckClose: closeWithin returns once the close is done,
+// and gives up after the wait when the close never finishes.
+func TestCloseWithinBoundsAStuckClose(t *testing.T) {
+	stuck := blockingCloser{release: make(chan struct{})}
+	defer close(stuck.release)
+	start := time.Now()
+	if closeWithin(stuck, 20*time.Millisecond) {
+		t.Fatal("closeWithin reported a stuck close as finished")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("closeWithin waited %v on a stuck close, want about the 20ms bound", elapsed)
+	}
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "f"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !closeWithin(f, 5*time.Second) {
+		t.Fatal("closeWithin gave up on an idle file's close")
+	}
+	if _, err := f.Write([]byte{1}); err == nil {
+		t.Fatal("file still writable after closeWithin reported it closed")
+	}
+}
+
+// TestFileStorageCloseDuringReads: Close returns promptly while block reads are
+// running on the cached handles it closes. On Windows a handle Close that
+// races a queued read can wait forever on a reference internal/poll leaks
+// (see boundedHandleClose); session teardown must not hang on it.
+func TestFileStorageCloseDuringReads(t *testing.T) {
+	const pieceLength, readers = 64 << 10, 8
+	for round := range 30 {
+		st, err := NewFileStorage(t.TempDir(), []FileInfo{{Path: "a", Length: pieceLength}}, pieceLength)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.WriteBlock(0, 0, budgetPiece(round, pieceLength)); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for range readers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				buf := make([]byte, 16<<10)
+				for {
+					if _, err := st.ReadBlock(0, 0, buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+		time.Sleep(time.Millisecond)
+		closed := make(chan error, 1)
+		go func() { closed <- st.Close() }()
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("round %d: Close: %v", round, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("round %d: Close still blocked after 30s with reads in flight", round)
+		}
+		wg.Wait()
+	}
+}

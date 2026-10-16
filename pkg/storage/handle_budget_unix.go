@@ -9,6 +9,10 @@ import "golang.org/x/sys/unix"
 // os.ErrClosed and is retried (see handleBudget).
 const evictCachedHandles = true
 
+// boundedHandleClose is false where closing a handle does not wait for its
+// in-flight I/O, so a plain Close cannot hang (see closeCachedHandle).
+const boundedHandleClose = false
+
 // handleLimit derives the cached-handle limit from the soft RLIMIT_NOFILE,
 // which the Go runtime has already raised to the hard limit (on macOS, to
 // kern.maxfilesperproc) by the time a storage opens its first file.

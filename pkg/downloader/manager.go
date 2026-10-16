@@ -95,6 +95,7 @@ type TorrentManager struct {
 	sentinelPath  string
 	sentinelTimer *time.Timer
 	sentinelDone  bool
+	sentinelRun   uint64 // bumped by each startRunningSentinel
 	uncleanExit   atomic.Bool
 }
 

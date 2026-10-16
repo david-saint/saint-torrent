@@ -159,13 +159,18 @@ type heldFile struct {
 // limit is free again, so that each pass pays for many opens. It never waits:
 // a handle whose file lock is held, because it is being opened or invalidated,
 // is skipped. It returns how many handles it closed.
+//
+// The background sweep and an opener's evictOverrun can run a pass at the same
+// time, so each pass checks the shared count as it goes rather than closing a
+// precomputed number: two passes each closing the whole excess would go on
+// past the stale files into the most recently used ones.
 func (b *handleBudget) evict() int {
 	if !evictCachedHandles {
 		return 0
 	}
 	limit := b.limitValue()
-	excess := b.open.Load() - (limit - limit/4)
-	if excess <= 0 {
+	target := limit - limit/4
+	if b.open.Load() <= target {
 		return 0
 	}
 	b.mu.Lock()
@@ -178,7 +183,7 @@ func (b *handleBudget) evict() int {
 
 	freed := 0
 	for _, c := range candidates {
-		if int64(freed) >= excess {
+		if b.open.Load() <= target {
 			break
 		}
 		freed += c.file.tryEvict()

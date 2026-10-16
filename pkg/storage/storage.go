@@ -259,7 +259,7 @@ func (f *fileLayout) invalidateReaderLocked() bool {
 	if h == nil {
 		return false
 	}
-	_ = h.Close()
+	closeCachedHandle(h)
 	fileHandles.release(f)
 	return true
 }
@@ -359,7 +359,7 @@ func (f *fileLayout) invalidateWriterLocked() bool {
 	if h == nil {
 		return false
 	}
-	_ = h.Close()
+	closeCachedHandle(h)
 	fileHandles.release(f)
 	return true
 }

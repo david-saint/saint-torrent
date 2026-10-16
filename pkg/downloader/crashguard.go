@@ -318,6 +318,17 @@ const (
 // as a constant.
 var sentinelStableAfter = 10 * time.Minute
 
+// sentinelStableRetries and sentinelRetryDelay bound how often, and how far
+// apart, marking the sentinel stable is retried after the write fails. On
+// Windows the rename that replaces the sentinel fails while another process
+// (an antivirus scan, a second instance classifying this run) has the file
+// open, and a run left unmarked counts toward the crash streak if it later
+// dies. Vars so tests can shorten them; treat them as constants.
+var (
+	sentinelStableRetries = 20
+	sentinelRetryDelay    = 250 * time.Millisecond
+)
+
 // processNonce identifies this process in the running sentinel, so a state
 // directory reopened by the same process (tests) is not taken for the
 // leftovers of a crashed run. A pid can be reused; 128 random bits cannot.
@@ -490,19 +501,26 @@ func (m *TorrentManager) startRunningSentinel(stateDir string) {
 	}
 	m.sentinelPath = ""
 	m.sentinelTimer = nil
+	m.sentinelRun++ // a stable mark still pending from an earlier start is void
 	if err := writeRunningSentinel(path, startedAt, false); err != nil {
 		return
 	}
 	m.sentinelPath = path
 	m.sentinelDone = false
-	m.sentinelTimer = time.AfterFunc(sentinelStableAfter, func() {
+	run, retries := m.sentinelRun, 0
+	var markStable func()
+	markStable = func() {
 		m.sentinelMu.Lock()
 		defer m.sentinelMu.Unlock()
-		if m.sentinelDone || m.sentinelPath != path {
+		if m.sentinelDone || m.sentinelRun != run {
 			return
 		}
-		_ = writeRunningSentinel(path, startedAt, true)
-	})
+		if writeRunningSentinel(path, startedAt, true) != nil && retries < sentinelStableRetries {
+			retries++
+			m.sentinelTimer = time.AfterFunc(sentinelRetryDelay, markStable)
+		}
+	}
+	m.sentinelTimer = time.AfterFunc(sentinelStableAfter, markStable)
 }
 
 // finishRunningSentinel ends this run's sentinel on a clean shutdown: it is
