@@ -99,10 +99,6 @@ func probeDownloadPath(path string) error {
 		_ = probe.Close()
 		return fmt.Errorf("write test: %w", err)
 	}
-	if err := probe.Sync(); err != nil {
-		_ = probe.Close()
-		return fmt.Errorf("sync write test: %w", err)
-	}
 	if err := probe.Close(); err != nil {
 		return fmt.Errorf("close write test: %w", err)
 	}

@@ -63,11 +63,13 @@ type TorrentManager struct {
 	wg                    sync.WaitGroup
 	closed                bool
 
-	stateDir       string
-	restoring      bool
-	startPaused    bool // see SetStartPaused
-	writeMu        sync.Mutex
-	failedTorrents []PersistedTorrent
+	stateDir        string
+	restoring       bool
+	startPaused     bool // see SetStartPaused
+	writeMu         sync.Mutex
+	saveStateCh     chan struct{}
+	saveLoopStarted bool
+	failedTorrents  []PersistedTorrent
 	// restoreMigrations tallies the files restore moved from their legacy
 	// names (see migrateLegacyPaths), for the startup notice.
 	restoreMigrations legacyMigrations
@@ -526,10 +528,15 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		sess.releasePathClaims()
 	}
 
-	// 4. Delete the cached .torrent file
+	// 4. Delete the cached .torrent file under writeMu so an in-flight
+	// saveStateInternal that snapshotted sessions before removal cannot observe
+	// the file missing and reconstruct it.
 	if stateDir != "" {
 		cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
-		if err := os.Remove(cachedPath); err != nil && !os.IsNotExist(err) {
+		m.writeMu.Lock()
+		err := os.Remove(cachedPath)
+		m.writeMu.Unlock()
+		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, fmt.Errorf("failed to delete cached torrent file: %w", err))
 		}
 	}
@@ -685,13 +692,13 @@ func (m *TorrentManager) ResumeAll() {
 // SetGlobalDownloadLimit updates the global download bandwidth limit in bytes/sec. 0 = unlimited.
 func (m *TorrentManager) SetGlobalDownloadLimit(bytesPerSec int64) {
 	m.globalDownloadLimiter.SetLimit(bytesPerSec)
-	m.saveState()
+	m.requestSaveState()
 }
 
 // SetGlobalUploadLimit updates the global upload bandwidth limit in bytes/sec. 0 = unlimited.
 func (m *TorrentManager) SetGlobalUploadLimit(bytesPerSec int64) {
 	m.globalUploadLimiter.SetLimit(bytesPerSec)
-	m.saveState()
+	m.requestSaveState()
 }
 
 // GlobalDownloadLimit returns the current global download limit in bytes/sec.
@@ -878,7 +885,7 @@ func (m *TorrentManager) addMagnet(uri string, downloadDir string, private bool)
 
 	sess.MagnetURI = uri
 	sess.OnStateChange = func() {
-		m.saveState()
+		m.requestSaveState()
 	}
 
 	if err := m.AddSession(infoHashHex, sess); err != nil {
@@ -1009,7 +1016,7 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	sess.releaseClaims = releaseClaims
 
 	sess.OnStateChange = func() {
-		m.saveState()
+		m.requestSaveState()
 	}
 
 	if err := m.AddSession(infoHashHex, sess); err != nil {
@@ -1130,6 +1137,44 @@ func (m *TorrentManager) getSnapshotLocked() PersistedState {
 
 func (m *TorrentManager) saveState() error {
 	return m.saveStateInternal(false)
+}
+
+// requestSaveState schedules an asynchronous, coalesced session.json write so
+// interactive controls (Pause, Resume, SetFilePriority, speed limits) and peer
+// metadata callbacks never block on F_FULLFSYNC or writeMu contention.
+func (m *TorrentManager) requestSaveState() {
+	m.mu.Lock()
+	if m.stateDir == "" || m.restoring || m.closed {
+		m.mu.Unlock()
+		return
+	}
+	if m.saveStateCh == nil {
+		m.saveStateCh = make(chan struct{}, 1)
+	}
+	if !m.saveLoopStarted {
+		m.saveLoopStarted = true
+		m.wg.Add(1)
+		go m.stateSaveLoop()
+	}
+	ch := m.saveStateCh
+	m.mu.Unlock()
+
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (m *TorrentManager) stateSaveLoop() {
+	defer m.wg.Done()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.saveStateCh:
+			_ = m.saveStateInternal(false)
+		}
+	}
 }
 
 func (m *TorrentManager) saveStateInternal(allowClosed bool) error {
@@ -1599,7 +1644,7 @@ func (m *TorrentManager) EnablePersistence(stateDir string) (string, error) {
 
 			// Re-apply properties to session
 			sess.OnStateChange = func() {
-				m.saveState()
+				m.requestSaveState()
 			}
 
 			// Restore pause state

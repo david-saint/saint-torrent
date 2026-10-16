@@ -438,6 +438,7 @@ type FileStorage struct {
 	// a checkpoint records one, and the checkpoint falls back to the snapshot.
 	trustedIdentity map[string]string
 	dirty           map[*fileLayout]dirtyState
+	allCreated      bool
 	checkpoint      resumeCheckpoint
 	downloadRoot    *DownloadRoot
 	closed          atomic.Bool
@@ -575,6 +576,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	// tool leaves them between identical payload files, and refusing them made
 	// such a torrent impossible to restore.
 	openedObjects := make(map[fileObjectKey]openedObject, len(files))
+	allCreated := true
 
 	for _, layout := range layouts {
 		path := layout.path
@@ -597,6 +599,9 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		f, created, err := openOrCreateRootFile(downloadRoot, path, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open/create file %s: %w", path, err)
+		}
+		if layout.length > 0 && !created {
+			allCreated = false
 		}
 		fi, err := f.Stat()
 		if err != nil {
@@ -656,6 +661,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		initialInfo:     initialInfo,
 		trustedIdentity: trustedIdentity,
 		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
+		allCreated:      allCreated,
 		downloadRoot:    downloadRoot,
 	}, nil
 }
@@ -889,6 +895,7 @@ func (s *FileStorage) writeFileAt(file *fileLayout, data []byte, fileOffset int6
 	// piece. Both paths are infrequent and off the block path.
 	s.mtMu.Lock()
 	s.dirty[file] |= dirtyMeta | dirtySync
+	s.allCreated = false
 	s.mtMu.Unlock()
 	return repaired, nil
 }

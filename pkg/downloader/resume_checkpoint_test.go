@@ -460,3 +460,98 @@ func TestCloseStopsServingBeforeCheckpoint(t *testing.T) {
 		t.Fatal("the shutdown checkpoint ran while a peer could still read through a mapping")
 	}
 }
+
+func TestFreshlyCreatedStorageSkipsFullScan(t *testing.T) {
+	data := []byte{1, 2, 3, 4}
+	tor := &torrent.Torrent{
+		Name:        "fresh",
+		InfoHash:    sha1.Sum([]byte("fresh")),
+		PieceLength: 4,
+		Files:       []torrent.File{{Path: []string{"a"}, Length: 8}},
+		PieceHashes: [][20]byte{sha1.Sum(data), sha1.Sum(data)},
+	}
+	st, err := storage.NewFileStorage(t.TempDir(), []storage.FileInfo{{Path: "a", Length: 8}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	counted := &countedVerificationStorage{FileStorage: st}
+
+	sess, err := NewSession(tor, counted, [20]byte{}, 0, st.BaseDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.IsVerifying() {
+		t.Fatal("freshly created empty storage triggered an opportunistic full scan")
+	}
+	sess.verifyResume(sess.ctx)
+	if len(counted.checks) != 0 {
+		t.Fatalf("freshly created storage hashed %v, want no checks", counted.checks)
+	}
+}
+
+func TestFullScanSkipsAlreadyDownloadedPieces(t *testing.T) {
+	tor, st := resumeSessionFixture(t, 16)
+	sess, err := NewSession(tor, st, [20]byte{}, 0, st.BaseDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate pieces 1 and 2 being downloaded/claimed before the full scan reaches them.
+	sess.mu.Lock()
+	sess.setPieceStateLocked(1, PieceCompleted)
+	sess.setPieceStateLocked(2, PieceDownloading)
+	sess.mu.Unlock()
+
+	sess.verifyResume(sess.ctx)
+	if !reflect.DeepEqual(st.checks, []int64{0, 3}) {
+		t.Fatalf("full scan checked pieces %v, want only unclaimed [0 3]", st.checks)
+	}
+}
+
+func TestOnStateChangeSchedulesAsyncManagerSave(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "config")
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(configDir); err != nil {
+		t.Fatal(err)
+	}
+	data, infoHash := testTorrent(t, "async-save.bin", false)
+	torrentPath := filepath.Join(t.TempDir(), "async-save.torrent")
+	if err := os.WriteFile(torrentPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := mgr.AddTorrentFile(torrentPath, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashHex := fmt.Sprintf("%x", infoHash)
+
+	// Hold writeMu to simulate a slow in-flight disk sync; Pause and SetGlobalDownloadLimit
+	// must return immediately without blocking the caller (the TUI thread).
+	mgr.writeMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		sess.Pause()
+		mgr.SetGlobalDownloadLimit(54321)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		mgr.writeMu.Unlock()
+		t.Fatal("Pause or SetGlobalDownloadLimit blocked on writeMu")
+	}
+	mgr.writeMu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state := readCrashTestState(t, configDir)
+		if state[hashHex].Paused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("async state save did not persist paused=true: %+v", state[hashHex])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

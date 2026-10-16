@@ -19,6 +19,10 @@ const resumeIdentityMode = "change_time"
 type ResumeState struct {
 	Verified []int
 	Recheck  []int
+	// FreshEmpty reports that no resume file existed and every non-empty payload
+	// file was freshly created (and untouched) by this storage instance, so there
+	// are no pre-existing bytes on disk to opportunistically hash.
+	FreshEmpty bool
 }
 
 // ResumeStorage is optional: other backends continue to use conservative LoadState hints.
@@ -56,6 +60,9 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 	}
 	f, info, err := rootOpenNoFollowInfo(s.downloadRoot, name, resumeMetadataReadFlags, 0)
 	if err != nil {
+		if os.IsNotExist(err) && s.isFreshEmptyPayload() {
+			result.FreshEmpty = true
+		}
 		return result, err
 	}
 	if !info.Mode().IsRegular() {
@@ -131,6 +138,38 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		s.adoptCheckpoint(state, intact)
 	}
 	return result, nil
+}
+
+// isFreshEmptyPayload reports whether every non-empty payload file was created
+// from scratch by NewFileStorage, has not been written since, and still matches
+// its initial on-disk identity and metadata.
+func (s *FileStorage) isFreshEmptyPayload() bool {
+	s.mtMu.Lock()
+	if !s.allCreated || len(s.dirty) > 0 {
+		s.mtMu.Unlock()
+		return false
+	}
+	initial := make(map[string]os.FileInfo, len(s.initialInfo))
+	for path, info := range s.initialInfo {
+		initial[path] = info
+	}
+	s.mtMu.Unlock()
+
+	for _, file := range s.files {
+		if file.length <= 0 {
+			continue
+		}
+		initInfo, ok := initial[file.path]
+		if !ok {
+			return false
+		}
+		current, err := s.downloadRoot.Lstat(file.path)
+		if err != nil || !current.Mode().IsRegular() || !os.SameFile(current, initInfo) ||
+			current.Size() != initInfo.Size() || !current.ModTime().Equal(initInfo.ModTime()) {
+			return false
+		}
+	}
+	return true
 }
 
 // openPayloadMetadata opens a payload file for metadata inspection, refusing to

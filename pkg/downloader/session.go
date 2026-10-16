@@ -1447,6 +1447,17 @@ func (s *Session) setQuarantinedLocked(note string) {
 	s.quarantined = true
 	s.quarantineNote = note
 	s.quarantineErr = errors.New(note)
+	if !s.verifying && !s.metadataMode && s.Storage != nil {
+		s.verifyFullScan = true
+		s.verifyTotalBytes = 0
+		for idx := range s.PieceStates {
+			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
+		}
+		s.verifying = s.verifyTotalBytes > 0
+		if s.verifying && s.verifyDone == nil {
+			s.verifyDone = make(chan struct{})
+		}
+	}
 }
 
 // clearQuarantineLocked lifts a quarantine and reports whether there was one.

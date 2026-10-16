@@ -311,7 +311,9 @@ func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) 
 	s.verifyTotalBytes = 0
 	s.verifyStartTime = time.Time{}
 	if err != nil {
-		s.verifyFullScan = true
+		if !resume.FreshEmpty {
+			s.verifyFullScan = true
+		}
 	} else {
 		for _, idx := range resume.Verified {
 			if idx >= 0 && idx < len(s.PieceStates) {
@@ -495,6 +497,26 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		default:
+		}
+
+		if fullScan {
+			s.mu.RLock()
+			closed := s.closed || s.Storage != st || idx >= len(s.PieceStates)
+			alreadyClaimed := !closed && s.PieceStates[idx] != PieceEmpty
+			s.mu.RUnlock()
+			if closed {
+				return false
+			}
+			if alreadyClaimed {
+				s.mu.Lock()
+				if s.closed || s.Storage != st || idx >= len(s.PieceStates) {
+					s.mu.Unlock()
+					return false
+				}
+				s.verifyCheckedBytes += st.PieceLength(int64(idx))
+				s.mu.Unlock()
+				continue
+			}
 		}
 
 		pieceStart := time.Now()
