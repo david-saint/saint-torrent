@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -24,10 +25,14 @@ type countedVerificationStorage struct {
 	mu        sync.Mutex
 	saves     []bool
 	onDurable func()
+	onVerify  func(int64)
 }
 
 func (s *countedVerificationStorage) VerifyPiece(idx int64, hash [20]byte) (bool, error) {
 	s.checks = append(s.checks, idx)
+	if s.onVerify != nil {
+		s.onVerify(idx)
+	}
 	return s.FileStorage.VerifyPiece(idx, hash)
 }
 
@@ -496,15 +501,120 @@ func TestFullScanSkipsAlreadyDownloadedPieces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Simulate pieces 1 and 2 being downloaded/claimed before the full scan reaches them.
-	sess.mu.Lock()
-	sess.setPieceStateLocked(1, PieceCompleted)
-	sess.setPieceStateLocked(2, PieceDownloading)
-	sess.mu.Unlock()
+	defer sess.Close()
+	st.onVerify = func(idx int64) {
+		if idx == 0 {
+			sess.mu.Lock()
+			sess.setPieceStateLocked(1, PieceCompleted)
+			sess.setPieceStateLocked(2, PieceDownloading)
+			sess.mu.Unlock()
+		}
+	}
 
 	sess.verifyResume(sess.ctx)
 	if !reflect.DeepEqual(st.checks, []int64{0, 3}) {
 		t.Fatalf("full scan checked pieces %v, want only unclaimed [0 3]", st.checks)
+	}
+	if got := sess.Snapshot().Verification.CheckedBytes; got != 16 {
+		t.Fatalf("checked bytes = %d, want 16 including skipped pieces", got)
+	}
+}
+
+func TestFreshStorageRecognizesZeroPieces(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		hashes [][20]byte
+		states []PieceState
+	}{
+		{"all zero", [][20]byte{sha1.Sum(make([]byte, 4)), sha1.Sum(make([]byte, 4)), sha1.Sum(make([]byte, 2))}, []PieceState{PieceCompleted, PieceCompleted, PieceCompleted}},
+		{"mixed", [][20]byte{sha1.Sum(make([]byte, 4)), sha1.Sum([]byte{1, 2, 3, 4}), sha1.Sum(make([]byte, 2))}, []PieceState{PieceCompleted, PieceEmpty, PieceCompleted}},
+	} {
+		for _, force := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/force=%v", test.name, force), func(t *testing.T) {
+				tor := &torrent.Torrent{
+					Name:        "fresh-zero",
+					InfoHash:    sha1.Sum([]byte(test.name)),
+					PieceLength: 4,
+					Files:       []torrent.File{{Path: []string{"a"}, Length: 5}, {Path: []string{"b"}, Length: 5}},
+					PieceHashes: test.hashes,
+				}
+				st, err := storage.NewFileStorage(t.TempDir(), []storage.FileInfo{{Path: "a", Length: 5}, {Path: "b", Length: 5}}, 4)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer st.Close()
+				counted := &countedVerificationStorage{FileStorage: st}
+				sess, err := newSession(tor, counted, [20]byte{}, 0, st.BaseDir(), force)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sess.Close()
+				sess.verifyResume(sess.ctx)
+				if got := sess.GetPieceStates(); !reflect.DeepEqual(got, test.states) {
+					t.Fatalf("piece states = %v, want %v", got, test.states)
+				}
+				if sess.IsVerifying() || len(counted.checks) != 0 {
+					t.Fatalf("fresh payload triggered disk verification: %v", counted.checks)
+				}
+				if got, want := sess.IsCompleted(), test.name == "all zero"; got != want {
+					t.Fatalf("completed = %v, want %v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestQuarantineRechecksAllPayloadPieces(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		verified   []int
+		unverified []int
+	}{
+		{"complete checkpoint", []int{0, 1, 2, 3}, nil},
+		{"partial checkpoint", []int{0, 2}, []int{1}},
+		{"missing checkpoint", nil, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tor, st := resumeSessionFixture(t, 16)
+			if len(test.verified) > 0 {
+				if err := st.SaveResumeState(fmt.Sprintf("%x", tor.InfoHash), test.verified, test.unverified, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sess, err := NewSession(tor, st, [20]byte{}, 0, st.BaseDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sess.Close()
+			sess.mu.Lock()
+			sess.paused = true
+			sess.setQuarantinedLocked("previous run crashed")
+			sess.mu.Unlock()
+			sess.maybeStartVerification()
+			if sess.IsCompleted() || !sess.IsVerifying() || len(st.checks) != 0 {
+				t.Fatalf("quarantine completed=%v verifying=%v checks=%v", sess.IsCompleted(), sess.IsVerifying(), st.checks)
+			}
+			for idx, state := range sess.GetPieceStates() {
+				if state != PieceUnverified {
+					t.Fatalf("quarantined piece %d is %v, want PieceUnverified", idx, state)
+				}
+			}
+			if err := st.WriteBlock(1, 0, []byte{9, 9, 9, 9}); err != nil {
+				t.Fatal(err)
+			}
+			sess.Resume()
+			sess.WaitVerified()
+			if !reflect.DeepEqual(st.checks, []int64{0, 1, 2, 3}) {
+				t.Fatalf("quarantine checked %v, want all pieces", st.checks)
+			}
+			want := []PieceState{PieceCompleted, PieceEmpty, PieceCompleted, PieceCompleted}
+			if got := sess.GetPieceStates(); !reflect.DeepEqual(got, want) {
+				t.Fatalf("piece states after recheck = %v, want %v", got, want)
+			}
+			if got := sess.Snapshot().Verification; got.CheckedBytes != 16 || got.TotalBytes != 16 {
+				t.Fatalf("quarantine verification progress = %+v, want 16 bytes checked", got)
+			}
+		})
 	}
 }
 
@@ -533,6 +643,7 @@ func TestOnStateChangeSchedulesAsyncManagerSave(t *testing.T) {
 	go func() {
 		sess.Pause()
 		mgr.SetGlobalDownloadLimit(54321)
+		mgr.SetGlobalUploadLimit(12345)
 		close(done)
 	}()
 	select {
@@ -545,12 +656,27 @@ func TestOnStateChangeSchedulesAsyncManagerSave(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		state := readCrashTestState(t, configDir)
-		if state[hashHex].Paused {
+		mgr.writeMu.Lock()
+		data, err := os.ReadFile(filepath.Join(configDir, "session.json"))
+		mgr.writeMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var state PersistedState
+		if err := json.Unmarshal(data, &state); err != nil {
+			t.Fatal(err)
+		}
+		paused := false
+		for _, entry := range state.Torrents {
+			if entry.InfoHashHex == hashHex {
+				paused = entry.Paused
+			}
+		}
+		if paused && state.GlobalDownloadLimit == 54321 && state.GlobalUploadLimit == 12345 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("async state save did not persist paused=true: %+v", state[hashHex])
+			t.Fatalf("async state save did not persist pause and limits: %+v", state)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

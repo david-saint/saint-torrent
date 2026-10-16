@@ -249,6 +249,7 @@ func (s *MMapStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
+	s.allCreated = false
 
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))

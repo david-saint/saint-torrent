@@ -27,6 +27,30 @@ func checkpointFixture(t *testing.T) (*FileStorage, string) {
 	return st, "checkpoint"
 }
 
+func TestFreshEmptyRejectsRestoredMtimeAfterEdit(t *testing.T) {
+	st, err := NewFileStorage(t.TempDir(), []FileInfo{{Path: "a", Length: 4}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	path := filepath.Join(st.BaseDir(), "a")
+	initial, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(path, []byte{1, 2, 3, 4}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, initial.ModTime(), initial.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := st.LoadResumeState("fresh")
+	if !errors.Is(err, os.ErrNotExist) || state.FreshEmpty {
+		t.Fatalf("edited payload resume = %+v, %v, want missing state without fresh flag", state, err)
+	}
+}
+
 func TestDurableResumeAndSelectiveFileChanges(t *testing.T) {
 	for _, change := range []string{"unchanged", "modified", "replaced", "resized", "grown", "missing"} {
 		t.Run(change, func(t *testing.T) {
