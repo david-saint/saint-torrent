@@ -16,6 +16,25 @@ import (
 	"time"
 )
 
+func TestMappedWritesInvalidateFreshEmpty(t *testing.T) {
+	st, err := NewMMapStorage(t.TempDir(), []FileInfo{{Path: "a", Length: 4}}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	state, err := st.LoadResumeState("fresh")
+	if !errors.Is(err, os.ErrNotExist) || !state.FreshEmpty {
+		t.Fatalf("new mapped storage resume = %+v, %v, want fresh flag", state, err)
+	}
+	if err := st.WriteBlock(0, 0, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = st.LoadResumeState("fresh")
+	if !errors.Is(err, os.ErrNotExist) || state.FreshEmpty {
+		t.Fatalf("written mapped storage resume = %+v, %v, want no fresh flag", state, err)
+	}
+}
+
 func TestMMapStorageCommonSuite(t *testing.T) {
 	files := []FileInfo{
 		{Path: filepath.Join("dir1", "file1.bin"), Length: 30},

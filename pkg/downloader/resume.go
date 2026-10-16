@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"sainttorrent/pkg/logging"
 	"sainttorrent/pkg/storage"
@@ -272,7 +273,7 @@ func (s *Session) loadResumeState() {
 	if st == nil || !hasPieces {
 		return
 	}
-	resume, err := readResumeState(st, s.Torrent.InfoHash)
+	resume, err := readResumeState(st, s.Torrent.InfoHash, s.Torrent.PieceHashes)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.Storage != st {
@@ -284,8 +285,9 @@ func (s *Session) loadResumeState() {
 // readResumeState reads the checkpoint of the torrent with this info hash from
 // st. It opens the .state file and every payload file, so callers run it
 // without s.mu: under the lock it stalled every peer loop and the UI for as
-// long as that took.
-func readResumeState(st storage.Storage, infoHash [20]byte) (storage.ResumeState, error) {
+// long as that took. Fresh zero-filled payloads are matched against the supplied
+// piece hashes without reading the files.
+func readResumeState(st storage.Storage, infoHash [20]byte, pieceHashes [][20]byte) (storage.ResumeState, error) {
 	hash := fmt.Sprintf("%x", infoHash)
 	var resume storage.ResumeState
 	var err error
@@ -294,7 +296,32 @@ func readResumeState(st storage.Storage, infoHash [20]byte) (storage.ResumeState
 	} else {
 		resume.Recheck, err = st.LoadState(hash)
 	}
-	return resume, err
+	if !resume.FreshEmpty || !errors.Is(err, os.ErrNotExist) {
+		return resume, err
+	}
+	var zeros [32 * 1024]byte
+	zeroHashes := make(map[int64][sha1.Size]byte, 2)
+	for idx, expected := range pieceHashes {
+		length := st.PieceLength(int64(idx))
+		if length <= 0 {
+			continue
+		}
+		zeroHash, cached := zeroHashes[length]
+		if !cached {
+			hasher := sha1.New()
+			for remaining := length; remaining > 0; {
+				chunk := min(remaining, int64(len(zeros)))
+				_, _ = hasher.Write(zeros[:chunk])
+				remaining -= chunk
+			}
+			zeroHash = [sha1.Size]byte(hasher.Sum(nil))
+			zeroHashes[length] = zeroHash
+		}
+		if expected == zeroHash {
+			resume.Verified = append(resume.Verified, idx)
+		}
+	}
+	return resume, nil
 }
 
 // applyResumeStateLocked installs what readResumeState read from s.Storage:
@@ -329,7 +356,7 @@ func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) 
 	// whatever is on disk while leaving every piece downloadable — marking a fresh
 	// torrent's pieces unverified would hide them from the picker until the hasher
 	// has rejected each one.
-	if s.verifyOnStartup && err == nil {
+	if s.verifyOnStartup && err == nil && !resume.FreshEmpty {
 		s.verifyFullScan = false
 		for idx, state := range s.PieceStates {
 			if state == PieceCompleted {
@@ -495,6 +522,26 @@ func (s *Session) runVerification(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		default:
+		}
+
+		if fullScan {
+			s.mu.RLock()
+			closed := s.closed || s.Storage != st || idx >= len(s.PieceStates)
+			alreadyClaimed := !closed && s.PieceStates[idx] != PieceEmpty
+			s.mu.RUnlock()
+			if closed {
+				return false
+			}
+			if alreadyClaimed {
+				s.mu.Lock()
+				if s.closed || s.Storage != st || idx >= len(s.PieceStates) {
+					s.mu.Unlock()
+					return false
+				}
+				s.verifyCheckedBytes += st.PieceLength(int64(idx))
+				s.mu.Unlock()
+				continue
+			}
 		}
 
 		pieceStart := time.Now()

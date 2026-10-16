@@ -1442,11 +1442,29 @@ func (s *Session) Resume() {
 }
 
 // setQuarantinedLocked quarantines a paused session with note (see
-// Session.quarantined). Caller holds s.mu.
+// Session.quarantined) and queues every payload piece for rechecking on Resume.
+// Caller holds s.mu.
 func (s *Session) setQuarantinedLocked(note string) {
 	s.quarantined = true
 	s.quarantineNote = note
 	s.quarantineErr = errors.New(note)
+	if !s.metadataMode && s.Storage != nil {
+		s.verifyFullScan = false
+		s.verifyStarted = false
+		s.verifyCheckedBytes = 0
+		s.verifyTotalBytes = 0
+		s.verifyStartTime = time.Time{}
+		for idx := range s.PieceStates {
+			s.PieceStates[idx] = PieceUnverified
+			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
+		}
+		s.recomputeNeededLocked()
+		s.recomputeStatsLocked()
+		s.verifying = s.verifyTotalBytes > 0
+		if s.verifying && s.verifyDone == nil {
+			s.verifyDone = make(chan struct{})
+		}
+	}
 }
 
 // clearQuarantineLocked lifts a quarantine and reports whether there was one.
@@ -1839,7 +1857,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 		resumeErr error
 	)
 	if st != nil {
-		resume, resumeErr = readResumeState(st, s.Torrent.InfoHash)
+		resume, resumeErr = readResumeState(st, s.Torrent.InfoHash, parsed.PieceHashes)
 	}
 
 	s.mu.Lock()
