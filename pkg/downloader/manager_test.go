@@ -1954,6 +1954,53 @@ func TestRunningSentinelLifecycle(t *testing.T) {
 	}
 }
 
+// TestRunningSentinelStableMarkRetries: when the write that marks the
+// sentinel stable fails (on Windows, while another process has the file open),
+// it is retried rather than leaving the run unmarked for good. Here a directory
+// in the sentinel's place makes the first attempts fail.
+func TestRunningSentinelStableMarkRetries(t *testing.T) {
+	savedAfter, savedRetries, savedDelay := sentinelStableAfter, sentinelStableRetries, sentinelRetryDelay
+	sentinelStableAfter = 300 * time.Millisecond
+	sentinelStableRetries = 1000
+	sentinelRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		sentinelStableAfter, sentinelStableRetries, sentinelRetryDelay = savedAfter, savedRetries, savedDelay
+	})
+	stateDir := filepath.Join(t.TempDir(), "config")
+	sentinelPath := filepath.Join(stateDir, sentinelName)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.EnablePersistence(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if sentinel, found := readRunningSentinel(stateDir); !found || sentinel.Stable {
+		t.Fatalf("sentinel %+v (found %v) before the stable mark, want an unstable one", sentinel, found)
+	}
+	// A non-empty directory where the sentinel was: renaming over it fails.
+	if err := os.Remove(sentinelPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sentinelPath, "blocker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(sentinelStableAfter + 5*sentinelRetryDelay)
+	if err := os.RemoveAll(sentinelPath); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sentinel, _ := readRunningSentinel(stateDir); sentinel.Stable {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sentinel was not marked stable once the write could succeed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestRunningSentinelIsNotSynced: EnablePersistence writes the sentinel before
 // it restores anything, and syncing it and its directory added about half a
 // millisecond to every Linux startup (more on macOS, where File.Sync is
