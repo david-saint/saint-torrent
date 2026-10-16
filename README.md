@@ -53,7 +53,7 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 ## Installation
 
 ### Prerequisites
-- Go 1.26.8 or later (older Go installs with `GOTOOLCHAIN=auto`, the default, fetch it automatically; the floor keeps known standard-library security fixes in every build).
+- Go 1.26.9 or later (older Go installs with `GOTOOLCHAIN=auto`, the default, fetch it automatically; the floor keeps known standard-library security fixes in every build).
 
 ### Build from Source
 Clone the repository and build the binary:
