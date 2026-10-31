@@ -219,7 +219,7 @@ func TestImmediateSocketAddUsesFallbackDirectory(t *testing.T) {
 	m := initialModel(mgr, t.TempDir(), "", nil)
 	const infoHash = "542e85596f7a0dd05eefdb78b0ac1736496f8626"
 
-	_, _ = m.Update(addTorrentMsg{msg: socketMessage{
+	updateAndRun(t, m, addTorrentMsg{msg: socketMessage{
 		Items:                []string{"magnet:?xt=urn:btih:" + infoHash + "&dn=Fallback"},
 		DownloadDir:          filepath.Join(blockingFile, "primary"),
 		FallbackDownloadDirs: []string{fallback},

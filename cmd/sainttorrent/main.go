@@ -150,6 +150,43 @@ type deleteFinishedMsg struct {
 	err         error
 }
 
+// addOrigin names the flow that started a background add, so its result is
+// reported where the user is looking.
+type addOrigin int
+
+const (
+	addFromInput   addOrigin = iota // the "a" input box
+	addFromConfirm                  // "y" on the add-confirm screen
+	addFromForward                  // a --no-confirm forward from another invocation
+)
+
+// addFinishedMsg reports adds that ran off the UI goroutine (addTorrentsCmd).
+type addFinishedMsg struct {
+	origin   addOrigin
+	err      error
+	respChan chan addTorrentResponse
+}
+
+// addTorrentsCmd adds and starts items in the background. An add probes the
+// download directory, creates the payload files, and durably writes the cached
+// .torrent and session.json, each a file plus directory sync (F_FULLFSYNC on
+// macOS). Run on the event loop, that froze every key and redraw for as long
+// as the disk took, which with other torrents writing ran to seconds per add.
+func addTorrentsCmd(mgr *downloader.TorrentManager, items []string, paths downloadPathOptions, origin addOrigin, respChan chan addTorrentResponse) tea.Cmd {
+	return func() tea.Msg {
+		var errs []error
+		for _, item := range items {
+			sess, err := addTorrentWithDownloadPaths(mgr, item, paths)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			sess.Start()
+		}
+		return addFinishedMsg{origin: origin, err: errors.Join(errs...), respChan: respChan}
+	}
+}
+
 type socketMessage struct {
 	Action               string   `json:"action,omitempty"`
 	Items                []string `json:"items"`
@@ -236,6 +273,8 @@ type model struct {
 	sessions         []*downloader.Session
 	deleteWithFiles  bool
 	deleteInProgress bool
+	inputAddBusy     bool // an add from the input box is running (addTorrentsCmd)
+	confirmAddBusy   bool // the add confirmed for pendingItems[pendingIdx] is running
 	deleteErr        error
 	addConfirmErr    error
 	deleteTargetName string
@@ -417,6 +456,18 @@ func (m *model) resumePendingOr(fallback viewMode) {
 	}
 }
 
+// advancePending moves the add-confirm queue past the current item, returning
+// to the list once the queue is done.
+func (m *model) advancePending() {
+	m.addConfirmErr = nil
+	m.pendingIdx++
+	if m.pendingIdx >= len(m.pendingItems) {
+		m.pendingItems = nil
+		m.pendingIdx = 0
+		m.viewMode = viewList
+	}
+}
+
 func (m *model) startDelete(withFiles bool, origin viewMode) {
 	s, ok := m.selectedSession()
 	if !ok {
@@ -560,18 +611,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				switch m.inputMode {
 				case inputAddTorrent:
-					sess, err := addTorrentWithDownloadPaths(m.manager, val, m.downloadPaths)
-
-					if err != nil {
-						m.inputErr = fmt.Sprintf("Failed to load torrent: %v", err)
+					if m.inputAddBusy {
 						return m, nil
 					}
-					sess.Start()
-					m.refreshSessions()
-					m.resumePendingOr(viewList)
-					m.inputMode = inputNone
+					m.inputAddBusy = true
 					m.inputErr = ""
-					m.textInput.Blur()
+					return m, addTorrentsCmd(m.manager, []string{val}, m.downloadPaths, addFromInput, nil)
 
 				case inputLimitDownload:
 					limitKb, err := strconv.ParseInt(val, 10, 64)
@@ -812,13 +857,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.addConfirmErr != nil {
 				switch msg.String() {
 				case "esc", "n", "N", "y", "Y":
-					m.addConfirmErr = nil
-					m.pendingIdx++
-					if m.pendingIdx >= len(m.pendingItems) {
-						m.pendingItems = nil
-						m.pendingIdx = 0
-						m.viewMode = viewList
-					}
+					m.advancePending()
 				}
 				return m, nil
 			}
@@ -829,44 +868,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resolveRemainingPending(fmt.Errorf("client shutting down"))
 				return m, tea.Quit
 			case "y", "Y":
+				// The item stays on screen until its add finishes, so it is not
+				// confirmed (or skipped) a second time meanwhile.
+				if m.confirmAddBusy {
+					return m, nil
+				}
 				if m.pendingIdx < len(m.pendingItems) {
 					item := m.pendingItems[m.pendingIdx]
-					var addErr error
 					if !item.isDuplicate {
-						sess, err := addTorrentWithDownloadPaths(m.manager, item.rawURL, item.pathOptions())
-						addErr = err
-						if addErr == nil {
-							sess.Start()
-						}
-					} else {
-						sess := m.manager.GetSession(item.infoHashHex)
-						if sess != nil {
-							sess.Resume()
-						}
+						m.confirmAddBusy = true
+						return m, addTorrentsCmd(m.manager, []string{item.rawURL}, item.pathOptions(), addFromConfirm, nil)
+					}
+					// Resuming an existing session does no disk I/O here.
+					if sess := m.manager.GetSession(item.infoHashHex); sess != nil {
+						sess.Resume()
 					}
 					m.refreshSessions()
-					if addErr != nil {
-						m.addConfirmErr = addErr
-					} else {
-						m.addConfirmErr = nil
-						m.pendingIdx++
-						if m.pendingIdx >= len(m.pendingItems) {
-							m.pendingItems = nil
-							m.pendingIdx = 0
-							m.viewMode = viewList
-						}
-					}
+					m.advancePending()
 				}
 				return m, nil
 			case "n", "N":
+				if m.confirmAddBusy {
+					return m, nil
+				}
 				if m.pendingIdx < len(m.pendingItems) {
-					m.addConfirmErr = nil
-					m.pendingIdx++
-					if m.pendingIdx >= len(m.pendingItems) {
-						m.pendingItems = nil
-						m.pendingIdx = 0
-						m.viewMode = viewList
-					}
+					m.advancePending()
 				}
 				return m, nil
 			}
@@ -898,24 +924,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case addTorrentMsg:
 		if !msg.msg.Confirm {
-			var addErr error
 			paths := socketDownloadPaths(msg.msg, m.downloadPaths)
-			for _, item := range msg.msg.Items {
-				sess, err := addTorrentWithDownloadPaths(m.manager, item, paths)
-				if err == nil {
-					sess.Start()
-				} else {
-					addErr = err
-				}
-			}
-			m.refreshSessions()
-			if msg.respChan != nil {
-				select {
-				case msg.respChan <- addTorrentResponse{err: addErr}:
-				default:
-				}
-			}
-			return m, nil
+			return m, addTorrentsCmd(m.manager, msg.msg.Items, paths, addFromForward, msg.respChan)
 		}
 
 		// Convert msg.msg.Items to pendingItems
@@ -961,6 +971,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			select {
 			case msg.respChan <- addTorrentResponse{}:
 			default:
+			}
+		}
+		return m, nil
+
+	case addFinishedMsg:
+		if msg.respChan != nil {
+			select {
+			case msg.respChan <- addTorrentResponse{err: msg.err}:
+			default:
+			}
+		}
+		if m.quitting {
+			return m, nil
+		}
+		m.refreshSessions()
+		switch msg.origin {
+		case addFromInput:
+			m.inputAddBusy = false
+			if m.viewMode != viewInput || m.inputMode != inputAddTorrent {
+				// The box was closed while the add ran; report a failure on the
+				// screen the user is on instead.
+				if msg.err != nil {
+					m.flash = fmt.Sprintf("Failed to load torrent: %v", msg.err)
+				}
+				return m, nil
+			}
+			if msg.err != nil {
+				m.inputErr = fmt.Sprintf("Failed to load torrent: %v", msg.err)
+				return m, nil
+			}
+			m.resumePendingOr(viewList)
+			m.inputMode = inputNone
+			m.inputErr = ""
+			m.textInput.Blur()
+		case addFromConfirm:
+			m.confirmAddBusy = false
+			if msg.err != nil {
+				m.addConfirmErr = msg.err
+			} else {
+				m.advancePending()
 			}
 		}
 		return m, nil

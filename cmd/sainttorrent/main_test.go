@@ -964,8 +964,7 @@ func TestConfirmViewFlow(t *testing.T) {
 		t.Errorf("expected pendingIdx to be 1, got %d", m.pendingIdx)
 	}
 
-	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	m = mUpdated.(model)
+	m = updateAndRun(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 	if m.viewMode != viewList {
 		t.Errorf("expected viewMode to transition to viewList after second item, got %v", m.viewMode)
 	}
@@ -1118,8 +1117,7 @@ func TestForwardingWithConfirmFalse(t *testing.T) {
 			Confirm: false,
 		},
 	}
-	mUpdated, _ := m.Update(msg)
-	m = mUpdated.(model)
+	m = updateAndRun(t, m, msg)
 
 	if m.viewMode != viewList {
 		t.Errorf("expected viewMode to remain viewList, got %v", m.viewMode)
@@ -1127,7 +1125,7 @@ func TestForwardingWithConfirmFalse(t *testing.T) {
 
 	sess := mgr.GetSession("542e85596f7a0dd05eefdb78b0ac1736496f8626")
 	if sess == nil {
-		t.Error("expected session to be added immediately")
+		t.Error("expected session to be added without confirmation")
 	}
 }
 
@@ -1670,8 +1668,7 @@ func TestForwardedDownloadDir(t *testing.T) {
 			DownloadDir: immediateDir,
 		},
 	}
-	mUpdated, _ = m.Update(msgNoConfirm)
-	m = mUpdated.(model)
+	m = updateAndRun(t, m, msgNoConfirm)
 
 	sess := mgr.GetSession("642e85596f7a0dd05eefdb78b0ac1736496f8626")
 	if sess == nil {
@@ -1858,8 +1855,7 @@ func TestCompletedQueueReset(t *testing.T) {
 		t.Fatalf("expected viewMode to be viewAddConfirm, got %v", m.viewMode)
 	}
 
-	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	m = mUpdated.(model)
+	m = updateAndRun(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 
 	if m.viewMode != viewList {
 		t.Errorf("expected viewMode to transition to viewList, got %v", m.viewMode)
@@ -1887,8 +1883,7 @@ func TestConfirmationAddErrors(t *testing.T) {
 
 	m := initialModel(mgr, ".", "", pending)
 
-	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
-	m = mUpdated.(model)
+	m = updateAndRun(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 
 	if m.addConfirmErr == nil {
 		t.Fatal("expected addConfirmErr to be set, but got nil")
@@ -1905,7 +1900,7 @@ func TestConfirmationAddErrors(t *testing.T) {
 		t.Errorf("expected view to contain error message, got:\n%s", renderedView)
 	}
 
-	mUpdated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	mUpdated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
 	m = mUpdated.(model)
 
 	if m.addConfirmErr != nil {
