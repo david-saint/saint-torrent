@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -96,11 +98,6 @@ func TestForwardedAddRunsOffEventLoopAndAnswersSocket(t *testing.T) {
 	if mgr.GetSession(hash) != nil {
 		t.Fatal("the forwarded add ran on the event loop")
 	}
-	select {
-	case r := <-resp:
-		t.Fatalf("socket answered before the add finished: %v", r.err)
-	default:
-	}
 
 	updated, _ = m.Update(cmd())
 	m = updated.(model)
@@ -109,14 +106,52 @@ func TestForwardedAddRunsOffEventLoopAndAnswersSocket(t *testing.T) {
 	}
 	select {
 	case r := <-resp:
-		if r.err == nil {
-			t.Fatal("the invalid item's error was not reported to the socket")
+		if r.err == nil || !strings.Contains(r.err.Error(), "not a torrent") {
+			t.Fatalf("the invalid item's error was not reported to the socket: %v", r.err)
 		}
 	default:
 		t.Fatal("socket was not answered")
 	}
 	if len(m.rows) != 1 {
 		t.Fatalf("list shows %d rows after the add, want 1", len(m.rows))
+	}
+}
+
+// The forwarding invocation is answered once its items validate, not when the
+// add finishes: the add waits on the disk, which outlasted the socket's wait
+// and made the launcher report a timeout for an add that then succeeded. A
+// failure after validation is reported in the TUI instead.
+func TestForwardedAddAnswersBeforeDiskWork(t *testing.T) {
+	mgr := downloader.NewTorrentManager()
+	defer mgr.Close()
+
+	notDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := initialModel(mgr, t.TempDir(), "", nil)
+	resp := make(chan addTorrentResponse, 1)
+	_, cmd := m.Update(addTorrentMsg{
+		msg: socketMessage{
+			Items:                []string{"magnet:?xt=urn:btih:d42e85596f7a0dd05eefdb78b0ac1736496f8626&dn=NoDir"},
+			DownloadDir:          filepath.Join(notDir, "sub"),
+			FallbackDownloadDirs: []string{},
+		},
+		respChan: resp,
+	})
+	msg := cmd()
+	select {
+	case r := <-resp:
+		if r.err != nil {
+			t.Fatalf("a valid item was answered with the later disk error: %v", r.err)
+		}
+	default:
+		t.Fatal("socket was not answered")
+	}
+	updated, _ := m.Update(msg)
+	m = updated.(model)
+	if !strings.Contains(m.flash, "Failed to add forwarded torrent") {
+		t.Fatalf("the failed add was not reported in the TUI (flash %q)", m.flash)
 	}
 }
 

@@ -162,9 +162,8 @@ const (
 
 // addFinishedMsg reports adds that ran off the UI goroutine (addTorrentsCmd).
 type addFinishedMsg struct {
-	origin   addOrigin
-	err      error
-	respChan chan addTorrentResponse
+	origin addOrigin
+	err    error
 }
 
 // addTorrentsCmd adds and starts items in the background. An add probes the
@@ -172,8 +171,30 @@ type addFinishedMsg struct {
 // .torrent and session.json, each a file plus directory sync (F_FULLFSYNC on
 // macOS). Run on the event loop, that froze every key and redraw for as long
 // as the disk took, which with other torrents writing ran to seconds per add.
+//
+// A non-nil respChan (a forward from another invocation) is answered once the
+// items are validated, before the add: the add waits on the disk, which can
+// outlast the socket handler's wait, and the launcher then reported a timeout
+// for an add that went on to succeed. Items that fail validation are reported
+// there and skipped; a later failure is reported in the TUI.
 func addTorrentsCmd(mgr *downloader.TorrentManager, items []string, paths downloadPathOptions, origin addOrigin, respChan chan addTorrentResponse) tea.Cmd {
 	return func() tea.Msg {
+		if respChan != nil {
+			var invalid []error
+			valid := make([]string, 0, len(items))
+			for _, item := range items {
+				if err := validateItem(item); err != nil {
+					invalid = append(invalid, err)
+					continue
+				}
+				valid = append(valid, item)
+			}
+			select {
+			case respChan <- addTorrentResponse{err: errors.Join(invalid...)}:
+			default:
+			}
+			items = valid
+		}
 		var errs []error
 		for _, item := range items {
 			sess, err := addTorrentWithDownloadPaths(mgr, item, paths)
@@ -183,7 +204,7 @@ func addTorrentsCmd(mgr *downloader.TorrentManager, items []string, paths downlo
 			}
 			sess.Start()
 		}
-		return addFinishedMsg{origin: origin, err: errors.Join(errs...), respChan: respChan}
+		return addFinishedMsg{origin: origin, err: errors.Join(errs...)}
 	}
 }
 
@@ -976,12 +997,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case addFinishedMsg:
-		if msg.respChan != nil {
-			select {
-			case msg.respChan <- addTorrentResponse{err: msg.err}:
-			default:
-			}
-		}
 		if m.quitting {
 			return m, nil
 		}
@@ -1011,6 +1026,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addConfirmErr = msg.err
 			} else {
 				m.advancePending()
+			}
+		case addFromForward:
+			// The forwarding invocation was answered before the add ran.
+			if msg.err != nil {
+				m.flash = fmt.Sprintf("Failed to add forwarded torrent: %v", msg.err)
 			}
 		}
 		return m, nil

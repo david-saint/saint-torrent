@@ -1446,9 +1446,13 @@ func TestSocketPartialFailures(t *testing.T) {
 		t.Errorf("expected status=error due to partial failure, got status=%s message=%s", resp.Status, resp.Message)
 	}
 
-	sess := mgr.GetSession("542e85596f7a0dd05eefdb78b0ac1736496f8626")
-	if sess == nil {
-		t.Error("expected valid torrent session to be created despite partial failure in batch")
+	// The socket is answered once the items validate; the add follows.
+	deadline := time.Now().Add(5 * time.Second)
+	for mgr.GetSession("542e85596f7a0dd05eefdb78b0ac1736496f8626") == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("expected valid torrent session to be created despite partial failure in batch")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	serverConn.Close()

@@ -149,6 +149,10 @@ func TestPersistenceRecordsPrivateFlag(t *testing.T) {
 	if _, err := mgr.AddTorrentFile(torrentPath, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	// The add only schedules the save; flush it here.
+	if err := mgr.saveState(); err != nil {
+		t.Fatal(err)
+	}
 	raw, err := os.ReadFile(filepath.Join(configDir, "session.json"))
 	if err != nil {
 		t.Fatal(err)

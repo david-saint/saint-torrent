@@ -63,10 +63,19 @@ type TorrentManager struct {
 	wg                    sync.WaitGroup
 	closed                bool
 
-	stateDir        string
-	restoring       bool
-	startPaused     bool // see SetStartPaused
-	writeMu         sync.Mutex
+	stateDir    string
+	restoring   bool
+	startPaused bool // see SetStartPaused
+	writeMu     sync.Mutex
+	// cacheMu guards the cached .torrent files and unsyncedCache. A cached file
+	// is written or rebuilt only while its torrent is registered, and removal
+	// deletes it under cacheMu, so neither can bring back a removed torrent's
+	// copy. It is separate from writeMu so an add never waits for the syncs of
+	// a state save in progress.
+	cacheMu sync.Mutex
+	// unsyncedCache lists cached .torrent files an add wrote without a sync;
+	// the next state save syncs them before session.json.
+	unsyncedCache   []string
 	saveStateCh     chan struct{}
 	saveLoopStarted bool
 	failedTorrents  []PersistedTorrent
@@ -529,14 +538,15 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 		sess.releasePathClaims()
 	}
 
-	// 4. Delete the cached .torrent file under writeMu so an in-flight
-	// saveStateInternal that snapshotted sessions before removal cannot observe
-	// the file missing and reconstruct it.
+	// 4. Delete the cached .torrent file under cacheMu. A state save that
+	// snapshotted sessions before removal rebuilds a missing copy only while the
+	// torrent is still registered, checked under cacheMu (see ensureCachedTorrent),
+	// so it cannot bring this one back.
 	if stateDir != "" {
 		cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
-		m.writeMu.Lock()
+		m.cacheMu.Lock()
 		err := os.Remove(cachedPath)
-		m.writeMu.Unlock()
+		m.cacheMu.Unlock()
 		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, fmt.Errorf("failed to delete cached torrent file: %w", err))
 		}
@@ -893,7 +903,11 @@ func (m *TorrentManager) addMagnet(uri string, downloadDir string, private bool)
 		sess.Close()
 		return nil, err
 	}
-	m.saveState()
+	// The save runs on the state-save goroutine: a durable write here made the
+	// caller, often the TUI, wait on two file syncs (F_FULLFSYNC on macOS),
+	// which take seconds while other torrents keep the disk busy. Close saves
+	// once more, so only a crash in the next moment can drop this add.
+	m.requestSaveState()
 
 	return sess, nil
 }
@@ -1037,12 +1051,18 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	if stateDir != "" && !restoring {
 		destPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
 		if torrentPath != destPath {
-			m.writeMu.Lock()
-			_ = atomicWriteFile(destPath, torrentData)
-			m.writeMu.Unlock()
+			// Written unsynced so the caller never waits on the disk (see
+			// addMagnet). The state save syncs it before the session.json that
+			// lists the torrent, keeping the durable pair consistent; if this
+			// write fails, that save rebuilds the copy from the info dict.
+			m.cacheMu.Lock()
+			if m.sessionRegistered(infoHashHex, sess) && replaceFileNoSync(destPath, torrentData) == nil {
+				m.unsyncedCache = append(m.unsyncedCache, destPath)
+			}
+			m.cacheMu.Unlock()
 		}
 	}
-	m.saveState()
+	m.requestSaveState()
 
 	return sess, nil
 }
@@ -1182,9 +1202,13 @@ func (m *TorrentManager) saveStateInternal(allowClosed bool) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
-	m.mu.Lock()
+	// A read lock is enough: writeMu already serializes saves, and nothing here
+	// changes the manager. Holding m.mu exclusively while each session's lock is
+	// taken in turn made one busy session stall every m.mu reader meanwhile,
+	// including inbound handshake routing for every torrent and the TUI.
+	m.mu.RLock()
 	if m.stateDir == "" || m.restoring || (m.closed && !allowClosed) {
-		m.mu.Unlock()
+		m.mu.RUnlock()
 		return nil
 	}
 	state := m.getSnapshotLocked()
@@ -1224,26 +1248,58 @@ func (m *TorrentManager) saveStateInternal(allowClosed bool) error {
 			})
 		}
 	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 
 	var errs []error
 	for _, item := range items {
 		if !item.metadata {
-			cachedPath := filepath.Join(stateDir, "torrents", item.infoHashHex+".torrent")
-			if _, err := os.Stat(cachedPath); os.IsNotExist(err) {
-				if err := reconstructAndWriteTorrent(stateDir, item.infoHashHex, item.torrent); err != nil {
-					errs = append(errs, fmt.Errorf("failed to write cached torrent %s: %w", item.infoHashHex, err))
-				}
-			} else if err != nil {
-				errs = append(errs, fmt.Errorf("failed to inspect cached torrent %s: %w", item.infoHashHex, err))
+			if err := m.ensureCachedTorrent(stateDir, item.infoHashHex, item.torrent); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
+
+	// Sync what adds wrote unsynced before the session.json that lists them.
+	m.cacheMu.Lock()
+	unsynced := m.unsyncedCache
+	m.unsyncedCache = nil
+	m.cacheMu.Unlock()
+	syncCachedTorrents(unsynced)
 
 	if err := atomicWriteState(stateDir, state); err != nil {
 		errs = append(errs, fmt.Errorf("failed to write session state: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// sessionRegistered reports whether sess is the session registered under
+// infoHashHex; with sess nil, whether any is.
+func (m *TorrentManager) sessionRegistered(infoHashHex string, sess *Session) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	registered, ok := m.sessions[infoHashHex]
+	return ok && (sess == nil || registered == sess)
+}
+
+// ensureCachedTorrent rebuilds a missing cached .torrent from the info dict,
+// unless the torrent has been removed since the caller's snapshot.
+func (m *TorrentManager) ensureCachedTorrent(stateDir, infoHashHex string, tor *torrent.Torrent) error {
+	cachedPath := filepath.Join(stateDir, "torrents", infoHashHex+".torrent")
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	_, err := os.Stat(cachedPath)
+	switch {
+	case err == nil:
+		return nil
+	case !os.IsNotExist(err):
+		return fmt.Errorf("failed to inspect cached torrent %s: %w", infoHashHex, err)
+	case !m.sessionRegistered(infoHashHex, nil):
+		return nil
+	}
+	if err := reconstructAndWriteTorrent(stateDir, infoHashHex, tor); err != nil {
+		return fmt.Errorf("failed to write cached torrent %s: %w", infoHashHex, err)
+	}
+	return nil
 }
 
 func reconstructAndWriteTorrent(stateDir string, infoHashHex string, tor *torrent.Torrent) error {
@@ -1357,14 +1413,43 @@ func replaceFile(destPath string, data []byte, durable bool) error {
 	renamed = true
 
 	if durable {
-		parentDir := filepath.Dir(destPath)
-		if dir, err := os.Open(parentDir); err == nil {
-			_ = dir.Sync()
-			dir.Close()
-		}
+		syncDir(filepath.Dir(destPath))
 	}
 
 	return nil
+}
+
+// syncDir syncs a directory so the renames in it survive a power loss. It is
+// best-effort: some platforms and filesystems refuse to sync a directory.
+func syncDir(path string) {
+	if dir, err := os.Open(path); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+}
+
+// syncCachedTorrents makes the cached .torrent files an add wrote unsynced
+// durable, then their directories, so a session.json written after it never
+// durably lists a torrent whose cached copy a power loss could still lose. A
+// file a removal has deleted meanwhile is skipped. The file is opened for
+// writing because Windows cannot flush a read-only handle.
+func syncCachedTorrents(paths []string) {
+	dirs := make(map[string]struct{}, 1)
+	for _, path := range paths {
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			continue
+		}
+		if hook := fileSyncHook.Load(); hook != nil {
+			(*hook)(path)
+		}
+		_ = f.Sync()
+		_ = f.Close()
+		dirs[filepath.Dir(path)] = struct{}{}
+	}
+	for dir := range dirs {
+		syncDir(dir)
+	}
 }
 
 const (
