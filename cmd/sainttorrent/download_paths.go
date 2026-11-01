@@ -125,6 +125,17 @@ type torrentAdder interface {
 	GetSession(string) *downloader.Session
 }
 
+// validateItem runs the source checks addTorrentWithDownloadPaths starts with,
+// without touching any download directory.
+func validateItem(item string) error {
+	item, _, err := canonicalItem(item)
+	if err != nil {
+		return err
+	}
+	_, _, err = parseItem(item)
+	return err
+}
+
 func addTorrentWithDownloadPaths(mgr torrentAdder, item string, paths downloadPathOptions) (*downloader.Session, error) {
 	// Validate the source before touching any candidate directories. Storage
 	// initialization can still fail for a specific disk (for example when it
