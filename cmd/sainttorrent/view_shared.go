@@ -566,6 +566,9 @@ func (m model) viewInputBox() string {
 	sb.WriteString(g + st.Header.Render(truncateRight(title, bw)) + "\n")
 	sb.WriteString(dividerLine(st, m.width) + "\n\n")
 	sb.WriteString(g + m.textInput.View() + "\n\n")
+	if m.inputAddBusy && m.inputMode == inputAddTorrent {
+		sb.WriteString(g + st.Help.Render(truncateRight("Adding torrent in the background...", bw)) + "\n\n")
+	}
 	if m.inputErr != "" {
 		sb.WriteString(g + st.Error.Render(truncateRight(displayText(m.inputErr), bw)) + "\n\n")
 	}
@@ -608,6 +611,13 @@ func (m model) viewAddConfirm() string {
 	if item.isDuplicate {
 		sb.WriteString(g + st.Error.Render(truncateRight(
 			"Warning: This torrent is already in the download list. Confirming will resume it.", bw)) + "\n\n")
+	}
+
+	if m.confirmAddBusy {
+		sb.WriteString(g + st.Help.Render(truncateRight("Adding torrent in the background...", bw)) + "\n\n")
+		sb.WriteString(renderHelp([][2]string{{"q", "Quit"}}, helpColumns, st, m.width))
+		sb.WriteString("\n")
+		return sb.String()
 	}
 
 	sb.WriteString(renderHelp([][2]string{
