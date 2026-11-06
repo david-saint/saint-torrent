@@ -437,10 +437,31 @@ func (s *Session) maintainPeerConnections() {
 // connectToPeer dials a peer and runs the message loop.
 // P2 FIX: Uses DialContext for context-aware cancellation.
 func (s *Session) connectToPeer(p tracker.Peer) {
-	defer s.crashGuard("peer_dial")()
+	s.connectToPeerVia(p, false)
+}
+
+// connectToPeerVia is connectToPeer. viaHolepunch marks a dial a BEP 55 relay
+// asked for (see holepunchConnect): it goes over uTP only, and its failure
+// starts no further holepunch. A direct dial that fails asks a relay to
+// introduce us instead (see requestHolepunch).
+func (s *Session) connectToPeerVia(p tracker.Peer, viaHolepunch bool) {
 	// Keyed like addPeer, PEX, DHT and inbound connections (net.JoinHostPort), so
 	// an IPv6 peer's entry is found here too.
 	peerAddr := net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))
+	// Deferred first so it runs last, once the cleanup below has cleared
+	// Dialing: the relay's connect message can come back within a round trip
+	// and must find the peer free to dial.
+	wantHolepunch := false
+	defer func() {
+		if wantHolepunch {
+			s.requestHolepunch(peerAddr)
+		}
+	}()
+	defer s.crashGuard("peer_dial")()
+	dial, redial := s.dialPeer, s.dialPeer
+	if viaHolepunch {
+		dial, redial = s.dialPeerUTP, s.dialPeerUTP
+	}
 	s.mu.RLock()
 	dialPauseEpoch := s.pauseEpoch
 	refused := s.refusesDialLocked(peerAddr, p.IP.String()) || s.privateRefusesDialLocked(s.Peers[peerAddr])
@@ -507,9 +528,10 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 	}
 	acquiredSlots = true
 
-	conn, transport, err := s.dialPeer(peerAddr)
+	conn, transport, err := dial(peerAddr)
 	if err != nil {
 		s.markPeerAttemptFailed(peerAddr)
+		wantHolepunch = !viaHolepunch
 		if logging.Enabled() {
 			logging.Debug("peer_dial_failed",
 				logging.String("peer", peerAddr),
@@ -538,8 +560,8 @@ func (s *Session) connectToPeer(p tracker.Peer) {
 		}
 	}()
 
-	out, step, err := s.handshakeOutgoingPeer(peerAddr, conn, transport, connMonitor, s.dialPeer)
-	if err != nil && out.transport == "utp" && isTimeoutErr(err) && s.ctx.Err() == nil {
+	out, step, err := s.handshakeOutgoingPeer(peerAddr, conn, transport, connMonitor, redial)
+	if err != nil && !viaHolepunch && out.transport == "utp" && isTimeoutErr(err) && s.ctx.Err() == nil {
 		// The uTP connection came up but the handshake over it timed out: most
 		// often a peer running an older saintTorrent, whose uTP numbering
 		// stalls against ours, or a path that passes uTP's SYN but not its
@@ -640,8 +662,9 @@ func isTimeoutErr(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-// peerDialTimeout bounds one dial attempt, whatever the transport.
-const peerDialTimeout = 5 * time.Second
+// peerDialTimeout bounds one dial attempt, whatever the transport. A var so
+// tests can shorten it; treat it as a constant.
+var peerDialTimeout = 5 * time.Second
 
 // peerDialHandshakeTimeout bounds each of an outbound connection's encryption
 // negotiation and BitTorrent handshake. A var so tests can shorten it; treat it
@@ -1059,6 +1082,16 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	pState.Choked = true
 	pState.Interested = false
 	s.activePeers[peerAddr] = client
+	connUTP := isUTPConn(conn)
+	live := &liveConn{client: client, outbound: outbound, utp: connUTP}
+	if outbound || connUTP {
+		// The address we dialed, or the source a uTP peer sends from (its
+		// listen port, or the NAT mapping of it, which is what a holepunch
+		// needs). An inbound TCP source port is ephemeral: wait for the
+		// extension handshake's listen port.
+		live.endpoint = peerAddr
+	}
+	s.registerLiveConnLocked(peerAddr, live)
 	if logEnabled {
 		logInfoHash, logName = s.logIdentityLocked()
 	}
@@ -1092,6 +1125,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.metadataOwner = nil // the next connection to ask takes the solo round over
 		}
 		s.releaseListenPortLocked(peerAddr, listenAddr)
+		s.releaseLiveConnLocked(peerAddr, client)
 		if activeClient, active := s.activePeers[peerAddr]; active && activeClient == client {
 			s.releasePeerLocked(peerAddr, hostKey, remoteID)
 			if ps, ok := s.Peers[peerAddr]; ok {
@@ -1251,13 +1285,17 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		if _, ok := extensions[peer.ExtNameMetadata]; ok {
 			infoLen = len(s.Torrent.InfoBytes)
 		}
+		listenPort := s.Port
 		s.mu.RUnlock()
 		// reqq tells the peer how many requests we queue (maxUploadQueue), so it
-		// does not pipeline requests we would have to reject.
+		// does not pipeline requests we would have to reject. p tells a peer we
+		// connected to where we listen, so it can hand that endpoint to others
+		// (PEX, a holepunch relay's connect) instead of our ephemeral source port.
 		_ = client.SendExtensionHandshake(&peer.ExtensionHandshake{
 			Extensions:   extensions,
 			MetadataSize: infoLen,
 			RequestQueue: maxUploadQueue,
+			ListenPort:   listenPort,
 		})
 	}
 
@@ -2448,6 +2486,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		atomic.AddInt64(&pState.Uploaded, blockLen)
 	}
 
+	// holepunch is this connection's BEP 55 state (see handleHolepunchMessage).
+	holepunch := &holepunchConn{key: peerAddr, ip: ip, client: client}
+
 	// handleExtendedMessage processes one BEP 10 message and returns a non-empty
 	// disconnect reason when the peer must be dropped.
 	handleExtendedMessage := func(payload []byte) string {
@@ -2481,13 +2522,20 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 					s.extAddrs.report(reporter, hs.YourIP)
 				}
 			}
+			// 0 when absent: ParseExtensionHandshake keeps IDs in 1..255.
+			hpID := hs.Extensions[peer.ExtNameHolepunch]
+			holepunch.peerID = byte(hpID)
+			s.mu.Lock()
 			if !outbound && hs.ListenPort != 0 {
 				// An inbound peer's listen endpoint is one we must not dial
 				// while this connection lasts.
-				s.mu.Lock()
 				listenAddr = s.noteListenPortLocked(peerAddr, ip, hs.ListenPort, listenAddr)
-				s.mu.Unlock()
+				if !live.utp {
+					live.endpoint = net.JoinHostPort(ip, strconv.Itoa(int(hs.ListenPort)))
+				}
 			}
+			live.holepunchID = byte(hpID)
+			s.mu.Unlock()
 			if utPexID, ok := hs.Extensions[peer.ExtNamePEX]; ok && s.pexEnabled() {
 				peerUtPexID = utPexID
 				startPEX()
@@ -2556,6 +2604,9 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			if pexMsg, err := peer.ParsePEXMessage(payloadBytes); err == nil {
 				s.handlePEXMessage(peerAddr, ip, pexMsg)
 			}
+
+		case extMsgID == peer.LocalHolepunchExtID:
+			s.handleHolepunchMessage(holepunch, payloadBytes)
 		}
 		return ""
 	}

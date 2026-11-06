@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,6 +112,13 @@ type Socket struct {
 	// SetRefuseIncoming). It is read only for SYNs and for packets that would
 	// complete a half-open handshake, never for established traffic.
 	refuseIncoming atomic.Bool
+	// expected holds endpoints exempt from refuseIncoming until the time
+	// given (see ExpectIncoming).
+	expected map[netip.AddrPort]time.Time
+
+	// nat, when set, drops datagrams from endpoints never sent to (see
+	// EmulateNAT). nil outside tests.
+	nat atomic.Pointer[natFilter]
 
 	// bufPool hands out scratch buffers for packet marshaling so writePacket
 	// does not allocate a fresh header+payload slice per send. sync.Pool keeps
@@ -279,6 +287,9 @@ func (s *Socket) unregister(c *Conn) {
 }
 
 func (s *Socket) writePacket(p packet, addr *net.UDPAddr) error {
+	if f := s.nat.Load(); f != nil {
+		f.noteSent(addr)
+	}
 	bufp := s.bufPool.Get().(*[]byte)
 	b := p.marshalInto((*bufp)[:0])
 	_, err := s.conn.WriteToUDP(b, addr)
@@ -300,6 +311,9 @@ func (s *Socket) readLoop() {
 			continue
 		}
 		backoff = 0
+		if f := s.nat.Load(); f != nil && !f.allows(addr) {
+			continue
+		}
 		if IsPacket(buf[:n]) {
 			// handleUTPPacket runs synchronously in this goroutine and the
 			// Conn copies any payload it retains (into readBuf or the pending
@@ -387,7 +401,7 @@ func (s *Socket) handleUTPPacket(data []byte, addr *net.UDPAddr) {
 		if h := s.liveHalfOpenLocked(key, now); h != nil {
 			halfOpen = true
 			if h.acknowledgedBy(p) {
-				if s.refuseIncoming.Load() {
+				if s.refusesLocked(addr, now) {
 					// Refusal began after the SYN-ACK went out (see
 					// SetRefuseIncoming).
 					delete(s.halfOpen, h.key)
@@ -485,7 +499,7 @@ func (s *Socket) handleSyn(p packet, key connKey, addr *net.UDPAddr) {
 		return
 	}
 	h := s.liveHalfOpenLocked(key, now)
-	if s.listener != nil && s.refuseIncoming.Load() {
+	if s.listener != nil && s.refusesLocked(addr, now) {
 		// Refused (see SetRefuseIncoming): a RESET goes out in place of the
 		// SYN-ACK, outside the budget, and a half-open entry this SYN
 		// retransmits for is dropped.
@@ -827,6 +841,9 @@ func (c *PacketConn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 	case <-c.socket.done:
 		return 0, net.ErrClosed
 	default:
+	}
+	if f := c.socket.nat.Load(); f != nil {
+		f.noteSent(addr)
 	}
 	return c.socket.conn.WriteToUDP(b, addr)
 }
