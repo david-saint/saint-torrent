@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/logging"
@@ -2475,6 +2476,11 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			}
 			// Keep our request window within the queue the peer says it has.
 			pipeline.LimitWindowBlocks(hs.RequestQueue)
+			if hs.YourIP.IsValid() {
+				if reporter, err := netip.ParseAddr(ip); err == nil {
+					s.extAddrs.report(reporter, hs.YourIP)
+				}
+			}
 			if !outbound && hs.ListenPort != 0 {
 				// An inbound peer's listen endpoint is one we must not dial
 				// while this connection lasts.

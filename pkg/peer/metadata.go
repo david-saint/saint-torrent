@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 
 	"sainttorrent/pkg/bencode"
 )
@@ -50,14 +51,16 @@ const (
 // ExtensionHandshake represents the BEP 10 extension handshake payload.
 // It carries the "m" dictionary mapping extension names to message IDs,
 // the total metadata size, an optional client identifier, the optional
-// number of outstanding requests the sender is willing to queue, and the
-// optional port the sender listens on.
+// number of outstanding requests the sender is willing to queue, the
+// optional port the sender listens on, and the optional address the sender
+// sees the receiver at.
 type ExtensionHandshake struct {
 	Extensions   map[string]int // m dict: extension name -> message ID
 	MetadataSize int            // metadata_size field
 	ClientName   string         // v field (optional)
 	RequestQueue int            // reqq field (optional; 0 when absent or invalid)
 	ListenPort   uint16         // p field (optional; 0 when absent or invalid)
+	YourIP       netip.Addr     // yourip field (optional; invalid when absent or malformed)
 }
 
 // maxRequestQueue caps a parsed reqq value; real clients advertise a few hundred
@@ -142,6 +145,16 @@ func ParseExtensionHandshake(data []byte) (*ExtensionHandshake, error) {
 		}
 	}
 
+	// yourip, the receiver's address as the sender sees it (4 or 16 raw
+	// bytes), is advisory: any other length is ignored.
+	if yVal, exists := dict["yourip"]; exists {
+		if y, ok := yVal.(string); ok && (len(y) == 4 || len(y) == 16) {
+			if a, ok := netip.AddrFromSlice([]byte(y)); ok {
+				hs.YourIP = a.Unmap()
+			}
+		}
+	}
+
 	return hs, nil
 }
 
@@ -190,6 +203,9 @@ func (hs *ExtensionHandshake) Serialize() ([]byte, error) {
 	}
 	if hs.ListenPort > 0 {
 		payload["p"] = int(hs.ListenPort)
+	}
+	if hs.YourIP.IsValid() {
+		payload["yourip"] = string(hs.YourIP.AsSlice())
 	}
 
 	data, err := bencode.Marshal(payload)

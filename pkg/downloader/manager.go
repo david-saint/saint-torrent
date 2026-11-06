@@ -52,6 +52,7 @@ type TorrentManager struct {
 	natGateway            portMapper
 	natStarted            bool
 	natStatus             NATStatus
+	extAddrs              *externalAddrs // our public addresses, shared with sessions
 	dht                   *dht.DHT
 	utpSocket             *utp.Socket
 	encryptionPolicy      mse.Policy
@@ -150,6 +151,7 @@ func NewTorrentManager() *TorrentManager {
 		globalUploadLimiter:   NewRateLimiter(0), // unlimited by default
 		globalOutboundSlots:   make(chan struct{}, maxGlobalOutboundPeers),
 		globalInboundSlots:    make(chan struct{}, maxGlobalInboundPeers),
+		extAddrs:              newExternalAddrs(),
 		inboundHandshakeSlots: make(chan struct{}, maxInboundHandshakes),
 		handshakeSources:      make(map[netip.Prefix]int),
 		storageFactory:        storage.NewStorage,
@@ -325,6 +327,7 @@ func (m *TorrentManager) AddSession(infoHashHex string, sess *Session) error {
 	sess.crash.Store(m.crash.Load())
 	sess.globalOutboundSlots = m.globalOutboundSlots
 	sess.globalInboundSlots = m.globalInboundSlots
+	sess.extAddrs = m.extAddrs
 	sess.EncryptionPolicy = m.encryptionPolicy
 	if sess.storageFactory == nil {
 		sess.storageFactory = m.storageFactory
