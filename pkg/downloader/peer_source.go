@@ -150,11 +150,18 @@ func trackerPeerAllowed(p tracker.Peer, source netip.Addr) bool {
 }
 
 // isOwnPeerEndpointLocked reports whether ip:port is our own advertised peer
-// endpoint: the NAT-mapped external address with the port we announce. DHT
-// nodes return our own announce in get_peers values; dialing it only reaches
-// ourselves (or fails) while holding an outbound slot. Caller holds m.mu.
+// endpoint: an external address of ours (NAT-mapped, or agreed on by peers'
+// yourip; see externalAddrs) with the port we announce. DHT nodes return our
+// own announce in get_peers values; dialing it only reaches ourselves (or
+// fails) while holding an outbound slot. Caller holds m.mu.
 func (m *TorrentManager) isOwnPeerEndpointLocked(ip net.IP, port uint16) bool {
-	if port == 0 || port != m.advertisedPeerPort || m.natStatus.ExternalIP == "" {
+	if port == 0 || port != m.advertisedPeerPort {
+		return false
+	}
+	if a, ok := netip.AddrFromSlice(ip); ok && m.extAddrs.contains(a) {
+		return true
+	}
+	if m.natStatus.ExternalIP == "" {
 		return false
 	}
 	ext := net.ParseIP(m.natStatus.ExternalIP)

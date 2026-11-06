@@ -3,6 +3,7 @@ package peer
 import (
 	"bytes"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -138,5 +139,41 @@ func TestExtensionParsersRejectOversizedPayloads(t *testing.T) {
 	}
 	if _, err := ParsePEXMessage(full); err != nil {
 		t.Fatalf("largest legitimate PEX message rejected: %v", err)
+	}
+}
+
+// TestExtensionHandshakeYourIP checks BEP 10 yourip (the receiver's address as
+// the sender sees it, 4 or 16 raw bytes) round-trips for both families, an
+// IPv4-mapped IPv6 value reads as IPv4, and any other length is ignored rather
+// than failing the handshake.
+func TestExtensionHandshakeYourIP(t *testing.T) {
+	for _, want := range []netip.Addr{netip.MustParseAddr("203.0.113.9"), netip.MustParseAddr("2001:db8::9")} {
+		data, err := (&ExtensionHandshake{Extensions: map[string]int{ExtNamePEX: 2}, YourIP: want}).Serialize()
+		if err != nil {
+			t.Fatalf("Serialize: %v", err)
+		}
+		hs, err := ParseExtensionHandshake(data)
+		if err != nil {
+			t.Fatalf("ParseExtensionHandshake: %v", err)
+		}
+		if hs.YourIP != want || hs.Extensions[ExtNamePEX] != 2 {
+			t.Fatalf("round trip of %v = %+v", want, hs)
+		}
+	}
+
+	mapped := netip.MustParseAddr("::ffff:203.0.113.9").As16()
+	hs, err := ParseExtensionHandshake([]byte("d1:mde6:yourip16:" + string(mapped[:]) + "e"))
+	if err != nil || hs.YourIP != netip.MustParseAddr("203.0.113.9") {
+		t.Fatalf("IPv4-mapped yourip = %v err=%v, want 203.0.113.9", hs, err)
+	}
+
+	for _, input := range []string{"d1:mde6:yourip3:abce", "d1:mde6:youripi5ee", "d1:mde6:yourip0:e", "d1:mde6:yourip5:abcdee"} {
+		hs, err := ParseExtensionHandshake([]byte(input))
+		if err != nil {
+			t.Fatalf("%q: %v", input, err)
+		}
+		if hs.YourIP.IsValid() {
+			t.Fatalf("%q: YourIP = %v, want none", input, hs.YourIP)
+		}
 	}
 }
