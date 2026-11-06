@@ -142,6 +142,14 @@ uTP first (libtorrent, uTorrent, Transmission) reconnect over TCP at once,
 which is much faster with saintTorrent's current uTP. When forwarding the port
 by hand, forward it for both TCP and UDP.
 
+Without a forwarded or mapped port (shared or campus Wi-Fi, carrier-grade NAT),
+saintTorrent can still reach peers that are behind NAT too, through BEP 55
+holepunching: when a direct dial to a peer fails, a peer connected to both of
+you introduces you, and both sides dial each other over uTP at the same moment.
+The inbound uTP that this needs is accepted only from the peer being introduced.
+This works through most home and campus NATs, but not through symmetric NATs.
+Private torrents do not use it, as with DHT and PEX.
+
 Peer protocol encryption defaults to `prefer`: saintTorrent tries BitTorrent
 MSE/PE first and falls back to plaintext when a peer does not support it. Use
 `require` to reject plaintext peer connections, or `disable` for plaintext-only

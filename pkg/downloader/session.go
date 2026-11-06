@@ -93,6 +93,11 @@ type PeerState struct {
 	// recorded while every outbound slot was busy has no LastAttempt yet, and
 	// prunePeersLocked ages it by this instead of evicting it first.
 	seenAt time.Time
+	// holepunchRelays are connected peers that can introduce us to this one
+	// (BEP 55), most recent first; see noteHolepunchRelaysLocked.
+	holepunchRelays [maxHolepunchRelays]string
+	// holepunchAt is when we last asked a relay to introduce us.
+	holepunchAt time.Time
 
 	WindowBlocks         int
 	TargetWindowBlocks   int
@@ -167,8 +172,11 @@ type Session struct {
 	pieceAvailability []int
 	Peers             map[string]*PeerState
 	activePeers       map[string]*peer.Client // for sending Have messages
-	admission         peerAdmission           // connection admission and bans; see peer_admission.go
-	pipelineBudget    *pipelineByteBudget
+	// liveConns mirrors activePeers with what other connections' loops need
+	// to know about each connection (BEP 55 relaying, PEX of inbound peers).
+	liveConns      map[string]*liveConn
+	admission      peerAdmission // connection admission and bans; see peer_admission.go
+	pipelineBudget *pipelineByteBudget
 
 	// Async hash/write pool (item #2). Completed-piece buffers are handed to a small
 	// background worker pool that verifies the SHA-1, writes to storage, and persists

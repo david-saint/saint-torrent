@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sainttorrent/pkg/peer"
 )
 
 // maxConnectionsPerIP bounds how many connections one remote host may have open
@@ -94,7 +96,10 @@ func peerHostKey(ip string) (key string, loopback bool) {
 // peer while it dialled us, so the same host holds the same ID in the other
 // direction. Refusing the second connection on both ends would drop both, so
 // each end keeps the connection opened by the side with the greater peer ID
-// and closes the other; that replacement is not held to the per-host cap. This
+// and closes the other; that replacement is not held to the per-host cap.
+// Over uTP, and so in every BEP 55 holepunch, both connections even share the
+// address key, since a uTP peer sends from the port it listens on; the same
+// rule then lets the winner take the key over from the loser. This
 // is libtorrent's peer ID rule ("the peer with greatest peer-id is the one
 // allowed to initiate connections", bt_peer_connection.cpp), so a libtorrent
 // peer that resolves the duplicate by ID closes the same connection we do. A
@@ -105,8 +110,12 @@ func peerHostKey(ip string) (key string, loopback bool) {
 // holds s.mu.
 func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remoteID [20]byte, outbound bool) string {
 	a := &s.admission
-	if _, active := s.activePeers[peerAddr]; active {
-		return "duplicate_address"
+	sameKey := false
+	if old, active := s.activePeers[peerAddr]; active {
+		if !a.crossedOpenLocked(old, peerAddr, remoteID, s.PeerID, outbound) {
+			return "duplicate_address"
+		}
+		sameKey = true
 	}
 	if a.bannedLocked(hostKey, time.Now()) {
 		return "banned"
@@ -135,6 +144,15 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 			replacing = true
 		}
 	}
+	if sameKey {
+		if !replacing {
+			return "duplicate_address"
+		}
+		// The replaced loop will find the key no longer its own when it
+		// exits, so it releases nothing; release its host count here. The
+		// peer ID passes to the new connection below.
+		a.releaseHostLocked(hostKey)
+	}
 	if !replacing && !loopback && a.perHost[hostKey] >= maxConnectionsPerIP {
 		return "per_ip_limit"
 	}
@@ -156,15 +174,32 @@ func (s *Session) admitPeerLocked(peerAddr, hostKey string, loopback bool, remot
 // replaced in a simultaneous open leaves it to its replacement. Caller holds s.mu.
 func (s *Session) releasePeerLocked(peerAddr, hostKey string, remoteID [20]byte) {
 	a := &s.admission
-	if a.perHost[hostKey] <= 1 {
-		delete(a.perHost, hostKey)
-	} else {
-		a.perHost[hostKey]--
-	}
+	a.releaseHostLocked(hostKey)
 	if remoteID != ([20]byte{}) {
 		if owner, ok := a.peerIDs[remoteID]; ok && owner.addr == peerAddr {
 			delete(a.peerIDs, remoteID)
 		}
+	}
+}
+
+// crossedOpenLocked reports whether a connection to remoteID, in direction
+// outbound, at the address key held by old is the other half of a
+// simultaneous open: old is the same nonzero peer ID, admitted under that key
+// in the other direction.
+func (a *peerAdmission) crossedOpenLocked(old *peer.Client, peerAddr string, remoteID, ourID [20]byte, outbound bool) bool {
+	if remoteID == ([20]byte{}) || remoteID == ourID || old == nil || old.RemotePeerID != remoteID {
+		return false
+	}
+	owner, ok := a.peerIDs[remoteID]
+	return ok && owner.addr == peerAddr && owner.outbound != outbound
+}
+
+// releaseHostLocked drops one connection from hostKey's count.
+func (a *peerAdmission) releaseHostLocked(hostKey string) {
+	if a.perHost[hostKey] <= 1 {
+		delete(a.perHost, hostKey)
+	} else {
+		a.perHost[hostKey]--
 	}
 }
 

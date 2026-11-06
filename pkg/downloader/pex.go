@@ -92,12 +92,15 @@ func (s *Session) pexEnabled() bool {
 // not known yet), but once metadata is known a private torrent stops offering it,
 // so its info dict is never handed to peers outside its tracker's swarm (BEP 27).
 func (s *Session) extensionHandshakeMapLocked() map[string]int {
-	extensions := make(map[string]int, 2)
+	extensions := make(map[string]int, 3)
 	if s.metadataMode || s.Torrent == nil || !s.Torrent.Private {
 		extensions[peer.ExtNameMetadata] = peer.LocalMetadataExtID
 	}
 	if s.pexEnabledLocked() {
 		extensions[peer.ExtNamePEX] = peer.LocalPEXExtID
+	}
+	if s.holepunchEnabledLocked() {
+		extensions[peer.ExtNameHolepunch] = peer.LocalHolepunchExtID
 	}
 	return extensions
 }
@@ -106,7 +109,9 @@ func (s *Session) extensionHandshakeMapLocked() map[string]int {
 // added. A sender may only point us at addresses as local as its own
 // (netpolicy): a public peer cannot aim our dials at loopback or LAN services,
 // nor anyone at multicast or broadcast addresses. Nor may it list one IP with
-// more than pexMaxPortsPerIP ports.
+// more than pexMaxPortsPerIP ports. The sender is remembered as a BEP 55 relay
+// for each listed peer flagged as holepunch-capable: it is connected to them,
+// so if our dial to one fails it can introduce us.
 func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage) {
 	if msg == nil || !s.pexEnabled() {
 		return
@@ -116,6 +121,7 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 	if len(added) > pexIngestLimit {
 		added = added[:pexIngestLimit]
 	}
+	var holepunchable []string
 	var portsPerIP map[netip.Addr]uint8 // only a list of 2+ can repeat an IP
 	if len(added) > 1 {
 		portsPerIP = make(map[netip.Addr]uint8, len(added))
@@ -136,6 +142,16 @@ func (s *Session) handlePEXMessage(fromAddr, fromIP string, msg *peer.PEXMessage
 			portsPerIP[ap.Addr()]++
 		}
 		pexDiscoverPeer(s, addr)
+		if p.Flags&peer.PEXFlagHolepunch != 0 {
+			holepunchable = append(holepunchable, addr)
+		}
+	}
+	if len(holepunchable) > 0 {
+		s.mu.Lock()
+		if s.holepunchEnabledLocked() {
+			s.noteHolepunchRelaysLocked(fromAddr, holepunchable)
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -185,7 +201,10 @@ func (s *Session) buildPEXDelta(excludeAddr string, advertised map[string]struct
 }
 
 // pexSnapshot returns the peers we may advertise to excludeAddr; ok is false
-// when we may not advertise any.
+// when we may not advertise any. Besides the dialable endpoints of connected
+// peers it lists inbound peers at the endpoint they can be reached on (see
+// liveConn.endpoint), as libtorrent does: a peer behind NAT only ever
+// connects in, and listing it is what lets others holepunch to it (BEP 55).
 func (s *Session) pexSnapshot(excludeAddr string) (map[string]peer.PEXPeer, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -203,7 +222,24 @@ func (s *Session) pexSnapshot(excludeAddr string) (map[string]peer.PEXPeer, bool
 		if !ok {
 			continue
 		}
+		if lc := s.liveConns[addr]; lc != nil {
+			p.Flags = lc.pexFlags()
+		}
 		peers[net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.Port)))] = p
+	}
+	for key, lc := range s.liveConns {
+		if key == excludeAddr || lc.endpoint == "" || lc.endpoint == excludeAddr {
+			continue
+		}
+		if _, listed := peers[lc.endpoint]; listed {
+			continue
+		}
+		p, ok := pexPeerFromAddr(lc.endpoint)
+		if !ok {
+			continue
+		}
+		p.Flags = lc.pexFlags()
+		peers[lc.endpoint] = p
 	}
 	return peers, true
 }
