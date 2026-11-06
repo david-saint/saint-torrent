@@ -226,10 +226,11 @@ type Session struct {
 	listener            net.Listener
 	utpSocket           *utp.Socket
 	sharedInbound       bool
-	outboundSlots       chan struct{} // semaphore bounding concurrent outbound dials (lock-free)
-	inboundSlots        chan struct{} // semaphore bounding concurrent inbound connections (lock-free)
-	globalOutboundSlots chan struct{} // manager-wide outbound cap shared across sessions (nil if standalone)
-	globalInboundSlots  chan struct{} // manager-wide inbound cap shared across sessions (nil if standalone)
+	outboundSlots       chan struct{}  // semaphore bounding concurrent outbound dials (lock-free)
+	inboundSlots        chan struct{}  // semaphore bounding concurrent inbound connections (lock-free)
+	globalOutboundSlots chan struct{}  // manager-wide outbound cap shared across sessions (nil if standalone)
+	globalInboundSlots  chan struct{}  // manager-wide inbound cap shared across sessions (nil if standalone)
+	extAddrs            *externalAddrs // manager-wide external addresses (nil if standalone)
 	currentSpeed        float64
 	currentUploadSpeed  float64
 	liveTransfer        bool // counted in liveTransfers

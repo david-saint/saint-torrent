@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 	"unicode"
@@ -311,6 +312,9 @@ func (m *TorrentManager) maintainNATMappings(gateway portMapper, tcpPort, udpPor
 		externalIP := ""
 		if ip, err := gateway.GetExternalAddress(mapCtx); err == nil && ip != nil {
 			externalIP = ip.String()
+			if a, ok := netip.AddrFromSlice(ip); ok {
+				m.extAddrs.setMapped(a)
+			}
 		}
 
 		m.mu.Lock()

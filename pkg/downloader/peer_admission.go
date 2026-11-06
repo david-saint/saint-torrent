@@ -277,10 +277,15 @@ func (a *peerAdmission) rememberSelfAddrLocked(peerAddr string) {
 }
 
 // refusesDialLocked reports whether we must not dial peerAddr (at ip): it is one
-// of our own addresses or its host is banned. Caller holds s.mu (read or write).
+// of our own addresses (seen as ours on a handshake, or our external address at
+// the port we advertise) or its host is banned. Caller holds s.mu (read or
+// write).
 func (s *Session) refusesDialLocked(peerAddr, ip string) bool {
 	a := &s.admission
 	if _, self := a.selfAddrs[peerAddr]; self {
+		return true
+	}
+	if s.extAddrs.isOwnEndpoint(peerAddr, s.Port) {
 		return true
 	}
 	if len(a.strikes) == 0 {
