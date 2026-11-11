@@ -8,12 +8,6 @@ import (
 	"os"
 )
 
-// resumeIdentityMode names the per-file identity recorded in a checkpoint. The
-// change timestamp is what makes an in-place edit detectable even when a tool
-// restores the modification time, so a checkpoint written with any other mode is
-// rejected rather than trusted.
-const resumeIdentityMode = "change_time"
-
 // ResumeState distinguishes durable verified pieces from hints that still need hashing.
 // Recheck may also contain pieces overlapping a changed file that were not in the hint.
 type ResumeState struct {
@@ -84,7 +78,7 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 	if state.InfoHashHex != infoHash || len(state.Files) != len(s.files) || state.Version < 0 || state.Version > 2 {
 		return result, fmt.Errorf("incompatible resume state")
 	}
-	if state.Version == 2 && (state.IdentityMode != resumeIdentityMode || state.PieceLength != s.pieceLength || len(state.Identities) != len(s.files)) {
+	if state.Version == 2 && (!acceptsIdentityMode(state.IdentityMode) || state.PieceLength != s.pieceLength || len(state.Identities) != len(s.files)) {
 		return result, fmt.Errorf("incompatible resume layout")
 	}
 	count := s.pieceCount()
@@ -104,6 +98,11 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		verified[idx] = state.Version == 2
 	}
 	intact := true
+	// The identities adopted for later hint writes are re-read from the files that
+	// still match, so a checkpoint loaded under a legacy mode is carried forward
+	// under the current one instead of being relabelled with identities it would
+	// no longer match.
+	identities := make([]string, len(s.files))
 	for i, file := range s.files {
 		saved := state.Files[i]
 		if saved.Path != file.path || saved.Size != file.length {
@@ -113,7 +112,10 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		if fi, h, ok := s.openPayloadMetadata(file, resumeMetadataReadFlags); ok {
 			matches = fi.Size() == saved.Size && fi.ModTime().UnixNano() == saved.Mtime
 			if state.Version == 2 {
-				matches = matches && state.Identities[i] != "" && fileIdentity(h, fi) == state.Identities[i]
+				matches = matches && identityMatches(state.IdentityMode, state.Identities[i], h, fi)
+				if matches {
+					identities[i] = fileIdentity(h, fi)
+				}
 			}
 			_ = h.Close()
 		}
@@ -135,6 +137,7 @@ func (s *FileStorage) LoadResumeState(infoHash string) (ResumeState, error) {
 		}
 	}
 	if state.Version == 2 {
+		state.Identities = identities
 		s.adoptCheckpoint(state, intact)
 	}
 	return result, nil
@@ -393,8 +396,8 @@ type releasedMapping struct {
 	before os.FileInfo
 }
 
-// markReleasedMappings accounts for the change timestamp that releasing a mapping
-// moves. A file still carrying the identity it was trusted under when its mapping
+// markReleasedMappings accounts for the timestamps that releasing a mapping can
+// move. A file still carrying the identity it was trusted under when its mapping
 // went away is the file the checkpoint already trusts, so it may adopt the metadata
 // the release leaves behind; anything else keeps the stale baseline and stays
 // distrusted until its contents have been proven again.

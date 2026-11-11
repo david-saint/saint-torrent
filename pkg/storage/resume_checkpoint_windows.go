@@ -16,6 +16,21 @@ const (
 	resumeSyncOpenFlags = os.O_RDWR
 )
 
+// resumeIdentityMode names the per-file identity a checkpoint records. On
+// Windows it carries the change timestamp, which moves even when a tool restores
+// the modification time after an in-place edit.
+const resumeIdentityMode = "change_time"
+
+func acceptsIdentityMode(mode string) bool {
+	return mode == resumeIdentityMode
+}
+
+// identityMatches reports whether a checkpoint's saved identity still describes
+// the file open at h.
+func identityMatches(mode, saved string, h *os.File, info os.FileInfo) bool {
+	return mode == resumeIdentityMode && saved != "" && saved == fileIdentity(h, info)
+}
+
 // fileBasicInfo mirrors FILE_BASIC_INFO. ChangeTime is the Windows equivalent of
 // the Unix change timestamp and is what catches an in-place edit whose author
 // restored the modification time; LastWriteTime stands in for it only where the

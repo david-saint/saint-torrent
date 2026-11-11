@@ -1050,7 +1050,7 @@ func (s *FileStorage) refreshDirtyLocked() {
 			s.stateFileInfo[file.path] = fi
 			// The snapshot now describes a file this client moved itself, so the
 			// identity it was trusted under no longer applies. Where a stat carries
-			// the change timestamp this re-anchors it immediately, keeping the
+			// the whole identity (Unix) this re-anchors it immediately, keeping the
 			// window in which a written file cannot be cross-checked down to one
 			// persist; elsewhere it clears, and the snapshot comparison takes over.
 			s.trustedIdentity[file.path] = fileIdentity(nil, fi)

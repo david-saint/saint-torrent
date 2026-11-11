@@ -53,7 +53,7 @@ A beautiful, high-performance BitTorrent client for the terminal, written in Go.
 ## Installation
 
 ### Prerequisites
-- Go 1.26.10 or later (older Go installs with `GOTOOLCHAIN=auto`, the default, fetch it automatically; the floor keeps known standard-library security fixes in every build).
+- Go 1.26.11 or later (older Go installs with `GOTOOLCHAIN=auto`, the default, fetch it automatically; the floor keeps known standard-library security fixes in every build).
 
 ### Build from Source
 Clone the repository and build the binary:
@@ -430,11 +430,11 @@ saintTorrent is released under the Apache License, Version 2.0. See [LICENSE](LI
 
 The file and mmap backends restore completed downloads from a durable resume
 checkpoint after validating each file's size, modification time, and identity.
-Identity includes the change timestamp (FAT and exFAT, which lack one, are
-described below), which moves even when a tool restores the modification time
-after an in-place edit; the mmap backend releases its mappings before taking a
-checkpoint so that timestamp is settled before it is recorded. Unchanged files
-need no content reads. Files that changed are rechecked
+On Unix (macOS, Linux, the BSDs) identity is the device and inode; on Windows it
+is the volume, file index and change timestamp (FAT and exFAT, which lack one,
+are described below). The mmap backend releases its mappings before taking a
+checkpoint so the file's timestamps are settled before they are recorded.
+Unchanged files need no content reads. Files that changed are rechecked
 along with any torrent pieces crossing their boundaries; unaffected files retain
 their verified state, and pieces the checkpoint never claimed stay immediately
 downloadable instead of queueing behind a hash.
@@ -447,10 +447,15 @@ paused and closing sessions flush the files they wrote and atomically replace
 resume state from background persistence work, outside peer and piece locks; a
 file nothing has written to since the last checkpoint is never re-flushed.
 
-Two trade-offs are deliberate. Changing a file's metadata without changing its
-contents — a `chmod`, a new extended attribute, a hardlink, or remounting the
-volume — moves the change timestamp, so those files are hashed once on the next
-launch. And a file the client is itself writing cannot be compared against its own
+Two trade-offs are deliberate. On Unix the change timestamp is not part of the
+identity, because macOS moves it whenever a file is merely opened (it records
+the "last opened" date as an extended attribute), which made every watched video
+rehash on the next launch. As in libtorrent and Transmission, a metadata-only
+change — opening the file, a `chmod`, a new extended attribute — therefore costs
+nothing, but an in-place edit whose author restores the modification time is not
+detected until the next full check. On Windows, where opening a file leaves its
+change timestamp alone, such a metadata change still hashes the file once on the
+next launch. And a file the client is itself writing cannot be compared against its own
 previous metadata, so an external in-place edit of an already-completed region of
 a file that is still downloading is not detected until the next full check.
 
@@ -458,7 +463,7 @@ FAT and exFAT volumes keep no change timestamp. On Windows, files on them are
 identified by volume, file index, size and exact modification time instead,
 which is what libtorrent relies on everywhere: they resume without hashing, but
 an in-place edit that restores the modification time is not detected there
-until the next full check. Any other volume that reports no change timestamp is
+until the next full check. Any other Windows volume that reports no change timestamp is
 not trusted, so its files are rechecked on every launch.
 
 Use `sainttorrent --recheck` to force full hashing of the torrents restored on a

@@ -425,10 +425,9 @@ func TestMMapDurableCheckpointNeverPublishesHint(t *testing.T) {
 	}
 }
 
-// Size, modification time and file identity alone cannot see an in-place edit whose
-// author restored the modification time, so the checkpoint must record the change
-// timestamp for mapped files too.
-func TestMMapCheckpointRejectsExternalEditWithRestoredMtime(t *testing.T) {
+// An external in-place edit of a mapped payload moves its modification time, which
+// the next launch must notice.
+func TestMMapCheckpointRejectsExternalEdit(t *testing.T) {
 	root := t.TempDir()
 	st := mmapPayload(t, root, 8)
 	if err := st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {
@@ -445,7 +444,7 @@ func TestMMapCheckpointRejectsExternalEditWithRestoredMtime(t *testing.T) {
 	if err = os.WriteFile(path, []byte("nonsense"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+	if err = os.Chtimes(path, before.ModTime().Add(time.Second), before.ModTime().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	next, err := NewMMapStorage(root, []FileInfo{{Path: "payload", Length: 8}}, 8)
@@ -498,8 +497,7 @@ func TestMMapCheckpointRefreshesAfterRemap(t *testing.T) {
 
 // Releasing a mapping moves a file's change timestamp even when this client only
 // read through it. Treating that as proof the client wrote the file would let an
-// in-place edit whose author restored the modification time be blessed by the very
-// next checkpoint.
+// external in-place edit be blessed by the very next checkpoint.
 func TestMMapCheckpointRejectsEditUnderCleanMapping(t *testing.T) {
 	root := t.TempDir()
 	files := []FileInfo{{Path: "payload", Length: 8}}
@@ -519,7 +517,7 @@ func TestMMapCheckpointRejectsEditUnderCleanMapping(t *testing.T) {
 	if err = os.WriteFile(path, []byte("nonsense"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+	if err = os.Chtimes(path, before.ModTime().Add(time.Second), before.ModTime().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err = st.SaveResumeState("mapped", []int{0}, nil, true); err != nil {

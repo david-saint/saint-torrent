@@ -86,9 +86,9 @@ type MMapStorage struct {
 	maps  []*mappedFile
 	dirty map[*fileLayout]struct{}
 	// checkpointing is set while a durable checkpoint holds the files released and
-	// captures their metadata. Re-establishing a mapping during that window would
-	// move the change timestamp the checkpoint just recorded, so reads fall back to
-	// the file handles instead of remapping.
+	// captures their metadata. Re-establishing a mapping during that window could
+	// move the timestamps the checkpoint just recorded, so reads fall back to the
+	// file handles instead of remapping.
 	checkpointing atomic.Bool
 }
 
@@ -458,8 +458,8 @@ func (s *MMapStorage) ensureMappedRange(globalStart, globalEnd int64) error {
 	}
 	if s.checkpointing.Load() {
 		// A durable checkpoint is capturing this file's metadata. Mapping it now
-		// would move the change timestamp the checkpoint records and cost a rehash
-		// on the next launch, so the caller reads through the file handles until the
+		// could move the timestamps the checkpoint records and cost a rehash on the
+		// next launch, so the caller reads through the file handles until the
 		// checkpoint is done — without ever waiting on the exclusive mapping lock.
 		return nil
 	}
@@ -670,7 +670,7 @@ func (s *MMapStorage) unmapForCheckpoint() error {
 		layout := mapped.layout
 		_, mappedWrite := s.dirty[layout]
 		wrote := mappedWrite || unflushed[layout]
-		// A mapping this client only ever read through still has its change timestamp
+		// A mapping this client only ever read through can still have its timestamps
 		// moved by the release, so record the identity the file carries while the
 		// mapping is up: only a file that still matches what the last checkpoint
 		// trusted may adopt the metadata the release leaves behind.
