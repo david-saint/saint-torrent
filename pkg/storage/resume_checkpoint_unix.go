@@ -5,6 +5,7 @@ package storage
 import (
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -17,17 +18,47 @@ const (
 	resumeSyncOpenFlags = os.O_RDONLY | unix.O_NONBLOCK
 )
 
+// resumeIdentityMode names the per-file identity a checkpoint records. On Unix it
+// is device, inode and exact modification time, which with the size the
+// checkpoint also compares is what libtorrent and Transmission trust. The change
+// timestamp is deliberately left out: macOS moves it whenever a file is merely
+// opened (LaunchServices records com.apple.lastuseddate#PS as an extended
+// attribute), so every video a user watched was re-hashed on the next launch.
+const resumeIdentityMode = "mtime"
+
+// legacyIdentityMode is the mode checkpoints carried while the identity included
+// the change timestamp ("dev:ino:ctime"). They are still honoured, by device and
+// inode alone, so upgrading costs no recheck.
+const legacyIdentityMode = "change_time"
+
+func acceptsIdentityMode(mode string) bool {
+	return mode == resumeIdentityMode || mode == legacyIdentityMode
+}
+
 func fileIdentity(_ *os.File, info os.FileInfo) string {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return ""
 	}
-	// The change timestamp catches in-place edits even if a tool restores mtime.
-	seconds, nanoseconds, ok := statChangeTime(st)
-	if !ok {
-		return ""
+	return fmt.Sprintf("%d:%d:%d", st.Dev, st.Ino, info.ModTime().UnixNano())
+}
+
+// identityMatches reports whether a checkpoint's saved identity, recorded under
+// mode, still describes the file open at h. The caller compares size and
+// modification time separately, so a legacy identity only has to name the same
+// device and inode.
+func identityMatches(mode, saved string, h *os.File, info os.FileInfo) bool {
+	if saved == "" {
+		return false
 	}
-	return fmt.Sprintf("%d:%d:%d.%09d", st.Dev, st.Ino, seconds, nanoseconds)
+	if mode != legacyIdentityMode {
+		return saved == fileIdentity(h, info)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return strings.Count(saved, ":") == 2 && strings.HasPrefix(saved, fmt.Sprintf("%d:%d:", st.Dev, st.Ino))
 }
 
 // fileObjectKeyOf keys a file by device and inode, which every name of one

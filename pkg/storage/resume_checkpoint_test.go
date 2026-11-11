@@ -27,7 +27,7 @@ func checkpointFixture(t *testing.T) (*FileStorage, string) {
 	return st, "checkpoint"
 }
 
-func TestFreshEmptyRejectsRestoredMtimeAfterEdit(t *testing.T) {
+func TestFreshEmptyRejectsEditedPayload(t *testing.T) {
 	st, err := NewFileStorage(t.TempDir(), []FileInfo{{Path: "a", Length: 4}}, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +42,7 @@ func TestFreshEmptyRejectsRestoredMtimeAfterEdit(t *testing.T) {
 	if err := os.WriteFile(path, []byte{1, 2, 3, 4}, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(path, initial.ModTime(), initial.ModTime()); err != nil {
+	if err := os.Chtimes(path, initial.ModTime().Add(time.Second), initial.ModTime().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	state, err := st.LoadResumeState("fresh")
@@ -427,7 +427,7 @@ func TestCheckpointNeverBlessesAnEditItAlreadyDistrusted(t *testing.T) {
 	if err = os.WriteFile(path, []byte{9, 9, 9, 9}, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+	if err = os.Chtimes(path, before.ModTime().Add(time.Second), before.ModTime().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 3; attempt++ {
