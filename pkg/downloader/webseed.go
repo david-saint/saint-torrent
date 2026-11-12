@@ -529,7 +529,7 @@ func (s *Session) runWebseedSource(client *http.Client, pool *webseedPool, src *
 		result := make(chan pieceWriteResult, 1)
 		s.ensurePieceWritePool()
 		select {
-		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, pieceBuf: buf, result: result, recoverableStorageError: true}:
+		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, pieceBuf: buf, result: result, recoverableStorageError: true, endgame: piece.endgame}:
 		case <-s.ctx.Done():
 			s.putPieceBuf(buf)
 			s.releaseWebseedPiece(piece, nil)

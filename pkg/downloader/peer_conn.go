@@ -3327,6 +3327,7 @@ peerLoop:
 
 			pieceIdx := dl.pieceIndex
 			pieceHash := dl.hash
+			isEndgame := dl.endgame
 			// The block data has been copied into pieceData; drop the reference to
 			// the (now empty) block slice so the removed activeDownload doesn't pin
 			// it for the life of the connection (e.g. an idle seeding conn, #63).
@@ -3336,18 +3337,20 @@ peerLoop:
 			if !validPiece || offset != int64(len(pieceData)) {
 				// Assembly invariant violated (shouldn't happen): return both buffers.
 				s.putPieceBuf(pieceBuf)
-				s.mu.Lock()
-				if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
-					s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
+				if !isEndgame {
+					s.mu.Lock()
+					if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
+						s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
+					}
+					s.mu.Unlock()
 				}
-				s.mu.Unlock()
 				break
 			}
 
 			s.ensurePieceWritePool()
 			writeQueueStarted := time.Now()
 			select {
-			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source}:
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source, endgame: isEndgame}:
 				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
 					pipeline.OnWriterLimited(time.Now())
 					publishPipelineSnapshot(time.Now(), true)
