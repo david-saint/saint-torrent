@@ -1883,6 +1883,27 @@ func (l *lookupSet) next(max int) []lookupCandidate {
 	return batch
 }
 
+// converged reports whether every candidate among the dhtLookupK closest
+// non-failed nodes has already answered, so any queries still in flight sit
+// farther from the target than the K closest live nodes.
+func (l *lookupSet) converged() bool {
+	live := 0
+	for i := range l.list {
+		c := &l.list[i]
+		if c.state == candidateFailed {
+			continue
+		}
+		if c.state != candidateResponded {
+			return false
+		}
+		live++
+		if live == dhtLookupK {
+			return true
+		}
+	}
+	return true
+}
+
 // find returns the candidate at k, or nil if it has since been dropped.
 func (l *lookupSet) find(k nodeAddrKey) *lookupCandidate {
 	for i := range l.list {
@@ -1922,11 +1943,12 @@ func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupO
 }
 
 // lookup runs one get_peers lookup to completion on the calling goroutine. It
-// is an iterative Kademlia traversal: each round queries up to
-// dhtLookupParallelism of the closest unqueried candidates, and the lookup
-// ends once the dhtLookupK closest live candidates have all answered, or after
-// dhtLookupQueryLimit queries. It then announces to the closest responders
-// that returned a token.
+// is an iterative Kademlia traversal: a sliding window keeps up to
+// dhtLookupParallelism queries to the closest unqueried candidates in flight,
+// processing each reply as it arrives and dispatching the next closest
+// candidate, until the dhtLookupK closest live candidates have all answered or
+// dhtLookupQueryLimit queries have been sent. It then announces to the closest
+// responders that returned a token.
 func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	logEnabled := logging.Enabled()
 	infoHashHex := ""
@@ -1976,101 +1998,112 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		res *GetPeersResult
 		err error
 	}
-	for queriesCount < dhtLookupQueryLimit {
+	var qwg sync.WaitGroup
+	defer qwg.Wait()
+	queryCtx, cancelQueries := context.WithCancel(d.ctx)
+	defer cancelQueries()
+
+	results := make(chan lookupResult, dhtLookupParallelism)
+	inFlight := 0
+	for {
+		if d.ctx.Err() != nil {
+			return
+		}
+		if avail := min(dhtLookupParallelism-inFlight, dhtLookupQueryLimit-queriesCount); avail > 0 {
+			for _, c := range set.next(avail) {
+				k := c.key
+				queriesCount++
+				inFlight++
+				qwg.Add(1)
+				go func() {
+					defer qwg.Done()
+					ctx, cancel := context.WithTimeout(queryCtx, dhtLookupQueryTimeout)
+					res, err := d.getPeersQuery(ctx, infoHash, k.udpAddr())
+					cancel()
+					results <- lookupResult{key: k, res: res, err: err}
+				}()
+			}
+		}
+		if inFlight == 0 || set.converged() {
+			break
+		}
+
+		var result lookupResult
 		select {
 		case <-d.ctx.Done():
 			return
-		default:
+		case result = <-results:
 		}
+		inFlight--
 
-		batch := set.next(min(dhtLookupParallelism, dhtLookupQueryLimit-queriesCount))
-		if len(batch) == 0 {
-			break
+		c := set.find(result.key)
+		if result.err != nil {
+			if c != nil {
+				c.state = candidateFailed
+			}
+			continue
 		}
-		queriesCount += len(batch)
-
-		results := make(chan lookupResult, len(batch))
-		for _, c := range batch {
-			k := c.key
-			go func() {
-				ctx, cancel := context.WithTimeout(d.ctx, dhtLookupQueryTimeout)
-				res, err := d.getPeersQuery(ctx, infoHash, k.udpAddr())
-				cancel()
-				results <- lookupResult{key: k, res: res, err: err}
-			}()
+		if c != nil {
+			// A responder whose ID differs from the one it was referred
+			// under sits at a bogus distance, so it does not count toward
+			// convergence or receive our announce.
+			if result.res.ID == c.id {
+				c.state = candidateResponded
+				c.token = result.res.Token
+			} else {
+				c.state = candidateFailed
+			}
 		}
+		responder := result.key.udpAddr()
 
-		for range batch {
-			result := <-results
-			c := set.find(result.key)
-			if result.err != nil {
-				if c != nil {
-					c.state = candidateFailed
-				}
+		// Store the responder under the ID it reported itself, never
+		// the one a referrer claimed for its address.
+		d.addNode(result.res.ID, responder)
+
+		for _, cp := range result.res.Peers {
+			var value [6]byte
+			copy(value[:], cp)
+			if _, dup := seenPeers[value]; dup {
 				continue
 			}
-			if c != nil {
-				// A responder whose ID differs from the one it was referred
-				// under sits at a bogus distance, so it does not count toward
-				// convergence or receive our announce.
-				if result.res.ID == c.id {
-					c.state = candidateResponded
-					c.token = result.res.Token
-				} else {
-					c.state = candidateFailed
-				}
+			seenPeers[value] = struct{}{}
+			pk := nodeAddrKey{ip: [4]byte(value[:4]), port: binary.BigEndian.Uint16(value[4:])}
+			// Some buggy DHT implementation hands out peers on port 1,
+			// where nothing listens, so a dial would only waste an
+			// outbound slot. Transmission drops these too (remove_bad_pex;
+			// transmission issues #527 and #5218).
+			if pk.port == 1 {
+				continue
 			}
-			responder := result.key.udpAddr()
-
-			// Store the responder under the ID it reported itself, never
-			// the one a referrer claimed for its address.
-			d.addNode(result.res.ID, responder)
-
-			for _, cp := range result.res.Peers {
-				var value [6]byte
-				copy(value[:], cp)
-				if _, dup := seenPeers[value]; dup {
-					continue
-				}
-				seenPeers[value] = struct{}{}
-				pk := nodeAddrKey{ip: [4]byte(value[:4]), port: binary.BigEndian.Uint16(value[4:])}
-				// Some buggy DHT implementation hands out peers on port 1,
-				// where nothing listens, so a dial would only waste an
-				// outbound slot. Transmission drops these too (remove_bad_pex;
-				// transmission issues #527 and #5218).
-				if pk.port == 1 {
-					continue
-				}
-				// We dial these, so a responder may only hand out peers no
-				// more local than itself: a public node cannot aim our
-				// connections at loopback or LAN services.
-				if !endpointAllowed(pk, responder) {
-					continue
-				}
-				ip := net.IP(append([]byte(nil), pk.ip[:]...))
-				port := pk.port
-
-				select {
-				case d.peerChan <- DiscoveredPeer{
-					InfoHash: infoHash,
-					IP:       ip,
-					Port:     port,
-				}:
-					discoveredPeers++
-					if logging.Enabled() {
-						logging.Debug("dht_peer_discovered",
-							logging.String("info_hash", infoHashHex),
-							logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
-						)
-					}
-				case <-d.ctx.Done():
-					return
-				default:
-				}
+			// We dial these, so a responder may only hand out peers no
+			// more local than itself: a public node cannot aim our
+			// connections at loopback or LAN services.
+			if !endpointAllowed(pk, responder) {
+				continue
 			}
+			ip := net.IP(append([]byte(nil), pk.ip[:]...))
+			port := pk.port
 
-			set.addReferrals(result.res.Nodes, responder)
+			select {
+			case d.peerChan <- DiscoveredPeer{
+				InfoHash: infoHash,
+				IP:       ip,
+				Port:     port,
+			}:
+				discoveredPeers++
+				if logging.Enabled() {
+					logging.Debug("dht_peer_discovered",
+						logging.String("info_hash", infoHashHex),
+						logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
+					)
+				}
+			case <-d.ctx.Done():
+				return
+			default:
+			}
 		}
+
+		set.addReferrals(result.res.Nodes, responder)
 	}
 
 	if !opts.Announce || peerPort == 0 {
