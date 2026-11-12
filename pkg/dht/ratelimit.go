@@ -33,6 +33,15 @@ const (
 	responseByteBurst = 128 << 10
 	// responseBurstTolerance is responseByteBurst expressed as GCRA slack.
 	responseBurstTolerance = int64(responseByteBurst) * int64(time.Second) / responseByteRate
+
+	// queryByteRate and queryByteBurst bound the bytes per second we spend
+	// sending our own DHT queries (ping, find_node, get_peers, announce_peer).
+	// queryByteCeiling sits above queryByteBurst so non-waiting probes and
+	// bootstrap queries still go out while lookups pace at the burst edge, and
+	// are dropped only past the hard ceiling.
+	queryByteRate    = 64 << 10
+	queryByteBurst   = 128 << 10
+	queryByteCeiling = 256 << 10
 )
 
 // queryLimiterSlot tracks one source IP with the generic cell rate algorithm:
@@ -124,6 +133,74 @@ func (b *responseBudget) take(n int, now int64) bool {
 		tat = now
 	}
 	if tat+cost-now > responseBurstTolerance {
+		return false
+	}
+	b.tat = tat + cost
+	return true
+}
+
+// queryBudget caps outbound DHT query bytes per second with a GCRA over bytes.
+// Zero-value fields default to queryByteRate, queryByteBurst, and
+// queryByteCeiling.
+type queryBudget struct {
+	mu      sync.Mutex
+	tat     int64
+	rate    int64
+	burst   int64
+	ceiling int64
+}
+
+func (b *queryBudget) params() (rate, burstTol, ceilingTol int64) {
+	rate = b.rate
+	if rate <= 0 {
+		rate = queryByteRate
+	}
+	burst := b.burst
+	if burst <= 0 {
+		burst = queryByteBurst
+	}
+	ceiling := b.ceiling
+	if ceiling <= 0 {
+		ceiling = queryByteCeiling
+	}
+	burstTol = burst * int64(time.Second) / rate
+	ceilingTol = ceiling * int64(time.Second) / rate
+	return rate, burstTol, ceilingTol
+}
+
+// reserve charges n query bytes at now and returns how long the caller must
+// wait before sending so the sustained rate past the burst allowance is
+// respected.
+func (b *queryBudget) reserve(n int, now int64) time.Duration {
+	rate, burstTol, _ := b.params()
+	cost := int64(n) * int64(time.Second) / rate
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tat := b.tat
+	if tat < now {
+		tat = now
+	}
+	newTAT := tat + cost
+	b.tat = newTAT
+	if wait := newTAT - now - burstTol; wait > 0 {
+		return time.Duration(wait)
+	}
+	return 0
+}
+
+// tryTake charges n query bytes at now without waiting, returning false (and
+// leaving the budget unchanged) only if doing so would exceed the hard
+// ceiling.
+func (b *queryBudget) tryTake(n int, now int64) bool {
+	rate, _, ceilingTol := b.params()
+	cost := int64(n) * int64(time.Second) / rate
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	tat := b.tat
+	if tat < now {
+		tat = now
+	}
+	if tat+cost-now > ceilingTol {
 		return false
 	}
 	b.tat = tat + cost

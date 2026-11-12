@@ -77,11 +77,12 @@ type DHT struct {
 	inFlightProbes    map[nodeAddrKey]struct{} // in-flight probes, keyed by probeKey
 	querySenderProbes int                      // in-flight probes started by inbound queries
 
-	// limiter is owned by the read goroutine; respBudget locks itself; started
-	// anchors the monotonic clock both run on.
-	limiter    *queryLimiter
-	respBudget responseBudget
-	started    time.Time
+	// limiter is owned by the read goroutine; respBudget and queryBudget lock
+	// themselves; started anchors the monotonic clock they run on.
+	limiter     *queryLimiter
+	respBudget  responseBudget
+	queryBudget queryBudget
+	started     time.Time
 
 	addrMu sync.Mutex
 	// addrChanges holds only the node IDs with a verification in flight, so a
@@ -1475,73 +1476,55 @@ func (d *DHT) probeNode(k nodeAddrKey, fromQuery bool) {
 	})
 }
 
-// queryNodeID pings addr and returns the responder's 20-byte Kademlia node ID.
-func (d *DHT) queryNodeID(ctx context.Context, addr *net.UDPAddr) ([20]byte, error) {
-	var id [20]byte
+var errQueryBudgetExceeded = errors.New("dht outbound query budget exceeded")
+
+// sendQuery encodes, budgets, transmits and awaits the reply to one outbound
+// KRPC query. When waitForBudget is true, the caller waits for outbound byte
+// budget before timeout begins; otherwise the query never waits and is dropped
+// only past the hard ceiling.
+func (d *DHT) sendQuery(ctx context.Context, q string, args map[string]interface{}, addr *net.UDPAddr, timeout time.Duration, waitForBudget bool) (map[string]interface{}, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	t := d.nextTransactionID()
 	query := map[string]interface{}{
 		"t": t,
 		"y": "q",
-		"q": "ping",
-		"a": map[string]interface{}{
-			"id": string(d.nodeID[:]),
-		},
+		"q": q,
+		"a": args,
 	}
-
-	payload, err := bencode.Marshal(query)
-	if err != nil {
-		return id, err
-	}
-
-	ch := make(chan interface{}, 1)
-	d.registerTransaction(t, addr, ch)
-	defer d.unregisterTransaction(t)
-
-	_, err = d.conn.WriteToUDP(payload, addr)
-	if err != nil {
-		return id, err
-	}
-
-	select {
-	case resp := <-ch:
-		rDict, ok := resp.(map[string]interface{})
-		if !ok {
-			return id, errors.New("invalid response")
-		}
-		idStr, _ := rDict["id"].(string)
-		if len(idStr) != 20 {
-			return id, errors.New("invalid responder id")
-		}
-		copy(id[:], idStr)
-		return id, nil
-	case <-ctx.Done():
-		return id, ctx.Err()
-	}
-}
-
-func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) ([]Node, error) {
-	t := d.nextTransactionID()
-	query := map[string]interface{}{
-		"t": t,
-		"y": "q",
-		"q": "find_node",
-		"a": map[string]interface{}{
-			"id":     string(d.nodeID[:]),
-			"target": string(target[:]),
-		},
-	}
-
 	payload, err := bencode.Marshal(query)
 	if err != nil {
 		return nil, err
 	}
 
+	now := int64(time.Since(d.started))
+	if waitForBudget {
+		if wait := d.queryBudget.reserve(len(payload), now); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	} else if !d.queryBudget.tryTake(len(payload), now) {
+		return nil, errQueryBudgetExceeded
+	}
+
+	waitCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	ch := make(chan interface{}, 1)
 	d.registerTransaction(t, addr, ch)
 	defer d.unregisterTransaction(t)
 
-	_, err = d.conn.WriteToUDP(payload, addr)
-	if err != nil {
+	if _, err := d.conn.WriteToUDP(payload, addr); err != nil {
 		return nil, err
 	}
 
@@ -1551,17 +1534,45 @@ func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) 
 		if !ok {
 			return nil, errors.New("invalid response")
 		}
-		if idStr, _ := rDict["id"].(string); len(idStr) != 20 {
-			return nil, errors.New("invalid responder id")
-		}
-		nodes, ok := nodesField(rDict)
-		if !ok {
-			return nil, errMalformedNodes
-		}
-		return nodes, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return rDict, nil
+	case <-waitCtx.Done():
+		return nil, waitCtx.Err()
 	}
+}
+
+// queryNodeID pings addr and returns the responder's 20-byte Kademlia node ID.
+func (d *DHT) queryNodeID(ctx context.Context, addr *net.UDPAddr) ([20]byte, error) {
+	var id [20]byte
+	rDict, err := d.sendQuery(ctx, "ping", map[string]interface{}{
+		"id": string(d.nodeID[:]),
+	}, addr, 0, false)
+	if err != nil {
+		return id, err
+	}
+	idStr, _ := rDict["id"].(string)
+	if len(idStr) != 20 {
+		return id, errors.New("invalid responder id")
+	}
+	copy(id[:], idStr)
+	return id, nil
+}
+
+func (d *DHT) findNode(ctx context.Context, target [20]byte, addr *net.UDPAddr) ([]Node, error) {
+	rDict, err := d.sendQuery(ctx, "find_node", map[string]interface{}{
+		"id":     string(d.nodeID[:]),
+		"target": string(target[:]),
+	}, addr, 0, false)
+	if err != nil {
+		return nil, err
+	}
+	if idStr, _ := rDict["id"].(string); len(idStr) != 20 {
+		return nil, errors.New("invalid responder id")
+	}
+	nodes, ok := nodesField(rDict)
+	if !ok {
+		return nil, errMalformedNodes
+	}
+	return nodes, nil
 }
 
 // GetPeersResult contains token, closer nodes, or discovered peers.
@@ -1574,116 +1585,59 @@ type GetPeersResult struct {
 }
 
 func (d *DHT) getPeersQuery(ctx context.Context, infoHash [20]byte, addr *net.UDPAddr) (*GetPeersResult, error) {
-	t := d.nextTransactionID()
-	query := map[string]interface{}{
-		"t": t,
-		"y": "q",
-		"q": "get_peers",
-		"a": map[string]interface{}{
-			"id":        string(d.nodeID[:]),
-			"info_hash": string(infoHash[:]),
-		},
-	}
-
-	payload, err := bencode.Marshal(query)
+	rDict, err := d.sendQuery(ctx, "get_peers", map[string]interface{}{
+		"id":        string(d.nodeID[:]),
+		"info_hash": string(infoHash[:]),
+	}, addr, dhtLookupQueryTimeout, true)
 	if err != nil {
 		return nil, err
 	}
-
-	ch := make(chan interface{}, 1)
-	d.registerTransaction(t, addr, ch)
-	defer d.unregisterTransaction(t)
-
-	_, err = d.conn.WriteToUDP(payload, addr)
-	if err != nil {
-		return nil, err
+	idStr, _ := rDict["id"].(string)
+	if len(idStr) != 20 {
+		return nil, errors.New("invalid responder id")
 	}
+	token, _ := rDict["token"].(string)
+	if len(token) > dhtMaxTokenLen {
+		// We echo the token in announce_peer; an oversized one would make
+		// us send the responder a large packet of its choosing. Dropping
+		// it means we never announce there (rakshasa/libtorrent@fa9812b).
+		token = ""
+	}
+	res := &GetPeersResult{Token: token}
+	copy(res.ID[:], idStr)
 
-	select {
-	case resp := <-ch:
-		rDict, ok := resp.(map[string]interface{})
-		if !ok {
-			return nil, errors.New("invalid response")
-		}
-		idStr, _ := rDict["id"].(string)
-		if len(idStr) != 20 {
-			return nil, errors.New("invalid responder id")
-		}
-		token, _ := rDict["token"].(string)
-		if len(token) > dhtMaxTokenLen {
-			// We echo the token in announce_peer; an oversized one would make
-			// us send the responder a large packet of its choosing. Dropping
-			// it means we never announce there (rakshasa/libtorrent@fa9812b).
-			token = ""
-		}
-		res := &GetPeersResult{Token: token}
-		copy(res.ID[:], idStr)
-
-		if val, exists := rDict["values"]; exists {
-			list, ok := val.([]interface{})
-			if ok {
-				for _, item := range list {
-					if len(res.Peers) == dhtMaxValuesPerResponse {
-						break
-					}
-					s, ok := item.(string)
-					if ok && len(s) == 6 {
-						res.Peers = append(res.Peers, s)
-					}
+	if val, exists := rDict["values"]; exists {
+		list, ok := val.([]interface{})
+		if ok {
+			for _, item := range list {
+				if len(res.Peers) == dhtMaxValuesPerResponse {
+					break
+				}
+				s, ok := item.(string)
+				if ok && len(s) == 6 {
+					res.Peers = append(res.Peers, s)
 				}
 			}
 		}
-		// A malformed node list fails the whole answer, so the lookup marks
-		// the responder failed and uses neither its token nor its values.
-		nodes, ok := nodesField(rDict)
-		if !ok {
-			return nil, errMalformedNodes
-		}
-		res.Nodes = nodes
-		return res, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
+	// A malformed node list fails the whole answer, so the lookup marks
+	// the responder failed and uses neither its token nor its values.
+	nodes, ok := nodesField(rDict)
+	if !ok {
+		return nil, errMalformedNodes
+	}
+	res.Nodes = nodes
+	return res, nil
 }
 
 func (d *DHT) announcePeerQuery(ctx context.Context, infoHash [20]byte, port uint16, token string, addr *net.UDPAddr) error {
-	t := d.nextTransactionID()
-	query := map[string]interface{}{
-		"t": t,
-		"y": "q",
-		"q": "announce_peer",
-		"a": map[string]interface{}{
-			"id":        string(d.nodeID[:]),
-			"info_hash": string(infoHash[:]),
-			"port":      int(port),
-			"token":     token,
-		},
-	}
-
-	payload, err := bencode.Marshal(query)
-	if err != nil {
-		return err
-	}
-
-	ch := make(chan interface{}, 1)
-	d.registerTransaction(t, addr, ch)
-	defer d.unregisterTransaction(t)
-
-	_, err = d.conn.WriteToUDP(payload, addr)
-	if err != nil {
-		return err
-	}
-
-	select {
-	case resp := <-ch:
-		_, ok := resp.(map[string]interface{})
-		if !ok {
-			return errors.New("invalid response")
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	_, err := d.sendQuery(ctx, "announce_peer", map[string]interface{}{
+		"id":        string(d.nodeID[:]),
+		"info_hash": string(infoHash[:]),
+		"port":      int(port),
+		"token":     token,
+	}, addr, dhtLookupQueryTimeout, true)
+	return err
 }
 
 // DefaultBootstrapHosts is the list of public DHT bootstrap routers.
@@ -1746,8 +1700,6 @@ const (
 	// kept, so a responder flooding referrals cannot grow it or push the
 	// search away from the target.
 	dhtLookupCandidates = 64
-	// dhtLookupQueryTimeout bounds each get_peers query of a lookup.
-	dhtLookupQueryTimeout = 3 * time.Second
 	// dhtBootstrapWait bounds how long a lookup that found the table empty
 	// waits for bootstrap referrals to answer their probes;
 	// dhtBootstrapPoll is how often it checks.
@@ -1761,6 +1713,10 @@ const (
 	// announce_peer. Common implementations use 4 to 20 bytes (ours are 8).
 	dhtMaxTokenLen = 64
 )
+
+// dhtLookupQueryTimeout bounds each get_peers and announce_peer query once its
+// outbound budget wait completes. It is a variable so tests can shorten it.
+var dhtLookupQueryTimeout = 3 * time.Second
 
 type candidateState uint8
 
@@ -2049,9 +2005,7 @@ func (d *DHT) lookup(ctx context.Context, infoHash [20]byte, peerPort uint16, op
 				qwg.Add(1)
 				go func() {
 					defer qwg.Done()
-					qCtx, cancel := context.WithTimeout(queryCtx, dhtLookupQueryTimeout)
-					res, err := d.getPeersQuery(qCtx, infoHash, k.udpAddr())
-					cancel()
+					res, err := d.getPeersQuery(queryCtx, infoHash, k.udpAddr())
 					results <- lookupResult{key: k, res: res, err: err}
 				}()
 			}
@@ -2164,9 +2118,7 @@ func (d *DHT) lookup(ctx context.Context, infoHash [20]byte, peerPort uint16, op
 				return
 			default:
 			}
-			ctxAnn, cancelAnn := context.WithTimeout(ctx, dhtLookupQueryTimeout)
-			defer cancelAnn()
-			if err := d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, addr); err != nil {
+			if err := d.announcePeerQuery(ctx, infoHash, peerPort, token, addr); err != nil {
 				if logging.Enabled() {
 					logging.Debug("dht_announce_peer_failed",
 						logging.String("info_hash", infoHashHex),
