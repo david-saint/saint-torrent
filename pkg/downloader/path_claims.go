@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/maphash"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"sainttorrent/pkg/logging"
@@ -103,6 +104,11 @@ func (m *TorrentManager) ownRefsLocked(key pathClaimKey, c pathClaim, infoHash [
 // path another torrent holds with the same length is shared (cross-seeding)
 // and logged. The returned release is idempotent.
 func (m *TorrentManager) claimPaths(infoHash [20]byte, baseDir string, files []storage.FileInfo) (func(), error) {
+	// Pad files (BEP 47) are never created, so they claim no path: two
+	// torrents may both name ".pad/16384", and a real file there is not theirs.
+	if slices.ContainsFunc(files, func(f storage.FileInfo) bool { return f.Pad }) {
+		files = slices.DeleteFunc(slices.Clone(files), func(f storage.FileInfo) bool { return f.Pad })
+	}
 	relPaths := make([]string, len(files))
 	for i, f := range files {
 		relPaths[i] = f.Path

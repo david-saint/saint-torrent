@@ -364,8 +364,13 @@ func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) 
 			}
 		}
 	}
+	// Pieces lying entirely in pad files are zeros: complete from the start, and
+	// never rechecked, since nothing on disk backs them.
+	s.markPadPiecesCompleteLocked()
 	for idx, state := range s.PieceStates {
-		if s.verifyFullScan || state == PieceUnverified {
+		// A full scan checks every piece not already complete (see
+		// runVerification), so only those count towards its progress.
+		if (s.verifyFullScan && state != PieceCompleted) || state == PieceUnverified {
 			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
 		}
 	}
@@ -994,6 +999,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 		s.PieceStates[i] = PieceEmpty
 	}
 	s.PieceStates[index] = PieceCompleted
+	s.markPadPiecesCompleteLocked() // no file backs them, so no repair touched them
 	s.recomputeNeededLocked()
 	s.recomputeStatsLocked()
 	s.lastErr = nil

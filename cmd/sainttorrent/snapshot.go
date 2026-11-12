@@ -75,11 +75,48 @@ type detailSig struct {
 // files view is entered and after a priority toggle, so it stays responsive
 // without the view re-locking the session every frame.
 type filesSnapshot struct {
-	valid      bool
-	session    *downloader.Session
-	name       string
+	valid   bool
+	session *downloader.Session
+	name    string
+	// files lists the payload files the explorer shows: BEP 47 pad files are
+	// left out. index maps a row to its file's index in the torrent (nil when
+	// no file is a pad file, so the two coincide), and total counts every file
+	// the torrent declares.
 	files      []torrent.File
-	priorities []downloader.FilePriority
+	index      []int
+	total      int
+	priorities []downloader.FilePriority // indexed like the torrent's files
+}
+
+// newFilesSnapshot builds the explorer snapshot of session s.
+func newFilesSnapshot(s *downloader.Session) filesSnapshot {
+	all := s.Files()
+	files, index := downloader.PayloadFiles(all)
+	return filesSnapshot{
+		valid:      true,
+		session:    s,
+		name:       displayText(s.Name()),
+		files:      files,
+		index:      index,
+		total:      len(all),
+		priorities: s.GetFilePriorities(),
+	}
+}
+
+// torrentIndex returns the index in the torrent of the file shown at row i.
+func (f filesSnapshot) torrentIndex(i int) int {
+	if f.index == nil {
+		return i
+	}
+	return f.index[i]
+}
+
+// priority returns the priority of the file shown at row i.
+func (f filesSnapshot) priority(i int) downloader.FilePriority {
+	if ti := f.torrentIndex(i); ti < len(f.priorities) {
+		return f.priorities[ti]
+	}
+	return downloader.PriorityNormal
 }
 
 // rowFromSnapshot converts a downloader.SessionSnapshot into the UI row,
@@ -233,13 +270,7 @@ func (m *model) buildFilesSnapshot() {
 		m.files = filesSnapshot{}
 		return
 	}
-	m.files = filesSnapshot{
-		valid:      true,
-		session:    s,
-		name:       displayText(s.Name()),
-		files:      s.Files(),
-		priorities: s.GetFilePriorities(),
-	}
+	m.files = newFilesSnapshot(s)
 }
 
 // refreshFilesSnapshot is the per-tick refresh: it rebuilds only when the
@@ -248,7 +279,7 @@ func (m *model) buildFilesSnapshot() {
 // under the session lock twice a second bought nothing.
 func (m *model) refreshFilesSnapshot() {
 	if s, ok := m.selectedSession(); ok && m.files.valid && m.files.session == s &&
-		len(s.Files()) == len(m.files.files) {
+		len(s.Files()) == m.files.total {
 		return
 	}
 	m.buildFilesSnapshot()
@@ -265,12 +296,7 @@ func (m *model) filesData() filesSnapshot {
 	if !ok {
 		return filesSnapshot{}
 	}
-	return filesSnapshot{
-		valid:      true,
-		name:       displayText(s.Name()),
-		files:      s.Files(),
-		priorities: s.GetFilePriorities(),
-	}
+	return newFilesSnapshot(s)
 }
 
 // detailData returns the detail snapshot, falling back to a fresh live build

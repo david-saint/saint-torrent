@@ -22,7 +22,7 @@ import (
 func (m *TorrentManager) migrateLegacyPaths(infoHash [20]byte, baseDir string, files []torrent.File) int {
 	var moves []storage.LegacyMove
 	for _, f := range files {
-		if len(f.LegacyPath) > 0 {
+		if len(f.LegacyPath) > 0 && !f.Pad { // a pad file was never written
 			moves = append(moves, storage.LegacyMove{
 				From:   filepath.Join(f.LegacyPath...),
 				To:     filepath.Join(f.Path...),
