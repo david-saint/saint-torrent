@@ -796,6 +796,9 @@ func (s *Session) Close() {
 		for _, client := range s.activePeers {
 			_ = client.Conn.Close()
 		}
+		if s.DHT != nil && s.Torrent != nil {
+			s.DHT.CancelLookup(s.Torrent.InfoHash)
+		}
 		s.mu.Unlock()
 		if wasStarted {
 			s.announceStopped()
@@ -1394,6 +1397,9 @@ func (s *Session) Pause() {
 	// worth taking. Hand it to the persistence goroutine: running the per-file
 	// flush here would freeze the caller (the TUI update loop) for the length of a
 	// full writeback.
+	if s.DHT != nil && s.Torrent != nil {
+		s.DHT.CancelLookup(s.Torrent.InfoHash)
+	}
 	s.stateDirty = true
 	s.mu.Unlock()
 	s.requestStateFlush()

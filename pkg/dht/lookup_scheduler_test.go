@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func installFakeLookups(t *testing.T, interval time.Duration) *fakeLookups {
 		started: make(chan fakeLookupCall, 2*dhtMaxQueuedLookups),
 	}
 	oldRun, oldInterval := runLookup, dhtLookupStartInterval
-	runLookup = func(d *DHT, infoHash [20]byte, peerPort uint16, opts LookupOptions) {
+	runLookup = func(d *DHT, ctx context.Context, infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		call := fakeLookupCall{infoHash: infoHash, peerPort: peerPort, opts: opts, at: time.Now()}
 		f.mu.Lock()
 		f.calls = append(f.calls, call)
@@ -46,7 +47,7 @@ func installFakeLookups(t *testing.T, interval time.Duration) *fakeLookups {
 		f.started <- call
 		select {
 		case <-gate:
-		case <-d.ctx.Done():
+		case <-ctx.Done():
 		}
 		f.mu.Lock()
 		f.running--
@@ -404,8 +405,9 @@ func TestLookupSchedulerFullSeenSetQueuesRoutine(t *testing.T) {
 	s.mu.Unlock()
 
 	s.enqueue(schedHash(1), 6881, LookupOptions{})
-	if len(s.urgent) != 1 || len(s.routine) != 1 || s.routine[0].infoHash != schedHash(1) {
-		t.Fatalf("with the seen set full a new info-hash was queued urgent (urgent %d, routine %d)", len(s.urgent), len(s.routine))
+	q := &s.levels[LookupPriorityLow]
+	if len(q.urgent) != 1 || len(q.routine) != 1 || q.routine[0].infoHash != schedHash(1) {
+		t.Fatalf("with the seen set full a new info-hash was queued urgent (urgent %d, routine %d)", len(q.urgent), len(q.routine))
 	}
 	for p, _ := s.take(time.Now(), 0); p != nil; p, _ = s.take(time.Now(), 0) {
 		s.finish(p.infoHash)
@@ -430,7 +432,10 @@ func TestLookupSchedulerQueueBound(t *testing.T) {
 
 	d.sched.mu.Lock()
 	queued := len(d.sched.pending)
-	queues := len(d.sched.urgent) + len(d.sched.routine)
+	queues := 0
+	for _, lq := range d.sched.levels {
+		queues += len(lq.urgent) + len(lq.routine)
+	}
 	d.sched.mu.Unlock()
 	if queued != dhtMaxQueuedLookups || queues != dhtMaxQueuedLookups {
 		t.Fatalf("queue holds %d (%d in FIFOs), bound %d", queued, queues, dhtMaxQueuedLookups)
@@ -468,7 +473,10 @@ func TestLookupSchedulerCloseDiscardsPending(t *testing.T) {
 	d.LookupWithOptions(schedHash(200), 6881, LookupOptions{})
 
 	d.sched.mu.Lock()
-	queued := len(d.sched.pending) + len(d.sched.urgent) + len(d.sched.routine)
+	queued := len(d.sched.pending)
+	for _, lq := range d.sched.levels {
+		queued += len(lq.urgent) + len(lq.routine)
+	}
 	d.sched.mu.Unlock()
 	if queued != 0 {
 		t.Fatalf("%d lookups still queued after Close", queued)
@@ -478,5 +486,140 @@ func TestLookupSchedulerCloseDiscardsPending(t *testing.T) {
 	f.mu.Unlock()
 	if calls != dhtMaxConcurrentLookups {
 		t.Fatalf("%d lookups ran, want only the %d running at Close", calls, dhtMaxConcurrentLookups)
+	}
+}
+
+// TestLookupSchedulerPriorityLevelsAndMagnetRetry verifies the three priority
+// levels drain High -> Normal -> Low, keeping first-lookup LIFO and repeat FIFO
+// within each level, and keeping a magnet retry at the top level ahead of
+// downloads and seeds.
+func TestLookupSchedulerPriorityLevelsAndMagnetRetry(t *testing.T) {
+	f := installFakeLookups(t, 0)
+	d, _ := newFakeDHT(t)
+
+	// Run one lookup each for the magnet retry, a normal repeat, and a low
+	// repeat so all three are in seen.
+	magnetRetry := schedHash(900)
+	normalRepeat := schedHash(800)
+	lowRepeat := schedHash(700)
+	for _, tc := range []struct {
+		h [20]byte
+		p LookupPriority
+	}{
+		{magnetRetry, LookupPriorityHigh},
+		{normalRepeat, LookupPriorityNormal},
+		{lowRepeat, LookupPriorityLow},
+	} {
+		d.LookupWithOptions(tc.h, 6881, LookupOptions{Priority: tc.p})
+		f.next(t)
+		f.release(tc.h)
+	}
+	awaitSchedIdle(t, d)
+
+	running := saturate(t, d, f, 0)
+
+	// Queue Low first (repeat + first-times), then Normal (repeat + first-times),
+	// then High (magnet retry + first-times).
+	d.LookupWithOptions(lowRepeat, 6881, LookupOptions{Priority: LookupPriorityLow})
+	d.LookupWithOptions(schedHash(701), 6881, LookupOptions{Priority: LookupPriorityLow})
+	d.LookupWithOptions(normalRepeat, 6881, LookupOptions{Priority: LookupPriorityNormal})
+	d.LookupWithOptions(schedHash(801), 6881, LookupOptions{Priority: LookupPriorityNormal})
+	d.LookupWithOptions(magnetRetry, 6881, LookupOptions{Priority: LookupPriorityHigh})
+	d.LookupWithOptions(schedHash(901), 6881, LookupOptions{Priority: LookupPriorityHigh})
+
+	// 6 items queued; all 6 start before the 8th start (anti-starvation), so
+	// priority order governs all 6:
+	// High urgent (901), High routine (900),
+	// Normal urgent (801), Normal routine (800),
+	// Low urgent (701), Low routine (700).
+	want := []int{901, 900, 801, 800, 701, 700}
+	for i, w := range want {
+		f.release(running[i])
+		if c := f.next(t); c.infoHash != schedHash(w) {
+			t.Fatalf("start %d was %x, want %x", i, c.infoHash, schedHash(w))
+		}
+	}
+}
+
+// TestLookupSchedulerAntiStarvationOneInEight verifies one start in eight goes
+// to the oldest queued request of any level so seeds are never starved by a
+// continuous stream of higher-priority lookups.
+func TestLookupSchedulerAntiStarvationOneInEight(t *testing.T) {
+	var s lookupScheduler
+	seed := schedHash(1)
+	s.enqueue(seed, 6881, LookupOptions{Priority: LookupPriorityLow})
+	for i := 0; i < 10; i++ {
+		s.enqueue(schedHash(100+i), 6881, LookupOptions{Priority: LookupPriorityHigh})
+	}
+
+	now := time.Unix(1000, 0)
+	for i := 0; i < 7; i++ {
+		p, _ := s.take(now, 0)
+		if p == nil || p.opts.Priority != LookupPriorityHigh {
+			t.Fatalf("start %d picked %v, want High priority", i+1, p)
+		}
+		s.finish(p.infoHash)
+	}
+	// 8th start must pick the oldest queued request (the Low seed).
+	p, _ := s.take(now, 0)
+	if p == nil || p.infoHash != seed {
+		t.Fatalf("8th start picked %v, want oldest queued request (%x)", p, seed)
+	}
+	s.finish(p.infoHash)
+}
+
+// TestLookupSchedulerCancelQueuedAndRunning verifies CancelLookup withdraws
+// queued requests, stops running ones immediately, and lets a subsequent
+// request for the same info-hash run once re-queued.
+func TestLookupSchedulerCancelQueuedAndRunning(t *testing.T) {
+	f := installFakeLookups(t, 0)
+	d, _ := newFakeDHT(t)
+
+	running := saturate(t, d, f, 0)
+	queued := schedHash(500)
+	kept := schedHash(501)
+	d.LookupWithOptions(queued, 6881, LookupOptions{Priority: LookupPriorityHigh})
+	d.LookupWithOptions(kept, 6881, LookupOptions{Priority: LookupPriorityNormal})
+
+	// Cancel the queued lookup before any slot opens.
+	d.CancelLookup(queued)
+	if _, ok := pendingFor(d, queued); ok {
+		t.Fatal("CancelLookup left queued lookup in pending")
+	}
+
+	// Cancel a running lookup; its ctx should unblock immediately and free its
+	// slot for kept (never starting queued).
+	d.CancelLookup(running[0])
+	c := f.next(t)
+	if c.infoHash != kept {
+		t.Fatalf("freed slot started %x, want %x", c.infoHash, kept)
+	}
+
+	// Cancelling a running lookup and immediately re-enqueuing it must not be
+	// dropped as already_running.
+	d.CancelLookup(running[1])
+	d.LookupWithOptions(running[1], 6881, LookupOptions{Priority: LookupPriorityHigh})
+	c2 := f.next(t)
+	if c2.infoHash != running[1] {
+		t.Fatalf("re-queued lookup after cancel started %x, want %x", c2.infoHash, running[1])
+	}
+}
+
+// TestLookupSchedulerMergePromotesPriority verifies merging a higher-priority
+// request into an already-queued entry moves it to the higher level.
+func TestLookupSchedulerMergePromotesPriority(t *testing.T) {
+	var s lookupScheduler
+	h1 := schedHash(1)
+	h2 := schedHash(2)
+	s.enqueue(h1, 6881, LookupOptions{Priority: LookupPriorityLow})
+	s.enqueue(h2, 6881, LookupOptions{Priority: LookupPriorityNormal})
+	// Promote h1 to High.
+	res, _ := s.enqueue(h1, 6881, LookupOptions{Priority: LookupPriorityHigh, Announce: true})
+	if res != lookupMerged {
+		t.Fatalf("enqueue merge result = %v, want merged", res)
+	}
+	p, _ := s.take(time.Now(), 0)
+	if p == nil || p.infoHash != h1 || !p.opts.Announce || p.opts.Priority != LookupPriorityHigh {
+		t.Fatalf("first take = %+v, want promoted h1", p)
 	}
 }

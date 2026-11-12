@@ -70,7 +70,7 @@ func TestLookupStoresResponderUnderReportedID(t *testing.T) {
 	})
 	d.addNode(startID, start)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	if storedAddrFor(d, forged) != nil {
 		t.Fatal("the responder was stored under the ID its referrer claimed")
@@ -99,7 +99,7 @@ func TestLookupIgnoresResponsesWithoutValidID(t *testing.T) {
 		return nil
 	})
 	d.addNode(startID, start)
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	if got := d.NodesCount(); got != 1 || storedAddrFor(d, startID) == nil {
 		t.Fatalf("a response without a valid ID changed the table: %d contacts", got)
@@ -157,7 +157,7 @@ func TestLookupTraversalResistsHijack(t *testing.T) {
 	d.addNode(attackerID, attacker)
 	d.addNode(honestID, honest)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	for _, a := range special {
 		if got := conn.queriesTo(a, "get_peers"); got != 0 {
@@ -219,7 +219,7 @@ func TestLookupResponderCannotFloodCandidateSet(t *testing.T) {
 	d.addNode(attackerID, attacker)
 	d.addNode(honestID, honest)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	if got := conn.queriesTo(closest, "get_peers"); got != 1 {
 		t.Fatalf("one responder's referrals kept the genuinely closest node from being queried (%d queries)", got)
@@ -261,7 +261,7 @@ func TestLookupQueriesClosestAndConverges(t *testing.T) {
 	})
 	d.addNode(seedID, seed)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	for i := 1; i <= 40; i++ {
 		addr := &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881}
@@ -307,7 +307,7 @@ func TestLookupAnnouncesOnlyToClosestK(t *testing.T) {
 	})
 	d.addNode(seedID, seed)
 
-	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+	d.lookup(d.ctx, infoHash, 51413, LookupOptions{Announce: true})
 
 	// Announces are sent from tracked goroutines once the lookup converges;
 	// wait for them, then give any stray extra ones a moment to show up.
@@ -367,7 +367,7 @@ func TestLookupReferralScope(t *testing.T) {
 				return map[string]interface{}{"id": idString(infoHash)}
 			})
 			d.addNode(responderID, responder)
-			d.lookup(infoHash, 0, LookupOptions{})
+			d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 			if got := conn.queriesTo(referral, "get_peers") == 1; got != tc.allowed {
 				t.Fatalf("referral %s from %s queried = %v, want %v", referral, responder, got, tc.allowed)
 			}
@@ -502,7 +502,7 @@ func TestLookupFiltersCapsAndDedupsValues(t *testing.T) {
 	})
 	d.addNode(seedID, seed)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	peers := drainDiscovered(d)
 	seen := make(map[string]bool)
@@ -542,7 +542,7 @@ func TestLookupLoopbackResponderMayHandOutLoopbackPeers(t *testing.T) {
 	})
 	d.addNode(seedID, seed)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	peers := drainDiscovered(d)
 	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("127.0.0.1")) || peers[0].Port != 6881 {
@@ -721,7 +721,7 @@ func TestLookupFailsResponderWithMalformedNodes(t *testing.T) {
 	d.addNode(brokenID, broken)
 	d.addNode(honestID, honest)
 
-	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+	d.lookup(d.ctx, infoHash, 51413, LookupOptions{Announce: true})
 
 	awaitQueryTo(t, conn, honest, "announce_peer")
 	time.Sleep(50 * time.Millisecond)
@@ -764,7 +764,7 @@ func TestLookupDoesNotEchoOversizedToken(t *testing.T) {
 	d.addNode(longID, long)
 	d.addNode(cappedID, capped)
 
-	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+	d.lookup(d.ctx, infoHash, 51413, LookupOptions{Announce: true})
 
 	awaitQueryTo(t, conn, capped, "announce_peer")
 	time.Sleep(50 * time.Millisecond)
@@ -793,7 +793,7 @@ func TestLookupDropsPortOneValues(t *testing.T) {
 	})
 	d.addNode(seedID, seed)
 
-	d.lookup(infoHash, 0, LookupOptions{})
+	d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 
 	peers := drainDiscovered(d)
 	if len(peers) != 1 || !peers[0].IP.Equal(net.ParseIP("198.51.100.81")) || peers[0].Port != 6881 {
@@ -898,7 +898,7 @@ func TestLookupSlidingWindowDoesNotStallOnDeadNode(t *testing.T) {
 	d.addNode(seedID, seed)
 
 	start := time.Now()
-	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+	d.lookup(d.ctx, infoHash, 51413, LookupOptions{Announce: true})
 	elapsed := time.Since(start)
 	if elapsed >= dhtLookupQueryTimeout/2 {
 		t.Fatalf("lookup took %v with dead nodes outside top K, want well below %v", elapsed, dhtLookupQueryTimeout)
@@ -966,7 +966,7 @@ func TestLookupSlidingWindowConcurrencyAndSingleQuery(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		d.lookup(infoHash, 0, LookupOptions{})
+		d.lookup(d.ctx, infoHash, 0, LookupOptions{})
 		close(done)
 	}()
 
@@ -988,5 +988,76 @@ func TestLookupSlidingWindowConcurrencyAndSingleQuery(t *testing.T) {
 		if i >= dhtLookupK && got != 0 {
 			t.Fatalf("referral %d outside top K queried %d times", i+1, got)
 		}
+	}
+}
+
+// TestLookupCancelStopsRunningLookupBeforeAnnounce verifies CancelLookup stops
+// a running lookup mid-flight so it returns promptly without sending
+// announce_peer after a pause/close.
+func TestLookupCancelStopsRunningLookupBeforeAnnounce(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "cancel-running-hash-")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.20"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0x80, 0)
+	silent := &net.UDPAddr{IP: net.ParseIP("198.18.1.1"), Port: 6881}
+	silentID := idAtDistance(infoHash, 0x01, 0)
+
+	seedResponded := make(chan struct{})
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		if sameUDPAddr(to, seed) {
+			select {
+			case <-seedResponded:
+			default:
+				close(seedResponded)
+			}
+			return map[string]interface{}{
+				"id":    idString(seedID),
+				"token": "tok",
+				"nodes": compactNodes([]Node{{ID: silentID, Addr: silent}}),
+			}
+		}
+		return nil // silent never replies, holding the lookup open
+	})
+	d.addNode(seedID, seed)
+
+	done := make(chan struct{})
+	d.LookupWithOptions(infoHash, 51413, LookupOptions{Announce: true, Priority: LookupPriorityHigh})
+
+	// Wait until silent has been queried (so seed already returned a token,
+	// and the lookup is waiting on silent).
+	awaitQueryTo(t, conn, silent, "get_peers")
+	d.CancelLookup(infoHash)
+
+	go func() {
+		deadline := time.After(5 * time.Second)
+		for {
+			d.sched.mu.Lock()
+			_, running := d.sched.running[infoHash]
+			d.sched.mu.Unlock()
+			if !running {
+				close(done)
+				return
+			}
+			select {
+			case <-deadline:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CancelLookup did not stop running lookup promptly")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := len(conn.queried("announce_peer")); got != 0 {
+		t.Fatalf("cancelled lookup sent %d announce_peer queries, want 0", got)
 	}
 }
