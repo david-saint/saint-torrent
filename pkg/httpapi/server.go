@@ -602,10 +602,15 @@ func snapshotPeers(peers []downloader.PeerState) []PeerStats {
 }
 
 func snapshotFiles(sess *downloader.Session) []FileStats {
-	files := sess.Files()
+	// BEP 47 pad files hold no payload and are never created, so they are not
+	// listed; index maps each listed file back to the torrent's numbering.
+	files, index := downloader.PayloadFiles(sess.Files())
 	priorities := sess.GetFilePriorities()
 	stats := make([]FileStats, 0, len(files))
 	for i, file := range files {
+		if index != nil {
+			i = index[i]
+		}
 		priority := downloader.PriorityNormal
 		if i < len(priorities) {
 			priority = priorities[i]

@@ -598,9 +598,11 @@ func (m *TorrentManager) RemoveSession(infoHashHex string, deleteFiles bool) err
 // another active torrent uses are kept and reported in kept (nil when none
 // were); err reports a failed delete.
 func (m *TorrentManager) deletePayload(infoHash [20]byte, downloadDir string, files []torrent.File) (kept *FilesKeptError, err error) {
-	relPaths := make([]string, len(files))
-	for i, f := range files {
-		relPaths[i] = filepath.Join(f.Path...)
+	relPaths := make([]string, 0, len(files))
+	for _, f := range files {
+		if !f.Pad { // never created, so never deleted: a real file may sit there
+			relPaths = append(relPaths, filepath.Join(f.Path...))
+		}
 	}
 	// The paths deleted stay reserved until the delete is done, so no torrent
 	// can be added on them meanwhile.
@@ -992,13 +994,7 @@ func (m *TorrentManager) addParsedTorrent(tor *torrent.Torrent, torrentData []by
 	m.mu.Unlock()
 
 	// Prepare storage files
-	files := make([]storage.FileInfo, len(tor.Files))
-	for i, f := range tor.Files {
-		files[i] = storage.FileInfo{
-			Path:   filepath.Join(f.Path...),
-			Length: f.Length,
-		}
-	}
+	files := storageFileInfos(tor.Files)
 
 	// Reserve the payload paths before the factory creates or extends a file
 	// another torrent may be using.

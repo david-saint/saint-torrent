@@ -460,3 +460,43 @@ func newHTTPTestSession(t *testing.T) *downloader.Session {
 	sess.Uploaded.Store(512)
 	return sess
 }
+
+// TestSnapshotFilesHidesPadFiles: BEP 47 pad files are not listed, and each
+// listed file keeps its own priority.
+func TestSnapshotFilesHidesPadFiles(t *testing.T) {
+	files := []torrent.File{
+		{Length: 10, Path: []string{"pad-test", "a.bin"}},
+		{Length: 6, Path: []string{"pad-test", ".pad", "6"}, Pad: true},
+		{Length: 10, Path: []string{"pad-test", "b.bin"}},
+	}
+	tor := &torrent.Torrent{
+		Name:        "pad-test",
+		InfoHash:    sha1.Sum([]byte("pad-test")),
+		PieceLength: 16,
+		PieceHashes: make([][20]byte, 2),
+		Files:       files,
+	}
+	infos := make([]storage.FileInfo, len(files))
+	for i, f := range files {
+		infos[i] = storage.FileInfo{Path: filepath.Join(f.Path...), Length: f.Length, Pad: f.Pad}
+	}
+	st, err := storage.NewMemStorage(t.TempDir(), infos, tor.PieceLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := downloader.NewSession(tor, st, [20]byte{}, 51413, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	sess.SetFilePriority(2, downloader.PriorityHigh)
+
+	got := snapshotFiles(sess)
+	want := []FileStats{
+		{Path: "pad-test/a.bin", LengthBytes: 10, Priority: "normal", PriorityValue: int(downloader.PriorityNormal)},
+		{Path: "pad-test/b.bin", LengthBytes: 10, Priority: "high", PriorityValue: int(downloader.PriorityHigh)},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("snapshotFiles = %+v, want %+v", got, want)
+	}
+}

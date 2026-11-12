@@ -298,8 +298,14 @@ type Session struct {
 	MagnetURI             string
 	pendingFilePriorities []FilePriority
 
-	// File selection and priorities (mutate only via locked setters/helpers)
+	// File selection and priorities (mutate only via locked setters/helpers).
+	// One entry per Torrent.Files entry; a pad file's is always PrioritySkip.
 	filePriorities []FilePriority
+
+	// padMask maps the torrent's BEP 47 pad ranges (nil without pad files). It
+	// is set with the torrent's metadata, under mu, and never modified; a peer
+	// loop copies the pointer into each piece it opens and reads it lock-free.
+	padMask *padMask
 
 	// Bandwidth limiting
 	DownloadLimiter       *RateLimiter
@@ -401,13 +407,14 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Initialize file priorities to Normal for all files
-	priorities := make([]FilePriority, len(tor.Files))
-	for i := range priorities {
-		priorities[i] = PriorityNormal
-	}
+	// Every file starts at Normal priority; pad files are always skipped.
+	priorities := newFilePriorities(tor.Files)
 
 	metadataMode := tor.PieceLength == 0
+	var mask *padMask
+	if !metadataMode {
+		mask = newPadMask(tor.Files, tor.PieceLength, numPieces)
+	}
 
 	resolvedDir := downloadDir
 	if st != nil && resolvedDir == "" {
@@ -436,6 +443,7 @@ func newSession(tor *torrent.Torrent, st storage.Storage, peerID [20]byte, port 
 		stateFlushCh:        make(chan struct{}, 1),
 		pauseStateCh:        make(chan struct{}),
 		filePriorities:      priorities,
+		padMask:             mask,
 		DownloadLimiter:     NewRateLimiter(0), // unlimited by default
 		UploadLimiter:       NewRateLimiter(0), // unlimited by default
 		metadataMode:        metadataMode,
@@ -1319,10 +1327,17 @@ func normalizedDirectory(dir string) string {
 func (s *Session) ContentPath() (path string, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.Torrent == nil || len(s.Torrent.Files) == 0 {
+	if s.Torrent == nil {
 		return "", false
 	}
-	root := s.Torrent.Files[0].Path
+	// The first payload file: a pad file is never created on disk.
+	var root []string
+	for _, f := range s.Torrent.Files {
+		if !f.Pad {
+			root = f.Path
+			break
+		}
+	}
 	if len(root) == 0 || root[0] == "" {
 		return "", false
 	}
@@ -1465,7 +1480,13 @@ func (s *Session) setQuarantinedLocked(note string) {
 		s.verifyStartTime = time.Time{}
 		for idx := range s.PieceStates {
 			s.PieceStates[idx] = PieceUnverified
-			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
+		}
+		// A piece lying entirely in pad files has nothing on disk to distrust.
+		s.markPadPiecesCompleteLocked()
+		for idx, state := range s.PieceStates {
+			if state == PieceUnverified {
+				s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
+			}
 		}
 		s.recomputeNeededLocked()
 		s.recomputeStatsLocked()
@@ -1514,6 +1535,9 @@ func (s *Session) setFilePriorityLocked(fileIndex int, priority FilePriority) bo
 	if priority < PrioritySkip || priority > PriorityHigh {
 		return false
 	}
+	if s.isPadFileLocked(fileIndex) {
+		return false // pad files hold no payload and stay skipped
+	}
 	if s.filePriorities[fileIndex] == priority {
 		return false
 	}
@@ -1529,7 +1553,9 @@ func (s *Session) applyFilePrioritiesNoRebuild(prios []FilePriority) bool {
 	changed := false
 	for i := 0; i < len(s.filePriorities) && i < len(prios); i++ {
 		prio := prios[i]
-		if prio >= PrioritySkip && prio <= PriorityHigh {
+		// A saved list, possibly written by a build that downloaded pad
+		// files, never revives one.
+		if prio >= PrioritySkip && prio <= PriorityHigh && !s.isPadFileLocked(i) {
 			if s.filePriorities[i] != prio {
 				s.filePriorities[i] = prio
 				changed = true
@@ -1552,12 +1578,17 @@ func (s *Session) applyFilePrioritiesLocked(prios []FilePriority) bool {
 	return false
 }
 
-// newFilePriorities returns a PriorityNormal-filled slice for numFiles files. It
+// newFilePriorities returns the initial priorities of files: PriorityNormal,
+// except PrioritySkip for BEP 47 pad files, whose bytes are never fetched. It
 // is built before s.mu is taken, so a many-file torrent never allocates under it.
-func newFilePriorities(numFiles int) []FilePriority {
-	priorities := make([]FilePriority, numFiles)
-	for i := range priorities {
-		priorities[i] = PriorityNormal
+func newFilePriorities(files []torrent.File) []FilePriority {
+	priorities := make([]FilePriority, len(files))
+	for i, f := range files {
+		if f.Pad {
+			priorities[i] = PrioritySkip
+		} else {
+			priorities[i] = PriorityNormal
+		}
 	}
 	return priorities
 }
@@ -1784,17 +1815,12 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 
 	// Build everything the session will publish before taking s.mu: a torrent
 	// can declare millions of pieces and hundreds of thousands of files.
-	fileInfos := make([]storage.FileInfo, len(parsed.Files))
-	for i, f := range parsed.Files {
-		fileInfos[i] = storage.FileInfo{
-			Path:   filepath.Join(f.Path...),
-			Length: f.Length,
-		}
-	}
+	fileInfos := storageFileInfos(parsed.Files)
 	numPieces := len(parsed.PieceHashes)
 	pieceStates := make([]PieceState, numPieces) // all PieceEmpty
 	pieceAvailability := make([]int, numPieces)
-	priorities := newFilePriorities(len(parsed.Files))
+	priorities := newFilePriorities(parsed.Files)
+	mask := newPadMask(parsed.Files, parsed.PieceLength, numPieces)
 
 	s.mu.Lock()
 	// A closing session must not start creating files: Close may already have
@@ -1918,6 +1944,7 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	s.Torrent.Files = parsed.Files
 	s.Torrent.InfoBytes = parsed.InfoBytes
 	s.Torrent.Private = parsed.Private
+	s.padMask = mask
 	s.purgeDiscoveryPeersLocked()
 	if parsed.Private {
 		s.DHT = nil
@@ -1973,6 +2000,21 @@ func (s *Session) onMetadataDownloaded(infoBytes []byte) (err error) {
 	}
 
 	return nil
+}
+
+// storageFileInfos describes a torrent's files to a storage factory, pad files
+// included: they keep the payload offsets in place, but storage never creates
+// them.
+func storageFileInfos(files []torrent.File) []storage.FileInfo {
+	infos := make([]storage.FileInfo, len(files))
+	for i, f := range files {
+		infos[i] = storage.FileInfo{
+			Path:   filepath.Join(f.Path...),
+			Length: f.Length,
+			Pad:    f.Pad,
+		}
+	}
+	return infos
 }
 
 // scheduleMetadataStorageRetryLocked arms the retry of a failed storage build
