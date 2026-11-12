@@ -1,6 +1,8 @@
 package dht
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -312,5 +314,136 @@ func BenchmarkQueryLimiterAllow(b *testing.B) {
 		ip := [4]byte{203, byte(i >> 16), byte(i >> 8), byte(i)}
 		l.allow(ip, now)
 		now += 1000
+	}
+}
+
+func TestQueryBudgetReserveBurstAndRate(t *testing.T) {
+	b := queryBudget{rate: 1000, burst: 2000, ceiling: 4000}
+	now := int64(time.Hour)
+
+	if w := b.reserve(2000, now); w != 0 {
+		t.Fatalf("within burst waited %v, want 0", w)
+	}
+	if w := b.reserve(500, now); w != 500*time.Millisecond {
+		t.Fatalf("500 bytes past burst waited %v, want 500ms", w)
+	}
+	// Another 500 bytes queues behind the previous reservation.
+	if w := b.reserve(500, now); w != time.Second {
+		t.Fatalf("second 500 bytes waited %v, want 1s", w)
+	}
+}
+
+func TestQueryBudgetTryTakeHardCeiling(t *testing.T) {
+	b := queryBudget{rate: 1000, burst: 1000, ceiling: 2000}
+	now := int64(time.Hour)
+
+	// Drain burst via reserve; pings/find_node still succeed up to ceiling.
+	if w := b.reserve(1000, now); w != 0 {
+		t.Fatalf("burst wait = %v, want 0", w)
+	}
+	if !b.tryTake(1000, now) {
+		t.Fatal("tryTake below hard ceiling failed")
+	}
+	if b.tryTake(1, now) {
+		t.Fatal("tryTake past hard ceiling succeeded")
+	}
+	// After 500ms, 500 bytes refill so tryTake accepts up to 500 bytes again.
+	if !b.tryTake(500, now+int64(500*time.Millisecond)) {
+		t.Fatal("tryTake after refill failed")
+	}
+}
+
+// TestSendQueryWaitsForBudgetBeforeTimeout verifies get_peers and announce_peer
+// wait for outbound budget before their response timeout starts, so waiting
+// behind the rate limit does not cause premature query timeouts.
+func TestSendQueryWaitsForBudgetBeforeTimeout(t *testing.T) {
+	oldTimeout := dhtLookupQueryTimeout
+	dhtLookupQueryTimeout = 80 * time.Millisecond
+	t.Cleanup(func() { dhtLookupQueryTimeout = oldTimeout })
+
+	d, conn := newFakeDHT(t)
+	d.queryBudget = queryBudget{rate: 1000, burst: 100, ceiling: 5000}
+
+	target := &net.UDPAddr{IP: net.ParseIP("198.51.100.10"), Port: 6881}
+	responderID := idInBucket(d.nodeID, 10, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"id": idString(responderID), "token": "tok"}
+	})
+
+	// Exhaust burst + 150ms of budget (> dhtLookupQueryTimeout = 80ms) before
+	// issuing get_peers and announce_peer. If the timeout started before the
+	// budget wait, both would time out before ever sending on UDP.
+	d.queryBudget.reserve(250, int64(time.Since(d.started)))
+
+	var infoHash [20]byte
+	copy(infoHash[:], "budget-timeout-hash-")
+
+	res, err := d.getPeersQuery(context.Background(), infoHash, target)
+	if err != nil || res == nil || res.ID != responderID {
+		t.Fatalf("getPeersQuery failed after budget wait: res=%v err=%v", res, err)
+	}
+	if err := d.announcePeerQuery(context.Background(), infoHash, 51413, "tok", target); err != nil {
+		t.Fatalf("announcePeerQuery failed after budget wait: %v", err)
+	}
+
+	// Verify budget cancellation aborts the wait immediately without sending.
+	d.queryBudget.reserve(2000, int64(time.Since(d.started)))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	before := conn.queriesTo(target, "get_peers")
+	if _, err := d.getPeersQuery(ctx, infoHash, target); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled budget wait err = %v, want DeadlineExceeded", err)
+	}
+	if after := conn.queriesTo(target, "get_peers"); after != before {
+		t.Fatalf("cancelled budget wait still transmitted %d queries", after-before)
+	}
+}
+
+// TestSendQueryNonWaitingDropsPastCeiling verifies pings and bootstrap
+// find_node queries never wait on the budget and are dropped past the hard
+// ceiling (so a dropped probe simply does not admit the node).
+func TestSendQueryNonWaitingDropsPastCeiling(t *testing.T) {
+	d, conn := newFakeDHT(t)
+	d.queryBudget = queryBudget{rate: 1000, burst: 100, ceiling: 150}
+
+	target := &net.UDPAddr{IP: net.ParseIP("198.51.100.20"), Port: 6881}
+	responderID := idInBucket(d.nodeID, 12, 1)
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"id": idString(responderID)}
+	})
+
+	// Push the budget just past burst (100B) but below ceiling (150B): a ping
+	// (~55B) would exceed ceiling, so both ping and find_node must drop
+	// immediately without waiting.
+	d.queryBudget.reserve(130, int64(time.Since(d.started)))
+
+	start := time.Now()
+	if _, err := d.queryNodeID(context.Background(), target); !errors.Is(err, errQueryBudgetExceeded) {
+		t.Fatalf("ping past ceiling err = %v, want errQueryBudgetExceeded", err)
+	}
+	if _, err := d.findNode(context.Background(), d.nodeID, target); !errors.Is(err, errQueryBudgetExceeded) {
+		t.Fatalf("find_node past ceiling err = %v, want errQueryBudgetExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("non-waiting queries waited %v past ceiling", elapsed)
+	}
+	if conn.queriesTo(target, "ping") != 0 || conn.queriesTo(target, "find_node") != 0 {
+		t.Fatal("dropped queries still wrote packets to UDP")
+	}
+
+	// Below ceiling (even past burst), ping succeeds immediately without waiting.
+	d2, conn2 := newFakeDHT(t)
+	d2.queryBudget = queryBudget{rate: 1000, burst: 50, ceiling: 500}
+	conn2.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		return map[string]interface{}{"id": idString(responderID)}
+	})
+	d2.queryBudget.reserve(80, int64(time.Since(d2.started))) // past burst=50, below ceiling=500
+	start = time.Now()
+	id, err := d2.queryNodeID(context.Background(), target)
+	if err != nil || id != responderID {
+		t.Fatalf("ping between burst and ceiling failed: err=%v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("ping between burst and ceiling waited %v", elapsed)
 	}
 }

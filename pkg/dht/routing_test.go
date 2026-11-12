@@ -654,3 +654,49 @@ func TestSlash24RuleOnReplacement(t *testing.T) {
 		checkRoutingIndex(t, d)
 	})
 }
+
+// TestBudgetDroppedPingDoesNotEvictIncumbent: a challenge ping the outbound
+// budget refuses to send says nothing about the questionable node, so the
+// node keeps its slot and the newcomer is not admitted in its place.
+func TestBudgetDroppedPingDoesNotEvictIncumbent(t *testing.T) {
+	const bucket = 24
+	d, conn := newFakeDHT(t)
+	nodes := fillBucket(t, d, bucket, 2)
+	head := nodes[0]
+	backdateNode(t, d, bucket, head.ID, time.Now().Add(-nodeQuestionableAfter-time.Minute))
+
+	// Past the hard ceiling: every non-waiting query is dropped unsent.
+	d.queryBudget = queryBudget{rate: 1000, burst: 100, ceiling: 150}
+	d.queryBudget.reserve(1<<20, int64(time.Since(d.started)))
+
+	newcomer := idInBucket(d.nodeID, bucket, 99)
+	d.addNode(newcomer, &net.UDPAddr{IP: net.ParseIP("198.51.100.12"), Port: 6881})
+
+	deadline := time.After(3 * nodePingTimeout)
+	for {
+		d.mu.RLock()
+		busy := d.buckets[bucket].pingInProgress
+		d.mu.RUnlock()
+		if !busy {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("challenge never finished")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if got := conn.queriesTo(head.Addr, "ping"); got != 0 {
+		t.Fatalf("sent %d pings past the budget ceiling, want 0", got)
+	}
+	var hasHead, hasNewcomer bool
+	for _, n := range bucketNodes(d, bucket) {
+		hasHead = hasHead || n.ID == head.ID
+		hasNewcomer = hasNewcomer || n.ID == newcomer
+	}
+	if !hasHead || hasNewcomer {
+		t.Fatalf("incumbent kept = %v, newcomer admitted = %v; want the unpinged incumbent kept", hasHead, hasNewcomer)
+	}
+	checkRoutingIndex(t, d)
+}
