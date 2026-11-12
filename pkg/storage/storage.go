@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/text/cases"
@@ -171,9 +172,13 @@ type fileLayout struct {
 	// open/stat/close syscall churn per completed piece on the download path. Reads
 	// reuse it too where readsShareWriteHandle allows, which keeps a file being
 	// downloaded and verified to one descriptor. Set and cleared under wmu.
-	// Invalidated on eviction and Close.
+	// Invalidated on eviction and Close, and when a periodic check finds that the
+	// file it was opened on is no longer the one at path (see writer).
 	wmu         sync.Mutex
 	writeHandle atomic.Pointer[os.File]
+	// writerChecked is the storageClock time writeHandle was last opened or
+	// checked against the file at path.
+	writerChecked atomic.Int64
 }
 
 // readsShareWriteHandle is whether a read uses a file's cached write handle
@@ -269,29 +274,144 @@ func (f *fileLayout) invalidateReaderLocked() bool {
 	return true
 }
 
+// writeHandleRecheckInterval is how often a cached write handle is checked
+// against the file its path now names. Checking costs a stat of the handle and a
+// rooted lstat of the path, far more than the write bookkeeping around it, so it
+// is not paid on every completed piece: between checks a write costs one clock
+// read. A file that is deleted, moved, replaced or truncated under the client is
+// therefore noticed by the first write at least this long after the previous
+// check. A var so tests can shorten it; treat it as a constant.
+var writeHandleRecheckInterval = time.Second
+
+// storageClockBase anchors the monotonic clock the recheck stamps are read from.
+var storageClockBase = time.Now()
+
+// storageClock returns monotonic nanoseconds since the package was loaded.
+func storageClock() int64 {
+	return int64(time.Since(storageClockBase))
+}
+
 // writer returns the cached O_RDWR handle, opening it on first use. The open
 // doubles as the repair check: if the file vanished it is recreated, and if it
-// is now shorter than the declared length it is grown back — either case reports
+// is now shorter than the declared length it is grown back; either case reports
 // repaired=true and drops the now-stale read handle. A longer file is left alone
-// for the same reason NewFileStorage never shrinks one. Once cached, subsequent
-// writes reuse the handle, so the open/stat/close syscall churn is paid once per
-// file rather than once per completed piece.
+// for the same reason NewFileStorage never shrinks one.
+//
+// Once cached, the handle is reused, so the open/stat/close churn is paid once
+// per file rather than once per completed piece. A cached handle keeps working
+// after the file it was opened on is deleted, moved or replaced, though, and
+// every write through it would then land in a file nobody can reach while
+// reporting success. So at most once per writeHandleRecheckInterval a cache hit
+// checks that the handle still is the full-length file at f.path, and otherwise
+// drops it and reopens, which repairs the file and reports repaired=true.
 func (f *fileLayout) writer() (*os.File, bool, error) {
 	if h := f.writeHandle.Load(); h != nil {
+		if f.recheckDue() {
+			switch f.checkCachedWriter(h) {
+			case writerStale:
+				return f.reopenWriter(h, true)
+			case writerClosed:
+				return f.reopenWriter(h, false)
+			}
+		}
 		f.touch()
 		return h, false, nil
 	}
 
 	f.wmu.Lock()
 	if h := f.writeHandle.Load(); h != nil {
+		f.touch()
 		f.wmu.Unlock()
 		return h, false, nil
 	}
+	return f.openAndCacheWriterUnlock()
+}
+
+// recheckDue reports whether the cached write handle is due a check, and claims
+// that check: of several writes finding it due at once, one runs it.
+func (f *fileLayout) recheckDue() bool {
+	now := storageClock()
+	last := f.writerChecked.Load()
+	return now-last >= int64(writeHandleRecheckInterval) && f.writerChecked.CompareAndSwap(last, now)
+}
+
+// writerState is what a check of a cached write handle found.
+type writerState int
+
+const (
+	// writerLive: the handle is the full-length file at f.path, or the check
+	// could not tell, and the handle stays in use.
+	writerLive writerState = iota
+	// writerStale: the file was deleted, moved, replaced or truncated.
+	writerStale
+	// writerClosed: an eviction or Close closed the handle under the check.
+	writerClosed
+)
+
+// checkCachedWriter checks a cached write handle against the file f.path now
+// names. Only positive evidence makes it stale: a path that is gone, is now a
+// symlink or names a different file, or a file shorter than declared. A stat
+// that fails for any other reason (a permission prompt, a volume going away)
+// proves nothing about the file, and calling it stale would make the session
+// discard its whole progress, so the handle is kept as it was before the check
+// existed.
+func (f *fileLayout) checkCachedWriter(h *os.File) writerState {
+	handleInfo, err := h.Stat()
+	if err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return writerClosed
+		}
+		return writerLive
+	}
+	if handleInfo.Size() < f.length {
+		return writerStale
+	}
+	pathInfo, err := f.downloadRoot.Lstat(f.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return writerStale
+		}
+		return writerLive
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, handleInfo) {
+		return writerStale
+	}
+	return writerLive
+}
+
+// reopenWriter replaces a stale or concurrently closed cached write handle.
+// When stale is true, the file changed underneath the handle, so any cached
+// read handle is also dropped and repaired is reported even if the replacement
+// file was already at least f.length bytes long.
+func (f *fileLayout) reopenWriter(expected *os.File, stale bool) (*os.File, bool, error) {
+	f.wmu.Lock()
+	if cur := f.writeHandle.Load(); cur != nil && cur != expected {
+		f.touch()
+		f.wmu.Unlock()
+		return cur, stale, nil
+	}
+	f.invalidateWriterLocked()
+	if stale {
+		f.invalidateReader()
+	}
+	h, repaired, err := f.openAndCacheWriterUnlock()
+	if err != nil {
+		return nil, false, err
+	}
+	return h, repaired || stale, nil
+}
+
+// openAndCacheWriterUnlock opens (and if needed repairs) the write handle,
+// caches it, releases wmu, and enforces the global handle budget. Caller must
+// hold wmu.
+func (f *fileLayout) openAndCacheWriterUnlock() (*os.File, bool, error) {
 	h, repaired, err := f.openWriterLocked()
 	if err != nil {
 		f.wmu.Unlock()
 		return nil, false, err
 	}
+	// The open just checked the file, so the next check is a full interval away.
+	f.writerChecked.Store(storageClock())
 	f.writeHandle.Store(h)
 	evictNow := fileHandles.acquire(f)
 	f.wmu.Unlock()
