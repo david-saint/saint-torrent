@@ -3624,10 +3624,10 @@ var dhtFirstLookupSlots struct {
 	next time.Time
 }
 
-// startDHTLookup starts a get_peers lookup for infoHash, announcing peerPort
-// when announce is set. A var so tests can observe lookups.
-var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, announce bool) {
-	d.LookupWithOptions(infoHash, peerPort, dht.LookupOptions{Announce: announce})
+// startDHTLookup starts a get_peers lookup for infoHash with opts. A var so
+// tests can observe lookups.
+var startDHTLookup = func(d *dht.DHT, infoHash [20]byte, peerPort uint16, opts dht.LookupOptions) {
+	d.LookupWithOptions(infoHash, peerPort, opts)
 }
 
 // dhtLoop looks the torrent up on the DHT on the cadence dhtLookupIntervalLocked
@@ -3659,40 +3659,36 @@ func (s *Session) dhtLoop() {
 }
 
 // dhtLookupTick runs one lookup unless the session is paused or cannot use
-// peers, and returns the delay until the next tick.
+// peers, and returns the delay until the next tick. It enqueues while still
+// holding the read lock so a concurrent Pause or Close cannot slip in between
+// checking the state and queueing the lookup.
 func (s *Session) dhtLookupTick() time.Duration {
 	s.mu.RLock()
-	interval, skip := s.dhtLookupIntervalLocked()
-	d := s.DHT
-	peerPort := s.Port
-	hasInbound := s.hasInboundListenerLocked()
-	hasTorrent := s.Torrent != nil
-	allowAnnounce := s.allowsDHTAnnounceLocked()
-	var infoHash [20]byte
-	if hasTorrent {
-		infoHash = s.Torrent.InfoHash
+	interval, priority, skip := s.dhtLookupIntervalLocked()
+	if !skip && s.DHT != nil && s.Torrent != nil && s.hasInboundListenerLocked() {
+		startDHTLookup(s.DHT, s.Torrent.InfoHash, s.Port, dht.LookupOptions{
+			Announce: s.allowsDHTAnnounceLocked(),
+			Priority: priority,
+		})
 	}
 	s.mu.RUnlock()
-
-	if !skip && d != nil && hasTorrent && hasInbound {
-		startDHTLookup(d, infoHash, peerPort, allowAnnounce)
-	}
 	return jitterDHTInterval(interval)
 }
 
 // dhtLookupIntervalLocked returns the time from one DHT lookup to the next,
-// and whether to skip lookups for now (paused, or metadata-stalled), in which
-// case it is when to check again. Caller holds s.mu (read or write).
-func (s *Session) dhtLookupIntervalLocked() (interval time.Duration, skip bool) {
+// the scheduler priority for the session's state, and whether to skip lookups
+// for now (paused, closing, closed, or metadata-stalled), in which case it is
+// when to check again. Caller holds s.mu (read or write).
+func (s *Session) dhtLookupIntervalLocked() (interval time.Duration, priority dht.LookupPriority, skip bool) {
 	switch {
-	case s.paused || s.metadataStalledLocked():
-		return dhtMetadataLookupInterval, true
+	case s.paused || s.closing || s.closed || s.metadataStalledLocked():
+		return dhtMetadataLookupInterval, dht.LookupPriorityHigh, true
 	case s.metadataMode:
-		return dhtMetadataLookupInterval, false
+		return dhtMetadataLookupInterval, dht.LookupPriorityHigh, false
 	case s.isCompletedLocked() || len(s.activePeers) >= dhtWellConnectedPeers:
-		return dhtIdleLookupInterval, false
+		return dhtIdleLookupInterval, dht.LookupPriorityLow, false
 	default:
-		return dhtDownloadLookupInterval, false
+		return dhtDownloadLookupInterval, dht.LookupPriorityNormal, false
 	}
 }
 

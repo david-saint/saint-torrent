@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ const (
 	// this DHT started, which is what lets a torrent's first lookup overtake
 	// the periodic repeats of others.
 	dhtMaxRememberedLookups = 65536
+	// dhtLookupAntiStarvationInterval is how many priority-ordered starts run
+	// before one start goes to the oldest queued request of any level.
+	dhtLookupAntiStarvationInterval = 7
 )
 
 // dhtLookupStartInterval spaces lookup starts, so a burst of requests turns
@@ -39,24 +43,33 @@ type pendingLookup struct {
 	infoHash [20]byte
 	peerPort uint16
 	opts     LookupOptions
+	seq      uint64
+	urgent   bool
 }
 
-// lookupScheduler queues lookups and starts them under the concurrency and
-// pacing limits above. Two queues are drained urgent first: urgent holds
-// info-hashes not looked up since this DHT started (a newly added torrent or
-// magnet), routine holds the periodic repeats. Routine is FIFO, so repeats
-// take turns. Urgent is drained newest first: at startup every restored
-// torrent's first lookup lands there within a second or two, and a magnet the
-// user adds just after (the magnet launcher starts the client with one) must
-// not wait for hundreds of them: lookups complete at well under one a second,
-// so that would take minutes.
+type runningLookup struct {
+	cancel    context.CancelFunc
+	cancelled bool
+}
+
+type levelQueue struct {
+	urgent  []*pendingLookup // first lookups, newest-first (LIFO)
+	routine []*pendingLookup // repeats, in turn (FIFO)
+}
+
+// lookupScheduler queues lookups and starts them under the concurrency,
+// pacing and priority limits above. Levels drain highest first, and within
+// each level urgent (first lookups since this DHT started) drains newest-first
+// ahead of routine (repeats, FIFO). One start in eight goes to the oldest
+// queued request of any level so lower-priority torrents are never starved.
 type lookupScheduler struct {
 	mu          sync.Mutex
 	pending     map[[20]byte]*pendingLookup // queued, by info-hash
-	urgent      []*pendingLookup
-	routine     []*pendingLookup
-	running     map[[20]byte]struct{}
+	levels      [numLookupPriorities]levelQueue
+	running     map[[20]byte]*runningLookup
 	seen        map[[20]byte]struct{} // info-hashes started since this DHT started
+	nextSeq     uint64
+	prioStarts  int
 	lastStart   time.Time
 	dispatching bool
 	closed      bool
@@ -90,12 +103,43 @@ func (r lookupEnqueueResult) String() string {
 	return "unknown"
 }
 
+func normalizePriority(p LookupPriority) LookupPriority {
+	if p > LookupPriorityHigh {
+		return LookupPriorityHigh
+	}
+	return p
+}
+
+func removeLookup(slice []*pendingLookup, target *pendingLookup) []*pendingLookup {
+	for i, p := range slice {
+		if p == target {
+			copy(slice[i:], slice[i+1:])
+			slice[len(slice)-1] = nil
+			return slice[:len(slice)-1]
+		}
+	}
+	return slice
+}
+
+func insertLookupBySeq(slice []*pendingLookup, p *pendingLookup) []*pendingLookup {
+	i := len(slice)
+	for i > 0 && slice[i-1].seq > p.seq {
+		i--
+	}
+	slice = append(slice, nil)
+	copy(slice[i+1:], slice[i:])
+	slice[i] = p
+	return slice
+}
+
 // enqueue queues a lookup request. A request for an info-hash already queued
-// merges into it: announcing is kept if either asked for it, and the latest
-// non-zero port wins. A request for an info-hash whose lookup is running is
-// dropped, since callers repeat on their own cadence. startDispatcher reports
-// that the caller must launch the dispatcher goroutine.
+// merges into it: announcing is kept if either asked for it, the latest
+// non-zero port wins, and a higher priority promotes it. A request for an
+// info-hash whose lookup is running (and not cancelled) is dropped, since
+// callers repeat on their own cadence. startDispatcher reports that the caller
+// must launch the dispatcher goroutine.
 func (s *lookupScheduler) enqueue(infoHash [20]byte, peerPort uint16, opts LookupOptions) (res lookupEnqueueResult, startDispatcher bool) {
+	opts.Priority = normalizePriority(opts.Priority)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -103,7 +147,7 @@ func (s *lookupScheduler) enqueue(infoHash [20]byte, peerPort uint16, opts Looku
 	}
 	if s.pending == nil {
 		s.pending = make(map[[20]byte]*pendingLookup)
-		s.running = make(map[[20]byte]struct{})
+		s.running = make(map[[20]byte]*runningLookup)
 		s.seen = make(map[[20]byte]struct{})
 	}
 	if p, ok := s.pending[infoHash]; ok {
@@ -111,21 +155,42 @@ func (s *lookupScheduler) enqueue(infoHash [20]byte, peerPort uint16, opts Looku
 		if peerPort != 0 {
 			p.peerPort = peerPort
 		}
+		if opts.Priority > p.opts.Priority {
+			oldQ := &s.levels[p.opts.Priority]
+			newQ := &s.levels[opts.Priority]
+			if p.urgent {
+				oldQ.urgent = removeLookup(oldQ.urgent, p)
+				newQ.urgent = insertLookupBySeq(newQ.urgent, p)
+			} else {
+				oldQ.routine = removeLookup(oldQ.routine, p)
+				newQ.routine = insertLookupBySeq(newQ.routine, p)
+			}
+			p.opts.Priority = opts.Priority
+		}
 		return lookupMerged, false
 	}
-	if _, ok := s.running[infoHash]; ok {
+	if r, ok := s.running[infoHash]; ok && !r.cancelled {
 		return lookupAlreadyRunning, false
 	}
 	if len(s.pending) >= dhtMaxQueuedLookups {
 		return lookupQueueFull, false
 	}
-	p := &pendingLookup{infoHash: infoHash, peerPort: peerPort, opts: opts}
-	s.pending[infoHash] = p
+	s.nextSeq++
 	_, seen := s.seen[infoHash]
-	if !seen && len(s.seen) < dhtMaxRememberedLookups {
-		s.urgent = append(s.urgent, p)
+	urgent := !seen && len(s.seen) < dhtMaxRememberedLookups
+	p := &pendingLookup{
+		infoHash: infoHash,
+		peerPort: peerPort,
+		opts:     opts,
+		seq:      s.nextSeq,
+		urgent:   urgent,
+	}
+	s.pending[infoHash] = p
+	q := &s.levels[opts.Priority]
+	if urgent {
+		q.urgent = append(q.urgent, p)
 	} else {
-		s.routine = append(s.routine, p)
+		q.routine = append(q.routine, p)
 	}
 	s.signalLocked()
 	if !s.dispatching {
@@ -133,6 +198,88 @@ func (s *lookupScheduler) enqueue(infoHash [20]byte, peerPort uint16, opts Looku
 		return lookupQueued, true
 	}
 	return lookupQueued, false
+}
+
+// cancel removes any queued lookup for infoHash and cancels an active one if
+// it is running.
+func (s *lookupScheduler) cancel(infoHash [20]byte) {
+	s.mu.Lock()
+	if p, ok := s.pending[infoHash]; ok {
+		delete(s.pending, infoHash)
+		q := &s.levels[p.opts.Priority]
+		if p.urgent {
+			q.urgent = removeLookup(q.urgent, p)
+		} else {
+			q.routine = removeLookup(q.routine, p)
+		}
+	}
+	var cancelFn context.CancelFunc
+	if r, ok := s.running[infoHash]; ok && !r.cancelled {
+		r.cancelled = true
+		cancelFn = r.cancel
+	}
+	s.mu.Unlock()
+	if cancelFn != nil {
+		cancelFn()
+	}
+}
+
+func (s *lookupScheduler) popByPriorityLocked() *pendingLookup {
+	for lvl := int(LookupPriorityHigh); lvl >= int(LookupPriorityLow); lvl-- {
+		q := &s.levels[lvl]
+		for i := len(q.urgent) - 1; i >= 0; i-- {
+			p := q.urgent[i]
+			if _, busy := s.running[p.infoHash]; busy {
+				continue
+			}
+			copy(q.urgent[i:], q.urgent[i+1:])
+			q.urgent[len(q.urgent)-1] = nil
+			q.urgent = q.urgent[:len(q.urgent)-1]
+			return p
+		}
+		for i := 0; i < len(q.routine); i++ {
+			p := q.routine[i]
+			if _, busy := s.running[p.infoHash]; busy {
+				continue
+			}
+			copy(q.routine[i:], q.routine[i+1:])
+			q.routine[len(q.routine)-1] = nil
+			q.routine = q.routine[:len(q.routine)-1]
+			return p
+		}
+	}
+	return nil
+}
+
+func (s *lookupScheduler) popOldestReadyLocked() *pendingLookup {
+	var best *pendingLookup
+	var bestSlice *[]*pendingLookup
+	bestIdx := -1
+	consider := func(slice *[]*pendingLookup) {
+		for i, p := range *slice {
+			if _, busy := s.running[p.infoHash]; busy {
+				continue
+			}
+			if best == nil || p.seq < best.seq {
+				best = p
+				bestSlice = slice
+				bestIdx = i
+			}
+			break // slices stay sorted by increasing seq
+		}
+	}
+	for lvl := 0; lvl < numLookupPriorities; lvl++ {
+		consider(&s.levels[lvl].urgent)
+		consider(&s.levels[lvl].routine)
+	}
+	if best == nil {
+		return nil
+	}
+	sl := *bestSlice
+	copy(sl[bestIdx:], sl[bestIdx+1:])
+	sl[len(sl)-1] = nil
+	*bestSlice = sl[:len(sl)-1]
+	return best
 }
 
 // take starts the next queued lookup if a slot is free and the pacing
@@ -151,22 +298,46 @@ func (s *lookupScheduler) take(now time.Time, interval time.Duration) (*pendingL
 		}
 	}
 	var p *pendingLookup
-	if n := len(s.urgent); n > 0 {
-		p = s.urgent[n-1]
-		s.urgent[n-1] = nil
-		s.urgent = s.urgent[:n-1]
+	if s.prioStarts >= dhtLookupAntiStarvationInterval {
+		p = s.popOldestReadyLocked()
+		if p != nil {
+			s.prioStarts = 0
+		}
 	} else {
-		p = s.routine[0]
-		s.routine[0] = nil
-		s.routine = s.routine[1:]
+		p = s.popByPriorityLocked()
+		if p != nil {
+			if len(s.pending) <= 1 {
+				s.prioStarts = 0
+			} else {
+				s.prioStarts++
+			}
+		}
+	}
+	if p == nil {
+		return nil, 0
 	}
 	delete(s.pending, p.infoHash)
-	s.running[p.infoHash] = struct{}{}
+	s.running[p.infoHash] = &runningLookup{}
 	if len(s.seen) < dhtMaxRememberedLookups {
 		s.seen[p.infoHash] = struct{}{}
 	}
 	s.lastStart = now
 	return p, 0
+}
+
+// attachCancel binds the per-lookup cancel func to the running entry, or
+// invokes it immediately if CancelLookup raced between take and launch.
+func (s *lookupScheduler) attachCancel(infoHash [20]byte, cancel context.CancelFunc) {
+	s.mu.Lock()
+	r, ok := s.running[infoHash]
+	cancelled := ok && r.cancelled
+	if ok && !cancelled {
+		r.cancel = cancel
+	}
+	s.mu.Unlock()
+	if cancelled {
+		cancel()
+	}
 }
 
 // finish records that the lookup for infoHash has returned and wakes the
@@ -183,8 +354,7 @@ func (s *lookupScheduler) close() {
 	s.mu.Lock()
 	s.closed = true
 	s.pending = nil
-	s.urgent = nil
-	s.routine = nil
+	s.levels = [numLookupPriorities]levelQueue{}
 	s.mu.Unlock()
 }
 
@@ -222,10 +392,16 @@ func (d *DHT) dispatchLookups() {
 		}
 		p, wait := d.sched.take(time.Now(), dhtLookupStartInterval)
 		if p != nil {
-			d.goTracked(func() {
+			ctx, cancel := context.WithCancel(d.ctx)
+			d.sched.attachCancel(p.infoHash, cancel)
+			if !d.goTracked(func() {
+				defer cancel()
 				defer d.sched.finish(p.infoHash)
-				runLookup(d, p.infoHash, p.peerPort, p.opts)
-			})
+				runLookup(d, ctx, p.infoHash, p.peerPort, p.opts)
+			}) {
+				cancel()
+				d.sched.finish(p.infoHash)
+			}
 			continue
 		}
 		var timer *time.Timer

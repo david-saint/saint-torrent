@@ -263,17 +263,18 @@ func (d *DHT) Port() uint16 {
 	return uint16(addr.Port)
 }
 
-func (d *DHT) goTracked(fn func()) {
+func (d *DHT) goTracked(fn func()) bool {
 	d.goMu.Lock()
 	defer d.goMu.Unlock()
 	if d.closed {
-		return
+		return false
 	}
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
 		fn()
 	}()
+	return true
 }
 
 // PeerChan returns the channel where discovered peers are published.
@@ -1914,32 +1915,60 @@ func (l *lookupSet) find(k nodeAddrKey) *lookupCandidate {
 	return nil
 }
 
+// LookupPriority orders queued DHT lookups when several torrents contend for
+// scheduler slots. Higher levels drain ahead of lower ones; one start in
+// eight goes to the oldest queued request of any level so lower levels are
+// never starved.
+type LookupPriority uint8
+
+const (
+	// LookupPriorityLow is for seeding or already well-connected torrents.
+	LookupPriorityLow LookupPriority = iota
+	// LookupPriorityNormal is for downloading torrents that still need peers.
+	LookupPriorityNormal
+	// LookupPriorityHigh is for magnet sessions fetching metadata.
+	LookupPriorityHigh
+)
+
+const numLookupPriorities = int(LookupPriorityHigh) + 1
+
 // LookupOptions controls how a DHT lookup behaves.
 type LookupOptions struct {
 	// Announce publishes our peer port with announce_peer responses. Callers that
 	// have not confirmed a torrent is public should leave this false.
 	Announce bool
+	// Priority sets the scheduler queue for this lookup.
+	Priority LookupPriority
 }
 
 // Lookup queries the DHT swarm for a given torrent's info-hash and announces
 // peerPort to nodes that return valid tokens. The lookup is queued; Lookup
 // returns immediately.
 func (d *DHT) Lookup(infoHash [20]byte, peerPort uint16) {
-	d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: true})
+	d.LookupWithOptions(infoHash, peerPort, LookupOptions{Announce: true, Priority: LookupPriorityNormal})
 }
 
 // LookupWithOptions queries the DHT swarm for a given torrent's info-hash. The
 // lookup is queued; LookupWithOptions returns immediately. At most
 // dhtMaxConcurrentLookups run at once and starts are spaced by
-// dhtLookupStartInterval, with an info-hash's first lookup since the DHT
-// started ahead of repeats. A request for an info-hash already queued is
-// merged into it, and one for an info-hash whose lookup is still running is
-// dropped: callers look up again on their own cadence. A queued request is
-// never withdrawn, so one made just before its torrent is paused or removed
-// still runs, and announces if asked to, when its turn comes; with many
-// torrents queued that can be minutes later.
+// dhtLookupStartInterval. Queues drain by Priority, with first lookups newest
+// first and repeats in turn within each level, except one start in eight goes
+// to the oldest queued request of any level so seeds are never starved. A
+// request for an info-hash already queued merges into it, and one for an
+// info-hash whose lookup is still running is dropped: callers look up again on
+// their own cadence. Call CancelLookup to withdraw a queued lookup or stop a
+// running one.
 func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	d.queueLookup(infoHash, peerPort, opts)
+}
+
+// CancelLookup withdraws any queued lookup for infoHash and cancels a running
+// lookup (including any pending announce_peer queries) if one is in flight.
+func (d *DHT) CancelLookup(infoHash [20]byte) {
+	if d == nil {
+		return
+	}
+	d.sched.cancel(infoHash)
 }
 
 // lookup runs one get_peers lookup to completion on the calling goroutine. It
@@ -1949,7 +1978,7 @@ func (d *DHT) LookupWithOptions(infoHash [20]byte, peerPort uint16, opts LookupO
 // candidate, until the dhtLookupK closest live candidates have all answered or
 // dhtLookupQueryLimit queries have been sent. It then announces to the closest
 // responders that returned a token.
-func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
+func (d *DHT) lookup(ctx context.Context, infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	logEnabled := logging.Enabled()
 	infoHashHex := ""
 	if logEnabled {
@@ -1973,10 +2002,13 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		}
 	}(time.Now())
 
+	if ctx.Err() != nil {
+		return
+	}
 	startNodes := d.getCloserNodes(infoHash, dhtLookupStartNodes)
 	if len(startNodes) == 0 {
 		d.bootstrap()
-		startNodes = d.awaitStartNodes(infoHash)
+		startNodes = d.awaitStartNodes(ctx, infoHash)
 		if len(startNodes) == 0 {
 			return
 		}
@@ -2000,13 +2032,13 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 	}
 	var qwg sync.WaitGroup
 	defer qwg.Wait()
-	queryCtx, cancelQueries := context.WithCancel(d.ctx)
+	queryCtx, cancelQueries := context.WithCancel(ctx)
 	defer cancelQueries()
 
 	results := make(chan lookupResult, dhtLookupParallelism)
 	inFlight := 0
 	for {
-		if d.ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 		if avail := min(dhtLookupParallelism-inFlight, dhtLookupQueryLimit-queriesCount); avail > 0 {
@@ -2017,8 +2049,8 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 				qwg.Add(1)
 				go func() {
 					defer qwg.Done()
-					ctx, cancel := context.WithTimeout(queryCtx, dhtLookupQueryTimeout)
-					res, err := d.getPeersQuery(ctx, infoHash, k.udpAddr())
+					qCtx, cancel := context.WithTimeout(queryCtx, dhtLookupQueryTimeout)
+					res, err := d.getPeersQuery(qCtx, infoHash, k.udpAddr())
 					cancel()
 					results <- lookupResult{key: k, res: res, err: err}
 				}()
@@ -2030,7 +2062,7 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 
 		var result lookupResult
 		select {
-		case <-d.ctx.Done():
+		case <-ctx.Done():
 			return
 		case result = <-results:
 		}
@@ -2097,7 +2129,7 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 						logging.String("peer", net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))),
 					)
 				}
-			case <-d.ctx.Done():
+			case <-ctx.Done():
 				return
 			default:
 			}
@@ -2106,14 +2138,16 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		set.addReferrals(result.res.Nodes, responder)
 	}
 
-	if !opts.Announce || peerPort == 0 {
+	if !opts.Announce || peerPort == 0 || ctx.Err() != nil {
 		return
 	}
 	// BEP 5: announce to the K closest nodes that returned a token, not to
-	// every node the lookup happened to query.
+	// every node the lookup happened to query. Wait for the announces so a
+	// CancelLookup during announcing still cancels them cleanly.
+	var annWG sync.WaitGroup
 	announced := 0
 	for _, c := range set.list {
-		if announced == dhtLookupK {
+		if announced == dhtLookupK || ctx.Err() != nil {
 			break
 		}
 		if c.state != candidateResponded || c.token == "" {
@@ -2122,13 +2156,15 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 		announced++
 		addr := c.key.udpAddr()
 		token := c.token
-		d.goTracked(func() {
+		annWG.Add(1)
+		if !d.goTracked(func() {
+			defer annWG.Done()
 			select {
-			case <-d.ctx.Done():
+			case <-ctx.Done():
 				return
 			default:
 			}
-			ctxAnn, cancelAnn := context.WithTimeout(d.ctx, dhtLookupQueryTimeout)
+			ctxAnn, cancelAnn := context.WithTimeout(ctx, dhtLookupQueryTimeout)
 			defer cancelAnn()
 			if err := d.announcePeerQuery(ctxAnn, infoHash, peerPort, token, addr); err != nil {
 				if logging.Enabled() {
@@ -2139,8 +2175,11 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 					)
 				}
 			}
-		})
+		}) {
+			annWG.Done()
+		}
 	}
+	annWG.Wait()
 }
 
 // awaitStartNodes waits for bootstrap to put a first contact in an empty table
@@ -2148,14 +2187,14 @@ func (d *DHT) lookup(infoHash [20]byte, peerPort uint16, opts LookupOptions) {
 // admitted, a round trip more than before, so instead of checking once after a
 // fixed second the lookup starts as soon as any contact is in, and gives slow
 // links up to dhtBootstrapWait.
-func (d *DHT) awaitStartNodes(target [20]byte) []Node {
+func (d *DHT) awaitStartNodes(ctx context.Context, target [20]byte) []Node {
 	deadline := time.NewTimer(dhtBootstrapWait)
 	defer deadline.Stop()
 	poll := time.NewTicker(dhtBootstrapPoll)
 	defer poll.Stop()
 	for {
 		select {
-		case <-d.ctx.Done():
+		case <-ctx.Done():
 			return nil
 		case <-deadline.C:
 			return d.getCloserNodes(target, dhtLookupStartNodes)
