@@ -965,6 +965,11 @@ func (d *DHT) challenge(idx int, stale, newcomer Node) {
 		if d.ctx.Err() != nil {
 			return
 		}
+		if errors.Is(err, errQueryBudgetExceeded) {
+			// The ping was never sent, so it says nothing about the node:
+			// it keeps its slot and the newcomer is not admitted.
+			return
+		}
 		switch {
 		case err == nil && gotID == stale.ID:
 			d.refreshNode(stale.ID, stale.Addr)
@@ -1248,6 +1253,11 @@ func (d *DHT) verifyAddressChange(id [20]byte, oldAddr, newAddr *net.UDPAddr) ad
 	ctx, cancel := context.WithTimeout(d.ctx, nodePingTimeout)
 	oldID, err := d.queryNodeID(ctx, oldAddr)
 	cancel()
+	if errors.Is(err, errQueryBudgetExceeded) {
+		// The stored address was never asked, so the candidate must not be
+		// adopted on its own answer.
+		return addrChangeFailed
+	}
 	if err == nil {
 		// Any answer from the stored address discards the candidate unprobed.
 		if oldID == id {
