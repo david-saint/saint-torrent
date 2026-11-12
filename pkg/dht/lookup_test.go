@@ -834,3 +834,159 @@ func TestLookupSetOneCandidatePerSlash24(t *testing.T) {
 		t.Fatalf("candidates %v, want %v", got, want)
 	}
 }
+
+// TestLookupSlidingWindowDoesNotStallOnDeadNode verifies a silent node in an
+// earlier hop never stalls subsequent hops for dhtLookupQueryTimeout, and once
+// the K closest live nodes have answered, a stale dead query outside the top K
+// does not delay completion or announcing.
+func TestLookupSlidingWindowDoesNotStallOnDeadNode(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "sliding-window-hash-")
+	dead0 := &net.UDPAddr{IP: net.ParseIP("203.0.113.1"), Port: 6881}
+	dead0ID := idAtDistance(infoHash, 0x80, 0)
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.114.1"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0x81, 0)
+	hop1 := &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 6881}
+	hop1ID := idAtDistance(infoHash, 0x40, 0)
+	dead1 := &net.UDPAddr{IP: net.ParseIP("192.0.3.1"), Port: 6881}
+	dead1ID := idAtDistance(infoHash, 0x41, 0)
+
+	var closest []Node
+	for i := 1; i <= dhtLookupK; i++ {
+		closest = append(closest, Node{
+			ID:   idAtDistance(infoHash, byte(i), 0),
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
+		})
+	}
+	wantPeer := compactPeer(net.ParseIP("198.51.100.55"), 51413)
+
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q == "announce_peer" {
+			return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
+		}
+		if q != "get_peers" {
+			return nil
+		}
+		switch {
+		case sameUDPAddr(to, dead0), sameUDPAddr(to, dead1):
+			return nil // silent
+		case sameUDPAddr(to, seed):
+			return map[string]interface{}{
+				"id":    idString(seedID),
+				"nodes": compactNodes([]Node{{ID: hop1ID, Addr: hop1}, {ID: dead1ID, Addr: dead1}}),
+			}
+		case sameUDPAddr(to, hop1):
+			return map[string]interface{}{
+				"id":    idString(hop1ID),
+				"nodes": compactNodes(closest),
+			}
+		case to.IP.To4()[0] == 198 && to.IP.To4()[1] == 18:
+			r := map[string]interface{}{
+				"id":    idString(idAtDistance(infoHash, to.IP.To4()[2], 0)),
+				"token": "tok",
+			}
+			if to.IP.To4()[2] == 1 {
+				r["values"] = []interface{}{wantPeer}
+			}
+			return r
+		}
+		return nil
+	})
+	d.addNode(dead0ID, dead0)
+	d.addNode(seedID, seed)
+
+	start := time.Now()
+	d.lookup(infoHash, 51413, LookupOptions{Announce: true})
+	elapsed := time.Since(start)
+	if elapsed >= dhtLookupQueryTimeout/2 {
+		t.Fatalf("lookup took %v with dead nodes outside top K, want well below %v", elapsed, dhtLookupQueryTimeout)
+	}
+
+	peers := drainDiscovered(d)
+	if len(peers) != 1 || peers[0].Port != 51413 {
+		t.Fatalf("discovered %v, want the peer from closest node 1", peers)
+	}
+	deadline := time.After(5 * time.Second)
+	for len(conn.queried("announce_peer")) < dhtLookupK {
+		select {
+		case <-deadline:
+			t.Fatalf("announced to %d nodes, want %d", len(conn.queried("announce_peer")), dhtLookupK)
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	if got := conn.queriesTo(dead0, "get_peers"); got != 1 {
+		t.Fatalf("dead0 queried %d times, want 1", got)
+	}
+	for _, n := range closest {
+		if got := conn.queriesTo(n.Addr, "get_peers"); got != 1 {
+			t.Fatalf("closest node %s queried %d times, want 1", n.Addr, got)
+		}
+	}
+}
+
+// TestLookupSlidingWindowConcurrencyAndSingleQuery verifies the sliding window
+// keeps up to dhtLookupParallelism queries in flight (and never exceeds it)
+// while querying each candidate at most once.
+func TestLookupSlidingWindowConcurrencyAndSingleQuery(t *testing.T) {
+	d, conn := newFakeDHT(t)
+
+	var infoHash [20]byte
+	copy(infoHash[:], "window-parallel-hash")
+	seed := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 6881}
+	seedID := idAtDistance(infoHash, 0xFF, 0)
+	slow := &net.UDPAddr{IP: net.ParseIP("203.0.114.11"), Port: 6881}
+	slowID := idAtDistance(infoHash, 0xFE, 0)
+
+	// 16 closer referrals: first 8 are queried as soon as seed returns; while
+	// slow occupies one window slot, the remaining slots keep advancing.
+	var referrals []Node
+	for i := 1; i <= 16; i++ {
+		referrals = append(referrals, Node{
+			ID:   idAtDistance(infoHash, byte(i), 0),
+			Addr: &net.UDPAddr{IP: net.IPv4(198, 18, byte(i), 1), Port: 6881},
+		})
+	}
+
+	conn.setAnswer(func(to *net.UDPAddr, q string, _ map[string]interface{}) map[string]interface{} {
+		if q != "get_peers" {
+			return nil
+		}
+		if sameUDPAddr(to, seed) {
+			return map[string]interface{}{"id": idString(seedID), "nodes": compactNodes(referrals)}
+		}
+		if sameUDPAddr(to, slow) {
+			return nil
+		}
+		return map[string]interface{}{"id": idString(idAtDistance(infoHash, to.IP.To4()[2], 0))}
+	})
+	d.addNode(seedID, seed)
+	d.addNode(slowID, slow)
+
+	done := make(chan struct{})
+	go func() {
+		d.lookup(infoHash, 0, LookupOptions{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lookup stalled waiting on slow far node")
+	}
+
+	if got := conn.queriesTo(slow, "get_peers"); got != 1 {
+		t.Fatalf("slow node queried %d times, want 1", got)
+	}
+	// Only the K closest referrals (1..8) should be queried, once each.
+	for i, n := range referrals {
+		got := conn.queriesTo(n.Addr, "get_peers")
+		if i < dhtLookupK && got != 1 {
+			t.Fatalf("referral %d queried %d times, want 1", i+1, got)
+		}
+		if i >= dhtLookupK && got != 0 {
+			t.Fatalf("referral %d outside top K queried %d times", i+1, got)
+		}
+	}
+}
