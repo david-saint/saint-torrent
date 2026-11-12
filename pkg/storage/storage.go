@@ -264,24 +264,75 @@ func (f *fileLayout) invalidateReaderLocked() bool {
 	return true
 }
 
-// writer returns the cached O_RDWR handle, opening it on first use. The open
-// doubles as the repair check: if the file vanished it is recreated, and if it
-// is now shorter than the declared length it is grown back — either case reports
-// repaired=true and drops the now-stale read handle. A longer file is left alone
-// for the same reason NewFileStorage never shrinks one. Once cached, subsequent
-// writes reuse the handle, so the open/stat/close syscall churn is paid once per
-// file rather than once per completed piece.
+// writer returns the cached O_RDWR handle, opening it on first use. On a cache
+// hit it verifies the descriptor still backs the live, full-length file at
+// f.path; if the file was externally deleted, moved, replaced, or truncated,
+// the stale handles are dropped and openWriterLocked recreates or resizes it,
+// reporting repaired=true.
 func (f *fileLayout) writer() (*os.File, bool, error) {
 	if h := f.writeHandle.Load(); h != nil {
-		f.touch()
-		return h, false, nil
+		valid, closedErr := f.cachedWriterValid(h)
+		if valid {
+			f.touch()
+			return h, false, nil
+		}
+		return f.reopenWriter(h, !closedErr)
 	}
 
 	f.wmu.Lock()
 	if h := f.writeHandle.Load(); h != nil {
+		f.touch()
 		f.wmu.Unlock()
 		return h, false, nil
 	}
+	return f.openAndCacheWriterUnlock()
+}
+
+// cachedWriterValid reports whether a cached write handle still refers to the
+// live, full-length regular file at f.path. closedErr is true when h itself was
+// already closed concurrently (by handle eviction or Close), so the caller knows
+// to reopen without treating the miss as an external repair.
+func (f *fileLayout) cachedWriterValid(h *os.File) (valid, closedErr bool) {
+	handleInfo, err := h.Stat()
+	if err != nil {
+		return false, errors.Is(err, os.ErrClosed)
+	}
+	if handleInfo.Size() < f.length {
+		return false, false
+	}
+	pathInfo, err := f.downloadRoot.Lstat(f.path)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, handleInfo) {
+		return false, false
+	}
+	return true, false
+}
+
+// reopenWriter replaces a stale or concurrently closed cached write handle.
+// When stale is true, the file changed underneath the handle, so any cached
+// read handle is also dropped and repaired is reported even if the replacement
+// file was already at least f.length bytes long.
+func (f *fileLayout) reopenWriter(expected *os.File, stale bool) (*os.File, bool, error) {
+	f.wmu.Lock()
+	if cur := f.writeHandle.Load(); cur != nil && cur != expected {
+		f.touch()
+		f.wmu.Unlock()
+		return cur, stale, nil
+	}
+	f.invalidateWriterLocked()
+	if stale {
+		f.invalidateReader()
+	}
+	h, repaired, err := f.openAndCacheWriterUnlock()
+	if err != nil {
+		return nil, false, err
+	}
+	return h, repaired || stale, nil
+}
+
+// openAndCacheWriterUnlock opens (and if needed repairs) the write handle,
+// caches it, releases wmu, and enforces the global handle budget. Caller must
+// hold wmu.
+func (f *fileLayout) openAndCacheWriterUnlock() (*os.File, bool, error) {
 	h, repaired, err := f.openWriterLocked()
 	if err != nil {
 		f.wmu.Unlock()

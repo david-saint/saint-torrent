@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -619,6 +620,119 @@ func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 	}
 	if !bytes.Equal(got, second) {
 		t.Fatalf("post-repair read returned stale data %q, want %q", got, second)
+	}
+}
+
+// TestStorageWriteCachedHandleDetectsExternalMutation verifies that once
+// readHandle and writeHandle are both cached, an external delete, move,
+// replacement, or truncation is detected on the next WriteBlock, returning
+// ErrFileRepaired and invalidating stale handles rather than writing to an
+// orphaned or truncated file.
+func TestStorageWriteCachedHandleDetectsExternalMutation(t *testing.T) {
+	const pieceLen = 16
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, dir, path string)
+	}{
+		{
+			name: "delete",
+			mutate: func(t *testing.T, _ string, path string) {
+				if err := os.Remove(path); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("windows prevents unlinking open handle: %v", err)
+					}
+					t.Fatalf("remove file: %v", err)
+				}
+			},
+		},
+		{
+			name: "move",
+			mutate: func(t *testing.T, dir, path string) {
+				if err := os.Rename(path, filepath.Join(dir, "moved.bin")); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("windows prevents renaming open handle: %v", err)
+					}
+					t.Fatalf("rename file: %v", err)
+				}
+			},
+		},
+		{
+			name: "replace",
+			mutate: func(t *testing.T, dir, path string) {
+				replacement := filepath.Join(dir, "replacement.bin")
+				if err := os.WriteFile(replacement, bytes.Repeat([]byte{'r'}, pieceLen*2), 0644); err != nil {
+					t.Fatalf("write replacement: %v", err)
+				}
+				if err := os.Rename(replacement, path); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("windows prevents replacing open handle: %v", err)
+					}
+					t.Fatalf("replace file: %v", err)
+				}
+			},
+		},
+		{
+			name: "truncate",
+			mutate: func(t *testing.T, _ string, path string) {
+				if err := os.Truncate(path, 0); err != nil {
+					t.Fatalf("truncate file: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			filePath := filepath.Join(tmpDir, "payload.bin")
+			s, err := NewStorage(tmpDir, []FileInfo{{Path: "payload.bin", Length: pieceLen * 2}}, pieceLen)
+			if err != nil {
+				t.Fatalf("NewStorage: %v", err)
+			}
+			defer s.Close()
+
+			// Warm readHandle before writeHandle so both handles are cached.
+			if _, err := s.ReadBlock(0, 0, make([]byte, pieceLen)); err != nil {
+				t.Fatalf("initial ReadBlock: %v", err)
+			}
+			piece0 := bytes.Repeat([]byte{'a'}, pieceLen)
+			if err := s.WriteBlock(0, 0, piece0); err != nil {
+				t.Fatalf("initial WriteBlock: %v", err)
+			}
+			if ok, err := s.VerifyPiece(0, sha1.Sum(piece0)); err != nil || !ok {
+				t.Fatalf("initial VerifyPiece = (%v, %v), want (true, nil)", ok, err)
+			}
+
+			fs := s.(*FileStorage)
+			if fs.files[0].readHandle.Load() == nil || fs.files[0].writeHandle.Load() == nil {
+				t.Fatal("expected both read and write handles to be cached")
+			}
+
+			tc.mutate(t, tmpDir, filePath)
+
+			piece1 := bytes.Repeat([]byte{'b'}, pieceLen)
+			if err := s.WriteBlock(1, 0, piece1); !errors.Is(err, ErrFileRepaired) {
+				t.Fatalf("WriteBlock after %s = %v, want ErrFileRepaired", tc.name, err)
+			}
+
+			info, err := os.Stat(filePath)
+			if err != nil {
+				t.Fatalf("stat repaired file: %v", err)
+			}
+			if info.Size() != pieceLen*2 {
+				t.Fatalf("repaired file size = %d, want %d", info.Size(), pieceLen*2)
+			}
+
+			// Piece 1 must be readable and verifiable from the repaired file on disk,
+			// while piece 0 was lost/zeroed by the external mutation (except replace
+			// which had 'r' bytes) and must not verify against the orphaned inode.
+			if ok, err := s.VerifyPiece(1, sha1.Sum(piece1)); err != nil || !ok {
+				t.Fatalf("post-repair VerifyPiece(1) = (%v, %v), want (true, nil)", ok, err)
+			}
+			if ok, err := s.VerifyPiece(0, sha1.Sum(piece0)); err != nil || ok {
+				t.Fatalf("post-repair VerifyPiece(0) = (%v, %v), want (false, nil)", ok, err)
+			}
+		})
 	}
 }
 
