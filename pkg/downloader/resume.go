@@ -107,6 +107,10 @@ type pieceWriteJob struct {
 	source                  *pieceSource
 	result                  chan<- pieceWriteResult
 	recoverableStorageError bool
+	// endgame is true when this job is a redundant endgame copy (#8). A corrupt
+	// or failed redundant copy must not reset the owning peer's PieceDownloading
+	// state back to PieceEmpty.
+	endgame bool
 }
 
 type pieceWriteStatus int
@@ -194,7 +198,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		verifyErr := fmt.Errorf("piece %d failed hash verification", job.index)
 		s.mu.Lock()
 		s.lastErr = verifyErr
-		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
+		if !job.endgame && job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
 		// Closing the connection alone let the peer reconnect at once and do it
@@ -250,7 +254,7 @@ func (s *Session) processCompletedPiece(job pieceWriteJob) {
 		if !job.recoverableStorageError {
 			s.statusErr = err
 		}
-		if job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
+		if !job.endgame && job.index >= 0 && job.index < int64(len(s.PieceStates)) && s.PieceStates[job.index] == PieceDownloading {
 			s.setPieceStateLocked(int(job.index), PieceEmpty)
 		}
 		s.broadcastPieceWaitersLocked()
@@ -364,8 +368,13 @@ func (s *Session) applyResumeStateLocked(resume storage.ResumeState, err error) 
 			}
 		}
 	}
+	// Pieces lying entirely in pad files are zeros: complete from the start, and
+	// never rechecked, since nothing on disk backs them.
+	s.markPadPiecesCompleteLocked()
 	for idx, state := range s.PieceStates {
-		if s.verifyFullScan || state == PieceUnverified {
+		// A full scan checks every piece not already complete (see
+		// runVerification), so only those count towards its progress.
+		if (s.verifyFullScan && state != PieceCompleted) || state == PieceUnverified {
 			s.verifyTotalBytes += s.Storage.PieceLength(int64(idx))
 		}
 	}
@@ -994,6 +1003,7 @@ func (s *Session) resetProgressAfterStorageRepair(index int64) {
 		s.PieceStates[i] = PieceEmpty
 	}
 	s.PieceStates[index] = PieceCompleted
+	s.markPadPiecesCompleteLocked() // no file backs them, so no repair touched them
 	s.recomputeNeededLocked()
 	s.recomputeStatsLocked()
 	s.lastErr = nil

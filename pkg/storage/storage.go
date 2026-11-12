@@ -36,6 +36,11 @@ var ErrStorageClosed = errors.New("storage is closed")
 type FileInfo struct {
 	Path   string // Relative path from the base directory
 	Length int64  // Size of the file in bytes
+	// Pad marks a BEP 47 pad file: Length zero bytes that only align the next
+	// file. A pad file is never created, opened or recorded in resume state; its
+	// range reads as zeros, writes to it are dropped, and verification hashes
+	// zeros for it. Its Path is ignored.
+	Pad bool
 }
 
 // Storage is the pluggable torrent storage contract used by the downloader.
@@ -466,9 +471,14 @@ func (s *FileStorage) ioError(op string, file *fileLayout, err error) error {
 // storage closed atomically before invalidating cached handles so session teardown
 // cannot wedge behind a blocked VerifyPiece/read lock.
 type FileStorage struct {
-	mu          sync.RWMutex
-	resolver    *PathResolver
-	baseDir     string
+	mu       sync.RWMutex
+	resolver *PathResolver
+	baseDir  string
+	// files holds the payload files in offset order. BEP 47 pad files get no
+	// layout: their ranges are the gaps between consecutive layouts (and after
+	// the last one, up to totalSize), which the block paths read and hash as
+	// zeros. Everything indexed by file (resume state, mappings, handles) thus
+	// only ever sees files that exist on disk.
 	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
@@ -543,6 +553,14 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		if file.Length < 0 {
 			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
+		if currentOffset > math.MaxInt64-file.Length {
+			return nil, fmt.Errorf("total file length overflows int64")
+		}
+		if file.Pad {
+			// A pad range is a gap between layouts (see FileStorage.files).
+			currentOffset += file.Length
+			continue
+		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
 		}
@@ -562,9 +580,6 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		if isReservedStorageName(topComponent) {
 			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
-		}
-		if currentOffset > math.MaxInt64-file.Length {
-			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
 		key := pathKey(file.Path)
@@ -803,6 +818,9 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(buf))
 
+	// covered is the end of what has been filled so far; a gap before the next
+	// file, or after the last one, is a pad range and reads as zeros.
+	covered := globalStart
 	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
@@ -816,10 +834,17 @@ func (s *FileStorage) ReadBlock(pieceIndex int64, offset int64, buf []byte) (int
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
 
+			if overlapStart > covered {
+				clear(buf[covered-globalStart : bufOffset])
+			}
 			if err := s.readFileAt(file, buf[bufOffset:bufOffset+nBytes], fileOffset); err != nil {
 				return 0, err
 			}
+			covered = overlapEnd
 		}
+	}
+	if covered < globalEnd {
+		clear(buf[covered-globalStart:])
 	}
 
 	return len(buf), nil
@@ -883,6 +908,8 @@ func (s *FileStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) er
 	globalStart := pieceIndex*s.pieceLength + offset
 	globalEnd := globalStart + int64(len(data))
 
+	// Only payload files are written: bytes falling in a gap between them belong
+	// to a pad range and are dropped.
 	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
@@ -990,6 +1017,7 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 	globalStart := pieceIndex * s.pieceLength
 	globalEnd := globalStart + pieceLen
 
+	covered := globalStart
 	for _, file := range s.files[s.firstFileEndingAfter(globalStart):] {
 		if file.startOffset >= globalEnd {
 			break
@@ -997,15 +1025,36 @@ func (s *FileStorage) VerifyPiece(pieceIndex int64, expectedHash [20]byte) (bool
 		if globalStart < file.endOffset && globalEnd > file.startOffset {
 			overlapStart := max(globalStart, file.startOffset)
 			overlapEnd := min(globalEnd, file.endOffset)
+			if overlapStart > covered {
+				hashZeros(h, overlapStart-covered)
+			}
 			if err := s.hashFileRange(h, file, overlapStart-file.startOffset, overlapEnd-overlapStart, chunk); err != nil {
 				return false, err
 			}
+			covered = overlapEnd
 		}
+	}
+	if covered < globalEnd {
+		hashZeros(h, globalEnd-covered)
 	}
 
 	var actualHash [20]byte
 	copy(actualHash[:], h.Sum(nil))
 	return actualHash == expectedHash, nil
+}
+
+// zeroChunk is a read-only block of zeros that pad ranges are hashed from, so
+// verifying a piece that holds pad bytes neither allocates nor touches disk.
+var zeroChunk [32 << 10]byte
+
+// hashZeros feeds length zero bytes, the content of a pad range, to h. A
+// hash.Hash never returns an error from Write.
+func hashZeros(h hash.Hash, length int64) {
+	for length > 0 {
+		n := min(int64(len(zeroChunk)), length)
+		_, _ = h.Write(zeroChunk[:n])
+		length -= n
+	}
 }
 
 // hashFileRange feeds length bytes of one file, starting at fileOffset, to h

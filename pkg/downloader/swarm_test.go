@@ -463,3 +463,280 @@ func TestEndgameRedundantFetchAndCancel(t *testing.T) {
 		t.Fatal("stalled peer was never sent a Cancel after the piece completed elsewhere")
 	}
 }
+
+// TestProcessCompletedPieceEndgameHashFailurePreservesOwner proves that a corrupt
+// redundant endgame copy does not reset the owning peer's PieceDownloading state,
+// while still closing the bad connection, recording a strike, and reporting failure.
+func TestProcessCompletedPieceEndgameHashFailurePreservesOwner(t *testing.T) {
+	data := []byte("the one true piece payload for slot 0!!!")
+	sess := newPieceTestSession(t, int64(len(data)), [][]byte{data})
+
+	sess.mu.Lock()
+	sess.setPieceStateLocked(0, PieceDownloading)
+	sess.mu.Unlock()
+
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	src := &pieceSource{host: "198.51.100.42"}
+	resCh := make(chan pieceWriteResult, 1)
+
+	sess.processCompletedPiece(pieceWriteJob{
+		index:   0,
+		hash:    sha1.Sum(data),
+		data:    []byte("garbage that does not match the hash!!!!"),
+		conn:    clientConn,
+		source:  src,
+		result:  resCh,
+		endgame: true,
+	})
+
+	if got := sess.GetPieceStates()[0]; got != PieceDownloading {
+		t.Fatalf("corrupt endgame copy reset piece 0 state to %v, want PieceDownloading", got)
+	}
+	res := <-resCh
+	if res.status != pieceWriteHashFailed {
+		t.Fatalf("result status = %v, want pieceWriteHashFailed", res.status)
+	}
+	// Connection must be closed by processCompletedPiece.
+	_ = serverConn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	var buf [1]byte
+	if _, err := serverConn.Read(buf[:]); err == nil {
+		t.Fatal("expected corrupt endgame peer connection to be closed")
+	}
+	sess.mu.Lock()
+	strikes := sess.admission.hostStrikesLocked(src.host, time.Now()).count
+	sess.mu.Unlock()
+	if strikes != 1 || !src.struck {
+		t.Fatalf("expected 1 hash-failure strike for %s (struck=%v), got %d", src.host, src.struck, strikes)
+	}
+}
+
+// TestEndgameCorruptDuplicateDoesNotResetOwner is an end-to-end proof for #93:
+// when peer A owns a piece (PieceDownloading) and peer B sends a corrupt redundant
+// endgame copy, peer B is disconnected, piece 0 stays PieceDownloading, and peer A
+// neither receives a Cancel nor re-requests block 0.
+func TestEndgameCorruptDuplicateDoesNotResetOwner(t *testing.T) {
+	const pieceLen = 2 * BlockSize
+	data := make([]byte, pieceLen)
+	for i := range data {
+		data[i] = byte(i*7 + 3)
+	}
+	tor := &torrent.Torrent{
+		Name:        "endgame-corrupt.bin",
+		PieceLength: int64(pieceLen),
+		PieceHashes: [][20]byte{sha1.Sum(data)},
+		Files:       []torrent.File{{Length: int64(pieceLen), Path: []string{"endgame-corrupt.bin"}}},
+	}
+
+	handshakeAndBitfield := func(conn net.Conn, peerID string) bool {
+		hs, err := peer.ParseHandshake(conn)
+		if err != nil {
+			return false
+		}
+		var pid [20]byte
+		copy(pid[:], peerID)
+		if _, err := conn.Write((&peer.Handshake{Pstr: "BitTorrent protocol", InfoHash: hs.InfoHash, PeerID: pid}).Serialize()); err != nil {
+			return false
+		}
+		_, err = conn.Write((&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x80}}).Serialize())
+		return err == nil
+	}
+
+	sendBlock := func(conn net.Conn, index, begin uint32, block []byte) error {
+		payload := make([]byte, 8+len(block))
+		binary.BigEndian.PutUint32(payload[0:4], index)
+		binary.BigEndian.PutUint32(payload[4:8], begin)
+		copy(payload[8:], block)
+		_, err := conn.Write((&peer.Message{ID: peer.MsgPiece, Payload: payload}).Serialize())
+		return err
+	}
+
+	var ownerClaimed atomic.Bool
+	var ownerGotCancel atomic.Bool
+	var ownerBlock0Count atomic.Int32
+	releaseBlock1 := make(chan struct{})
+
+	ownerLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen owner: %v", err)
+	}
+	defer ownerLn.Close()
+	go func() {
+		conn, err := ownerLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if !handshakeAndBitfield(conn, "-OWNR01-endgametest!") {
+			return
+		}
+		heldBlock1 := false
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			msg, err := peer.ParseMessage(conn)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					select {
+					case <-releaseBlock1:
+						if heldBlock1 {
+							heldBlock1 = false
+							_ = sendBlock(conn, 0, BlockSize, data[BlockSize:])
+						}
+					default:
+						// Nudge the client's loop so dropCompletedElsewhere would run if
+						// PieceStates[0] had been erroneously reset.
+						_, _ = conn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+					}
+					continue
+				}
+				return
+			}
+			if msg == nil {
+				continue
+			}
+			switch msg.ID {
+			case peer.MsgInterested:
+				_, _ = conn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+			case peer.MsgRequest:
+				if len(msg.Payload) != 12 {
+					continue
+				}
+				index := binary.BigEndian.Uint32(msg.Payload[0:4])
+				begin := binary.BigEndian.Uint32(msg.Payload[4:8])
+				length := binary.BigEndian.Uint32(msg.Payload[8:12])
+				if begin == 0 {
+					ownerBlock0Count.Add(1)
+					ownerClaimed.Store(true)
+					_ = sendBlock(conn, index, begin, data[begin:begin+length])
+				} else {
+					heldBlock1 = true
+				}
+			case peer.MsgCancel:
+				ownerGotCancel.Store(true)
+			}
+		}
+	}()
+
+	var badServedAll atomic.Bool
+	var badClosed atomic.Bool
+	badLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen bad: %v", err)
+	}
+	defer badLn.Close()
+	go func() {
+		conn, err := badLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if !handshakeAndBitfield(conn, "-BAD001-endgametest!") {
+			return
+		}
+		served := 0
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			msg, err := peer.ParseMessage(conn)
+			if err != nil {
+				if served >= 2 {
+					badClosed.Store(true)
+				}
+				return
+			}
+			if msg == nil {
+				continue
+			}
+			switch msg.ID {
+			case peer.MsgInterested:
+				_, _ = conn.Write((&peer.Message{ID: peer.MsgUnchoke}).Serialize())
+			case peer.MsgRequest:
+				if len(msg.Payload) != 12 {
+					continue
+				}
+				index := binary.BigEndian.Uint32(msg.Payload[0:4])
+				begin := binary.BigEndian.Uint32(msg.Payload[4:8])
+				length := binary.BigEndian.Uint32(msg.Payload[8:12])
+				corrupt := make([]byte, length)
+				for i := range corrupt {
+					corrupt[i] = data[int(begin)+i] ^ 0xff
+				}
+				_ = sendBlock(conn, index, begin, corrupt)
+				served++
+				if served == 2 {
+					badServedAll.Store(true)
+				}
+			}
+		}
+	}()
+
+	dir := t.TempDir()
+	st, err := storage.NewStorage(dir, []storage.FileInfo{{Path: "endgame-corrupt.bin", Length: int64(pieceLen)}}, tor.PieceLength)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	defer st.Close()
+	var pid [20]byte
+	copy(pid[:], "-ST0001-endgame1234")
+	sess, err := NewSession(tor, st, pid, 0, dir)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	sess.Start()
+	defer sess.Close()
+
+	_, ownerPort, _ := net.SplitHostPort(ownerLn.Addr().String())
+	sess.AddPeerFromDiscovery("127.0.0.1:" + ownerPort)
+
+	claimed := false
+	for i := 0; i < 200; i++ {
+		if ownerClaimed.Load() && sess.GetPieceStates()[0] == PieceDownloading {
+			claimed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !claimed {
+		t.Fatal("owner peer never claimed piece 0")
+	}
+
+	_, badPort, _ := net.SplitHostPort(badLn.Addr().String())
+	sess.AddPeerFromDiscovery("127.0.0.1:" + badPort)
+
+	// Wait until the bad peer has served its corrupt copy and been disconnected.
+	for i := 0; i < 200; i++ {
+		if badServedAll.Load() && badClosed.Load() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !badServedAll.Load() || !badClosed.Load() {
+		t.Fatalf("bad peer did not complete corrupt endgame cycle (served=%v closed=%v)", badServedAll.Load(), badClosed.Load())
+	}
+
+	// Give the owner peer's loop a couple of nudge cycles to react if it were going to.
+	time.Sleep(150 * time.Millisecond)
+
+	if got := sess.GetPieceStates()[0]; got != PieceDownloading {
+		t.Fatalf("piece 0 state after corrupt endgame copy = %v, want PieceDownloading", got)
+	}
+	if ownerGotCancel.Load() {
+		t.Fatal("owner peer received Cancel after corrupt endgame copy")
+	}
+	if count := ownerBlock0Count.Load(); count != 1 {
+		t.Fatalf("owner peer block 0 request count = %d, want 1", count)
+	}
+
+	// Release the owner's remaining block and verify the download completes cleanly.
+	close(releaseBlock1)
+	completed := false
+	for i := 0; i < 200; i++ {
+		if sess.PercentComplete() == 100.0 {
+			completed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !completed {
+		t.Fatalf("download did not complete after releasing owner block 1 (%.1f%%)", sess.PercentComplete())
+	}
+}

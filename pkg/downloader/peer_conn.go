@@ -1358,6 +1358,15 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		blocksReceived int64
 		nextBlock      int64   // index of the next never-requested block (cursor)
 		retry          []int64 // begin offsets of timed-out requests awaiting re-send
+		// requestEnd is one past the last block the cursor requests: numBlocks,
+		// unless the piece ends in blocks lying entirely in BEP 47 pad files. It
+		// keeps requestable O(1) and exact for such a piece.
+		requestEnd int64
+		// pad is the session's pad mask when this piece holds pad bytes, else nil.
+		// padRuns are its blocks lying entirely in pad files: never requested,
+		// counted in blocksReceived up front, and zero-filled at assembly.
+		pad     *padMask
+		padRuns []padRun
 		// endgame is set when this is a redundant copy of a piece another peer already
 		// holds open (#8). The piece's PieceDownloading state is owned by that other
 		// peer, so this copy never returns the piece to the pool on release.
@@ -1705,16 +1714,25 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 			s.setPieceStateLocked(bestIdx, PieceDownloading)
 		}
 		numBlocks := s.blocksInPiece(int64(bestIdx))
-		return &activeDownload{
+		dl := &activeDownload{
 			pieceIndex: int64(bestIdx),
 			hash:       s.Torrent.PieceHashes[bestIdx],
 			length:     s.Storage.PieceLength(int64(bestIdx)),
 			numBlocks:  numBlocks,
+			requestEnd: numBlocks,
 			blocks:     make([][]byte, numBlocks),
 			blockMsgs:  make([]*peer.Message, numBlocks),
 			pending:    make(map[int64]*blockRequest),
 			endgame:    endgame,
 		}
+		if mask := s.padMask; mask != nil {
+			runs, padBlocks, requestEnd, hasPad := mask.pieceBlocks(dl.pieceIndex, dl.length, numBlocks)
+			if hasPad {
+				dl.pad, dl.padRuns = mask, runs
+				dl.blocksReceived, dl.requestEnd = padBlocks, requestEnd
+			}
+		}
+		return dl
 	}
 
 	// nextBlockInPiece returns the begin offset of the next block to request from
@@ -1729,9 +1747,15 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 				return begin
 			}
 		}
-		for dl.nextBlock < dl.numBlocks {
+		for dl.nextBlock < dl.requestEnd {
 			b := dl.nextBlock
 			dl.nextBlock++
+			if dl.padRuns != nil {
+				if end := padRunEnd(dl.padRuns, b); end != -1 {
+					dl.nextBlock = end // pad blocks are zeros, never requested
+					continue
+				}
+			}
 			begin := b * BlockSize
 			if _, exists := dl.pending[begin]; exists {
 				continue
@@ -1750,7 +1774,7 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 		return -1
 	}
 	requestable := func(dl *activeDownload) bool {
-		return len(dl.retry) > 0 || dl.nextBlock < dl.numBlocks
+		return len(dl.retry) > 0 || dl.nextBlock < dl.requestEnd
 	}
 	anyRequestable := func() bool {
 		for _, dl := range activeDownloads {
@@ -3311,12 +3335,21 @@ peerLoop:
 			validPiece := true
 			for b := int64(0); b < dl.numBlocks; b++ {
 				block := dl.blocks[b]
+				if block == nil && dl.pad != nil && padRunEnd(dl.padRuns, b) != -1 {
+					// A pad block: never requested, zeroed below with the
+					// rest of the piece's pad bytes.
+					offset += min(BlockSize, dl.length-offset)
+					continue
+				}
 				if block == nil || offset+int64(len(block)) > int64(len(pieceData)) {
 					validPiece = false
 					break
 				}
 				copy(pieceData[offset:], block)
 				offset += int64(len(block))
+			}
+			if dl.pad != nil && validPiece && offset == int64(len(pieceData)) {
+				dl.pad.zeroPad(dl.pieceIndex*dl.pad.pieceLength, pieceData)
 			}
 			// The blocks are now copied into pieceData (an independent buffer), so the
 			// pooled wire buffers backing them can go back to the inbound pool.
@@ -3327,6 +3360,7 @@ peerLoop:
 
 			pieceIdx := dl.pieceIndex
 			pieceHash := dl.hash
+			isEndgame := dl.endgame
 			// The block data has been copied into pieceData; drop the reference to
 			// the (now empty) block slice so the removed activeDownload doesn't pin
 			// it for the life of the connection (e.g. an idle seeding conn, #63).
@@ -3336,18 +3370,20 @@ peerLoop:
 			if !validPiece || offset != int64(len(pieceData)) {
 				// Assembly invariant violated (shouldn't happen): return both buffers.
 				s.putPieceBuf(pieceBuf)
-				s.mu.Lock()
-				if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
-					s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
+				if !isEndgame {
+					s.mu.Lock()
+					if pieceIdx >= 0 && pieceIdx < int64(len(s.PieceStates)) && s.PieceStates[pieceIdx] == PieceDownloading {
+						s.setPieceStateLocked(int(pieceIdx), PieceEmpty)
+					}
+					s.mu.Unlock()
 				}
-				s.mu.Unlock()
 				break
 			}
 
 			s.ensurePieceWritePool()
 			writeQueueStarted := time.Now()
 			select {
-			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source}:
+			case s.pieceWriteCh <- pieceWriteJob{index: pieceIdx, hash: pieceHash, data: pieceData, pieceBuf: pieceBuf, conn: conn, source: source, endgame: isEndgame}:
 				if blocked := time.Since(writeQueueStarted); blocked > 10*time.Millisecond {
 					pipeline.OnWriterLimited(time.Now())
 					publishPipelineSnapshot(time.Now(), true)

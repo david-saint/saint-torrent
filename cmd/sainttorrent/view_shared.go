@@ -482,7 +482,6 @@ func (m model) viewFileExplorer() string {
 		start, end := visibleSessionRange(len(files), m.selectedFileIdx, m.fileRowCapacity())
 		sb.WriteString(g + st.Subtle.Render(truncateRight(
 			fmt.Sprintf("%d–%d of %d files", start+1, end, len(files)), bw)) + "\n")
-		priorities := data.priorities
 		const badgeW = 6 // " HIGH " / "NORMAL" / " SKIP "
 		const sizeW = 10
 		pathW := bw - (sizeW + 1 + badgeW + 1)
@@ -491,10 +490,7 @@ func (m model) viewFileExplorer() string {
 		}
 		for i := start; i < end; i++ {
 			f := files[i]
-			prio := downloader.PriorityNormal
-			if i < len(priorities) {
-				prio = priorities[i]
-			}
+			prio := data.priority(i)
 			path := truncateMiddle(displayText(filepath.Join(f.Path...)), pathW)
 			row := padTo(path, pathW) + " " + padTo(formatBytes(f.Length), sizeW) + " " + priorityBadge(st, prio)
 			if i == m.selectedFileIdx {

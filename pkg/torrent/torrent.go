@@ -43,6 +43,16 @@ type File struct {
 	// legacyPathComponent). The downloader moves a file it finds there to
 	// Path, so upgrading does not orphan it and download it again.
 	LegacyPath []string
+	// BEP 47 file attributes ("attr"). Pad marks a pad file: Length zero bytes
+	// that align the next file to a piece boundary, which are never fetched or
+	// created on disk and are exempt from the duplicate-path checks (libtorrent
+	// names them ".pad/<size>", so equal sizes collide). Only a multi-file
+	// torrent can have one. Exec, Hidden and Symlink are recorded but inert:
+	// nothing is ever applied to disk from them.
+	Pad     bool
+	Exec    bool
+	Hidden  bool
+	Symlink bool
 }
 
 // Torrent represents the metadata extracted from a torrent file.
@@ -257,7 +267,8 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 				Length: length,
 				Path:   path,
 			}
-			if legacyDiffers {
+			parseFileAttr(fMap, &file)
+			if !file.Pad && legacyDiffers {
 				file.LegacyPath = legacyFilePath(legacyName, pathSlice)
 			}
 			files = append(files, file)
@@ -273,15 +284,18 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 		}
 		totalLength = length
 		cleanName := sanitizePathComponent(name)
-		files = []File{
-			{
-				Length: length,
-				Path:   []string{cleanName},
-			},
+		file := File{
+			Length: length,
+			Path:   []string{cleanName},
 		}
+		parseFileAttr(info, &file)
+		// A single-file torrent's one file is its whole payload: honouring "p"
+		// there would make a torrent with nothing to download.
+		file.Pad = false
 		if legacyName, differs := legacyComponent(name, cleanName); differs && len(legacyName) <= maxLegacyComponentBytes {
-			files[0].LegacyPath = []string{legacyName}
+			file.LegacyPath = []string{legacyName}
 		}
+		files = []File{file}
 	}
 	if totalLength <= 0 {
 		return nil, fmt.Errorf("torrent total length must be positive")
@@ -289,11 +303,23 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 	if err := checkPieceCount(numPieces, pieceLength, totalLength); err != nil {
 		return nil, err
 	}
+	pieceHashes := make([][20]byte, numPieces)
+	for i := range pieceHashes {
+		copy(pieceHashes[i][:], piecesStr[i*20:])
+	}
+	if err := checkPadFiles(files, pieceLength, totalLength, pieceHashes); err != nil {
+		return nil, err
+	}
 	// Reject paths that differ only in case or Unicode normalization: case- or
-	// normalization-insensitive filesystems would store them as one file.
+	// normalization-insensitive filesystems would store them as one file. Pad
+	// files (BEP 47) are never created on disk, and libtorrent 2.x deliberately
+	// lets equal-sized ".pad/<size>" files collide, so they are exempt.
 	seenPaths := make(map[string]struct{}, len(files))
 	keys := make([]string, len(files))
 	for i, f := range files {
+		if f.Pad {
+			continue
+		}
 		relPath := filepath.Join(f.Path...)
 		key := pathKey(relPath)
 		if _, dup := seenPaths[key]; dup {
@@ -304,10 +330,6 @@ func ParseInfo(infoBytes []byte) (*Torrent, error) {
 	}
 	if err := checkFileDirCollisions(files, keys); err != nil {
 		return nil, err
-	}
-	pieceHashes := make([][20]byte, numPieces)
-	for i := range pieceHashes {
-		copy(pieceHashes[i][:], piecesStr[i*20:])
 	}
 
 	return &Torrent{
@@ -346,6 +368,9 @@ func checkFileDirCollisions(files []File, keys []string) error {
 	dirs := make(map[pathEntry]int)
 	leaves := make([]pathEntry, len(files))
 	for i, key := range keys {
+		if files[i].Pad {
+			continue
+		}
 		parent, rest := 0, key
 		for {
 			name, tail, ok := strings.Cut(rest, sep)
@@ -363,6 +388,9 @@ func checkFileDirCollisions(files []File, keys []string) error {
 		leaves[i] = pathEntry{parent: parent, name: rest}
 	}
 	for i, leaf := range leaves {
+		if files[i].Pad {
+			continue
+		}
 		if _, isDir := dirs[leaf]; isDir {
 			return fmt.Errorf("file path %q is also a directory in torrent metadata", filepath.Join(files[i].Path...))
 		}
@@ -402,6 +430,110 @@ func checkFileLength(length int64) error {
 		return fmt.Errorf("file length %d exceeds the maximum of %d", length, MaxTotalLength)
 	}
 	return nil
+}
+
+// parseFileAttr decodes BEP 47 file attribute flags from m["attr"]. Only "p"
+// affects client behavior (virtual zero padding); "x", "h" and "l" are
+// recorded as inert metadata flags and never applied to disk, and unknown
+// flags are ignored as BEP 47 specifies.
+func parseFileAttr(m map[string]interface{}, f *File) {
+	attr, ok := getString(m, "attr")
+	if !ok {
+		return
+	}
+	for i := 0; i < len(attr); i++ {
+		switch attr[i] {
+		case 'p':
+			f.Pad = true
+		case 'x':
+			f.Exec = true
+		case 'h':
+			f.Hidden = true
+		case 'l':
+			f.Symlink = true
+		}
+	}
+}
+
+// PadSpan is a run of BEP 47 pad bytes, [Start, End) in torrent byte offsets.
+type PadSpan struct {
+	Start, End int64
+}
+
+// PadSpans returns the byte ranges files' pad files cover, in offset order,
+// with adjacent pad files merged into one span. It returns nil when no pad
+// file has any length, which is every torrent but aligned and hybrid ones.
+func PadSpans(files []File) []PadSpan {
+	var spans []PadSpan
+	var offset int64
+	for _, f := range files {
+		if f.Pad && f.Length > 0 {
+			if n := len(spans); n > 0 && spans[n-1].End == offset {
+				spans[n-1].End += f.Length
+			} else {
+				spans = append(spans, PadSpan{Start: offset, End: offset + f.Length})
+			}
+		}
+		offset += f.Length
+	}
+	return spans
+}
+
+// checkPadFiles refuses torrents whose pad files cannot be honoured. Pad bytes
+// are zeros that are never fetched, so a piece lying entirely in pad files is
+// complete from the start; if its hash is not that of zeros it could never
+// verify, and the torrent would sit below 100% forever with nothing to fetch.
+// libtorrent's pad files are shorter than a piece, so only a crafted torrent
+// has such a piece. A torrent that is nothing but pad files has no payload.
+func checkPadFiles(files []File, pieceLength, totalLength int64, pieceHashes [][20]byte) error {
+	spans := PadSpans(files)
+	if spans == nil {
+		return nil
+	}
+	var padBytes int64
+	for _, span := range spans {
+		padBytes += span.End - span.Start
+	}
+	if padBytes >= totalLength {
+		return fmt.Errorf("torrent has no payload: every file is a BEP 47 pad file")
+	}
+	var zeroHashes map[int64][20]byte // by piece length; at most two
+	for _, span := range spans {
+		for piece := (span.Start + pieceLength - 1) / pieceLength; piece < int64(len(pieceHashes)); piece++ {
+			start := piece * pieceLength
+			end := min(start+pieceLength, totalLength)
+			if end > span.End {
+				break
+			}
+			length := end - start
+			zero, ok := zeroHashes[length]
+			if !ok {
+				zero = zeroPieceHash(length)
+				if zeroHashes == nil {
+					zeroHashes = make(map[int64][20]byte, 2)
+				}
+				zeroHashes[length] = zero
+			}
+			if pieceHashes[piece] != zero {
+				return fmt.Errorf("piece %d lies entirely in BEP 47 pad files, but its hash is not that of zeros", piece)
+			}
+		}
+	}
+	return nil
+}
+
+// zeroPieceHash returns the SHA-1 of length zero bytes.
+func zeroPieceHash(length int64) [20]byte {
+	var zeros [32 << 10]byte
+	h := sha1.New()
+	for length > 0 {
+		n := min(length, int64(len(zeros)))
+		_, _ = h.Write(zeros[:n])
+		length -= n
+	}
+	var sum [20]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
 }
 
 func getString(m map[string]interface{}, key string) (string, bool) {

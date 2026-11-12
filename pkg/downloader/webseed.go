@@ -101,6 +101,10 @@ type webseedFile struct {
 	start int64
 	end   int64
 	path  []string
+	// pad marks a BEP 47 pad file: its bytes are zeros, filled in locally.
+	// Mirrors do not host pad files, and asking for one would 404 and retire
+	// the mirror.
+	pad bool
 }
 
 type webseedPiece struct {
@@ -152,13 +156,14 @@ func webseedWorkerCount(sources int, pieceLen int64) int {
 type webseedTorrentFile struct {
 	length int64
 	path   []string
+	pad    bool
 }
 
 func makeWebseedTorrentFiles(files []torrent.File) []webseedTorrentFile {
 	out := make([]webseedTorrentFile, 0, len(files))
 	for _, f := range files {
 		path := append([]string(nil), f.Path...)
-		out = append(out, webseedTorrentFile{length: f.Length, path: path})
+		out = append(out, webseedTorrentFile{length: f.Length, path: path, pad: f.Pad})
 	}
 	return out
 }
@@ -171,7 +176,7 @@ func newWebseedPool(rawURLs []string, files []webseedTorrentFile) *webseedPool {
 	pool := &webseedPool{multiFile: len(files) != 1 || len(files[0].path) != 1}
 	var offset int64
 	for _, f := range files {
-		pool.files = append(pool.files, webseedFile{start: offset, end: offset + f.length, path: f.path})
+		pool.files = append(pool.files, webseedFile{start: offset, end: offset + f.length, path: f.path, pad: f.pad})
 		offset += f.length
 	}
 	seen := make(map[string]struct{}, min(len(rawURLs), maxWebseedSources))
@@ -529,7 +534,7 @@ func (s *Session) runWebseedSource(client *http.Client, pool *webseedPool, src *
 		result := make(chan pieceWriteResult, 1)
 		s.ensurePieceWritePool()
 		select {
-		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, pieceBuf: buf, result: result, recoverableStorageError: true}:
+		case s.pieceWriteCh <- pieceWriteJob{index: piece.index, hash: piece.hash, data: data, pieceBuf: buf, result: result, recoverableStorageError: true, endgame: piece.endgame}:
 		case <-s.ctx.Done():
 			s.putPieceBuf(buf)
 			s.releaseWebseedPiece(piece, nil)
@@ -683,11 +688,13 @@ func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, po
 		if !ok {
 			return nil, nil, fmt.Errorf("offset %d is outside webseed file layout", piece.absoluteStart)
 		}
-		refund, err := s.reserveWebseedDownload(ctx, int(min(pieceEnd, f.end)-piece.absoluteStart))
-		if err != nil {
-			return nil, nil, err
+		if !f.pad { // a pad part is not fetched, so it uses no bandwidth
+			refund, err := s.reserveWebseedDownload(ctx, int(min(pieceEnd, f.end)-piece.absoluteStart))
+			if err != nil {
+				return nil, nil, err
+			}
+			firstRefund = refund
 		}
-		firstRefund = refund
 	}
 
 	buf := webseedGetPieceBuf(s, piece.length)
@@ -712,6 +719,13 @@ func (s *Session) fetchWebseedPiece(ctx context.Context, client *http.Client, po
 		partLen := min(pieceEnd, f.end) - absolute
 		if partLen <= 0 || written+partLen > int64(len(data)) {
 			return fail(fmt.Errorf("invalid webseed range for piece %d", piece.index))
+		}
+		if f.pad {
+			// Pad bytes are zeros; the pooled buffer is not, so clear them.
+			clear(data[int(written):int(written+partLen)])
+			absolute += partLen
+			written += partLen
+			continue
 		}
 		fileURL, ok := src.fileURL(f, pool.multiFile)
 		if !ok {

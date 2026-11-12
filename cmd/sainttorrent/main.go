@@ -455,11 +455,10 @@ func (m *model) selectedSession() (*downloader.Session, bool) {
 }
 
 func (m *model) moveFileSelection(delta int) {
-	s, ok := m.selectedSession()
-	if !ok {
+	if _, ok := m.selectedSession(); !ok {
 		return
 	}
-	files := s.Files()
+	files := m.filesData().files
 	if len(files) == 0 {
 		return
 	}
@@ -795,7 +794,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resumePendingOr(viewList)
 				return m, nil
 			}
-			files := s.Files()
+			data := m.filesData()
+			if data.session != nil && data.session != s {
+				// The list re-sorted under the explorer: rows must map to
+				// this session's files.
+				m.buildFilesSnapshot()
+				data = m.files
+			}
+			files := data.files
 
 			switch msg.String() {
 			case "q", "ctrl+c":
@@ -818,10 +824,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selectedFileIdx = max(0, len(files)-1)
 			case " ", "p":
 				if len(files) > 0 && m.selectedFileIdx < len(files) {
-					priorities := s.GetFilePriorities()
+					index := data.torrentIndex(m.selectedFileIdx)
 					current := downloader.PriorityNormal
-					if m.selectedFileIdx < len(priorities) {
-						current = priorities[m.selectedFileIdx]
+					if priorities := s.GetFilePriorities(); index < len(priorities) {
+						current = priorities[index]
 					}
 					next := downloader.PriorityNormal
 					switch current {
@@ -832,7 +838,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case downloader.PrioritySkip:
 						next = downloader.PriorityNormal
 					}
-					s.SetFilePriority(m.selectedFileIdx, next)
+					s.SetFilePriority(index, next)
 					m.buildFilesSnapshot()
 				}
 			}

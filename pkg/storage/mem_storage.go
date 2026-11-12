@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,15 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		if file.Length < 0 {
 			return nil, fmt.Errorf("file length cannot be negative: %q has length %d", file.Path, file.Length)
 		}
+		if currentOffset > math.MaxInt64-file.Length {
+			return nil, fmt.Errorf("total file length overflows int64")
+		}
+		if file.Pad {
+			// As in FileStorage, a pad range is a gap between layouts. Its bytes
+			// in data are never written, so they stay zero.
+			currentOffset += file.Length
+			continue
+		}
 		if file.Path == "" {
 			return nil, fmt.Errorf("file path cannot be empty")
 		}
@@ -84,9 +94,6 @@ func NewMemStorage(baseDir string, files []FileInfo, pieceLength int64) (*MemSto
 		}
 		if isReservedStorageName(topComponent) {
 			return nil, fmt.Errorf("file path uses reserved internal name %q: %q", topComponent, file.Path)
-		}
-		if currentOffset > math.MaxInt64-file.Length {
-			return nil, fmt.Errorf("total file length overflows int64")
 		}
 
 		key := pathKey(cleanPath)
@@ -188,8 +195,21 @@ func (s *MemStorage) WriteBlock(pieceIndex int64, offset int64, data []byte) err
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
-	copy(s.data[start:end], data)
-	s.touchOverlappingLocked(start, end)
+	// Copy file by file so the bytes of a pad range (a gap between files) are
+	// dropped and keep reading as zeros, and stamp each file written.
+	first := sort.Search(len(s.files), func(i int) bool { return s.files[i].endOffset > start })
+	now := time.Now().UnixNano()
+	for _, file := range s.files[first:] {
+		if file.startOffset >= end {
+			break
+		}
+		if start < file.endOffset && end > file.startOffset {
+			overlapStart := max(start, file.startOffset)
+			overlapEnd := min(end, file.endOffset)
+			copy(s.data[overlapStart:overlapEnd], data[overlapStart-start:overlapEnd-start])
+			s.stateFileMt[file.path] = now
+		}
+	}
 	return nil
 }
 
@@ -341,13 +361,4 @@ func (s *MemStorage) blockRange(pieceIndex int64, offset int64, length int) (int
 	start := pieceIndex*s.pieceLength + offset
 	end := start + int64(length)
 	return start, end, nil
-}
-
-func (s *MemStorage) touchOverlappingLocked(globalStart, globalEnd int64) {
-	now := time.Now().UnixNano()
-	for _, file := range s.files {
-		if globalStart < file.endOffset && globalEnd > file.startOffset {
-			s.stateFileMt[file.path] = now
-		}
-	}
 }

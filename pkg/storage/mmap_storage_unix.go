@@ -172,6 +172,8 @@ func (s *MMapStorage) copyMapped(globalStart, globalEnd int64, buf []byte) (bool
 func (s *MMapStorage) copyFromMappingsLocked(globalStart, globalEnd int64, buf []byte) (err error) {
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
 	defer recoverMappingFault(&err)
+	// A gap before a file, or after the last one, is a pad range: zeros.
+	covered := globalStart
 	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
 		if file.startOffset >= globalEnd {
@@ -183,6 +185,10 @@ func (s *MMapStorage) copyFromMappingsLocked(globalStart, globalEnd int64, buf [
 			fileOffset := overlapStart - file.startOffset
 			bufOffset := overlapStart - globalStart
 			nBytes := overlapEnd - overlapStart
+			if overlapStart > covered {
+				clear(buf[covered-globalStart : bufOffset])
+			}
+			covered = overlapEnd
 			if mapped.viaHandles {
 				if err := s.readFileAt(file, buf[bufOffset:bufOffset+nBytes], fileOffset); err != nil {
 					return err
@@ -191,6 +197,9 @@ func (s *MMapStorage) copyFromMappingsLocked(globalStart, globalEnd int64, buf [
 			}
 			copy(buf[bufOffset:bufOffset+nBytes], mapped.data[fileOffset:fileOffset+nBytes])
 		}
+	}
+	if covered < globalEnd {
+		clear(buf[covered-globalStart:])
 	}
 	return nil
 }
@@ -380,6 +389,8 @@ func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int
 			verifyBuffers.Put(buffer)
 		}
 	}()
+	// A gap before a file, or after the last one, is a pad range: zeros.
+	covered := globalStart
 	for _, mapped := range s.maps[s.firstFileEndingAfter(globalStart):] {
 		file := mapped.layout
 		if file.startOffset >= globalEnd {
@@ -390,6 +401,10 @@ func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int
 			overlapEnd := min(globalEnd, file.endOffset)
 			fileOffset := overlapStart - file.startOffset
 			nBytes := overlapEnd - overlapStart
+			if overlapStart > covered {
+				hashZeros(h, overlapStart-covered)
+			}
+			covered = overlapEnd
 			if mapped.viaHandles {
 				if buffer == nil {
 					buffer = verifyBuffers.Get().(*[]byte)
@@ -403,6 +418,9 @@ func (s *MMapStorage) hashMappingsLocked(h hash.Hash, globalStart, globalEnd int
 				return err
 			}
 		}
+	}
+	if covered < globalEnd {
+		hashZeros(h, globalEnd-covered)
 	}
 	return nil
 }
