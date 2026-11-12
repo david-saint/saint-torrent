@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestStorage_SingleFile(t *testing.T) {
@@ -623,13 +624,23 @@ func TestStorageWriteRepairInvalidatesReadHandle(t *testing.T) {
 	}
 }
 
+// recheckWriteHandlesEvery sets how often a cached write handle is checked
+// against its path for the rest of the test; zero checks on every write.
+func recheckWriteHandlesEvery(t *testing.T, interval time.Duration) {
+	t.Helper()
+	previous := writeHandleRecheckInterval
+	writeHandleRecheckInterval = interval
+	t.Cleanup(func() { writeHandleRecheckInterval = previous })
+}
+
 // TestStorageWriteCachedHandleDetectsExternalMutation verifies that once
 // readHandle and writeHandle are both cached, an external delete, move,
-// replacement, or truncation is detected on the next WriteBlock, returning
-// ErrFileRepaired and invalidating stale handles rather than writing to an
-// orphaned or truncated file.
+// replacement, or truncation is detected by the next WriteBlock that checks the
+// handle, returning ErrFileRepaired and invalidating stale handles rather than
+// writing to an orphaned or truncated file.
 func TestStorageWriteCachedHandleDetectsExternalMutation(t *testing.T) {
 	const pieceLen = 16
+	recheckWriteHandlesEvery(t, 0)
 	cases := []struct {
 		name   string
 		mutate func(t *testing.T, dir, path string)
@@ -733,6 +744,156 @@ func TestStorageWriteCachedHandleDetectsExternalMutation(t *testing.T) {
 				t.Fatalf("post-repair VerifyPiece(0) = (%v, %v), want (false, nil)", ok, err)
 			}
 		})
+	}
+}
+
+// TestStorageWriteHandleRecheckIsRateLimited pins the cost bound: a cached write
+// handle is checked against its path at most once per interval, so writes in
+// between pay no stat, and the first write after the interval catches a file
+// deleted meanwhile.
+func TestStorageWriteHandleRecheckIsRateLimited(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows prevents unlinking a file with an open handle")
+	}
+	const pieceLen = 16
+	recheckWriteHandlesEvery(t, time.Hour)
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "payload.bin")
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: "payload.bin", Length: pieceLen * 2}}, pieceLen)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.Close()
+	file := s.(*FileStorage).files[0]
+
+	piece := bytes.Repeat([]byte{'a'}, pieceLen)
+	if err := s.WriteBlock(0, 0, piece); err != nil {
+		t.Fatalf("initial WriteBlock: %v", err)
+	}
+	opened := file.writerChecked.Load()
+	if err := os.Remove(filePath); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+
+	// Inside the interval the handle is reused unchecked.
+	if err := s.WriteBlock(1, 0, piece); err != nil {
+		t.Fatalf("WriteBlock inside the interval = %v, want nil (no check)", err)
+	}
+	if got := file.writerChecked.Load(); got != opened {
+		t.Fatalf("the handle was checked inside the interval (stamp %d, was %d)", got, opened)
+	}
+
+	// Once the interval has passed, the next write checks and repairs.
+	file.writerChecked.Store(storageClock() - int64(writeHandleRecheckInterval))
+	if err := s.WriteBlock(1, 0, piece); !errors.Is(err, ErrFileRepaired) {
+		t.Fatalf("WriteBlock after the interval = %v, want ErrFileRepaired", err)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("the file was not recreated: %v", err)
+	}
+	// The repair reopened the file, which counts as a check.
+	if err := s.WriteBlock(1, 0, piece); err != nil {
+		t.Fatalf("WriteBlock after the repair = %v, want nil", err)
+	}
+}
+
+// TestStorageWriteHandleRecheckIgnoresUnrelatedStatErrors verifies that a check
+// which cannot stat the path proves nothing: only a file known to be gone,
+// replaced or short is repaired. Treating any failed stat as a repair would
+// make the session throw away all its progress over a transient error.
+func TestStorageWriteHandleRecheckIgnoresUnrelatedStatErrors(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the test can make unsearchable")
+	}
+	const pieceLen = 16
+	recheckWriteHandlesEvery(t, 0)
+	tmpDir := t.TempDir()
+	s, err := NewStorage(tmpDir, []FileInfo{{Path: filepath.Join("sub", "payload.bin"), Length: pieceLen * 2}}, pieceLen)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.Close()
+
+	piece0 := bytes.Repeat([]byte{'a'}, pieceLen)
+	if err := s.WriteBlock(0, 0, piece0); err != nil {
+		t.Fatalf("initial WriteBlock: %v", err)
+	}
+	file := s.(*FileStorage).files[0]
+	handle := file.writeHandle.Load()
+
+	sub := filepath.Join(tmpDir, "sub")
+	if err := os.Chmod(sub, 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0755) })
+	if _, err := file.downloadRoot.Lstat(file.path); err == nil || os.IsNotExist(err) {
+		t.Skipf("lstat through an unsearchable directory = %v; cannot provoke a stat error here", err)
+	}
+
+	piece1 := bytes.Repeat([]byte{'b'}, pieceLen)
+	if err := s.WriteBlock(1, 0, piece1); err != nil {
+		t.Fatalf("WriteBlock with an unreadable path = %v, want nil", err)
+	}
+	if file.writeHandle.Load() != handle {
+		t.Fatal("a failed stat replaced the cached write handle")
+	}
+	if err := os.Chmod(sub, 0755); err != nil {
+		t.Fatalf("chmod back: %v", err)
+	}
+	for i, want := range [][]byte{piece0, piece1} {
+		if ok, err := s.VerifyPiece(int64(i), sha1.Sum(want)); err != nil || !ok {
+			t.Fatalf("VerifyPiece(%d) = (%v, %v), want (true, nil)", i, ok, err)
+		}
+	}
+}
+
+// TestResumeDistrustsWriteToDeletedFileInsideRecheckInterval covers the window
+// the rate limit leaves: a write that lands in a deleted file before the next
+// check is reported as written. The durable checkpoint must not vouch for it,
+// so the next launch rechecks the file instead of trusting pieces that are gone.
+func TestResumeDistrustsWriteToDeletedFileInsideRecheckInterval(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows prevents unlinking a file with an open handle")
+	}
+	const pieceLen = 16
+	const infoHash = "0123456789abcdef0123456789abcdef01234567"
+	recheckWriteHandlesEvery(t, time.Hour)
+	tmpDir := t.TempDir()
+	files := []FileInfo{{Path: "payload.bin", Length: pieceLen * 2}}
+	s, err := NewFileStorage(tmpDir, files, pieceLen)
+	if err != nil {
+		t.Fatalf("NewFileStorage: %v", err)
+	}
+	piece := bytes.Repeat([]byte{'a'}, pieceLen)
+	if err := s.WriteBlock(0, 0, piece); err != nil {
+		t.Fatalf("WriteBlock(0): %v", err)
+	}
+	if err := os.Remove(filepath.Join(tmpDir, "payload.bin")); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+	if err := s.WriteBlock(1, 0, piece); err != nil {
+		t.Fatalf("WriteBlock(1) inside the interval = %v, want nil", err)
+	}
+	if err := s.SaveResumeState(infoHash, []int{0, 1}, nil, true); err != nil {
+		t.Fatalf("SaveResumeState: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewFileStorage(tmpDir, files, pieceLen)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	state, err := reopened.LoadResumeState(infoHash)
+	if err == nil && len(state.Verified) != 0 {
+		t.Fatalf("resume trusted pieces %v of a file that was deleted under the client", state.Verified)
+	}
+	for i := range int64(2) {
+		if ok, err := reopened.VerifyPiece(i, sha1.Sum(piece)); err != nil || ok {
+			t.Fatalf("VerifyPiece(%d) on the recreated file = (%v, %v), want (false, nil)", i, ok, err)
+		}
 	}
 }
 
