@@ -199,6 +199,96 @@ func TestDHTLookupAfterResumeA2(t *testing.T) {
 	waitLookup("after a resume through Start")
 }
 
+// TestDHTLookupAfterPauseStartDuringTick deterministically exercises a
+// Pause+Start and Pause+Resume cycle completing while dhtLookupTick is still
+// running (after releasing s.mu) before dhtLoop returns to select.
+func TestDHTLookupAfterPauseStartDuringTick(t *testing.T) {
+	resetDHTFirstLookupSlotsA3R(t)
+	defer swapDuration(&dhtFirstLookupDelay, 10*time.Millisecond)()
+	defer swapDuration(&dhtDownloadLookupInterval, time.Hour)()
+	defer swapDuration(&dhtMetadataLookupInterval, time.Hour)()
+	defer swapDuration(&dhtResumeLookupDelay, 20*time.Millisecond)()
+
+	lookups := make(chan struct{}, 16)
+	oldLookup := startDHTLookup
+	startDHTLookup = func(*dht.DHT, [20]byte, uint16, dht.LookupOptions) { lookups <- struct{}{} }
+	defer func() { startDHTLookup = oldLookup }()
+
+	d, err := dht.NewDHT(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("dht: %v", err)
+	}
+	defer d.Close()
+	sess := newWireTestSession(t, 4, 16*1024)
+	sess.AttachDHT(d)
+	sess.mu.Lock()
+	sess.sharedInbound, sess.Port = true, 6881
+	sess.mu.Unlock()
+
+	var tickCount int
+	var mu sync.Mutex
+	inTick := make(chan struct{}, 4)
+	proceed := make(chan chan struct{}, 4)
+
+	oldJitter := jitterDHTInterval
+	jitterDHTInterval = func(dur time.Duration) time.Duration {
+		mu.Lock()
+		tickCount++
+		n := tickCount
+		mu.Unlock()
+		if n <= 2 {
+			gate := make(chan struct{})
+			proceed <- gate
+			inTick <- struct{}{}
+			select {
+			case <-gate:
+			case <-sess.ctx.Done():
+			}
+		}
+		return oldJitter(dur)
+	}
+	defer func() { jitterDHTInterval = oldJitter }()
+
+	sess.wg.Add(1)
+	go sess.dhtLoop()
+	defer sess.Close() // stops dhtLoop before hooks are restored
+
+	waitLookup := func(what string) {
+		t.Helper()
+		select {
+		case <-lookups:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no DHT lookup %s", what)
+		}
+	}
+	waitInTick := func(what string) chan struct{} {
+		t.Helper()
+		select {
+		case <-inTick:
+			return <-proceed
+		case <-time.After(2 * time.Second):
+			t.Fatalf("dhtLookupTick did not reach post-unlock hook %s", what)
+			return nil
+		}
+	}
+
+	waitLookup("after initial start")
+	gate := waitInTick("before Pause+Start")
+	sess.Pause()
+	sess.mu.Lock()
+	sess.started = true
+	sess.mu.Unlock()
+	sess.Start()
+	close(gate)
+	waitLookup("after Pause+Start during dhtLookupTick")
+
+	gate = waitInTick("before Pause+Resume")
+	sess.Pause()
+	sess.Resume()
+	close(gate)
+	waitLookup("after Pause+Resume during dhtLookupTick")
+}
+
 type cadencePacket struct {
 	data []byte
 	addr *net.UDPAddr
