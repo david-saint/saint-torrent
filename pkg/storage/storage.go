@@ -141,6 +141,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 // retryClosedHandle).
 type fileLayout struct {
 	repaired     atomic.Bool
+	index        int
 	path         string // relative path (torrent-declared)
 	downloadRoot *DownloadRoot
 	volumeGuard  *externalVolumeGuard
@@ -551,13 +552,14 @@ type FileStorage struct {
 	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
-	// mtMu guards stateFileMt, stateFileInfo, initialInfo, dirty and checkpoint,
-	// which the shared-read-lock WriteBlock and persistence paths mutate
-	// concurrently. dirty records what each file still owes: a metadata snapshot
-	// (captured lazily when state is persisted instead of via a stat syscall on
-	// every completed piece) and a flush before the next durable checkpoint.
+	// mtMu guards fileMtime, stateFileInfo, initialInfo, dirty, syncDirty,
+	// metaDirty, hintDirty, hintAllDirty, checkpointGen and checkpoint, which the
+	// shared-read-lock WriteBlock and persistence paths mutate concurrently. dirty
+	// records what each file still owes: a metadata snapshot (captured lazily when
+	// state is persisted instead of via a stat syscall on every completed piece)
+	// and a flush before the next durable checkpoint.
 	mtMu          sync.Mutex
-	stateFileMt   map[string]int64
+	fileMtime     []int64
 	stateFileInfo map[string]os.FileInfo
 	initialInfo   map[string]os.FileInfo
 	// trustedIdentity is the identity each file carried the last time this client
@@ -568,8 +570,15 @@ type FileStorage struct {
 	// a checkpoint records one, and the checkpoint falls back to the snapshot.
 	trustedIdentity map[string]string
 	dirty           map[*fileLayout]dirtyState
+	syncDirty       []bool
+	metaDirty       []*fileLayout
+	hintDirty       map[*fileLayout]struct{}
+	hintAllDirty    bool
+	checkpointGen   uint64
 	allCreated      bool
 	checkpoint      resumeCheckpoint
+	hintMu          sync.Mutex
+	hintCache       resumeHintCache
 	downloadRoot    *DownloadRoot
 	closed          atomic.Bool
 }
@@ -664,6 +673,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 
 		layout := &fileLayout{
+			index:        len(layouts),
 			path:         file.Path,
 			downloadRoot: downloadRoot,
 			volumeGuard:  volumeGuard,
@@ -700,7 +710,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 			}
 		}
 	}()
-	stateFileMt := make(map[string]int64, len(files))
+	fileMtime := make([]int64, len(layouts))
 	stateFileInfo := make(map[string]os.FileInfo, len(files))
 	initialInfo := make(map[string]os.FileInfo, len(files))
 	trustedIdentity := make(map[string]string, len(files))
@@ -773,7 +783,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		}
 		stateFileInfo[path] = fi
 		initialInfo[path] = fi
-		stateFileMt[path] = fi.ModTime().UnixNano()
+		fileMtime[layout.index] = fi.ModTime().UnixNano()
 		// Capture the identity while the handle is open: Windows reads the change
 		// timestamp from the handle, so this is the only chance to anchor a file the
 		// session never writes to without paying a second open.
@@ -791,11 +801,13 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		files:           layouts,
 		pieceLength:     pieceLength,
 		totalSize:       currentOffset,
-		stateFileMt:     stateFileMt,
+		fileMtime:       fileMtime,
 		stateFileInfo:   stateFileInfo,
 		initialInfo:     initialInfo,
 		trustedIdentity: trustedIdentity,
 		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
+		syncDirty:       make([]bool, len(layouts)),
+		hintAllDirty:    true,
 		allCreated:      allCreated,
 		downloadRoot:    downloadRoot,
 	}, nil
@@ -1041,7 +1053,7 @@ func (s *FileStorage) writeFileAt(file *fileLayout, data []byte, fileOffset int6
 	// file dirty rather than paying a stat or fsync syscall on every completed
 	// piece. Both paths are infrequent and off the block path.
 	s.mtMu.Lock()
-	s.dirty[file] |= dirtyMeta | dirtySync
+	s.markDirtyLocked(file, dirtyMeta|dirtySync)
 	s.allCreated = false
 	s.mtMu.Unlock()
 	return repaired, nil
@@ -1203,6 +1215,24 @@ type resumeFileEntry struct {
 	Mtime int64  `json:"mtime"`
 }
 
+// markDirtyLocked records dirty flags on file and updates the incremental hint
+// tracking sets. The caller must hold mtMu.
+func (s *FileStorage) markDirtyLocked(file *fileLayout, flags dirtyState) {
+	prev := s.dirty[file]
+	s.dirty[file] = prev | flags
+	if flags&dirtySync != 0 && prev&dirtySync == 0 && file.index < len(s.syncDirty) {
+		s.syncDirty[file.index] = true
+	}
+	if flags&dirtyMeta != 0 && prev&dirtyMeta == 0 {
+		s.metaDirty = append(s.metaDirty, file)
+		if s.hintDirty != nil {
+			s.hintDirty[file] = struct{}{}
+		}
+	} else if flags&dirtySync != 0 && prev&dirtySync == 0 && s.hintDirty != nil {
+		s.hintDirty[file] = struct{}{}
+	}
+}
+
 // refreshDirtyLocked captures the on-disk mtime of every file written since the
 // last persist and clears their metadata debt. WriteAt already bumps the mtime, so
 // a plain stat suffices; failures are ignored (mirroring the previous per-write
@@ -1210,12 +1240,17 @@ type resumeFileEntry struct {
 // The pending-flush bit survives: only a durable checkpoint clears that.
 // The caller must hold mtMu.
 func (s *FileStorage) refreshDirtyLocked() {
-	for file, flags := range s.dirty {
+	metaDirty := s.metaDirty
+	s.metaDirty = nil
+	for _, file := range metaDirty {
+		flags := s.dirty[file]
 		if flags&dirtyMeta == 0 {
 			continue
 		}
 		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
-			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+			if file.index < len(s.fileMtime) {
+				s.fileMtime[file.index] = fi.ModTime().UnixNano()
+			}
 			s.stateFileInfo[file.path] = fi
 			// The snapshot now describes a file this client moved itself, so the
 			// identity it was trusted under no longer applies. Where a stat carries
@@ -1259,15 +1294,11 @@ func (s *FileStorage) SaveState(infoHashHex string, completedPieces []int) error
 		// (deferred from WriteBlock) before snapshotting the metadata.
 		s.refreshDirtyLocked()
 		filesMeta = make([]fileMeta, 0, len(s.files))
-		for _, f := range s.files {
-			mtime := int64(0)
-			if mt, ok := s.stateFileMt[f.path]; ok {
-				mtime = mt
-			}
+		for i, f := range s.files {
 			filesMeta = append(filesMeta, fileMeta{
 				path:  f.path,
 				size:  f.length,
-				mtime: mtime,
+				mtime: s.fileMtime[i],
 			})
 		}
 		s.mtMu.Unlock()
@@ -1358,9 +1389,14 @@ func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file modification mismatch for %s", f.path)
 		}
 	}
-	for i, f := range s.files {
-		s.stateFileMt[f.path] = state.Files[i].Mtime
+	s.mtMu.Lock()
+	for i := range s.files {
+		s.fileMtime[i] = state.Files[i].Mtime
 	}
+	s.checkpointGen++
+	s.hintAllDirty = true
+	s.hintDirty = nil
+	s.mtMu.Unlock()
 
 	return state.CompletedPieces, nil
 }
