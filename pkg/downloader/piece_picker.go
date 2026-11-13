@@ -357,10 +357,17 @@ func (s *Session) removeNeededLocked(idx int) {
 
 // noteNeededShrunkLocked advances pickGen when the needed set has just emptied:
 // endgame begins, so pieces in flight elsewhere become pickable as endgame
-// copies. Caller holds s.mu.
+// copies. It also wakes every connection: one with nothing in flight would
+// otherwise take its copy only at the peer's next message or liveness tick, and
+// in the tail the next piece to complete may be the slow one endgame is for.
+// The set empties once per endgame entry, not per piece, and Notify never
+// blocks. Caller holds s.mu.
 func (s *Session) noteNeededShrunkLocked() {
 	if len(s.neededPieces) == 0 {
 		s.pickGen.Add(1)
+		for _, c := range s.activePeers {
+			c.Notify()
+		}
 	}
 }
 
