@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -179,6 +180,7 @@ type fileLayout struct {
 	// writerChecked is the storageClock time writeHandle was last opened or
 	// checked against the file at path.
 	writerChecked atomic.Int64
+	index         int
 }
 
 // readsShareWriteHandle is whether a read uses a file's cached write handle
@@ -572,6 +574,15 @@ type FileStorage struct {
 	checkpoint      resumeCheckpoint
 	downloadRoot    *DownloadRoot
 	closed          atomic.Bool
+
+	// resumeFileFragments caches the serialized per-file JSON fragment
+	// `{"path":<path>,"size":<length>,"mtime":` for each layout in files.
+	// Since paths and lengths never change for a layout, these fragments
+	// are immutable for the lifetime of this storage layout.
+	resumeFileFragments [][]byte
+	// resumeCleanMtimes stores the initial on-disk mtimes for files before
+	// any checkpoint is adopted or saved.
+	resumeCleanMtimes []int64
 }
 
 // dirtyState records the bookkeeping a file still owes. dirtyMeta means this
@@ -785,20 +796,55 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 
 	keepCreatedFiles = true
 	keepDownloadRoot = true
-	return &FileStorage{
-		resolver:        resolver,
-		baseDir:         resolver.BaseDir(),
-		files:           layouts,
-		pieceLength:     pieceLength,
-		totalSize:       currentOffset,
-		stateFileMt:     stateFileMt,
-		stateFileInfo:   stateFileInfo,
-		initialInfo:     initialInfo,
-		trustedIdentity: trustedIdentity,
-		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
-		allCreated:      allCreated,
-		downloadRoot:    downloadRoot,
-	}, nil
+	cleanMtimes := make([]int64, len(layouts))
+	for i, l := range layouts {
+		cleanMtimes[i] = stateFileMt[l.path]
+	}
+	fs := &FileStorage{
+		resolver:          resolver,
+		baseDir:           resolver.BaseDir(),
+		files:             layouts,
+		pieceLength:       pieceLength,
+		totalSize:         currentOffset,
+		stateFileMt:       stateFileMt,
+		stateFileInfo:     stateFileInfo,
+		initialInfo:       initialInfo,
+		trustedIdentity:   trustedIdentity,
+		dirty:             make(map[*fileLayout]dirtyState, len(layouts)),
+		allCreated:        allCreated,
+		downloadRoot:      downloadRoot,
+		resumeCleanMtimes: cleanMtimes,
+	}
+	fs.initResumeFragments()
+	return fs, nil
+}
+
+// initResumeFragments pre-serializes the JSON fragment `{"path":<path>,"size":<length>,"mtime":`
+// for every layout in files. Paths and lengths are fixed for the lifetime of the layout;
+// caching these fragments avoids JSON reflection and per-tick formatting of constant fields.
+func (s *FileStorage) initResumeFragments() {
+	if len(s.files) == 0 {
+		s.resumeFileFragments = nil
+		return
+	}
+	fragBuf := make([]byte, 0, len(s.files)*64)
+	offsets := make([]int, len(s.files)+1)
+	for i, layout := range s.files {
+		layout.index = i
+		offsets[i] = len(fragBuf)
+		pathJSON, _ := json.Marshal(layout.path)
+		fragBuf = append(fragBuf, `{"path":`...)
+		fragBuf = append(fragBuf, pathJSON...)
+		fragBuf = append(fragBuf, `,"size":`...)
+		fragBuf = strconv.AppendInt(fragBuf, layout.length, 10)
+		fragBuf = append(fragBuf, `,"mtime":`...)
+	}
+	offsets[len(s.files)] = len(fragBuf)
+	fragments := make([][]byte, len(s.files))
+	for i := range s.files {
+		fragments[i] = fragBuf[offsets[i]:offsets[i+1]]
+	}
+	s.resumeFileFragments = fragments
 }
 
 func openOrCreateRootFile(root *DownloadRoot, path string, perm os.FileMode) (*os.File, bool, error) {

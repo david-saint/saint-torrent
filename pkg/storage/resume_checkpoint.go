@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"strconv"
 )
 
 // ResumeState distinguishes durable verified pieces from hints that still need hashing.
@@ -254,7 +257,6 @@ func (s *FileStorage) SaveResumeState(infoHash string, verified, unverified []in
 // written mid-recheck (or at shutdown) preserves the pieces that checkpoint proved
 // rather than replacing it with a version-less guess that forces a full rehash.
 func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed []int) error {
-	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, CompletedPieces: completed}
 	// Only pieces the caller still holds as verified may keep their durable status:
 	// one it has queued for rechecking must not be blessed back into place.
 	trusted := make([]bool, s.pieceCount())
@@ -263,30 +265,137 @@ func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed 
 			trusted[idx] = true
 		}
 	}
+
+	type dirtyEntry struct {
+		index int
+		mtime int64
+	}
+
 	s.mtMu.Lock()
 	s.refreshDirtyLocked()
 	checkpoint := s.checkpoint
-	for i, file := range s.files {
-		identity := ""
-		mtime := s.stateFileMt[file.path]
-		if checkpoint.valid && s.dirty[file]&dirtySync == 0 {
-			identity = checkpoint.identities[i]
-			mtime = checkpoint.mtimes[i]
+
+	var dirtyList []dirtyEntry
+	if len(s.dirty) > 0 {
+		dirtyList = make([]dirtyEntry, 0, len(s.dirty))
+		for file, flags := range s.dirty {
+			if flags&dirtySync != 0 {
+				dirtyList = append(dirtyList, dirtyEntry{
+					index: file.index,
+					mtime: s.stateFileMt[file.path],
+				})
+			}
 		}
-		state.Identities = append(state.Identities, identity)
-		state.Files = append(state.Files, resumeFileEntry{file.path, file.length, mtime})
 	}
 	s.mtMu.Unlock()
+
+	if len(dirtyList) > 1 {
+		slices.SortFunc(dirtyList, func(a, b dirtyEntry) int {
+			return cmp.Compare(a.index, b.index)
+		})
+	}
+
+	var verifiedPieces []int
 	for _, idx := range checkpoint.verified {
 		if idx >= 0 && idx < len(trusted) && trusted[idx] {
-			state.VerifiedPieces = append(state.VerifiedPieces, idx)
+			verifiedPieces = append(verifiedPieces, idx)
 		}
 	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
+
+	if len(s.resumeFileFragments) != len(s.files) {
+		s.initResumeFragments()
 	}
-	return s.writeResumeAtomically(name, data, false)
+
+	buf := make([]byte, 0, len(s.files)*70+len(completed)*10+len(verifiedPieces)*10+1024)
+	buf = append(buf, `{"version":2,"piece_length":`...)
+	buf = strconv.AppendInt(buf, s.pieceLength, 10)
+	if len(verifiedPieces) > 0 {
+		buf = append(buf, `,"verified_pieces":[`...)
+		for i, p := range verifiedPieces {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = strconv.AppendInt(buf, int64(p), 10)
+		}
+		buf = append(buf, ']')
+	}
+	buf = append(buf, `,"identities":[`...)
+	dirtyPtr := 0
+	for i := 0; i < len(s.files); i++ {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		for dirtyPtr < len(dirtyList) && dirtyList[dirtyPtr].index < i {
+			dirtyPtr++
+		}
+		isDirty := dirtyPtr < len(dirtyList) && dirtyList[dirtyPtr].index == i
+		if isDirty {
+			buf = append(buf, `""`...)
+			dirtyPtr++
+		} else if checkpoint.valid && i < len(checkpoint.identities) {
+			buf = appendJSONString(buf, checkpoint.identities[i])
+		} else {
+			buf = append(buf, `""`...)
+		}
+	}
+	buf = append(buf, `],"identity_mode":`...)
+	modeJSON, _ := json.Marshal(resumeIdentityMode)
+	buf = append(buf, modeJSON...)
+	buf = append(buf, `,"info_hash_hex":`...)
+	hashJSON, _ := json.Marshal(infoHash)
+	buf = append(buf, hashJSON...)
+
+	buf = append(buf, `,"files":[`...)
+	dirtyPtr = 0
+	for i := 0; i < len(s.files); i++ {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, s.resumeFileFragments[i]...)
+		for dirtyPtr < len(dirtyList) && dirtyList[dirtyPtr].index < i {
+			dirtyPtr++
+		}
+		mtime := int64(0)
+		if dirtyPtr < len(dirtyList) && dirtyList[dirtyPtr].index == i {
+			mtime = dirtyList[dirtyPtr].mtime
+			dirtyPtr++
+		} else if checkpoint.valid && i < len(checkpoint.mtimes) {
+			mtime = checkpoint.mtimes[i]
+		} else if i < len(s.resumeCleanMtimes) {
+			mtime = s.resumeCleanMtimes[i]
+		}
+		buf = strconv.AppendInt(buf, mtime, 10)
+		buf = append(buf, '}')
+	}
+	buf = append(buf, `],"completed_pieces":[`...)
+	for i, p := range completed {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = strconv.AppendInt(buf, int64(p), 10)
+	}
+	buf = append(buf, `]}`...)
+
+	return s.writeResumeAtomically(name, buf, false)
+}
+
+func appendJSONString(dst []byte, s string) []byte {
+	fast := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '\\' || c == '"' {
+			fast = false
+			break
+		}
+	}
+	if fast {
+		dst = append(dst, '"')
+		dst = append(dst, s...)
+		dst = append(dst, '"')
+		return dst
+	}
+	data, _ := json.Marshal(s)
+	return append(dst, data...)
 }
 
 // saveResumeCheckpoint flushes the files written since the last checkpoint and

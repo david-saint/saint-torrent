@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func checkpointFixture(t *testing.T) (*FileStorage, string) {
@@ -482,5 +483,71 @@ func TestRestoredCheckpointSkipsRedundantFlush(t *testing.T) {
 	}
 	if !os.SameFile(first, second) {
 		t.Fatal("a restored checkpoint nothing had touched was rewritten")
+	}
+}
+
+func TestResumeHintFormatCompatibility(t *testing.T) {
+	st, hash := checkpointFixture(t)
+	// Write durable checkpoint first
+	if err := st.SaveResumeState(hash, []int{0, 1, 2, 3}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dirty one file
+	if err := st.WriteBlock(0, 0, []byte{1, 2, 3, 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Emit hint state
+	if err := st.SaveResumeState(hash, []int{0, 1}, []int{2, 3}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	statePath := filepath.Join(st.BaseDir(), "."+hash+".state")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var state FastResumeState
+	if err = json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("failed to unmarshal state: %v", err)
+	}
+
+	if state.Version != 2 || state.InfoHashHex != hash || state.PieceLength != st.pieceLength || state.IdentityMode != resumeIdentityMode {
+		t.Fatalf("unexpected header in hint state: %+v", state)
+	}
+	if len(state.Files) != len(st.files) || len(state.Identities) != len(st.files) {
+		t.Fatalf("file/identity length mismatch: %d files, %d identities", len(state.Files), len(state.Identities))
+	}
+	// File 0 was written, so its identity must be empty in hint
+	if state.Identities[0] != "" {
+		t.Fatalf("dirty file kept identity: %q", state.Identities[0])
+	}
+	// Files 1 and 2 were clean, so they must keep checkpoint identities
+	if state.Identities[1] == "" || state.Identities[2] == "" {
+		t.Fatalf("clean files lost checkpoint identities: %v", state.Identities)
+	}
+
+	// Must load cleanly and partition correctly
+	loaded, err := st.LoadResumeState(hash)
+	if err != nil {
+		t.Fatalf("LoadResumeState failed: %v", err)
+	}
+	// File 0 was written, so pieces covering it are rechecked; clean files keep verified status
+	for _, p := range loaded.Verified {
+		if p == 0 {
+			t.Fatalf("dirty piece 0 remained verified: %+v", loaded)
+		}
+	}
+}
+
+func TestFileLayoutAtomicAlignment(t *testing.T) {
+	var f fileLayout
+	if off := unsafe.Offsetof(f.lastUse); off%8 != 0 {
+		t.Fatalf("fileLayout.lastUse offset %d is not 8-byte aligned", off)
+	}
+	if off := unsafe.Offsetof(f.writerChecked); off%8 != 0 {
+		t.Fatalf("fileLayout.writerChecked offset %d is not 8-byte aligned", off)
 	}
 }
