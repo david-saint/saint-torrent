@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 )
 
 // ResumeState distinguishes durable verified pieces from hints that still need hashing.
@@ -221,6 +222,9 @@ func (s *FileStorage) adoptCheckpoint(state FastResumeState, intact bool) {
 	}
 	s.mtMu.Lock()
 	s.checkpoint = checkpoint
+	s.checkpointGen++
+	s.hintAllDirty = true
+	s.hintDirty = nil
 	s.mtMu.Unlock()
 }
 
@@ -249,42 +253,374 @@ func (s *FileStorage) SaveResumeState(infoHash string, verified, unverified []in
 	return s.saveResumeCheckpoint(name, infoHash, verified, completed)
 }
 
+const resumeHintChunkSize = 64
+
+// resumeHintCache caches serialized per-file JSON fragments for saveResumeHint
+// so periodic hint writes only rebuild chunks whose files changed.
+type resumeHintCache struct {
+	built        bool
+	pieceLength  int64
+	numChunks    int
+	prefixArena  []byte
+	prefixEnd    []uint64
+	mtimes       []int64
+	dirtySync    []bool
+	checkpoint   resumeCheckpoint
+	fileChunks   [][]byte
+	idChunks     [][]byte
+	dirtyChunks  []bool
+	dirtyChunkID []int
+	totalFileLen int
+	totalIDLen   int
+	outBuf       []byte
+	metaScratch  []*fileLayout
+	updateBuf    []hintDirtyUpdate
+	statBuf      []hintStatResult
+	trustedBuf   []bool
+}
+
+type hintDirtyUpdate struct {
+	index     int
+	mtime     int64
+	dirtySync bool
+}
+
+type hintStatResult struct {
+	file *fileLayout
+	info os.FileInfo
+}
+
+func (c *resumeHintCache) matchesLayout(pieceLength int64, fileCount int) bool {
+	return c.built && c.pieceLength == pieceLength && len(c.prefixEnd) == fileCount
+}
+
+func (c *resumeHintCache) ensureLayout(files []*fileLayout, pieceLength int64) bool {
+	if c.matchesLayout(pieceLength, len(files)) {
+		return false
+	}
+	n := len(files)
+	c.pieceLength = pieceLength
+	c.numChunks = (n + resumeHintChunkSize - 1) / resumeHintChunkSize
+	if cap(c.prefixArena) < n*48 {
+		c.prefixArena = make([]byte, 0, n*48)
+	} else {
+		c.prefixArena = c.prefixArena[:0]
+	}
+	if cap(c.prefixEnd) < n {
+		c.prefixEnd = make([]uint64, n)
+	} else {
+		c.prefixEnd = c.prefixEnd[:n]
+	}
+	for i, file := range files {
+		if i > 0 {
+			c.prefixArena = append(c.prefixArena, ',')
+		}
+		c.prefixArena = append(c.prefixArena, `{"path":`...)
+		c.prefixArena = appendJSONString(c.prefixArena, file.path)
+		c.prefixArena = append(c.prefixArena, `,"size":`...)
+		c.prefixArena = strconv.AppendInt(c.prefixArena, file.length, 10)
+		c.prefixArena = append(c.prefixArena, `,"mtime":`...)
+		c.prefixEnd[i] = uint64(len(c.prefixArena))
+	}
+	c.mtimes = make([]int64, n)
+	c.dirtySync = make([]bool, n)
+	// Pre-fault mtimes and dirtySync pages outside mtMu so copy() under mtMu
+	// does not trigger OS page faults while holding the lock.
+	for i := 0; i < n; i += 512 {
+		c.mtimes[i] = 0
+	}
+	for i := 0; i < n; i += 4096 {
+		c.dirtySync[i] = false
+	}
+	c.fileChunks = make([][]byte, c.numChunks)
+	c.idChunks = make([][]byte, c.numChunks)
+	if n > 0 {
+		const maxMtimeAndBrace = 21 // "-9223372036854775808}"
+		fileSlab := make([]byte, int(c.prefixEnd[n-1])+n*maxMtimeAndBrace)
+		const estIDEntry = 48
+		idSlab := make([]byte, n*estIDEntry)
+		var fOff, iOff int
+		for k := 0; k < c.numChunks; k++ {
+			start := k * resumeHintChunkSize
+			end := min(start+resumeHintChunkSize, n)
+			var pStart uint64
+			if start > 0 {
+				pStart = c.prefixEnd[start-1]
+			}
+			fCap := int(c.prefixEnd[end-1]-pStart) + (end-start)*maxMtimeAndBrace
+			c.fileChunks[k] = fileSlab[fOff : fOff : fOff+fCap]
+			fOff += fCap
+			iCap := (end - start) * estIDEntry
+			c.idChunks[k] = idSlab[iOff : iOff : iOff+iCap]
+			iOff += iCap
+		}
+	}
+	c.dirtyChunks = make([]bool, c.numChunks)
+	c.dirtyChunkID = c.dirtyChunkID[:0]
+	c.totalFileLen = 0
+	c.totalIDLen = 0
+	c.built = true
+	return true
+}
+
+func (c *resumeHintCache) markChunkDirty(chunkID int) {
+	if !c.dirtyChunks[chunkID] {
+		c.dirtyChunks[chunkID] = true
+		c.dirtyChunkID = append(c.dirtyChunkID, chunkID)
+	}
+}
+
+func (c *resumeHintCache) rebuildChunk(chunkID int) {
+	start := chunkID * resumeHintChunkSize
+	end := min(start+resumeHintChunkSize, len(c.prefixEnd))
+
+	fbuf := c.fileChunks[chunkID][:0]
+	ibuf := c.idChunks[chunkID][:0]
+	for i := start; i < end; i++ {
+		var pStart uint64
+		if i > 0 {
+			pStart = c.prefixEnd[i-1]
+			ibuf = append(ibuf, ',')
+		}
+		fbuf = append(fbuf, c.prefixArena[pStart:c.prefixEnd[i]]...)
+
+		mtime := c.mtimes[i]
+		if c.checkpoint.valid && !c.dirtySync[i] {
+			mtime = c.checkpoint.mtimes[i]
+			ibuf = appendJSONString(ibuf, c.checkpoint.identities[i])
+		} else {
+			ibuf = append(ibuf, '"', '"')
+		}
+		fbuf = strconv.AppendInt(fbuf, mtime, 10)
+		fbuf = append(fbuf, '}')
+	}
+	c.fileChunks[chunkID] = fbuf
+	c.idChunks[chunkID] = ibuf
+}
+
+func (c *resumeHintCache) rebuildAll() {
+	c.totalFileLen = 0
+	c.totalIDLen = 0
+	for k := 0; k < c.numChunks; k++ {
+		c.dirtyChunks[k] = false
+		c.rebuildChunk(k)
+		c.totalFileLen += len(c.fileChunks[k])
+		c.totalIDLen += len(c.idChunks[k])
+	}
+	c.dirtyChunkID = c.dirtyChunkID[:0]
+}
+
+func (c *resumeHintCache) applyUpdates(updates []hintDirtyUpdate, statResults []hintStatResult) {
+	c.dirtyChunkID = c.dirtyChunkID[:0]
+	for _, u := range updates {
+		if u.index < len(c.mtimes) {
+			c.mtimes[u.index] = u.mtime
+			c.dirtySync[u.index] = u.dirtySync
+			c.markChunkDirty(u.index / resumeHintChunkSize)
+		}
+	}
+	for _, res := range statResults {
+		idx := res.file.index
+		if idx < len(c.mtimes) {
+			c.mtimes[idx] = res.info.ModTime().UnixNano()
+			c.markChunkDirty(idx / resumeHintChunkSize)
+		}
+	}
+	for _, chunkID := range c.dirtyChunkID {
+		c.dirtyChunks[chunkID] = false
+		oldFileLen := len(c.fileChunks[chunkID])
+		oldIDLen := len(c.idChunks[chunkID])
+		c.rebuildChunk(chunkID)
+		c.totalFileLen += len(c.fileChunks[chunkID]) - oldFileLen
+		c.totalIDLen += len(c.idChunks[chunkID]) - oldIDLen
+	}
+}
+
+func (c *resumeHintCache) marshalJSON(pieceLength int64, infoHash string, verifiedOut, completed []int) []byte {
+	needCap := 128 + len(infoHash) + c.totalFileLen + c.totalIDLen + len(verifiedOut)*12 + len(completed)*12
+	if cap(c.outBuf) < needCap {
+		c.outBuf = make([]byte, 0, needCap)
+	}
+	out := c.outBuf[:0]
+	out = append(out, `{"version":2,"piece_length":`...)
+	out = strconv.AppendInt(out, pieceLength, 10)
+	if len(verifiedOut) > 0 {
+		out = append(out, `,"verified_pieces":[`...)
+		out = appendIntSlice(out, verifiedOut)
+		out = append(out, ']')
+	}
+	if len(c.prefixEnd) > 0 {
+		out = append(out, `,"identities":[`...)
+		for _, chunk := range c.idChunks {
+			out = append(out, chunk...)
+		}
+		out = append(out, ']')
+	}
+	out = append(out, `,"identity_mode":`...)
+	out = appendJSONString(out, resumeIdentityMode)
+	out = append(out, `,"info_hash_hex":`...)
+	out = appendJSONString(out, infoHash)
+	if len(c.prefixEnd) == 0 {
+		out = append(out, `,"files":null`...)
+	} else {
+		out = append(out, `,"files":[`...)
+		for _, chunk := range c.fileChunks {
+			out = append(out, chunk...)
+		}
+		out = append(out, ']')
+	}
+	if len(completed) == 0 {
+		out = append(out, `,"completed_pieces":null}`...)
+	} else {
+		out = append(out, `,"completed_pieces":[`...)
+		out = appendIntSlice(out, completed)
+		out = append(out, ']', '}')
+	}
+	c.outBuf = out
+	return out
+}
+
+func appendIntSlice(dst []byte, nums []int) []byte {
+	for i, v := range nums {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = strconv.AppendInt(dst, int64(v), 10)
+	}
+	return dst
+}
+
+func appendJSONString(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b < 0x20 || b > 0x7e || b == '"' || b == '\\' || b == '<' || b == '>' || b == '&' {
+			encoded, err := json.Marshal(s)
+			if err == nil {
+				return append(dst, encoded...)
+			}
+			break
+		}
+	}
+	dst = append(dst, '"')
+	dst = append(dst, s...)
+	return append(dst, '"')
+}
+
 // saveResumeHint writes the cheap periodic state. It replays the identities of the
 // last durable checkpoint for every file nothing has written since, so a hint
 // written mid-recheck (or at shutdown) preserves the pieces that checkpoint proved
 // rather than replacing it with a version-less guess that forces a full rehash.
 func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed []int) error {
-	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, CompletedPieces: completed}
-	// Only pieces the caller still holds as verified may keep their durable status:
-	// one it has queued for rechecking must not be blessed back into place.
-	trusted := make([]bool, s.pieceCount())
-	for _, idx := range verified {
-		if idx >= 0 && idx < len(trusted) {
-			trusted[idx] = true
+	s.hintMu.Lock()
+	defer s.hintMu.Unlock()
+
+	// Build or validate the immutable per-file path/size prefix cache outside mtMu.
+	rebuiltLayout := s.hintCache.ensureLayout(s.files, s.pieceLength)
+
+	s.mtMu.Lock()
+	metaDirty := s.metaDirty
+	s.metaDirty = s.hintCache.metaScratch[:0]
+	for _, file := range metaDirty {
+		if flags := s.dirty[file]; flags&dirtyMeta != 0 {
+			flags &^= dirtyMeta
+			if flags == 0 {
+				delete(s.dirty, file)
+			} else {
+				s.dirty[file] = flags
+			}
 		}
 	}
-	s.mtMu.Lock()
-	s.refreshDirtyLocked()
+	gen := s.checkpointGen
 	checkpoint := s.checkpoint
-	for i, file := range s.files {
-		identity := ""
-		mtime := s.stateFileMt[file.path]
-		if checkpoint.valid && s.dirty[file]&dirtySync == 0 {
-			identity = checkpoint.identities[i]
-			mtime = checkpoint.mtimes[i]
+	allDirty := s.hintAllDirty || rebuiltLayout
+	updates := s.hintCache.updateBuf[:0]
+	if allDirty {
+		s.hintAllDirty = false
+		if s.hintDirty == nil {
+			s.hintDirty = make(map[*fileLayout]struct{})
+		} else {
+			clear(s.hintDirty)
 		}
-		state.Identities = append(state.Identities, identity)
-		state.Files = append(state.Files, resumeFileEntry{file.path, file.length, mtime})
+		copy(s.hintCache.mtimes, s.fileMtime)
+		copy(s.hintCache.dirtySync, s.syncDirty)
+	} else if len(s.hintDirty) > 0 {
+		for file := range s.hintDirty {
+			updates = append(updates, hintDirtyUpdate{
+				index:     file.index,
+				mtime:     s.fileMtime[file.index],
+				dirtySync: s.syncDirty[file.index],
+			})
+		}
+		clear(s.hintDirty)
 	}
 	s.mtMu.Unlock()
-	for _, idx := range checkpoint.verified {
-		if idx >= 0 && idx < len(trusted) && trusted[idx] {
-			state.VerifiedPieces = append(state.VerifiedPieces, idx)
+	s.hintCache.metaScratch = metaDirty
+	s.hintCache.updateBuf = updates
+
+	statResults := s.hintCache.statBuf[:0]
+	for _, file := range metaDirty {
+		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
+			statResults = append(statResults, hintStatResult{file: file, info: fi})
 		}
 	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
+	s.hintCache.statBuf = statResults
+
+	genMatched := true
+	if len(statResults) > 0 {
+		s.mtMu.Lock()
+		if s.checkpointGen == gen {
+			for _, res := range statResults {
+				if res.file.index < len(s.fileMtime) {
+					s.fileMtime[res.file.index] = res.info.ModTime().UnixNano()
+				}
+				s.stateFileInfo[res.file.path] = res.info
+				s.trustedIdentity[res.file.path] = fileIdentity(nil, res.info)
+			}
+		} else {
+			genMatched = false
+		}
+		s.mtMu.Unlock()
+	}
+
+	if allDirty {
+		for _, res := range statResults {
+			if res.file.index < len(s.hintCache.mtimes) {
+				s.hintCache.mtimes[res.file.index] = res.info.ModTime().UnixNano()
+			}
+		}
+		s.hintCache.checkpoint = checkpoint
+		s.hintCache.rebuildAll()
+	} else {
+		s.hintCache.applyUpdates(updates, statResults)
+	}
+
+	// Only pieces the caller still holds as verified may keep their durable status:
+	// one it has queued for rechecking must not be blessed back into place.
+	var verifiedOut []int
+	if len(checkpoint.verified) > 0 && len(verified) > 0 {
+		nPieces := s.pieceCount()
+		if cap(s.hintCache.trustedBuf) < nPieces {
+			s.hintCache.trustedBuf = make([]bool, nPieces)
+		} else {
+			s.hintCache.trustedBuf = s.hintCache.trustedBuf[:nPieces]
+			clear(s.hintCache.trustedBuf)
+		}
+		trusted := s.hintCache.trustedBuf
+		for _, idx := range verified {
+			if idx >= 0 && idx < len(trusted) {
+				trusted[idx] = true
+			}
+		}
+		for _, idx := range checkpoint.verified {
+			if idx >= 0 && idx < len(trusted) && trusted[idx] {
+				verifiedOut = append(verifiedOut, idx)
+			}
+		}
+	}
+
+	data := s.hintCache.marshalJSON(s.pieceLength, infoHash, verifiedOut, completed)
+	if !genMatched {
+		s.hintCache.built = false
 	}
 	return s.writeResumeAtomically(name, data, false)
 }
@@ -302,6 +638,9 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		return nil
 	}
 	s.dirty = make(map[*fileLayout]dirtyState, len(dirty))
+	clear(s.syncDirty)
+	s.metaDirty = nil
+	s.hintDirty = nil
 	expected := make(map[string]os.FileInfo, len(s.stateFileInfo))
 	for path, info := range s.stateFileInfo {
 		expected[path] = info
@@ -324,15 +663,21 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		}
 		for file, flags := range pending {
 			if flags != 0 {
-				s.dirty[file] |= flags
+				s.markDirtyLocked(file, flags)
 			}
+		}
+		if !saved {
+			s.checkpointGen++
+			s.hintAllDirty = true
+			s.hintDirty = nil
 		}
 		s.mtMu.Unlock()
 	}()
 
 	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, VerifiedPieces: verified, CompletedPieces: completed}
 	checkpoint := resumeCheckpoint{identities: make([]string, len(s.files)), mtimes: make([]int64, len(s.files)), valid: true, complete: true}
-	current := make(map[string]int64, len(s.files))
+	current := make([]int64, len(s.files))
+	hasCurrent := make([]bool, len(s.files))
 	proven := make(map[string]checkpointRecord, len(s.files))
 	for i, file := range s.files {
 		flags := dirty[file]
@@ -346,7 +691,8 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		mtime := int64(0)
 		if info != nil {
 			mtime = info.ModTime().UnixNano()
-			current[file.path] = mtime
+			current[i] = mtime
+			hasCurrent[i] = true
 			if identity != "" {
 				proven[file.path] = checkpointRecord{info: info, identity: identity}
 			}
@@ -367,8 +713,10 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 	checkpoint.verified = append([]int(nil), verified...)
 	checkpoint.completed = append([]int(nil), completed...)
 	s.mtMu.Lock()
-	for path, mtime := range current {
-		s.stateFileMt[path] = mtime
+	for i, ok := range hasCurrent {
+		if ok {
+			s.fileMtime[i] = current[i]
+		}
 	}
 	// Only a file this checkpoint proved becomes the baseline the next one compares
 	// against. Adopting the metadata of a file it distrusted would let the very next
@@ -378,6 +726,9 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		s.trustedIdentity[path] = record.identity
 	}
 	s.checkpoint = checkpoint
+	s.checkpointGen++
+	s.hintAllDirty = true
+	s.hintDirty = nil
 	s.mtMu.Unlock()
 	return nil
 }
@@ -413,7 +764,7 @@ func (s *FileStorage) markReleasedMappings(released []releasedMapping) {
 		}
 		identity := fileIdentity(nil, entry.before)
 		if identity != "" && identity == s.trustedIdentity[entry.file.path] {
-			s.dirty[entry.file] |= dirtyMeta
+			s.markDirtyLocked(entry.file, dirtyMeta)
 		}
 	}
 }
