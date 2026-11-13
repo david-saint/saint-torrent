@@ -758,9 +758,17 @@ func (s *Session) webseedPaused() bool {
 // transition. Callers block on the returned channel instead of polling
 // webseedPaused on a timer.
 func (s *Session) pauseStateSignal() (bool, <-chan struct{}) {
+	paused, _, ch := s.pauseStateSnapshot()
+	return paused, ch
+}
+
+// pauseStateSnapshot atomically reads the paused/closed state, pauseEpoch,
+// and the channel closed on the next pause/resume transition so callers can
+// detect transitions that completed while they were outside select.
+func (s *Session) pauseStateSnapshot() (paused bool, epoch uint64, ch <-chan struct{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.paused || s.closed, s.pauseStateCh
+	return s.paused || s.closed, s.pauseEpoch, s.pauseStateCh
 }
 
 // webseedCause strips net/http's *url.Error wrapper, whose message repeats

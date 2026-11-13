@@ -3638,20 +3638,25 @@ func (s *Session) dhtLoop() {
 
 	s.mu.RLock()
 	metadataMode := s.metadataMode
+	wasPaused := s.paused || s.closed
+	lastEpoch := s.pauseEpoch
 	s.mu.RUnlock()
 	timer := time.NewTimer(dhtFirstLookupAfter(metadataMode, time.Now()))
 	defer timer.Stop()
 	for {
-		_, pauseChanged := s.pauseStateSignal()
+		paused, epoch, pauseChanged := s.pauseStateSnapshot()
+		if !paused && (wasPaused || epoch != lastEpoch) {
+			// Lookups are skipped while paused; after a resume (including a
+			// pause+resume cycle that completed while outside select) the next
+			// one runs soon instead of up to a whole interval later.
+			timer.Reset(dhtResumeLookupDelay + randDuration(dhtResumeLookupDelay))
+		}
+		wasPaused, lastEpoch = paused, epoch
 		select {
 		case <-timer.C:
 			timer.Reset(s.dhtLookupTick())
 		case <-pauseChanged:
-			// Lookups are skipped while paused; after a resume the next one runs
-			// soon instead of up to a whole interval later.
-			if paused, _ := s.pauseStateSignal(); !paused {
-				timer.Reset(dhtResumeLookupDelay + randDuration(dhtResumeLookupDelay))
-			}
+			// Wake to re-evaluate the snapshot at the top of the loop.
 		case <-s.ctx.Done():
 			return
 		}
@@ -3720,8 +3725,8 @@ func dhtFirstLookupAfter(metadataMode bool, now time.Time) time.Duration {
 }
 
 // jitterDHTInterval spreads d uniformly over ±20%, so sessions that started
-// together drift apart.
-func jitterDHTInterval(d time.Duration) time.Duration {
+// together drift apart. A var so tests can observe/synchronize post-unlock ticks.
+var jitterDHTInterval = func(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
 }
 
