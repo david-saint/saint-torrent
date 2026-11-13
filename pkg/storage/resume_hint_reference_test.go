@@ -74,7 +74,7 @@ func requireHintMatchesReference(t *testing.T, s *FileStorage, hash string, veri
 }
 
 func TestResumeHintMatchesReferenceThroughTheLifecycle(t *testing.T) {
-	files := []FileInfo{{Path: "a", Length: 6}, {Path: "dir/b <&> \"q\" é", Length: 4}, {Path: "empty", Length: 0}, {Path: "c", Length: 6}}
+	files := []FileInfo{{Path: "a", Length: 6}, {Path: "dir/b & 'q' é", Length: 4}, {Path: "empty", Length: 0}, {Path: "c", Length: 6}}
 	st, err := NewFileStorage(t.TempDir(), files, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -230,4 +230,19 @@ func TestResumeHintConcurrentWithWrites(t *testing.T) {
 	close(stop)
 	<-done
 	requireHintMatchesReference(t, st, hash, nil, []int{0, 1})
+}
+
+// TestAppendJSONStringMatchesEncodingJSON covers the characters a payload path
+// cannot carry on every platform, so the escaping is checked without creating
+// files named after them.
+func TestAppendJSONStringMatchesEncodingJSON(t *testing.T) {
+	for _, s := range []string{"", "plain", `quote"and\slash`, "<tag>&amp", "tab\tnewline\n", "caf\u00e9 \u65e5\u672c", "sep\u2028\u2029", "bad\xffutf8", "del\x7f", "16777232:20000000:1700000000000000000"} {
+		want, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := appendJSONString(nil, s); !bytes.Equal(got, want) {
+			t.Errorf("appendJSONString(%q) = %s, want %s", s, got, want)
+		}
+	}
 }

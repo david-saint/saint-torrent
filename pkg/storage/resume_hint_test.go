@@ -14,7 +14,7 @@ func TestSaveResumeHintMatchesJSONMarshalAndTrustRules(t *testing.T) {
 	root := t.TempDir()
 	files := []FileInfo{
 		{Path: "ascii.bin", Length: 6},
-		{Path: `sub/quote"and\slash<tag>&amp.bin`, Length: 4},
+		{Path: "sub/amp&and 'quote' +plus.bin", Length: 4},
 		{Path: "日本語/ファイル.bin", Length: 6},
 	}
 	st, err := NewFileStorage(root, files, 4)
