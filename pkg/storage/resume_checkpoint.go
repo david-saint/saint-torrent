@@ -254,7 +254,6 @@ func (s *FileStorage) SaveResumeState(infoHash string, verified, unverified []in
 // written mid-recheck (or at shutdown) preserves the pieces that checkpoint proved
 // rather than replacing it with a version-less guess that forces a full rehash.
 func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed []int) error {
-	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, CompletedPieces: completed}
 	// Only pieces the caller still holds as verified may keep their durable status:
 	// one it has queued for rechecking must not be blessed back into place.
 	trusted := make([]bool, s.pieceCount())
@@ -263,29 +262,45 @@ func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed 
 			trusted[idx] = true
 		}
 	}
+	h := &s.hint
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.prepareLayout(s.files)
+	// mtMu is held only for what is proportional to the dirty set: the refresh of
+	// the files written since the last persist, the indices of the files still owing
+	// a flush, and the swap of the queued mtime changes. The per-file table is built
+	// below, from cached fragments, after the lock is released.
 	s.mtMu.Lock()
-	s.refreshDirtyLocked()
-	checkpoint := s.checkpoint
-	for i, file := range s.files {
-		identity := ""
-		mtime := s.stateFileMt[file.path]
-		if checkpoint.valid && s.dirty[file]&dirtySync == 0 {
-			identity = checkpoint.identities[i]
-			mtime = checkpoint.mtimes[i]
-		}
-		state.Identities = append(state.Identities, identity)
-		state.Files = append(state.Files, resumeFileEntry{file.path, file.length, mtime})
-	}
+	snap := s.snapshotHintLocked(h)
 	s.mtMu.Unlock()
+	if !snap.resync {
+		for _, u := range snap.delta {
+			h.mtimes[u.idx] = u.mtime
+		}
+		h.spareDelt = snap.delta[:0]
+	}
+	checkpoint := snap.checkpoint
+	h.prepareIdentities(checkpoint.identities)
+	// A file written since the last durable checkpoint loses its identity: the
+	// checkpoint no longer describes it.
+	for _, idx := range h.syncIdx {
+		if idx >= 0 && idx < len(h.syncMark) {
+			h.syncMark[idx] = true
+		}
+	}
+	var checkpointVerified []int
 	for _, idx := range checkpoint.verified {
 		if idx >= 0 && idx < len(trusted) && trusted[idx] {
-			state.VerifiedPieces = append(state.VerifiedPieces, idx)
+			checkpointVerified = append(checkpointVerified, idx)
 		}
 	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
+	data := s.appendHintJSON(h, make([]byte, 0, h.lastSize+h.lastSize/16+4096), infoHash, checkpoint, checkpointVerified, completed)
+	for _, idx := range h.syncIdx {
+		if idx >= 0 && idx < len(h.syncMark) {
+			h.syncMark[idx] = false
+		}
 	}
+	h.lastSize = len(data)
 	return s.writeResumeAtomically(name, data, false)
 }
 
@@ -332,7 +347,7 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 
 	state := FastResumeState{IdentityMode: resumeIdentityMode, Version: 2, PieceLength: s.pieceLength, InfoHashHex: infoHash, VerifiedPieces: verified, CompletedPieces: completed}
 	checkpoint := resumeCheckpoint{identities: make([]string, len(s.files)), mtimes: make([]int64, len(s.files)), valid: true, complete: true}
-	current := make(map[string]int64, len(s.files))
+	current := make(map[*fileLayout]int64, len(s.files))
 	proven := make(map[string]checkpointRecord, len(s.files))
 	for i, file := range s.files {
 		flags := dirty[file]
@@ -346,7 +361,7 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 		mtime := int64(0)
 		if info != nil {
 			mtime = info.ModTime().UnixNano()
-			current[file.path] = mtime
+			current[file] = mtime
 			if identity != "" {
 				proven[file.path] = checkpointRecord{info: info, identity: identity}
 			}
@@ -367,8 +382,8 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 	checkpoint.verified = append([]int(nil), verified...)
 	checkpoint.completed = append([]int(nil), completed...)
 	s.mtMu.Lock()
-	for path, mtime := range current {
-		s.stateFileMt[path] = mtime
+	for file, mtime := range current {
+		s.setStateMtLocked(file, mtime)
 	}
 	// Only a file this checkpoint proved becomes the baseline the next one compares
 	// against. Adopting the metadata of a file it distrusted would let the very next

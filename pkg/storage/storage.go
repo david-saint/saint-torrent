@@ -142,6 +142,7 @@ func NewStorage(baseDir string, files []FileInfo, pieceLength int64) (Storage, e
 type fileLayout struct {
 	repaired     atomic.Bool
 	path         string // relative path (torrent-declared)
+	idx          int    // position in FileStorage.files
 	downloadRoot *DownloadRoot
 	volumeGuard  *externalVolumeGuard
 	length       int64
@@ -551,7 +552,8 @@ type FileStorage struct {
 	files       []*fileLayout
 	pieceLength int64
 	totalSize   int64
-	// mtMu guards stateFileMt, stateFileInfo, initialInfo, dirty and checkpoint,
+	// mtMu guards stateFileMt, stateFileInfo, initialInfo, dirty, checkpoint and
+	// mtDelta/mtResync,
 	// which the shared-read-lock WriteBlock and persistence paths mutate
 	// concurrently. dirty records what each file still owes: a metadata snapshot
 	// (captured lazily when state is persisted instead of via a stat syscall on
@@ -570,8 +572,14 @@ type FileStorage struct {
 	dirty           map[*fileLayout]dirtyState
 	allCreated      bool
 	checkpoint      resumeCheckpoint
-	downloadRoot    *DownloadRoot
-	closed          atomic.Bool
+	// mtDelta queues the stateFileMt changes the hint writer has not folded into
+	// its own per-file copy yet; mtResync replaces it with one full copy when it
+	// would have grown without bound. Both are guarded by mtMu.
+	mtDelta      []mtUpdate
+	mtResync     bool
+	hint         resumeHint
+	downloadRoot *DownloadRoot
+	closed       atomic.Bool
 }
 
 // dirtyState records the bookkeeping a file still owes. dirtyMeta means this
@@ -665,6 +673,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 
 		layout := &fileLayout{
 			path:         file.Path,
+			idx:          len(layouts),
 			downloadRoot: downloadRoot,
 			volumeGuard:  volumeGuard,
 			length:       file.Length,
@@ -713,7 +722,10 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 	openedObjects := make(map[fileObjectKey]openedObject, len(files))
 	allCreated := true
 
-	for _, layout := range layouts {
+	// hintMt seeds the hint writer's per-file mtime copy so its first tick needs no
+	// full copy under mtMu.
+	hintMt := make([]int64, len(layouts))
+	for i, layout := range layouts {
 		path := layout.path
 
 		parentDir := filepath.Clean(filepath.Dir(path))
@@ -774,6 +786,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		stateFileInfo[path] = fi
 		initialInfo[path] = fi
 		stateFileMt[path] = fi.ModTime().UnixNano()
+		hintMt[i] = stateFileMt[path]
 		// Capture the identity while the handle is open: Windows reads the change
 		// timestamp from the handle, so this is the only chance to anchor a file the
 		// session never writes to without paying a second open.
@@ -797,6 +810,7 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		trustedIdentity: trustedIdentity,
 		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
 		allCreated:      allCreated,
+		hint:            resumeHint{mtimes: hintMt, synced: true},
 		downloadRoot:    downloadRoot,
 	}, nil
 }
@@ -1215,7 +1229,7 @@ func (s *FileStorage) refreshDirtyLocked() {
 			continue
 		}
 		if fi, err := file.downloadRoot.Stat(file.path); err == nil {
-			s.stateFileMt[file.path] = fi.ModTime().UnixNano()
+			s.setStateMtLocked(file, fi.ModTime().UnixNano())
 			s.stateFileInfo[file.path] = fi
 			// The snapshot now describes a file this client moved itself, so the
 			// identity it was trusted under no longer applies. Where a stat carries
@@ -1358,9 +1372,11 @@ func (s *FileStorage) LoadState(infoHashHex string) ([]int, error) {
 			return nil, fmt.Errorf("file modification mismatch for %s", f.path)
 		}
 	}
+	s.mtMu.Lock()
 	for i, f := range s.files {
-		s.stateFileMt[f.path] = state.Files[i].Mtime
+		s.setStateMtLocked(f, state.Files[i].Mtime)
 	}
+	s.mtMu.Unlock()
 
 	return state.CompletedPieces, nil
 }
