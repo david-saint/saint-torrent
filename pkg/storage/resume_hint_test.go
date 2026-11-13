@@ -50,8 +50,7 @@ func TestSaveResumeHintMatchesJSONMarshalAndTrustRules(t *testing.T) {
 	}
 	assertHintMatchesMarshal(t, st, infoHash, []int{0, 2, 3}, []int{0, 2, 3, 1}, []bool{false, false, false})
 
-	// Write to file 1 (piece 1 spans file 0 and file 1, piece 2 spans file 1 and file 2;
-	// writing offset 0 of piece 2 writes the tail of file 1? Let's write directly into file 1 via piece 1 offset 2).
+	// Piece 1 spans files 0 and 1; offset 2 of it lands in file 1 only.
 	if err := st.WriteBlock(1, 2, []byte{9, 9}); err != nil {
 		t.Fatal(err)
 	}

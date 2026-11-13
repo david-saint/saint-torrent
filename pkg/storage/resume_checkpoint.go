@@ -566,7 +566,7 @@ func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed 
 	s.hintCache.statBuf = statResults
 
 	genMatched := true
-	if len(statResults) > 0 {
+	if len(metaDirty) > 0 {
 		s.mtMu.Lock()
 		if s.checkpointGen == gen {
 			for _, res := range statResults {
@@ -577,7 +577,14 @@ func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed 
 				s.trustedIdentity[res.file.path] = fileIdentity(nil, res.info)
 			}
 		} else {
+			// A checkpoint or load ran while the files were being statted, so these
+			// snapshots may predate what it recorded and are dropped. The files go
+			// back to owing a metadata refresh: left cleared, they would carry a
+			// stale trusted identity and every later checkpoint would distrust them.
 			genMatched = false
+			for _, file := range metaDirty {
+				s.markDirtyLocked(file, dirtyMeta)
+			}
 		}
 		s.mtMu.Unlock()
 	}
