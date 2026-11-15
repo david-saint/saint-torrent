@@ -727,7 +727,7 @@ func (s *MMapStorage) markFileStorageDirty(files []*fileLayout, flags dirtyState
 	}
 	s.mtMu.Lock()
 	for _, file := range files {
-		s.FileStorage.dirty[file] |= flags
+		s.markDirtyLocked(file, flags)
 	}
 	s.mtMu.Unlock()
 }
