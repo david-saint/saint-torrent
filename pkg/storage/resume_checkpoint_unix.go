@@ -9,6 +9,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"sainttorrent/internal/fsync"
 )
 
 const (
@@ -83,7 +85,7 @@ func replaceResumeFile(root *DownloadRoot, oldName, newName string, durable bool
 		return err
 	}
 	if durable {
-		return directory.Sync()
+		return fsync.File(directory)
 	}
 	return nil
 }
