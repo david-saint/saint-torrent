@@ -23,6 +23,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"sainttorrent/internal/fsync"
 	"sainttorrent/pkg/bencode"
 	"sainttorrent/pkg/dht"
 	"sainttorrent/pkg/logging"
@@ -1398,7 +1399,7 @@ func replaceFile(destPath string, data []byte, durable bool) error {
 		if hook := fileSyncHook.Load(); hook != nil {
 			(*hook)(destPath)
 		}
-		if err := f.Sync(); err != nil {
+		if err := fsync.File(f); err != nil {
 			return err
 		}
 	}
@@ -1422,7 +1423,7 @@ func replaceFile(destPath string, data []byte, durable bool) error {
 // best-effort: some platforms and filesystems refuse to sync a directory.
 func syncDir(path string) {
 	if dir, err := os.Open(path); err == nil {
-		_ = dir.Sync()
+		_ = fsync.File(dir)
 		dir.Close()
 	}
 }
@@ -1442,7 +1443,7 @@ func syncCachedTorrents(paths []string) {
 		if hook := fileSyncHook.Load(); hook != nil {
 			(*hook)(path)
 		}
-		_ = f.Sync()
+		_ = fsync.File(f)
 		_ = f.Close()
 		dirs[filepath.Dir(path)] = struct{}{}
 	}

@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"sainttorrent/internal/fsync"
 )
 
 // Crash handling. A panic in a session or restore goroutine is recorded under
@@ -101,7 +103,7 @@ func (c *crashRecorder) record(component, infoHashHex string, v any, stack []byt
 			return ""
 		}
 		_, werr := f.WriteString(body.String())
-		_ = f.Sync()
+		_ = fsync.File(f)
 		_ = f.Close()
 		if werr != nil {
 			return ""

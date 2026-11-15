@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"sainttorrent/internal/fsync"
 )
 
 // ResumeState distinguishes durable verified pieces from hints that still need hashing.
@@ -488,7 +490,7 @@ func (s *FileStorage) checkpointFile(file *fileLayout, flags dirtyState, expecte
 	trustworthy := !repaired && before.Size() == file.length && initial != nil && os.SameFile(before, initial) &&
 		(flags&dirtyMeta != 0 || unchanged)
 	if flags&dirtySync != 0 {
-		if err := f.Sync(); err != nil {
+		if err := fsync.File(f); err != nil {
 			_ = f.Close()
 			return nil, ""
 		}
@@ -541,7 +543,7 @@ func (s *FileStorage) writeResumeAtomically(name string, data []byte, durable bo
 		return err
 	}
 	if durable {
-		if err = f.Sync(); err != nil {
+		if err = fsync.File(f); err != nil {
 			_ = f.Close()
 			return err
 		}
