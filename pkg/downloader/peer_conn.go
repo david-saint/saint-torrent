@@ -2748,6 +2748,20 @@ func (s *Session) runPeerMessageLoop(client *peer.Client, conn net.Conn, peerAdd
 	// connection is registered (choked, as every connection starts), so a repeated
 	// choke or unchoke is recognised without the session lock.
 	peerChoking := true
+	// idlePickDue reports whether a connection with nothing in flight should run
+	// pump although the peer sent nothing: the peer has unchoked us, and its last
+	// pick either found nothing at an older pickGen (a piece was released, or
+	// endgame began, since) or never concluded there was nothing. The liveness
+	// tick and Notify check it, so a peer that only sends keep-alives picks such a
+	// piece within a tick, or when a completed piece or endgame starting wakes the
+	// loop, instead of at its next message. When nothing has changed it costs one
+	// atomic load, and each pickGen advance costs an idle connection at most one
+	// pick however many wakes follow. We stay interested in every peer until the
+	// download completes, and then the pick is empty and stays cached.
+	idlePickDue := func() bool {
+		return len(activeDownloads) == 0 && !peerChoking && initializedPeersAndBitfield &&
+			(!noPick || s.pickGen.Load() != noPickGen)
+	}
 	// lastInterestScanAt is when an Interested last ran the unchoke scan; see
 	// peerInterestScanInterval.
 	var lastInterestScanAt time.Time
@@ -2915,7 +2929,8 @@ peerLoop:
 			msg = result.msg
 			pooledMsg = msg // release its pooled buffer at the top of the next iteration
 		case <-client.Notified():
-			// The choker changed our choke state or pieces completed.
+			// The choker changed our choke state, pieces completed, or endgame
+			// began.
 			syncChoke()
 			if initializedPeersAndBitfield {
 				_ = client.SendQueuedHaves()
@@ -2923,6 +2938,9 @@ peerLoop:
 				// Nothing may precede the bitfield, which is sent at the top of
 				// the loop once metadata is in and already covers these pieces.
 				client.DropQueuedHaves()
+			}
+			if idlePickDue() {
+				scheduleRateRetry(minRetry(pump(), uploadPump()))
 			}
 			continue
 		case now := <-livenessTicker.C:
@@ -2933,6 +2951,11 @@ peerLoop:
 					disconnectErr = err
 					break peerLoop
 				}
+			}
+			// A peer that unchoked us and sends nothing would otherwise pick a
+			// piece freed since its last empty pick only at its next message.
+			if idlePickDue() {
+				scheduleRateRetry(minRetry(pump(), uploadPump()))
 			}
 			// Back to the top of the loop, which runs the reaper, the inactivity
 			// check and any overdue request-timeout sweep.

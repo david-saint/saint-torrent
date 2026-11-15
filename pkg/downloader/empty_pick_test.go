@@ -115,7 +115,8 @@ func TestRestrictedEmptyPickIsRedoneOnUnchoke(t *testing.T) {
 
 // TestEmptyPickFollowsSessionChanges checks the empty-pick cache against changes
 // on the session side: a piece another peer releases, and endgame starting, make
-// a piece this peer has pickable again, and the next message picks it.
+// a piece this peer has pickable again, and the next message picks it. A peer
+// that sends nothing picks it too; see TestIdleUnchokedPeerPicksWithoutAMessage.
 func TestEmptyPickFollowsSessionChanges(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -152,6 +153,72 @@ func TestEmptyPickFollowsSessionChanges(t *testing.T) {
 			if _, err := w.remote.Write(make([]byte, 4)); err != nil { // keep-alive
 				t.Fatalf("write keep-alive: %v", err)
 			}
+			w.expectRequestFor(5, 2*time.Second)
+		})
+	}
+}
+
+// TestIdleUnchokedPeerPicksWithoutAMessage is the regression test for #133: a
+// peer that unchoked us but had nothing we could pick, and then sends nothing (a
+// seed that only sends keep-alives), picked a piece that became pickable only at
+// its next message, up to two minutes later. A released piece is now picked at
+// the next liveness tick, or when a completed piece's Have wakes the loop, and
+// endgame starting wakes the loop at once. A tick with nothing new runs no pick.
+func TestIdleUnchokedPeerPicksWithoutAMessage(t *testing.T) {
+	release := func(sess *Session) {
+		sess.mu.Lock()
+		sess.setPieceStateLocked(5, PieceEmpty) // its downloader was choked
+		sess.mu.Unlock()
+	}
+	for _, tc := range []struct {
+		name   string
+		tick   time.Duration
+		change func(sess *Session)
+	}{
+		{"released, next tick", 20 * time.Millisecond, release},
+		{"released, then a piece completes", time.Hour, func(sess *Session) {
+			release(sess)
+			sess.mu.Lock()
+			sess.setPieceStateLocked(0, PieceCompleted)
+			sess.mu.Unlock()
+			sess.broadcastHave(0)
+		}},
+		{"endgame", time.Hour, func(sess *Session) {
+			sess.mu.Lock()
+			for i := range sess.PieceStates {
+				if i != 5 {
+					sess.setPieceStateLocked(i, PieceDownloading) // the last pieces are claimed
+				}
+			}
+			sess.mu.Unlock()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(swapDuration(&peerIdleTickInterval, tc.tick))
+			scans := countPickerScans(t)
+			sess := newWireTestSession(t, 8, 16)
+			sess.mu.Lock()
+			sess.setPieceStateLocked(5, PieceDownloading) // in flight on another peer
+			sess.mu.Unlock()
+			w := startWirePeer(t, sess, 6253, fastReserved())
+			w.send(&peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x04}}) // piece 5 only
+			w.send(&peer.Message{ID: peer.MsgUnchoke})
+			w.barrier()
+			if scans.Load() == 0 {
+				t.Fatal("the unchoke did not run the picker")
+			}
+
+			if tc.tick < time.Second {
+				// Ticks with nothing new reuse the empty pick.
+				before := scans.Load()
+				time.Sleep(5 * tc.tick)
+				if n := scans.Load() - before; n != 0 {
+					t.Fatalf("idle ticks with nothing new ran the picker %d times", n)
+				}
+			}
+
+			// The peer sends nothing from here on.
+			tc.change(sess)
 			w.expectRequestFor(5, 2*time.Second)
 		})
 	}
