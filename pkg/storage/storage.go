@@ -581,6 +581,15 @@ type FileStorage struct {
 	hintCache       resumeHintCache
 	downloadRoot    *DownloadRoot
 	closed          atomic.Bool
+
+	// pushDirty marks, per file index, data written since the last flush helper
+	// over that file started (see flush_helper.go). Guarded by mtMu.
+	pushDirty []bool
+	// pushMu guards pushJob, the most recent flush helper, and spawner, which
+	// starts helpers and is nil when flushes run in-process.
+	pushMu  sync.Mutex
+	pushJob *flushJob
+	spawner flushSpawner
 }
 
 // dirtyState records the bookkeeping a file still owes. dirtyMeta means this
@@ -807,6 +816,8 @@ func NewFileStorage(baseDir string, files []FileInfo, pieceLength int64) (*FileS
 		trustedIdentity: trustedIdentity,
 		dirty:           make(map[*fileLayout]dirtyState, len(layouts)),
 		syncDirty:       make([]bool, len(layouts)),
+		pushDirty:       make([]bool, len(layouts)),
+		spawner:         currentFlushSpawner(),
 		hintAllDirty:    true,
 		allCreated:      allCreated,
 		downloadRoot:    downloadRoot,
@@ -1222,6 +1233,9 @@ func (s *FileStorage) markDirtyLocked(file *fileLayout, flags dirtyState) {
 	s.dirty[file] = prev | flags
 	if flags&dirtySync != 0 && prev&dirtySync == 0 && file.index < len(s.syncDirty) {
 		s.syncDirty[file.index] = true
+	}
+	if flags&dirtySync != 0 && file.index < len(s.pushDirty) {
+		s.pushDirty[file.index] = true
 	}
 	if flags&dirtyMeta != 0 && prev&dirtyMeta == 0 {
 		s.metaDirty = append(s.metaDirty, file)

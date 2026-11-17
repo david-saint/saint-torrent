@@ -640,6 +640,15 @@ func (s *FileStorage) saveResumeHint(name, infoHash string, verified, completed 
 // its pieces are rechecked next launch — instead of failing the whole checkpoint
 // and leaving the caller retrying a full sweep every second.
 func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, completed []int) error {
+	// Flushing a large backlog in-process would hold up the process exit for as
+	// long as the disk takes, so the data goes out through a flush helper first.
+	// If it is still on its way, record a hint and leave the proof for later.
+	if !s.awaitPushed(durableFlushBudget) {
+		if err := s.saveResumeHint(name, infoHash, verified, completed); err != nil {
+			return err
+		}
+		return ErrCheckpointDeferred
+	}
 	s.mtMu.Lock()
 	dirty := s.dirty
 	if s.checkpointCurrentLocked(verified, completed, dirty) {
@@ -648,6 +657,13 @@ func (s *FileStorage) saveResumeCheckpoint(name, infoHash string, verified, comp
 	}
 	s.dirty = make(map[*fileLayout]dirtyState, len(dirty))
 	clear(s.syncDirty)
+	// This checkpoint flushes every file it takes, so none of them owes the
+	// helper a push any more; a write from here on marks its file again.
+	for file, flags := range dirty {
+		if flags&dirtySync != 0 && file.index < len(s.pushDirty) {
+			s.pushDirty[file.index] = false
+		}
+	}
 	s.metaDirty = nil
 	s.hintDirty = nil
 	expected := make(map[string]os.FileInfo, len(s.stateFileInfo))

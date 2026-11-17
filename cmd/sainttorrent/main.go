@@ -1909,6 +1909,14 @@ func (m *model) resolveRemainingPending(err error) {
 }
 
 func main() {
+	// A flush helper only pushes the descriptors it inherited to the disk; it
+	// must not touch config, locks, sockets or the terminal.
+	if len(os.Args) > 1 && os.Args[1] == storage.FlushHelperArg {
+		os.Exit(storage.RunFlushHelper(os.Args[2:]))
+	}
+	if exe, err := os.Executable(); err == nil {
+		storage.SetFlushHelper(exe)
+	}
 	perfInit()
 	for i := 1; i < len(os.Args); i++ {
 		if os.Args[i] == "--write-config" {

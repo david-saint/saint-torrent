@@ -694,7 +694,21 @@ func (s *Session) statePersistLoop() {
 			s.flushState()
 		case <-ticker.C:
 			s.flushState()
+			s.writeBehind()
 		}
+	}
+}
+
+// writeBehind lets the storage push out what was written since the last tick.
+// Scattered piece writes otherwise sit in the page cache until the kernel's
+// delayed-write timer, and the backlog they build up is what a later durable
+// checkpoint, or the exit, has to wait for. It never waits on the disk.
+func (s *Session) writeBehind() {
+	s.mu.RLock()
+	st := s.Storage
+	s.mu.RUnlock()
+	if wb, ok := st.(storage.WriteBehinder); ok {
+		wb.WriteBehind()
 	}
 }
 
@@ -746,6 +760,16 @@ func (s *Session) flushState() {
 		err = checkpoint.SaveResumeState(infoHashHex, completed, unverified, durable)
 	} else {
 		err = st.SaveState(infoHashHex, append(completed, unverified...))
+	}
+	if errors.Is(err, storage.ErrCheckpointDeferred) {
+		// A hint was saved; the checkpoint waits for the flush helper to get the
+		// data out. Retry it on a later tick, unless this was the last chance.
+		s.mu.Lock()
+		if !s.closing && !s.closed {
+			s.stateDirty = true
+		}
+		s.mu.Unlock()
+		err = nil
 	}
 	if err != nil {
 		if err == storage.ErrStorageClosed && closed {
