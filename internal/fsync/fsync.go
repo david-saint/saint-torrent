@@ -25,3 +25,13 @@ func File(f *os.File) error {
 	}
 	return file(f)
 }
+
+// WriteBack pushes f's written data out to the device without the drive-cache
+// barrier File adds on macOS. It is the cheap half of a durable flush: once it
+// has run, a File on the same file only has the drive cache left to settle.
+func WriteBack(f *os.File) error {
+	if f == nil {
+		return os.ErrInvalid
+	}
+	return writeBack(f)
+}
