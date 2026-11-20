@@ -190,3 +190,106 @@ func TestRemoveSessionKeepsFilesAnotherTorrentUses(t *testing.T) {
 		t.Fatalf("active torrent's file was deleted with another torrent: %v", err)
 	}
 }
+
+func writeMultiFileTorrent(t *testing.T, dir, fileName, rootName string, files []map[string]interface{}) (string, [20]byte) {
+	t.Helper()
+	info := map[string]interface{}{
+		"name":         rootName,
+		"piece length": int64(1 << 14),
+		"pieces":       string(make([]byte, 20)),
+		"files":        files,
+	}
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := bencode.Marshal(map[string]interface{}{
+		"info": info,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fileName)
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path, sha1.Sum(infoBytes)
+}
+
+// TestRemoveSessionRemovesFolderWithOSMetadata verifies that deleting a
+// multi-file torrent with its files removes its folder tree even when macOS
+// Finder (.DS_Store, AppleDouble "._*") or Windows Explorer left OS metadata
+// files inside those directories.
+func TestRemoveSessionRemovesFolderWithOSMetadata(t *testing.T) {
+	downloadDir := t.TempDir()
+	torrentDir := t.TempDir()
+
+	torrentPath, infoHash := writeMultiFileTorrent(t, torrentDir, "show.torrent", "Show", []map[string]interface{}{
+		{"length": int64(100), "path": []interface{}{"Season 1", "ep1.mkv"}},
+		{"length": int64(50), "path": []interface{}{"readme.txt"}},
+	})
+	hashHex := fmt.Sprintf("%x", infoHash)
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.AddTorrentFile(torrentPath, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate Finder browsing both the torrent root and its subfolder.
+	if err := os.WriteFile(filepath.Join(downloadDir, "Show", ".DS_Store"), []byte("finder"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(downloadDir, "Show", "Season 1", ".DS_Store"), []byte("finder"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	appleDouble := []byte{0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00}
+	if err := os.WriteFile(filepath.Join(downloadDir, "Show", "Season 1", "._ep1.mkv"), appleDouble, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.RemoveSession(hashHex, true); err != nil {
+		t.Fatalf("RemoveSession: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(downloadDir, "Show")); !os.IsNotExist(err) {
+		t.Fatalf("torrent folder survived remove-and-delete: %v", err)
+	}
+	if _, err := os.Stat(downloadDir); err != nil {
+		t.Fatalf("downloadDir should still exist: %v", err)
+	}
+}
+
+// TestRemoveSessionKeepsCrossSeededDSStore ensures OS metadata cleanup never
+// deletes a file another active torrent still claims.
+func TestRemoveSessionKeepsCrossSeededDSStore(t *testing.T) {
+	downloadDir := t.TempDir()
+	torrentDir := t.TempDir()
+
+	firstPath, firstHash := writeMultiFileTorrent(t, torrentDir, "first.torrent", "Pack", []map[string]interface{}{
+		{"length": int64(100), "path": []interface{}{"movie.mkv"}},
+		{"length": int64(16), "path": []interface{}{".DS_Store"}},
+	})
+	secondPath, _ := writeMultiFileTorrent(t, torrentDir, "second.torrent", "Pack", []map[string]interface{}{
+		{"length": int64(16), "path": []interface{}{".DS_Store"}},
+	})
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+	if _, err := mgr.AddTorrentFile(firstPath, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.AddTorrentFile(secondPath, downloadDir); err != nil {
+		t.Fatal(err)
+	}
+
+	err := mgr.RemoveSession(fmt.Sprintf("%x", firstHash), true)
+	if !errors.Is(err, ErrFilesKept) {
+		t.Fatalf("RemoveSession = %v, want ErrFilesKept", err)
+	}
+	if _, err := os.Lstat(filepath.Join(downloadDir, "Pack", "movie.mkv")); !os.IsNotExist(err) {
+		t.Fatalf("unshared file should be deleted: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(downloadDir, "Pack", ".DS_Store")); err != nil {
+		t.Fatalf("cross-seeded .DS_Store was deleted: %v", err)
+	}
+}
