@@ -205,23 +205,64 @@ func TestRemoveFilesRefusesOSMetadataSymlink(t *testing.T) {
 	requireExists(t, parent, "outside/victim", "dl/folder", "dl/folder/.DS_Store")
 }
 
-func TestRemoveFilesKeepingProtectsCrossSeedMetadataFile(t *testing.T) {
-	base := t.TempDir()
-	writeTree(t, base,
-		"folder/payload.bin",
-		"folder/.DS_Store",
-	)
+func TestRemoveFilesWithMetadataClaimer(t *testing.T) {
+	t.Run("refusal keeps metadata and directory", func(t *testing.T) {
+		base := t.TempDir()
+		writeTree(t, base,
+			"folder/payload.bin",
+			"folder/.DS_Store",
+		)
 
-	removed, err := RemoveFilesKeeping(
-		base,
-		[]string{filepath.FromSlash("folder/payload.bin")},
-		[]string{filepath.FromSlash("folder/.DS_Store")},
-	)
-	if err != nil || removed != 1 {
-		t.Fatalf("RemoveFilesKeeping = %d, %v; want 1 and no error", removed, err)
-	}
-	requireGone(t, base, "folder/payload.bin")
-	requireExists(t, base, "folder", "folder/.DS_Store")
+		var claimed []string
+		removed, err := RemoveFilesWithMetadataClaimer(
+			base,
+			[]string{filepath.FromSlash("folder/payload.bin")},
+			func(paths []string) (bool, func()) {
+				claimed = append(claimed, paths...)
+				return false, nil
+			},
+		)
+		if err != nil || removed != 1 {
+			t.Fatalf("RemoveFilesWithMetadataClaimer = %d, %v; want 1 and no error", removed, err)
+		}
+		if len(claimed) != 1 || claimed[0] != filepath.FromSlash("folder/.DS_Store") {
+			t.Fatalf("claimed = %q, want [folder/.DS_Store]", claimed)
+		}
+		requireGone(t, base, "folder/payload.bin")
+		requireExists(t, base, "folder", "folder/.DS_Store")
+	})
+
+	t.Run("release runs only after directory is removed", func(t *testing.T) {
+		base := t.TempDir()
+		writeTree(t, base,
+			"folder/payload.bin",
+			"folder/.DS_Store",
+		)
+
+		released := false
+		folderGoneAtRelease := false
+		removed, err := RemoveFilesWithMetadataClaimer(
+			base,
+			[]string{filepath.FromSlash("folder/payload.bin")},
+			func(paths []string) (bool, func()) {
+				return true, func() {
+					released = true
+					_, statErr := os.Lstat(filepath.Join(base, "folder"))
+					folderGoneAtRelease = os.IsNotExist(statErr)
+				}
+			},
+		)
+		if err != nil || removed != 1 {
+			t.Fatalf("RemoveFilesWithMetadataClaimer = %d, %v; want 1 and no error", removed, err)
+		}
+		if !released {
+			t.Fatal("release callback was not called")
+		}
+		if !folderGoneAtRelease {
+			t.Fatal("release callback ran before directory removal completed")
+		}
+		requireGone(t, base, "folder")
+	})
 }
 
 // BenchmarkRemoveFilesDeepTree shows the walk validates each directory once:

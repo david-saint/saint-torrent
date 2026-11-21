@@ -293,3 +293,87 @@ func TestRemoveSessionKeepsCrossSeededDSStore(t *testing.T) {
 		t.Fatalf("cross-seeded .DS_Store was deleted: %v", err)
 	}
 }
+
+// TestRemoveSessionKeepsUnlistedActiveTorrentMetadataFile ensures OS metadata
+// cleanup consults live pathClaims so removing a torrent that does NOT list a
+// metadata-named file never deletes one actively claimed by another torrent in
+// the same or an overlapping download directory.
+func TestRemoveSessionKeepsUnlistedActiveTorrentMetadataFile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		nestedDir bool
+	}{
+		{name: "same download dir"},
+		{name: "overlapping nested download dir", nestedDir: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			downloadDir := t.TempDir()
+			torrentDir := t.TempDir()
+
+			firstPath, firstHash := writeMultiFileTorrent(t, torrentDir, "first.torrent", "Pack", []map[string]interface{}{
+				{"length": int64(100), "path": []interface{}{"movie.mkv"}},
+			})
+			var secondPath string
+			secondDownloadDir := downloadDir
+			if tc.nestedDir {
+				secondDownloadDir = filepath.Join(downloadDir, "Pack")
+				secondPath, _ = writeTestTorrent(t, torrentDir, ".DS_Store", 16, "second")
+			} else {
+				secondPath, _ = writeMultiFileTorrent(t, torrentDir, "second.torrent", "Pack", []map[string]interface{}{
+					{"length": int64(16), "path": []interface{}{".DS_Store"}},
+				})
+			}
+
+			mgr := NewTorrentManager()
+			defer mgr.Close()
+			if _, err := mgr.AddTorrentFile(firstPath, downloadDir); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := mgr.AddTorrentFile(secondPath, secondDownloadDir); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := mgr.RemoveSession(fmt.Sprintf("%x", firstHash), true); err != nil {
+				t.Fatalf("RemoveSession: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(downloadDir, "Pack", "movie.mkv")); !os.IsNotExist(err) {
+				t.Fatalf("removed torrent's file should be deleted: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(downloadDir, "Pack", ".DS_Store")); err != nil {
+				t.Fatalf("other active torrent's .DS_Store was deleted: %v", err)
+			}
+		})
+	}
+}
+
+// TestClaimAllFreePathsReservesMetadataAgainstConcurrentAdd verifies that
+// dynamically discovered OS metadata files are reserved in pathClaims while
+// being removed, blocking any concurrent torrent add on those paths until
+// removal completes.
+func TestClaimAllFreePathsReservesMetadataAgainstConcurrentAdd(t *testing.T) {
+	downloadDir := t.TempDir()
+	torrentDir := t.TempDir()
+
+	metaTorrent, _ := writeMultiFileTorrent(t, torrentDir, "meta.torrent", "Pack", []map[string]interface{}{
+		{"length": int64(16), "path": []interface{}{".DS_Store"}},
+	})
+
+	mgr := NewTorrentManager()
+	defer mgr.Close()
+
+	ok, release := mgr.claimAllFreePaths([20]byte{1}, downloadDir, []string{filepath.Join("Pack", ".DS_Store")})
+	if !ok {
+		t.Fatal("claimAllFreePaths refused an unheld metadata path")
+	}
+
+	if _, err := mgr.AddTorrentFile(metaTorrent, downloadDir); !errors.Is(err, ErrPathInUse) {
+		release()
+		t.Fatalf("concurrent add during metadata reservation = %v, want ErrPathInUse", err)
+	}
+
+	release()
+
+	if _, err := mgr.AddTorrentFile(metaTorrent, downloadDir); err != nil {
+		t.Fatalf("add after metadata reservation released: %v", err)
+	}
+}

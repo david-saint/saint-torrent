@@ -11,6 +11,15 @@ import (
 	"strings"
 )
 
+// MetadataClaimer checks and reserves OS metadata paths (given relative to
+// baseDir) that are about to be deleted while cleaning an otherwise-empty
+// directory. It returns ok=true and an optional release callback only when
+// every path in relPaths is safe to delete (not held by another active
+// torrent); release is invoked after the metadata files and their parent
+// directory have been removed (or immediately if removal aborts). When ok is
+// false, nothing in that directory is deleted.
+type MetadataClaimer func(relPaths []string) (ok bool, release func())
+
 // RemoveFiles deletes a torrent's payload files, given as paths relative to
 // baseDir, and then the directories under baseDir they leave empty (including
 // directories whose only remaining entries are OS-generated metadata files such
@@ -31,31 +40,20 @@ import (
 // removed counts the payload files actually deleted; files already missing are
 // not an error. err joins everything that was refused or failed.
 func RemoveFiles(baseDir string, relPaths []string) (removed int, err error) {
-	return RemoveFilesKeeping(baseDir, relPaths, nil)
+	return RemoveFilesWithMetadataClaimer(baseDir, relPaths, nil)
 }
 
-// RemoveFilesKeeping behaves like RemoveFiles, except that paths listed in
-// keepPaths (relative to baseDir) are never removed during empty-directory
-// metadata cleanup — protecting files another active torrent (such as a
-// cross-seed) still uses even when their name matches an OS metadata file.
-func RemoveFilesKeeping(baseDir string, relPaths, keepPaths []string) (removed int, err error) {
+// RemoveFilesWithMetadataClaimer behaves like RemoveFiles, except that before
+// deleting OS metadata files discovered during empty-directory cleanup it calls
+// claim with their paths relative to baseDir so callers can verify and reserve
+// them against live path claims before unlinking.
+func RemoveFilesWithMetadataClaimer(baseDir string, relPaths []string, claim MetadataClaimer) (removed int, err error) {
 	root, err := openExistingPlatformDownloadRoot(baseDir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, fmt.Errorf("open download directory %s: %w", baseDir, err)
-	}
-
-	var keep map[string]struct{}
-	if len(keepPaths) > 0 {
-		keep = make(map[string]struct{}, len(keepPaths))
-		for _, kp := range keepPaths {
-			clean := filepath.Clean(kp)
-			if clean != "." && filepath.IsLocal(clean) {
-				keep[pathKey(clean)] = struct{}{}
-			}
-		}
 	}
 
 	var errs []error
@@ -72,7 +70,7 @@ func RemoveFilesKeeping(baseDir string, relPaths, keepPaths []string) (removed i
 	// below opens each directory once and leaves it for good.
 	slices.SortFunc(paths, slices.Compare)
 
-	w := removalWalk{dirs: []*os.Root{root}, keep: keep}
+	w := removalWalk{dirs: []*os.Root{root}, claim: claim}
 	for _, components := range paths {
 		dir, name := components[:len(components)-1], components[len(components)-1]
 		parent, err := w.enter(dir)
@@ -109,13 +107,14 @@ func RemoveFilesKeeping(baseDir string, relPaths, keepPaths []string) (removed i
 // removalWalk keeps the chain of verified directory handles from the download
 // root to the directory of the file being removed. dirs[0] is the root and
 // dirs[i] is names[:i]. blocked is a directory that is missing or was refused;
-// every file under it is skipped without another lookup. keep holds pathKeys of
-// files another torrent still uses, which must never be cleaned as OS metadata.
+// every file under it is skipped without another lookup. claim, when set,
+// verifies and reserves OS metadata candidates against live torrent path claims
+// before removing them.
 type removalWalk struct {
 	dirs    []*os.Root
 	names   []string
 	blocked []string
-	keep    map[string]struct{}
+	claim   MetadataClaimer
 }
 
 // enter moves the walk to dir and returns its handle, or nil when dir lies
@@ -168,11 +167,17 @@ func (w *removalWalk) leave(depth int) []error {
 			continue
 		}
 		err := parent.Remove(name)
-		if err != nil && isDirNotEmpty(err) && w.removeOSMetadataOnlyDir(parent, name) {
-			if info, statErr := parent.Lstat(name); statErr != nil || !info.IsDir() {
-				continue
+		if err != nil && isDirNotEmpty(err) {
+			if retry, release := w.removeOSMetadataOnlyDir(parent, name); retry {
+				if info, statErr := parent.Lstat(name); statErr == nil && info.IsDir() {
+					err = parent.Remove(name)
+				} else {
+					err = nil
+				}
+				if release != nil {
+					release()
+				}
 			}
-			err = parent.Remove(name)
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) && !isDirNotEmpty(err) {
 			errs = append(errs, fmt.Errorf("remove empty directory %s: %w", filepath.Join(append(slices.Clone(w.names), name)...), err))
@@ -221,32 +226,22 @@ func isAppleDoubleFile(dir *os.Root, name string, info os.FileInfo) bool {
 	return hdr == appleDoubleMagic
 }
 
-func (w *removalWalk) isKept(dirName, entryName string) bool {
-	if len(w.keep) == 0 {
-		return false
-	}
-	parts := make([]string, 0, len(w.names)+2)
-	parts = append(parts, w.names...)
-	parts = append(parts, dirName, entryName)
-	_, ok := w.keep[pathKey(filepath.Join(parts...))]
-	return ok
-}
-
 // removeOSMetadataOnlyDir inspects the real directory name under parent and,
-// if every entry in it is an unkept regular OS metadata file, removes those
-// files and returns true so the caller can retry removing the now-empty
-// directory. If any other file, directory, symlink, or kept cross-seed path is
-// present, nothing is deleted and it returns false.
-func (w *removalWalk) removeOSMetadataOnlyDir(parent *os.Root, name string) bool {
+// if every entry in it is a regular OS metadata file that w.claim permits
+// deleting, removes those files and returns retry=true along with any release
+// callback so the caller can retry removing the now-empty directory while the
+// reservation is still held. If any other file, directory, symlink, or claimed
+// torrent path is present, nothing is deleted and it returns retry=false.
+func (w *removalWalk) removeOSMetadataOnlyDir(parent *os.Root, name string) (retry bool, release func()) {
 	dir, err := openDirNoFollow(parent, name)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	defer dir.Close()
 
 	f, err := dir.Open(".")
 	if err != nil {
-		return false
+		return false, nil
 	}
 
 	var junk []string
@@ -254,21 +249,17 @@ func (w *removalWalk) removeOSMetadataOnlyDir(parent *os.Root, name string) bool
 		entries, readErr := f.ReadDir(64)
 		for _, entry := range entries {
 			entryName := entry.Name()
-			if w.isKept(name, entryName) {
-				_ = f.Close()
-				return false
-			}
 			info, statErr := dir.Lstat(entryName)
 			if errors.Is(statErr, fs.ErrNotExist) {
 				continue
 			}
 			if statErr != nil || !info.Mode().IsRegular() {
 				_ = f.Close()
-				return false
+				return false, nil
 			}
 			if !isOSMetadataName(entryName) && !isAppleDoubleFile(dir, entryName, info) {
 				_ = f.Close()
-				return false
+				return false, nil
 			}
 			junk = append(junk, entryName)
 		}
@@ -277,12 +268,35 @@ func (w *removalWalk) removeOSMetadataOnlyDir(parent *os.Root, name string) bool
 		}
 		if readErr != nil {
 			_ = f.Close()
-			return false
+			return false, nil
 		}
 	}
 	if err := f.Close(); err != nil {
-		return false
+		return false, nil
 	}
+
+	if len(junk) > 0 && w.claim != nil {
+		dirPath := filepath.Join(append(slices.Clone(w.names), name)...)
+		relPaths := make([]string, len(junk))
+		for i, entryName := range junk {
+			relPaths[i] = filepath.Join(dirPath, entryName)
+		}
+		ok, rel := w.claim(relPaths)
+		if !ok {
+			if rel != nil {
+				rel()
+			}
+			return false, nil
+		}
+		release = rel
+	}
+
+	keepRelease := false
+	defer func() {
+		if !keepRelease && release != nil {
+			release()
+		}
+	}()
 
 	for _, entryName := range junk {
 		info, err := dir.Lstat(entryName)
@@ -290,13 +304,14 @@ func (w *removalWalk) removeOSMetadataOnlyDir(parent *os.Root, name string) bool
 			continue
 		}
 		if err != nil || !info.Mode().IsRegular() {
-			return false
+			return false, nil
 		}
 		if err := dir.Remove(entryName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	keepRelease = true
+	return true, release
 }
 
 // openDirNoFollow opens the directory name beneath parent, refusing anything
