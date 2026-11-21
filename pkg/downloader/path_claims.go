@@ -264,6 +264,32 @@ func (m *TorrentManager) claimUnheldPaths(baseDir string, relPaths []string) (fr
 	return free, m.releaseDeletingFunc(freeKeys)
 }
 
+// claimAllFreePaths atomically reserves every path in relPaths under baseDir
+// for deletion, succeeding only when no torrent other than infoHash holds any
+// of them. On failure nothing is reserved and ok is false. Used when cleaning
+// OS metadata files discovered on disk during directory teardown so another
+// active torrent's claimed file is never deleted and no concurrent add can
+// claim the path before removal completes.
+func (m *TorrentManager) claimAllFreePaths(infoHash [20]byte, baseDir string, relPaths []string) (ok bool, release func()) {
+	if len(relPaths) == 0 {
+		return true, func() {}
+	}
+	keys := pathClaimKeys(baseDir, relPaths)
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	for _, key := range keys {
+		c := m.pathClaims[key]
+		if c.refs+c.shared > m.ownRefsLocked(key, c, infoHash) {
+			return false, nil
+		}
+	}
+	for _, key := range keys {
+		m.markDeletingLocked(key, m.pathClaims[key])
+	}
+	return true, m.releaseDeletingFunc(keys)
+}
+
 // markDeletingLocked records c, the claim at key, as reserved by one more
 // removal or move. Caller holds m.claimMu.
 func (m *TorrentManager) markDeletingLocked(key pathClaimKey, c pathClaim) {

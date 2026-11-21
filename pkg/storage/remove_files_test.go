@@ -119,6 +119,152 @@ func TestRemoveFilesRefusesSymlinks(t *testing.T) {
 	requireExists(t, parent, "outside/victim", "dl/real/victim", "dl/realdir/victim", "dl/escape", "dl/inner", "dl/fileref", "dl/rel")
 }
 
+func TestRemoveFilesCleansOSMetadataOnlyDirectories(t *testing.T) {
+	base := t.TempDir()
+	writeTree(t, base,
+		".DS_Store",
+		"album/.DS_Store",
+		"album/Thumbs.db",
+		"album/desktop.ini",
+		"album/disc1/.DS_Store",
+		"album/disc1/ehthumbs.db",
+		"album/disc1/ehthumbs_vista.db",
+		"album/disc1/track1.flac",
+		"album/cover.jpg",
+	)
+	appleDouble := append([]byte{0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00}, make([]byte, 32)...)
+	if err := os.WriteFile(filepath.Join(base, "album", "disc1", "._track1.flac"), appleDouble, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "album", "._.DS_Store"), appleDouble, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rel := []string{
+		filepath.FromSlash("album/disc1/track1.flac"),
+		filepath.FromSlash("album/cover.jpg"),
+	}
+	removed, err := RemoveFiles(base, rel)
+	if err != nil || removed != 2 {
+		t.Fatalf("RemoveFiles = %d, %v; want 2 payload files and no error", removed, err)
+	}
+	requireGone(t, base, "album")
+	// Download root and its own OS metadata must stay untouched.
+	requireExists(t, base, ".", ".DS_Store")
+}
+
+func TestRemoveFilesPreservesOSMetadataWhenOtherFilesRemain(t *testing.T) {
+	base := t.TempDir()
+	writeTree(t, base,
+		"folder/.DS_Store",
+		"folder/payload.bin",
+		"folder/notes.txt",
+	)
+	appleDouble := append([]byte{0x00, 0x05, 0x16, 0x07}, []byte("resource")...)
+	if err := os.WriteFile(filepath.Join(base, "folder", "._payload.bin"), appleDouble, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := RemoveFiles(base, []string{filepath.FromSlash("folder/payload.bin")})
+	if err != nil || removed != 1 {
+		t.Fatalf("RemoveFiles = %d, %v; want 1 and no error", removed, err)
+	}
+	requireGone(t, base, "folder/payload.bin")
+	requireExists(t, base, "folder", "folder/notes.txt", "folder/.DS_Store", "folder/._payload.bin")
+}
+
+func TestRemoveFilesPreservesNonAppleDoubleDotUnderscoreFile(t *testing.T) {
+	base := t.TempDir()
+	writeTree(t, base,
+		"folder/.DS_Store",
+		"folder/payload.bin",
+		"folder/._custom.txt",
+	)
+
+	removed, err := RemoveFiles(base, []string{filepath.FromSlash("folder/payload.bin")})
+	if err != nil || removed != 1 {
+		t.Fatalf("RemoveFiles = %d, %v; want 1 and no error", removed, err)
+	}
+	requireGone(t, base, "folder/payload.bin")
+	requireExists(t, base, "folder", "folder/._custom.txt", "folder/.DS_Store")
+}
+
+func TestRemoveFilesRefusesOSMetadataSymlink(t *testing.T) {
+	parent := t.TempDir()
+	base := filepath.Join(parent, "dl")
+	writeTree(t, parent, "outside/victim", "dl/folder/payload.bin")
+	if err := os.Symlink(filepath.Join(parent, "outside", "victim"), filepath.Join(base, "folder", ".DS_Store")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	removed, err := RemoveFiles(base, []string{filepath.FromSlash("folder/payload.bin")})
+	if err != nil || removed != 1 {
+		t.Fatalf("RemoveFiles = %d, %v; want 1 and no error", removed, err)
+	}
+	requireGone(t, base, "folder/payload.bin")
+	requireExists(t, parent, "outside/victim", "dl/folder", "dl/folder/.DS_Store")
+}
+
+func TestRemoveFilesWithMetadataClaimer(t *testing.T) {
+	t.Run("refusal keeps metadata and directory", func(t *testing.T) {
+		base := t.TempDir()
+		writeTree(t, base,
+			"folder/payload.bin",
+			"folder/.DS_Store",
+		)
+
+		var claimed []string
+		removed, err := RemoveFilesWithMetadataClaimer(
+			base,
+			[]string{filepath.FromSlash("folder/payload.bin")},
+			func(paths []string) (bool, func()) {
+				claimed = append(claimed, paths...)
+				return false, nil
+			},
+		)
+		if err != nil || removed != 1 {
+			t.Fatalf("RemoveFilesWithMetadataClaimer = %d, %v; want 1 and no error", removed, err)
+		}
+		if len(claimed) != 1 || claimed[0] != filepath.FromSlash("folder/.DS_Store") {
+			t.Fatalf("claimed = %q, want [folder/.DS_Store]", claimed)
+		}
+		requireGone(t, base, "folder/payload.bin")
+		requireExists(t, base, "folder", "folder/.DS_Store")
+	})
+
+	t.Run("release runs only after directory is removed", func(t *testing.T) {
+		base := t.TempDir()
+		writeTree(t, base,
+			"folder/payload.bin",
+			"folder/.DS_Store",
+		)
+
+		released := false
+		folderGoneAtRelease := false
+		removed, err := RemoveFilesWithMetadataClaimer(
+			base,
+			[]string{filepath.FromSlash("folder/payload.bin")},
+			func(paths []string) (bool, func()) {
+				return true, func() {
+					released = true
+					_, statErr := os.Lstat(filepath.Join(base, "folder"))
+					folderGoneAtRelease = os.IsNotExist(statErr)
+				}
+			},
+		)
+		if err != nil || removed != 1 {
+			t.Fatalf("RemoveFilesWithMetadataClaimer = %d, %v; want 1 and no error", removed, err)
+		}
+		if !released {
+			t.Fatal("release callback was not called")
+		}
+		if !folderGoneAtRelease {
+			t.Fatal("release callback ran before directory removal completed")
+		}
+		requireGone(t, base, "folder")
+	})
+}
+
 // BenchmarkRemoveFilesDeepTree shows the walk validates each directory once:
 // removing 200 files 16 directories deep costs about what it does at depth 1,
 // where re-walking every path would multiply the lookups by the depth.

@@ -613,7 +613,10 @@ func (m *TorrentManager) deletePayload(infoHash [20]byte, downloadDir string, fi
 	if len(keptPaths) > 0 {
 		kept = &FilesKeptError{Kept: len(keptPaths), Example: keptPaths[0]}
 	}
-	if _, removeErr := storage.RemoveFiles(downloadDir, free); removeErr != nil {
+	claimMetadata := func(paths []string) (bool, func()) {
+		return m.claimAllFreePaths(infoHash, downloadDir, paths)
+	}
+	if _, removeErr := storage.RemoveFilesWithMetadataClaimer(downloadDir, free, claimMetadata); removeErr != nil {
 		err = fmt.Errorf("failed to delete files: %w", removeErr)
 	}
 	return kept, err
